@@ -43,6 +43,7 @@ export function audit(events) {
     busy: busy.length,
     dropped: dropped.map((event) => ({ need: event.need, params: event.params })),
     bridgeRefusals: diagnostics.filter((event) => event.code === "html_read_refused").map((event) => event.detail),
+    subscribeRefusals: diagnostics.filter((event) => event.code === "html_subscribe_refused").map((event) => event.detail),
     runtimeErrors: diagnostics.filter((event) => event.code === "html_runtime_error").map((event) => event.detail),
     refused: events.filter((event) => event.type === "read-refused").map((event) => ({ need: event.need, code: event.code })),
   };
@@ -72,9 +73,11 @@ export async function openFakeHost(page, options) {
     pushInput: () => page.evaluate(() => window.__alphaTabHost.pushInput()),
     reload: () => page.evaluate(() => window.__alphaTabHost.reload()),
     subscriptions: () => page.evaluate(() => window.__alphaTabHost.subscriptions()),
+    subscriptionDiagnostics: () => page.evaluate(() => window.__alphaTabHost.subscriptionDiagnostics()),
     pushSubscription: (id, result, options) => page.evaluate(([i, r, o]) => window.__alphaTabHost.pushSubscription(i, r, o), [id, result, options]),
     failSubscription: (id, code, message, terminal) => page.evaluate(([i, c, m, t]) => window.__alphaTabHost.failSubscription(i, c, m, t), [id, code, message, terminal]),
     pushAgentStatus: (status) => page.evaluate((body) => window.__alphaTabHost.pushAgentStatus(body), status),
+    pushViewer: (viewer) => page.evaluate((body) => window.__alphaTabHost.pushViewer(body), viewer),
     sessionPost: (requestId, frame) => page.evaluate(([id, body]) => window.__alphaTabHost.sessionPost(id, body), [requestId, frame]),
     async audit() { return audit(await events()); },
     async expectHealthy() {

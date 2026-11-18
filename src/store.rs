@@ -92,7 +92,7 @@ struct PreparedEvent {
 struct SqliteContentPorts<'transaction> {
     // Set only by ordinary locally computed append, never import/replay.
     live_named_view: bool,
-    transaction: &'transaction mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    transaction: &'transaction mut sqlx::SqliteConnection,
     native_source: Option<NativeEventSource>,
     act: i64,
 }
@@ -110,12 +110,12 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                     let heads: Vec<String> = sqlx::query_scalar(
                         "SELECT event_id FROM content_event_heads ORDER BY event_id",
                     )
-                    .fetch_all(&mut **self.transaction)
+                    .fetch_all(&mut *self.transaction)
                     .await?;
                     if heads.is_empty() {
                         let event_count: i64 =
                             sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
-                                .fetch_one(&mut **self.transaction)
+                                .fetch_one(&mut *self.transaction)
                                 .await?;
                         if event_count != 0 {
                             return Err(Error::engine(
@@ -156,7 +156,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                 "SELECT EXISTS(SELECT 1 FROM content_event_causal_frontier WHERE parent_event_id=?)",
             )
             .bind(&event.id)
-            .fetch_one(&mut **self.transaction)
+            .fetch_one(&mut *self.transaction)
             .await?;
             if referenced {
                 for parent_event_id in causal_envelope.frontier().as_slice() {
@@ -172,7 +172,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                     )
                     .bind(parent_event_id)
                     .bind(&event.id)
-                    .fetch_one(&mut **self.transaction)
+                    .fetch_one(&mut *self.transaction)
                     .await?;
                     if closes_cycle {
                         return Err(Error::engine("causal frontier would create a cycle"));
@@ -202,7 +202,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                     .bind(event.causal_envelope.version().as_i64())
                     .bind(event.causal_envelope.status().as_str())
                     .bind(act)
-                    .fetch_one(&mut **self.transaction)
+                    .fetch_one(&mut *self.transaction)
                     .await)
                 })
                 .await
@@ -217,7 +217,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                 )
                 .bind(&event.id)
                 .bind(parent_event_id)
-                .execute(&mut **self.transaction)
+                .execute(&mut *self.transaction)
                 .await?;
             }
             if let Some(source) = &self.native_source {
@@ -233,7 +233,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                 .bind(&source.source_record_id)
                 .bind(&source.source_principal)
                 .bind(hex::encode(source.fingerprint))
-                .execute(&mut **self.transaction)
+                .execute(&mut *self.transaction)
                 .await?;
             }
             Ok(seq)
@@ -307,7 +307,16 @@ pub(crate) fn current_event_annotations() -> EventAnnotations {
 /// would deadlock against it until `busy_timeout` expires.
 pub(crate) async fn append_in(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    append_on(db, tx, spec, act_alloc).await
+}
+
+pub(crate) async fn append_on(
+    db: &Db,
+    tx: &mut sqlx::SqliteConnection,
     spec: AppendSpec,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
@@ -322,14 +331,31 @@ pub(crate) async fn append_in(
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
             | "kernel.notification_preference_set.v1"
+            | "kernel.mcp_write_receipt_recorded.v1"
+            | "kernel.mcp_write_fenced.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes require the sealed kernel commit port",
         ));
     }
+    if crate::mcp::tools::webhooks::is_event(&spec.event_type) {
+        return Err(Error::engine(
+            "webhook events require the sealed hosting intake route",
+        ));
+    }
+    // Visible-set cache (Native b171a9d): a registered serving handle's first
+    // ordinary write creates the persisted access epoch in this transaction.
+    #[cfg(feature = "v2-kernel-probe")]
+    crate::mcp::kernel_v2::sql::visible_cache::ensure_epoch_in_write(db, tx).await?;
     if spec.event_type.starts_with("kernel.hcp_") {
         return Err(Error::engine(
             "HCP events require the sealed kernel HCP route",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if spec.event_type.starts_with("kernel.publication_") {
+        return Err(Error::engine(
+            "publication events require the sealed publication route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -343,7 +369,26 @@ pub(crate) async fn append_in(
             "record.type_corrected.v1 is correction-operation-owned and cannot be appended through the generic content seam",
         ));
     }
-    append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
+    append_with_event_id_on(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
+}
+
+/// Private keyed-outcome admission. Ordinary append/import cannot mint receipts.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_mcp_receipt_on(
+    db: &Db,
+    tx: &mut sqlx::SqliteConnection,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if !matches!(
+        spec.event_type.as_str(),
+        crate::kernel::mcp_write_receipts::EVENT | crate::kernel::mcp_write_receipts::fences::EVENT
+    ) || spec.record_id != crate::kernel::mcp_write_receipts::STREAM
+    {
+        return Err(Error::engine("invalid keyed outcome admission"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelProvider, acts).await
 }
 
 /// Internal host-only run ledger event route. Public append/import cannot acquire it.
@@ -417,7 +462,7 @@ pub(crate) async fn append_kernel_instruction_binding_in(
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub(crate) async fn append_kernel_provider_in(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     spec: AppendSpec,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
@@ -469,6 +514,28 @@ pub(crate) async fn append_kernel_slot_in(
     append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelSlot, act_alloc).await
 }
 
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_publication_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    _seal: &crate::kernel::publications::Seal,
+    spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if spec.event_type != crate::kernel::publications::EVENT {
+        return Err(Error::engine("invalid sealed publication event"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(
+        db,
+        tx,
+        prepared,
+        PreparedAdmission::KernelPublication,
+        act_alloc,
+    )
+    .await
+}
+
 /// Governed-only append capability for the prepared record-type correction
 /// operation. The caller must have revalidated its bound plan in this same
 /// transaction before entering this seam.
@@ -483,7 +550,7 @@ pub(crate) async fn append_record_type_correction_in(
             "append_record_type_correction_in accepts only record.type_corrected.v1",
         ));
     }
-    append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
+    append_with_event_id_on(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
 }
 
 async fn append_engine_seed_in(
@@ -549,6 +616,16 @@ pub(crate) async fn append_with_event_id_in(
     spec: AppendSpec,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
+    append_with_event_id_on(db, tx, event_id, spec, act_alloc).await
+}
+
+pub(crate) async fn append_with_event_id_on(
+    db: &Db,
+    tx: &mut sqlx::SqliteConnection,
+    event_id: String,
+    spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
     let uuid = Uuid::parse_str(&event_id)
         .map_err(|_| Error::engine("preallocated content event id must be a canonical UUIDv4"))?;
     if uuid.get_version() != Some(uuid::Version::Random)
@@ -609,6 +686,8 @@ pub(crate) async fn append_kernel_legacy_in(
     acts: &mut crate::act::ActAllocation,
 ) -> Result<()> {
     crate::db::enrolled::require_content_connection(conn, None).await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    crate::coedit::live::kernel_writes::admit_import_on(conn).await?;
     if event.event_type != "kernel.legacy_recorded.v1" {
         return Err(Error::engine(
             "legacy append requires kernel legacy envelope",
@@ -638,6 +717,8 @@ pub(crate) async fn append_kernel_import_receipts_in(
     subjects: &[(&str, &str)],
     acts: &mut crate::act::ActAllocation,
 ) -> Result<()> {
+    #[cfg(feature = "v2-kernel-probe")]
+    crate::coedit::live::kernel_writes::admit_import_on(tx).await?;
     let mut previous = None;
     for (record, legacy_id) in subjects {
         let spec = AppendSpec {
@@ -711,14 +792,27 @@ pub(crate) async fn append_migration_on(
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
             | "kernel.notification_preference_set.v1"
+            | "kernel.mcp_write_receipt_recorded.v1"
+            | "kernel.mcp_write_fenced.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes cannot be imported through the generic event seam",
         ));
     }
+    if crate::mcp::tools::webhooks::is_event(&spec.event_type) {
+        return Err(Error::engine(
+            "webhook events require the sealed hosting intake route",
+        ));
+    }
     if spec.event_type.starts_with("kernel.hcp_") {
         return Err(Error::engine(
             "HCP events require the sealed kernel HCP route",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if spec.event_type.starts_with("kernel.publication_") {
+        return Err(Error::engine(
+            "publication events require the sealed publication route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -776,6 +870,20 @@ fn normalize_payload(record_id: &str, event_type: &str, payload: Value) -> Value
     crate::domain_transaction::normalize_event_payload(record_id, event_type, payload)
 }
 
+pub(crate) async fn append_webhook_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    _seal: &crate::mcp::tools::webhooks::Seal,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if !crate::mcp::tools::webhooks::is_event(&spec.event_type) {
+        return Err(Error::engine("invalid sealed webhook event"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::Webhook, acts).await
+}
+
 /// Private sealed-local preparation shared by the engine-seed, provisioning,
 /// derived, and preallocated-id append seams. It owns only the mechanical
 /// construction — payload normalization, annotation capture, timestamp, default
@@ -824,7 +932,7 @@ fn prepare_sealed_local_event(event_id: String, spec: AppendSpec) -> Result<Prep
 /// before entry.
 async fn append_prepared_in(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     prepared: PreparedEvent,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
@@ -842,12 +950,15 @@ async fn append_prepared_engine_seed_in(
 
 #[derive(Clone, Copy)]
 enum PreparedAdmission {
+    Webhook,
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     KernelProvider,
     #[cfg(feature = "v2-kernel-probe")]
     KernelHcp,
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     KernelSlot,
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    KernelPublication,
     Ordinary,
     EngineSeed,
     EngineProvisioning,
@@ -859,13 +970,13 @@ enum PreparedAdmission {
 /// and runs on 2 MiB server workers, so it must not carry the query future.
 #[inline(never)]
 fn boxed_stored_kind<'a>(
-    tx: &'a mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &'a mut sqlx::SqliteConnection,
     record_id: &'a str,
 ) -> futures::future::BoxFuture<'a, Result<Option<String>>> {
     Box::pin(async move {
         Ok(sqlx::query_scalar("SELECT kind FROM records WHERE id = ?")
             .bind(record_id)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten())
     })
@@ -873,11 +984,77 @@ fn boxed_stored_kind<'a>(
 
 async fn append_prepared_admitted(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
-    mut prepared: PreparedEvent,
+    tx: &mut sqlx::SqliteConnection,
+    prepared: PreparedEvent,
     admission: PreparedAdmission,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
+    append_prepared_admitted_impl(
+        db,
+        tx,
+        prepared,
+        admission,
+        act_alloc,
+        KernelAppendAdmission::Unowned,
+    )
+    .await
+}
+
+enum KernelAppendAdmission {
+    Unowned,
+    #[cfg(feature = "v2-kernel-probe")]
+    Owned(crate::coedit::live::kernel_writes::KernelAppendPermit),
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn append_owned_kernel_body_in(
+    db: &Db,
+    tx: &mut sqlx::SqliteConnection,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+    permit: crate::coedit::live::kernel_writes::KernelAppendPermit,
+) -> Result<EventRow> {
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted_impl(
+        db,
+        tx,
+        prepared,
+        PreparedAdmission::Ordinary,
+        acts,
+        KernelAppendAdmission::Owned(permit),
+    )
+    .await
+}
+
+async fn append_prepared_admitted_impl(
+    db: &Db,
+    tx: &mut sqlx::SqliteConnection,
+    mut prepared: PreparedEvent,
+    admission: PreparedAdmission,
+    act_alloc: &mut crate::act::ActAllocation,
+    kernel_admission: KernelAppendAdmission,
+) -> Result<EventRow> {
+    #[cfg(feature = "v2-kernel-probe")]
+    match kernel_admission {
+        KernelAppendAdmission::Owned(permit) => permit.consume(
+            db,
+            tx,
+            &prepared.event.record_id,
+            &prepared.event.event_type,
+            &prepared.payload,
+        )?,
+        KernelAppendAdmission::Unowned if prepared.event.event_type.starts_with("kernel.") => {
+            crate::coedit::live::kernel_writes::admit_unowned_event(
+                db,
+                &prepared.event.record_id,
+                &prepared.event.event_type,
+                &prepared.payload,
+            )?
+        }
+        KernelAppendAdmission::Unowned => {}
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let _ = kernel_admission;
     crate::db::enrolled::require_content_connection(tx, Some(db)).await?;
     // Authenticated incoming events are not local effects. Their projector
     // below is canonical (live_named_view=false) and checks the full prefix,
@@ -895,7 +1072,7 @@ async fn append_prepared_admitted(
         let kernel_schema: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kernel_records')",
         )
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         if !kernel_schema {
             return Err(Error::engine(
@@ -908,7 +1085,7 @@ async fn append_prepared_admitted(
     // event that takes the record out of live-editable scope closes it.
     // Only databases with live sessions in this process pay for the
     // backstop at all (a cheap map lookup gates it).
-    if crate::coedit::live::has_sessions(db) {
+    if !prepared.event.event_type.starts_with("kernel.") && crate::coedit::live::has_sessions(db) {
         let stored_kind: Option<String> = if crate::coedit::live::needs_stored_kind(
             db,
             &prepared.event.record_id,
@@ -945,7 +1122,7 @@ async fn append_prepared_admitted(
              )",
         )
         .bind(&prepared.event.record_id)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         if active_binding {
             return Err(Error::engine(
@@ -963,7 +1140,7 @@ async fn append_prepared_admitted(
              )",
         )
         .bind(&prepared.event.record_id)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         if active_artifact_role {
             return Err(Error::engine(
@@ -982,7 +1159,7 @@ async fn append_prepared_admitted(
               WHERE target_kind='record' AND target_record_id=? AND target_slot='body'",
         )
         .bind(&prepared.event.record_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?;
         let authority = DERIVED_BODY_AUTHORITY.try_with(Clone::clone).ok();
         match (head, authority) {
@@ -1034,7 +1211,7 @@ async fn append_prepared_admitted(
         if let Some(vocab_ref) = prepared.payload.get("vocab_ref").and_then(Value::as_str) {
             let found = sqlx::query("SELECT 1 FROM vocabularies WHERE id = ?")
                 .bind(resolve_vocab_ref(vocab_ref))
-                .fetch_optional(&mut **tx)
+                .fetch_optional(&mut *tx)
                 .await?;
             if found.is_none() {
                 return Err(Error::engine(format!(
@@ -1104,6 +1281,33 @@ async fn append_prepared_admitted(
                 return Err(Error::engine("slot events cannot carry imported causality"));
             }
             crate::domain_transaction::append_and_project_kernel_slot(
+                &mut ports,
+                &mut prepared.event,
+                &control,
+            )
+            .await?;
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        PreparedAdmission::KernelPublication => {
+            if !matches!(causal_admission, CausalAdmission::LocalComputed) {
+                return Err(Error::engine(
+                    "publication events cannot carry imported causality",
+                ));
+            }
+            crate::domain_transaction::append_and_project_kernel_publication(
+                &mut ports,
+                &mut prepared.event,
+                &control,
+            )
+            .await?;
+        }
+        PreparedAdmission::Webhook => {
+            if !matches!(causal_admission, CausalAdmission::LocalComputed) {
+                return Err(Error::engine(
+                    "webhook events cannot carry imported causality",
+                ));
+            }
+            crate::domain_transaction::append_and_project_webhook(
                 &mut ports,
                 &mut prepared.event,
                 &control,
@@ -1202,12 +1406,12 @@ async fn append_prepared_admitted(
 /// reach this path. Events which leave the target outside the current set are a
 /// cheap no-op query and, importantly, free the slot on archive/delete.
 async fn assert_one_current_definition_per_term(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     record_id: &str,
 ) -> Result<()> {
     let identity = sqlx::query("SELECT type, kind FROM records WHERE id = ?")
         .bind(record_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?;
     let Some(identity) = identity else {
         return Ok(());
@@ -1239,7 +1443,7 @@ async fn assert_one_current_definition_per_term(
             )",
     )
     .bind(record_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(current) = current else {
         return Ok(());
@@ -1269,7 +1473,7 @@ async fn assert_one_current_definition_per_term(
     )
     .bind(record_id)
     .bind(&canonical_term)
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut *tx)
     .await?;
     let mut conflict = None;
     for candidate in candidates {
@@ -1298,6 +1502,10 @@ async fn assert_one_current_definition_per_term(
 /// exactly one act.
 pub async fn append(db: &Db, spec: AppendSpec) -> Result<EventRow> {
     reject_public_runtime_event(&spec)?;
+    #[cfg(feature = "v2-kernel-probe")]
+    if spec.event_type.starts_with("kernel.") {
+        return Ok(append_kernel_public(db, vec![spec]).await?.remove(0));
+    }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     reject_public_governed_attribution_in(&mut tx, &spec).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
@@ -1319,6 +1527,19 @@ pub async fn append_batch(db: &Db, specs: Vec<AppendSpec>) -> Result<Vec<EventRo
     for spec in &specs {
         reject_public_runtime_event(spec)?;
     }
+    #[cfg(feature = "v2-kernel-probe")]
+    if specs
+        .iter()
+        .any(|spec| spec.event_type.starts_with("kernel."))
+    {
+        if specs
+            .iter()
+            .any(|spec| !spec.event_type.starts_with("kernel."))
+        {
+            return Err(Error::engine("raw append cannot mix kernel and v1 events"));
+        }
+        return append_kernel_public(db, specs).await;
+    }
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     let mut events = Vec::with_capacity(specs.len());
@@ -1328,6 +1549,53 @@ pub async fn append_batch(db: &Db, specs: Vec<AppendSpec>) -> Result<Vec<EventRo
     }
     db.commit_content(tx).await?;
     Ok(events)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+async fn append_kernel_public(db: &Db, specs: Vec<AppendSpec>) -> Result<Vec<EventRow>> {
+    use crate::coedit::live::kernel_writes::{
+        owned_result, KernelBodyWrite, KernelTransaction, KernelWriteMode,
+    };
+    let db = db.clone();
+    owned_result(db.clone(), async move {
+        let ownership = KernelBodyWrite::acquire(
+            &db,
+            &crate::mcp::Caller::local(),
+            None,
+            KernelWriteMode::Metadata,
+        )
+        .await?;
+        let mut transaction =
+            KernelTransaction::begin(&db, ownership, KernelBodyWrite::quarantine).await?;
+        let result = async {
+            let (tx, _) = transaction.parts();
+            let mut acts = crate::act::ActAllocation::new();
+            let mut events = Vec::with_capacity(specs.len());
+            for spec in specs {
+                reject_public_governed_attribution_in(tx, &spec).await?;
+                events.push(append_on(&db, tx, spec, &mut acts).await?);
+            }
+            Ok::<_, Error>(events)
+        }
+        .await;
+        match result {
+            Ok(events) => {
+                #[cfg(test)]
+                if let Err(error) = crate::coedit::live::kernel_writes::test_checkpoint(
+                    &db,
+                    crate::coedit::live::kernel_writes::TestStage::AfterMutation,
+                )
+                .await
+                {
+                    return Err(transaction.rollback(error).await);
+                }
+                let _ownership = transaction.commit().await?;
+                Ok(events)
+            }
+            Err(error) => Err(transaction.rollback(error).await),
+        }
+    })
+    .await
 }
 
 /// Genesis-only append capability for the two canonical filing records.
@@ -1351,7 +1619,7 @@ pub(crate) async fn append_engine_seed_batch(
 }
 
 async fn reject_public_governed_attribution_in(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     spec: &AppendSpec,
 ) -> Result<()> {
     if !matches!(
@@ -1371,7 +1639,7 @@ async fn reject_public_governed_attribution_in(
     } else {
         sqlx::query_scalar::<_, String>("SELECT type FROM records WHERE id=?")
             .bind(&spec.record_id)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut *tx)
             .await?
     };
     let Some(record_type) = record_type else {
@@ -1403,12 +1671,21 @@ fn reject_public_runtime_event(spec: &AppendSpec) -> Result<()> {
         || spec.event_type == "kernel.artifact_excluded.v1"
         || spec.event_type == "kernel.app_install_removed.v1"
         || spec.event_type == "kernel.app_install_recorded.v1"
+        || spec.event_type == "kernel.app_source_published.v1"
+        || spec.event_type == "kernel.app_catalog_source_published.v1"
+        || spec.event_type == "kernel.app_catalog_update_materialized.v1"
         || spec.event_type == "kernel.app_install_adopted.v1"
+        || spec.event_type == "kernel.app_install_scope_set.v1"
+        || spec.event_type == "kernel.workspace_app_added.v1"
+        || spec.event_type == "kernel.workspace_app_removed.v1"
         || spec.event_type == "kernel.app_action_started.v1"
         || spec.event_type == "kernel.app_action_recorded.v1"
         || spec.event_type == crate::kernel::v1_state::EVENT
         || spec.event_type == "kernel.hosted_offboarding.v1"
         || spec.event_type == "kernel.hosted_membership.v1"
+        || spec.event_type == "kernel.hosted_membership.v2"
+        || spec.event_type == "kernel.membership_bundle_defined.v1"
+        || spec.event_type == "kernel.membership_bundle_updated.v1"
         || spec.event_type == "kernel.import_member_policy.v1"
         || spec.event_type == "kernel.import_hosted_accounts.v1"
         || spec.event_type == "kernel.host_import_created.v1"
@@ -1449,12 +1726,25 @@ fn reject_public_runtime_event(spec: &AppendSpec) -> Result<()> {
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
             | "kernel.notification_preference_set.v1"
+            | "kernel.mcp_write_receipt_recorded.v1"
+            | "kernel.mcp_write_fenced.v1"
     ) {
         return Err(Error::engine("provider outcomes are kernel commit-port-owned and cannot be appended through the public event seam"));
+    }
+    if crate::mcp::tools::webhooks::is_event(&spec.event_type) {
+        return Err(Error::engine(
+            "webhook events require the sealed hosting intake route",
+        ));
     }
     if spec.event_type.starts_with("kernel.hcp_") {
         return Err(Error::engine(
             "HCP events require the sealed kernel HCP route",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if spec.event_type.starts_with("kernel.publication_") {
+        return Err(Error::engine(
+            "publication events require the sealed publication route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -2334,6 +2624,10 @@ mod version_metadata_tests {
             contributors: &contributors,
             session_ref: "sess-1",
             merged_offline: true,
+            offline_interval: Some(crate::coedit::live::OfflineMerge {
+                started_at_ms: 1000,
+                reconnected_at_ms: 2000,
+            }),
             span_map: None,
         };
         let base = json!({"summary": "carried"}).as_object().unwrap().clone();
@@ -2359,6 +2653,7 @@ mod version_metadata_tests {
         assert!(stored.get("contributors").is_some());
         assert_eq!(stored["session"], json!("sess-1"));
         assert_eq!(stored["merged_offline"], json!(true));
+        assert_eq!(stored["offline_interval"]["client_reported"], json!(true));
         db.close().await;
     }
 }

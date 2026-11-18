@@ -13,6 +13,7 @@ default-run = "conformance"
 members = [
     "crates/artifact-html",
     "crates/artifact-runtime",
+    "crates/body-merge",
     "crates/cel-subset",
     # Development guest integration; deliberately absent from default-members.
     "crates/package-cel-wire",
@@ -34,6 +35,7 @@ default-members = [
     ".",
     "crates/artifact-html",
     "crates/artifact-runtime",
+    "crates/body-merge",
     "crates/native-federation",
     "crates/query-contract",
     "crates/policy-kernel",
@@ -134,7 +136,8 @@ test = false
 name = "standby_admit"
 path = "examples/standby_admit.rs"
 required-features = ["dev-tools"]
-test = true
+# Its behavioral tests live with the shared product implementation.
+test = false
 
 [[bin]]
 name = "named-view-export"
@@ -152,8 +155,9 @@ default = ["experimental-agent-intents", "mcp-executor-prototype"]
 v2-kernel-probe = []
 # Checked guest CEL is an explicit local development opt-in, never a shipping closure.
 package-cel-dev = ["v2-kernel-probe", "dep:native-package-cel-host", "dep:native-package-cel-wire"]
-# Read-only observation of existing body jobs for inter-crate fixture lifecycle
-# proofs. Enabled by Held's dev-dependency only, never a production default.
+# Inter-crate test support: read-only observation of existing body jobs, and
+# the fork module's test hooks (copy-worker permit, map-lock hold). Enabled by
+# Held's dev-dependency only, never a production default.
 body-read-test-support = []
 # The selected JOSE–HPKE profile is still an Internet-Draft. This feature is a
 # compile-time acknowledgement that callers are running an interoperability
@@ -229,17 +233,21 @@ chrono-tz = { version = "0.10", default-features = false }
 # Seals the records.changes.v1 tab cursor (AEAD). The same crate and version
 # native-federation already uses for custody wrapping, so no new crate enters
 # the graph.
+chacha20 = "0.9"
 chacha20poly1305 = "0.10"
 futures = "0.3"
 async-stream = "0.3"
 hex = "0.4"
 hmac = "0.12"
+ed25519-dalek = "2.2"
+jsonwebtoken = { version = "10.4.0", default-features = false }
 image = { version = "=0.25.6", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 # E3 M3 increment 1: GFM task-list extraction for record bodies. Same pin as
 # crates/artifact-runtime, so no new crate enters the graph.
 markdown = "=1.0.0"
 native-artifact-html = { path = "crates/artifact-html" }
 native-artifact-runtime = { path = "crates/artifact-runtime" }
+native-body-merge = { path = "crates/body-merge" }
 native-federation = { path = "crates/native-federation", default-features = false }
 native-query-contract = { path = "crates/query-contract" }
 native-policy-kernel = { path = "crates/policy-kernel" }
@@ -259,6 +267,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     # crate version as Turso core and the validator) on every SQLite
     # connection; enabled per connection with `.with_regexp()` in db.rs.
     "regexp",
+    # Standby set-digest capture (design record 5065900): the preupdate hook
+    # needs a SQLite built with SQLITE_ENABLE_PREUPDATE_HOOK, which
+    # libsqlite3-sys can only produce through build-time bindgen (libclang).
+    "sqlite-preupdate-hook",
 ] }
 # Keep Postgres-native JSONB/TIMESTAMPTZ codecs scoped to the opt-in adapter;
 # enabling sqlx's umbrella type features would also activate its MySQL driver.
@@ -268,7 +280,7 @@ tempfile = "3"
 thiserror = "2"
 # Session saver daemon client (S1): minimal WebSocket transport for the
 # read-only Paseo daemon connection. Small pure-WS crate; no TLS features.
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 tokio = { version = "1", features = [
@@ -316,6 +328,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     # Advisors (S4) stream reply bodies to enforce the response-size cap.
     "stream",
 ] }
+# Preserve metadata and stream ownership during bounded compatibility inspection.
+http = "1"
+bytes = "1"
 rust-embed = "8.7"
 percent-encoding = "2"
 regex = "1"
@@ -325,6 +340,9 @@ url = "2"
 yrs = "0.28"
 
 [dev-dependencies]
+# Already in the graph through jsonschema; the independent oracle for the
+# fixed-width MuHash arithmetic.
+num-bigint = "0.4"
 # Governance maps whole-file syn attributes back to original source bytes.
 proc-macro2 = { version = "1", features = ["span-locations"] }
 # Pure bridge controls exercise the actual native scalar-kind admission.
@@ -367,8 +385,18 @@ path = "examples/v2_import.rs"
 required-features = ["v2-kernel-probe"]
 
 [[example]]
+name = "v2-preinspection-reuse"
+path = "examples/v2_preinspection_reuse.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
 name = "v2-digest-bench"
 path = "examples/v2_digest_bench.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
+name = "v2-digest-compare"
+path = "examples/v2_digest_compare.rs"
 required-features = ["v2-kernel-probe"]
 
 [[example]]

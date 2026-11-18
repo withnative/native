@@ -43,7 +43,7 @@ test("author policy changes digest v1; resolved host release is not an input", (
   assert.notEqual(first.digest, second.digest);
   assert.equal(first.declaration_digest, second.declaration_digest);
   // The digest inputs stay the exact author source, permission declaration and runtime id.
-  for (const hostRelease of ["1.0.0", "1.1.0"]) {
+  for (const hostRelease of ["1.0.0", "1.1.0", "1.1.1", "1.1.2", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.7.1", "1.7.2", "1.7.3", "1.7.4", "1.7.5", "1.7.6", "1.7.7", "1.7.8", "1.7.9", "1.7.10", "1.7.11", "1.7.12", "1.7.13", "1.7.14"]) {
     const host = { resolvedKitRelease: hostRelease, descriptor, html: source };
     assert.deepEqual(validatePackage(host).digests, first);
   }

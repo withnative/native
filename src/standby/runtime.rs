@@ -18,6 +18,24 @@ pub struct StandbyRuntimeConfig {
     pub origin_database_id: String,
 }
 
+pub(crate) fn runtime_declarations() -> serde_json::Value {
+    serde_json::json!({
+        "consumer_coordinates":{
+            "contract":crate::standby_snapshot::STANDBY_CONSUMER_CONTRACT,
+            "engine_schema_version":crate::CURRENT_ENGINE_SCHEMA_VERSION,
+            "ddl_sha256":crate::schema::FROZEN_DDL_SHA256,
+            "kernel_v2_reader":super::kernel_v2::KernelV2Reader::compiled()
+        },
+        "kernel_v2_decoder_compiled":cfg!(feature = "v2-kernel-probe"),
+        "accepted_shapes":serde_json::from_str::<serde_json::Value>(&super::shapes::advertisement()).expect("compiled shapes"),
+        "consumer_coordinates_are_not_accepted_shapes":true,
+        "persisted":super::generation_store::runtime_declaration(),
+        "configuration":{"reader":"StandbyRuntimeConfig",
+            "source":"src/standby/runtime.rs#StandbyRuntimeConfig","envelope":"unversioned",
+            "unknown_fields":"reject","compatibility":"new_optional_fields_can_break_older_strict_readers"}
+    })
+}
+
 impl StandbyRuntimeConfig {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let config: Self = serde_json::from_slice(bytes)
@@ -113,6 +131,7 @@ fn observe_consumer_identity_at(
     let platform = installed_platform()?;
     let artifact_sha256 = sha256_file(executable)?;
     Ok(ObservedInstalledConsumerIdentity {
+        kernel_v2_reader: super::kernel_v2::KernelV2Reader::compiled(),
         platform,
         source_sha: source_sha.into(),
         artifact_sha256,

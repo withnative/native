@@ -16,6 +16,7 @@ const ORIGIN_MAX = 512;
 const ORIGIN_JSON_MAX = ORIGIN_MAX * 6 + 2;
 const here = new URL("./", import.meta.url);
 const BOOTSTRAP = readFileSync(new URL("bridge-bootstrap.js", here), "utf8");
+const APP_STATE = readFileSync(new URL("app-state.mjs", here), "utf8");
 const SHELL = readFileSync(new URL("shell.js", here), "utf8");
 const RULES = readFileSync(new URL("rules.mjs", here), "utf8");
 const BOOTSTRAP_SHA256 = createHash("sha256").update(BOOTSTRAP).digest("hex");
@@ -42,7 +43,8 @@ function composeFrame(html, hostOrigin, resolved) {
   const bootstrap = BOOTSTRAP.replace(/__NATIVE_(?:WORKBENCH_ORIGIN|KIT_FACTORY|KIT_RELEASE)__/g, token => replacements[token]);
   const bytes = Buffer.byteLength(html) + Buffer.byteLength(bootstrap) + 17;
   const overhead = Buffer.byteLength(BOOTSTRAP) + 65536 + 1024 + ORIGIN_JSON_MAX + 17;
-  if (Buffer.byteLength(html) > 1048576 || bytes > 1048576 + overhead) throw new Error('delivered bounds exceeded');
+  const max = LIMITS.html.package_body_max_bytes;
+  if (Buffer.byteLength(html) > max || bytes > max + overhead) throw new Error('delivered bounds exceeded');
   return Object.freeze({html: `${html.slice(0, offset)}<script>${bootstrap}</script>${html.slice(offset)}`, kit_release: resolved?.release ?? null});
 }
 
@@ -56,6 +58,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {object} [options.fixtures]  { sql: {key: rows | (params, ctx) => rows}, records, search, resolve, scene, changes }
  * @param {"live"|"sample"} [options.mode]
  * @param {number|((need, params) => number)} [options.latencyMs]  per-read backend latency (default 40)
+ * @param {boolean} [options.bodyDraft]  offer the host-owned device recovery journal
  * @param {boolean} [options.holdViewState]  re-deliver the latest view state on reload (Workbench host)
  * @param {number} [options.readTimeoutMs]  host read timeout (default limits.shell.read_timeout_ms)
  * @param {(intent: object, ctx: object) => object | Promise<object>} [options.intents]
@@ -104,6 +107,8 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *   `agents-status` only when the current frame's ask was answered with `status.ask_id`, as the real host
  *   scopes them. Not offered in sample mode. Logged as `agents-list`, `agents-ask`,
  *   `agents-ask-result`, `agents-status` and `agents-status-dropped`.
+ * @param {boolean} [options.appState] Offers app.state.v1 using browser storage and the production store.
+ * @param {boolean} [options.tabTitles] Offers the independent app.tab-title.v1 setter.
  * @param {boolean | "refuse" | "reject"} [options.presentation]
  *   Offers `app.presentation.v1` (task e27b79d): the frame gets
  *   `native.presentation.setFloatingChat`. `true` answers accepted true;
@@ -114,6 +119,8 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {number} [options.port]  default: an ephemeral port on 127.0.0.1
  */
 export async function startFakeHost(options) {
+  // Optional repo-local proof; ordinary standalone fake hosts do not need launcher sources.
+  const BODY_DRAFTS = options.bodyDraft ? readFileSync(new URL('../../../native-launcher/src/bodyDrafts.mjs', here), 'utf8') : 'export const bodyDraftJournal = null;';
   const { descriptor, html, fixtures = {}, mode = "live", holdViewState = false } = options;
   const kitFindings = descriptorKitPolicyFindings(descriptor, html);
   if (kitFindings.length) throw new Error(`${kitFindings[0].message} [${kitFindings[0].rule}]`);
@@ -243,7 +250,7 @@ export async function startFakeHost(options) {
     try {
       if (url.pathname === "/") {
         const presentation = options.presentation === true ? "accept" : typeof options.presentation === "string" ? options.presentation : undefined;
-        const config = { mode, writes: typeof options.intents === "function", calls: appV2 && (options.calls === true || typeof options.calls === "function"), sessions: appV2 && (options.sessions === true || typeof options.sessions === "function"), queries: appV2 && (options.queries === true || typeof options.queries === "function"), agents: appV2 && !!options.agents, presentation: appV2 ? presentation : undefined, title: `${descriptor.package} ${descriptor.version}`, plan, init: await initFor(), holdViewState, limits: LIMITS, readTimeoutMs: options.readTimeoutMs, kitRelease: preparedFrame.kit_release, frameUrl: initialSession.url };
+        const config = { mode, writes: typeof options.intents === "function", calls: appV2 && (options.calls === true || typeof options.calls === "function"), sessions: appV2 && (options.sessions === true || typeof options.sessions === "function"), queries: appV2 && (options.queries === true || typeof options.queries === "function"), agents: appV2 && !!options.agents, presentation: appV2 ? presentation : undefined, tabTitles: appV2 && options.tabTitles === true, appState: appV2 && options.appState === true, bodyDraft: appV2 && options.bodyDraft === true, viewer: appV2 && options.viewer !== undefined ? options.viewer : undefined, title: `${descriptor.package} ${descriptor.version}`, plan, init: await initFor(), holdViewState, limits: LIMITS, readTimeoutMs: options.readTimeoutMs, kitRelease: preparedFrame.kit_release, frameUrl: initialSession.url };
         return send(200, "text/html; charset=utf-8", `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>alpha-tab-kit fake host — ${descriptor.package}</title><style>html,body{margin:0;height:100%}body{display:flex;flex-direction:column;font:12px system-ui}#holder{flex:1;display:flex}#holder iframe{flex:1;border:0}#host-log{padding:2px 8px;background:#eee}</style></head><body><div id="host-log">fake host (${mode})</div><div id="holder"></div><script>window.__ALPHA_TAB_HOST_CONFIG__=${JSON.stringify(config).replace(/</g, "\\u003c")};</script><script type="module" src="/__kit/shell.js"></script></body></html>`);
       }
       if (url.pathname === "/__host/frame-session" && request.method === "POST") {
@@ -261,6 +268,8 @@ export async function startFakeHost(options) {
           "x-content-type-options": "nosniff",
         });
       }
+      if (url.pathname === "/__kit/body-drafts.mjs") return send(200, "text/javascript", BODY_DRAFTS);
+      if (url.pathname === "/__kit/app-state.mjs") return send(200, "text/javascript", APP_STATE);
       if (url.pathname === "/__kit/shell.js") return send(200, "text/javascript", SHELL);
       if (url.pathname === "/__kit/rules.mjs") return send(200, "text/javascript", RULES);
       if (url.pathname === "/__host/read" && request.method === "POST") {
@@ -284,7 +293,8 @@ export async function startFakeHost(options) {
         } catch (error) {
           const status = error?.status === "refused" || error?.status === "uncertain" ? error.status : "error";
           const code = typeof error?.code === "string" ? error.code : status === "error" ? "handler_error" : status;
-          return send(200, "application/json", JSON.stringify({ status, code, message: String(error?.message ?? error).slice(0, 200) }));
+          // Like the real host, vouch for a whole-write commit only when the handler says `applied: true`.
+          return send(200, "application/json", JSON.stringify({ status, code, message: String(error?.message ?? error).slice(0, 200), ...(error?.applied === true ? { applied: true } : {}) }));
         }
       }
       if (url.pathname === "/__host/query" && request.method === "POST") {

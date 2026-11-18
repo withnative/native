@@ -194,9 +194,6 @@ fn schema_actions(schema: &Value) -> BTreeSet<String> {
             collect(branch.pointer("/properties/action"), &mut actions);
         }
     }
-    if actions.is_empty() {
-        actions.insert("$tool".to_string());
-    }
     actions
 }
 
@@ -211,7 +208,12 @@ fn production_operations(registry: &ToolRegistry) -> BTreeMap<(String, String), 
         // Status tools are registered only with their configured providers:
         // an activated standby, or a hosted outbox/retained status service.
         // Neither belongs to the ordinary SQLite authorization manifest.
-        .filter(|kind| !matches!(kind, ToolKind::StandbyStatus | ToolKind::OutboxStatus))
+        .filter(|kind| {
+            !matches!(
+                kind,
+                ToolKind::StandbyStatus | ToolKind::OutboxStatus | ToolKind::ManagePublication
+            )
+        })
         .map(|kind| (kind.name(), kind))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(registered.len(), kinds.len());
@@ -220,14 +222,22 @@ fn production_operations(registry: &ToolRegistry) -> BTreeMap<(String, String), 
         .into_iter()
         .flat_map(|(tool, spec)| {
             let disposition = disposition_name(kinds[tool].authorization());
-            schema_actions(&spec.input_schema)
-                .into_iter()
-                .map(move |action| {
-                    (
-                        (tool.to_string(), action),
-                        ExpectedOperation { disposition },
-                    )
-                })
+            let mut actions = std::iter::once(&spec.input_schema)
+                .chain(spec.operation_schemas())
+                .flat_map(schema_actions)
+                .collect::<BTreeSet<_>>();
+            // A hydrated branch may omit the selector already declared by its
+            // compact source (send is one). Apply the non-action fallback only
+            // after collecting the whole tool, never to each narrow schema.
+            if actions.is_empty() {
+                actions.insert("$tool".to_string());
+            }
+            actions.into_iter().map(move |action| {
+                (
+                    (tool.to_string(), action),
+                    ExpectedOperation { disposition },
+                )
+            })
         })
         .collect()
 }
@@ -440,7 +450,7 @@ fn render_operation_census(stats: &ContractStats) -> String {
 - **{} operations carry a non-disclosure obligation**.\n\
 - All **{} mutating operations** carry an explicit no-write-on-deny obligation\n  and named negative evidence.\n\
 - **{} read operations** have justified `negative_evidence: not_applicable`:\n  `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and\n  `manage_vocabularies.list_values`. They have no authorization threshold;\n  each still has positive executable evidence.\n\
-- Complete-coverage claim: **SQLite local**, exercised by\n  `sqlite-reference-ci`. Postgres and Turso contract profiles do not inherit\n  this claim. Named-view rows separately qualify hosted-v2 success and\n  ordinary-SQLite refusal; they do not claim local success.",
+- Complete-coverage claim: **SQLite local**, exercised by\n  `sqlite-reference-ci`. Postgres and Turso contract profiles do not inherit\n  this claim. Named-view, saved-tab and catalog-publication rows separately qualify\n  Kernel V2 success and ordinary-SQLite refusal; they do not claim legacy local\n  success.",
         stats.tools,
         stats.operations,
         stats.ordinary,
@@ -476,6 +486,58 @@ fn parsed_manifest() -> ContractManifest {
     serde_json::from_str(MANIFEST).unwrap()
 }
 
+pub(super) fn saved_tab_operation_arguments() -> [Value; 5] {
+    [
+        json!({"action":"create","creation_key":"authorization-slot","app":"agent.docs","initial_record_id":null,"reason":"authorization boundary proof"}),
+        json!({"action":"get","record_id":MATRIX_OWNER}),
+        json!({"action":"list","limit":1}),
+        json!({"action":"rename","record_id":MATRIX_OWNER,"expected_revision":"saved-tab:1","operation_id":"rename-slot","custom_title":"Private label","reason":"authorization boundary proof"}),
+        json!({"action":"retire","record_id":MATRIX_OWNER,"expected_revision":"saved-tab:1","operation_id":"retire-slot","reason":"authorization boundary proof"}),
+    ]
+}
+
+#[tokio::test]
+async fn saved_tab_operations_refuse_legacy_and_offline_without_events_or_disclosure() {
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = production_registry();
+    let before = event_counts(&db).await;
+    for caller in [
+        Caller::local(),
+        Caller::authenticated("acct:owner"),
+        Caller::authenticated("acct:member"),
+    ] {
+        for args in saved_tab_operation_arguments() {
+            let error = call_as(&registry, &db, caller.clone(), "manage_saved_tabs", args)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("manage_saved_tabs: unsupported engine; kernel_v2 required"),
+                "{error}"
+            );
+            assert!(!error.contains(MATRIX_OWNER));
+            assert_eq!(event_counts(&db).await, before);
+        }
+    }
+    registry.set_standby_read_only(true);
+    for args in saved_tab_operation_arguments() {
+        let error = call_as(
+            &registry,
+            &db,
+            Caller::authenticated("acct:member"),
+            "manage_saved_tabs",
+            args,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unavailable_offline"), "{error}");
+        assert!(!error.contains(MATRIX_OWNER));
+        assert_eq!(event_counts(&db).await, before);
+    }
+    db.close().await;
+}
+
 #[tokio::test]
 async fn named_view_operations_refuse_the_ordinary_sqlite_profile_without_events() {
     let db = create_database(":memory:").await.unwrap();
@@ -491,6 +553,7 @@ async fn named_view_operations_refuse_the_ordinary_sqlite_profile_without_events
         json!({"action":"activate_view","id":MATRIX_OWNER,"pin":{},"name":"view_test","expected_binding_event_id":null,"idempotency_key":"publish"}),
         json!({"action":"unpublish_view","id":MATRIX_OWNER,"expected_binding_event_id":null,"idempotency_key":"unpublish"}),
         json!({"action":"prepare_named_views"}),
+        json!({"action":"propose_view","id":MATRIX_OWNER,"record_type":"WorkItem","home":"native:root","selection":{"kind":"all"}}),
     ] {
         let error = call_as(&registry, &db, Caller::local(), "manage_named_views", args)
             .await
@@ -1174,5 +1237,36 @@ async fn vocabulary_operation_matrix_proves_each_host_owner_boundary() {
     .await
     .unwrap();
     assert_eq!(listed["vocabulary"]["name"], "matrix-vocab");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn publication_operations_refuse_ordinary_sqlite_without_events() {
+    let db = create_database(":memory:").await.unwrap();
+    let mut registry = production_registry();
+    native_ce::mcp::tools::register_publication_management_tool(&mut registry).unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for args in [
+        json!({"action":"inspect","id":MATRIX_OWNER}),
+        json!({"action":"preview","id":MATRIX_OWNER}),
+        json!({"action":"publish","id":MATRIX_OWNER,"expected_revision":1,"expected_publication_version":null,"operation_key":"publish","reason":"test"}),
+        json!({"action":"unpublish","id":MATRIX_OWNER,"public_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":1,"expected_publication_version":1,"operation_key":"unpublish","reason":"test"}),
+    ] {
+        let error = call_as(&registry, &db, Caller::local(), "manage_publication", args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("publication_profile_unsupported"), "{error}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            before
+        );
+    }
     db.close().await;
 }

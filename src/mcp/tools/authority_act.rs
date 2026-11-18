@@ -34,6 +34,7 @@ struct EmptyArgs {}
 struct AuthorityActDeltaArgs {
     from_exclusive_act: i64,
     blob_inventory: Option<Vec<String>>,
+    kernel_delta_version: Option<u32>,
 }
 
 const AUTHORITY_ACT_HEAD_DESCRIPTION: &str = "Owner-only replicated authority act-head probe for local standby delta refresh. Returns the authority's replicated head coordinates (origin, head act, per-log and non-sequenced watermarks, cutovers, binding seeds and pins) without creating a snapshot. Hosted and HostOwner-only; absent on local/stdio.";
@@ -57,6 +58,11 @@ fn authority_act_delta_schema() -> Value {
                 "type": "integer",
                 "minimum": 0,
                 "description": "Exclusive lower bound F1. The authority observes F2 itself."
+            },
+            "kernel_delta_version": {
+                "type": "integer",
+                "enum": [1, 2],
+                "description": "Kernel-v2 delta wire version requested; omit for 1. Send 2 only if the head probe advertised it in kernel_delta_versions."
             }
         },
         "additionalProperties": false
@@ -88,6 +94,7 @@ async fn authority_act_delta(
             AuthorityActDeltaRequest {
                 from_exclusive_act: args.from_exclusive_act,
                 blob_inventory: args.blob_inventory,
+                kernel_delta_version: args.kernel_delta_version,
             },
         )
         .await?;
@@ -194,5 +201,48 @@ impl crate::mcp::authority_act::AuthorityActSource for SchemaOnlyAuthorityActSou
                 "authority_act_delta schema-only delegate cannot be dispatched",
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod wire_argument_tests {
+    use super::*;
+
+    /// The schema-only delegate always refuses to dispatch, so the message
+    /// tells whether argument parsing got that far.
+    async fn outcome(arguments: Value) -> String {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        authority_act_delta(
+            db,
+            Caller::authenticated("acct:test"),
+            arguments,
+            std::sync::Arc::new(SchemaOnlyAuthorityActSource),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_optional_version_is_accepted_and_unknown_fields_still_are_not() {
+        let dispatched = "schema-only delegate cannot be dispatched";
+        assert!(outcome(json!({"from_exclusive_act": 0}))
+            .await
+            .contains(dispatched));
+        assert!(
+            outcome(json!({"from_exclusive_act": 0, "kernel_delta_version": 2}))
+                .await
+                .contains(dispatched)
+        );
+        assert!(
+            !outcome(json!({"from_exclusive_act": 0, "kernel_delta_edition": 2}))
+                .await
+                .contains(dispatched)
+        );
+        assert!(
+            !outcome(json!({"from_exclusive_act": 0, "kernel_delta_version": "2"}))
+                .await
+                .contains(dispatched)
+        );
     }
 }

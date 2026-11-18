@@ -33,6 +33,9 @@ async fn development_package_contracts_are_read_only_and_kernel_v2_only() {
             .unwrap();
         assert_eq!(row.access, "read");
         assert!(!row.plan_required);
+        // Reads are never declared; see executor_prototype::acceptance.
+        assert!(!row.requires_acceptance);
+        assert!(acceptance::declaration("records_read", name).is_none());
         let key = ("records_read".into(), name.into());
         let contract = &catalogue.contracts[&key];
         assert_eq!(contract.access, OperationAccess::Read);

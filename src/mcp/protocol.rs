@@ -199,14 +199,30 @@ pub(crate) async fn handle_modern_lens_message(
     .await
 }
 
-/// A database-less `tools/call` refusal for a member copy that holds no
-/// admitted snapshot. The transport supplies the typed member classification
+/// Engine-free `tools/call` handling for a member copy. The transport supplies
+/// an admitted native reader or the typed member classification
 /// (R6 copy state, or `STANDBY_READ_ONLY` for writes); the shared dispatcher
 /// keeps every other protocol concern (validation, discovery, catalog and
-/// resource methods) identical to the held path. It is pure: no canonical
-/// record or storage IO.
+/// resource methods) identical to the held path. This never supplies a
+/// canonical engine or write capability.
 pub(crate) trait NoHeldToolCall: Send + Sync {
     fn refuse(&self, name: &str, arguments: &Value) -> Error;
+    fn call(
+        &self,
+        _registry: &ToolRegistry,
+        name: &str,
+        arguments: &Value,
+    ) -> crate::Result<Value> {
+        Err(self.refuse(name, arguments))
+    }
+    fn call_async<'a>(
+        &'a self,
+        registry: &'a ToolRegistry,
+        name: &'a str,
+        arguments: &'a Value,
+    ) -> futures::future::BoxFuture<'a, crate::Result<Value>> {
+        Box::pin(futures::future::ready(self.call(registry, name, arguments)))
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -255,7 +271,7 @@ impl ProtocolToolDispatch {
 /// missing name keep the shared `INVALID_PARAMS` JSON-RPC semantics; a known
 /// tool answers the supplied typed refusal as a tool result. Mirrors
 /// [`tools_call_kernel`]'s pre-dispatch shape without touching storage.
-fn no_held_call_result(
+async fn no_held_call_result(
     registry: &ToolRegistry,
     refusal: &dyn NoHeldToolCall,
     params: &serde_json::Map<String, Value>,
@@ -270,12 +286,21 @@ fn no_held_call_result(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let error = refusal.refuse(name, &arguments);
-    Ok(call_error_content(
-        &error,
-        Value::Null,
-        tool.ui.as_ref().map(|ui| ui.resource_uri),
-    ))
+    let mut arguments = arguments;
+    let format = render::take_format(name, &mut arguments).map_err(|e| (INVALID_PARAMS, e))?;
+    Ok(match refusal.call_async(registry, name, &arguments).await {
+        Ok(result) => call_result_content(
+            name,
+            format,
+            result.into(),
+            tool.ui.as_ref().map(|ui| ui.resource_uri),
+        ),
+        Err(error) => call_error_content(
+            &error,
+            Value::Null,
+            tool.ui.as_ref().map(|ui| ui.resource_uri),
+        ),
+    })
 }
 
 /// Handle one stateless 2026-era MCP message for a member copy holding no
@@ -453,6 +478,15 @@ async fn handle_modern_message_with_dispatch(
         Err(outcome) => return outcome,
     };
     if method == "tools/call" {
+        if let Some(name) = params.get("name").and_then(Value::as_str) {
+            if let Err(error) =
+                super::proposal_run::check(name, params.get("arguments").unwrap_or(&Value::Null))
+            {
+                let mut result = call_error_content(&error, Value::Null, None);
+                add_modern_result_fields(&mut result);
+                return RpcOutcome::response(json!({"jsonrpc":"2.0","id":id,"result":result}));
+            }
+        }
         if let Some(name) = params
             .get("name")
             .and_then(Value::as_str)
@@ -530,10 +564,12 @@ async fn handle_modern_message_with_dispatch(
                 dispatcher.tools_call(&registry, params, true).await
             }
             ProtocolToolDispatch::Refusing(refusal) => {
-                no_held_call_result(&registry, refusal.as_ref(), params).map(|mut result| {
-                    add_modern_result_fields(&mut result);
-                    result
-                })
+                no_held_call_result(&registry, refusal.as_ref(), params)
+                    .await
+                    .map(|mut result| {
+                        add_modern_result_fields(&mut result);
+                        result
+                    })
             }
         },
         "initialize" => Err((
@@ -683,6 +719,17 @@ async fn handle_legacy_message_with_dispatch(
         }
     };
 
+    if method == "tools/call" {
+        if let Some(name) = params.get("name").and_then(Value::as_str) {
+            if let Err(error) =
+                super::proposal_run::check(name, params.get("arguments").unwrap_or(&Value::Null))
+            {
+                return RpcOutcome::response(json!({"jsonrpc":"2.0","id":id,
+                    "result":call_error_content(&error, Value::Null, None)}));
+            }
+        }
+    }
+
     let outcome = match method {
         "initialize" => Ok(legacy_initialize_result_for(&registry, &params)),
         "ping" => Ok(json!({})),
@@ -722,7 +769,7 @@ async fn handle_legacy_message_with_dispatch(
                 )),
             },
             ProtocolToolDispatch::Refusing(refusal) => match params.as_object() {
-                Some(params) => no_held_call_result(&registry, refusal.as_ref(), params),
+                Some(params) => no_held_call_result(&registry, refusal.as_ref(), params).await,
                 None => Err((
                     INVALID_PARAMS,
                     "invalid params: tools/call params must be an object".into(),
@@ -902,6 +949,10 @@ fn attach_mcp_evidence(result: &mut Value, evidence: &[super::evidence::Transien
 /// stays byte-identical.
 fn member_refusal_wire(error: &Error) -> Option<(String, Value)> {
     match error {
+        Error::OriginalConflict(conflict) => Some((
+            "original is durably fenced; obtain a binding-verified settlement".into(),
+            json!({"error_code":"original_conflict","conflict":conflict,"retryable":false,"applied":false}),
+        )),
         Error::StandbyReadOnly {
             code,
             message,
@@ -1068,6 +1119,7 @@ fn preflight_read_only_call(
     arguments: &Value,
     persistence_lease: Option<&DeploymentPersistenceLease>,
 ) -> crate::Result<()> {
+    super::proposal_run::check(name, arguments)?;
     registry.admit_standby_call(name, arguments)?;
     if let Some(lease) = persistence_lease {
         registry.reuse_deployment_admission(lease, name, arguments)?;
@@ -1237,18 +1289,39 @@ async fn legacy_tools_call_result(
 /// Local desktop main carries an installed app's identity outside tool
 /// arguments. It never selects the principal: the standby caller is already
 /// bound to the admitted copy's account. The registry checks the install and
-/// ordinary app refusals before dispatch. Writable MCP has no such ingress.
+/// ordinary app refusals before dispatch. Writable MCP additionally requires
+/// a sealed Desktop proof marker from explicitly configured hosted ingress.
 pub(crate) const STANDBY_APP_META: &str = "native/app";
 
 pub(crate) fn standby_app_caller(
     registry: &ToolRegistry,
-    mut caller: Caller,
+    caller: Caller,
     meta: Option<&Value>,
 ) -> std::result::Result<Caller, (i64, String)> {
+    app_carrier_caller_at(
+        registry,
+        caller,
+        meta,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+fn app_carrier_caller_at(
+    registry: &ToolRegistry,
+    mut caller: Caller,
+    meta: Option<&Value>,
+    now_ms: i64,
+) -> std::result::Result<Caller, (i64, String)> {
+    let verified = caller
+        .check_desktop_app_identity(now_ms)
+        .map_err(|_| (INVALID_PARAMS, "desktop app proof refused".into()))?;
     let Some(value) = meta.and_then(|meta| meta.get(STANDBY_APP_META)) else {
+        if verified {
+            return Err((INVALID_PARAMS, "desktop app proof refused".into()));
+        }
         return Ok(caller);
     };
-    if !registry.is_standby_read_only() {
+    if !registry.is_standby_read_only() && !verified {
         return Err((
             INVALID_PARAMS,
             "native/app metadata is supported only on the read-only owner standby".into(),
@@ -1266,7 +1339,13 @@ pub(crate) fn standby_app_caller(
             crate::mcp::app_attribution::parse_header(raw)
                 .map_err(|error| (INVALID_PARAMS, error.to_string()))
         })?;
-    caller.set_host_asserted_app(app);
+    if verified {
+        if caller.host_asserted_app() != Some(&app) {
+            return Err((INVALID_PARAMS, "desktop app proof refused".into()));
+        }
+    } else {
+        caller.set_host_asserted_app(app);
+    }
     Ok(caller)
 }
 
@@ -1679,6 +1758,124 @@ mod tests {
                 .unwrap();
         assert_eq!(caller.credential(), "acct:alice");
         assert_eq!(caller.host_asserted_app().unwrap().install_event_id, "evt");
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    async fn desktop_app_ingress_identity(
+        now: i64,
+        ttl: i64,
+    ) -> crate::mcp::desktop_app_proof::VerifiedDesktopAppIdentity {
+        use base64::Engine as _;
+        let keys = crate::mcp::DeploymentPlanKeyring::from_json(&json!({
+            "active_key_id":"test", "keys":[{"id":"test", "key":base64::engine::general_purpose::STANDARD.encode([7u8;32])}]
+        }).to_string()).unwrap();
+        let core = crate::mcp::desktop_app_proof::DesktopAppProofCore::new(Arc::new(keys))
+            .await
+            .unwrap();
+        let binding = crate::mcp::desktop_app_proof::DesktopAppProofBinding {
+            account_id: "acct:alice".into(),
+            hosted_db_id: "route".into(),
+            origin_database_id: "portable".into(),
+            hosted_origin: "https://mcp.example".into(),
+            app: crate::mcp::app_attribution::AppAttribution::new("docs", "1", "evt").unwrap(),
+        };
+        let proof = core.issue(&binding, now, ttl).await.unwrap();
+        core.verify(proof.expose_secret(), &binding, now)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[tokio::test]
+    async fn desktop_app_ingress_sealed_marker_matches_carrier_and_expires() {
+        let registry = ToolRegistry::new();
+        let meta = json!({STANDBY_APP_META:"docs@1; install=evt","private":"unchanged"});
+        let caller = Caller::authenticated("acct:alice")
+            .with_hosting_context("catalog-user", "route")
+            .with_verified_desktop_app_identity(desktop_app_ingress_identity(100, 10).await, 100)
+            .unwrap();
+        let admitted = app_carrier_caller_at(&registry, caller.clone(), Some(&meta), 109).unwrap();
+        assert_eq!(admitted.credential(), "acct:alice");
+        assert_eq!(
+            admitted.host_asserted_app().unwrap().install_event_id,
+            "evt"
+        );
+        assert_eq!(meta["private"], "unchanged");
+        assert!(app_carrier_caller_at(&registry, caller.clone(), Some(&meta), 110).is_err());
+        assert!(app_carrier_caller_at(&registry, caller.clone(), None, 100).is_err());
+        for bad in [
+            json!({STANDBY_APP_META:"docs@2; install=evt"}),
+            json!({STANDBY_APP_META:null}),
+        ] {
+            assert!(app_carrier_caller_at(&registry, caller.clone(), Some(&bad), 100).is_err());
+        }
+        assert!(caller.check_desktop_app_identity(110).is_err());
+        assert!(caller
+            .clone()
+            .with_hosting_context("catalog-user", "foreign")
+            .check_desktop_app_identity(100)
+            .is_err());
+        // Existing cookie setter cannot preserve/recreate a Desktop marker.
+        let cookie = caller.with_host_asserted_app(
+            crate::mcp::app_attribution::AppAttribution::new("docs", "1", "evt").unwrap(),
+        );
+        assert!(app_carrier_caller_at(&registry, cookie, Some(&meta), 100).is_err());
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[tokio::test]
+    async fn desktop_app_ingress_attachment_refuses_other_caller_route_or_elapsed_verification() {
+        for (account, route, now) in [
+            ("acct:bob", "route", 100),
+            ("acct:alice", "foreign", 100),
+            ("acct:alice", "route", 110),
+        ] {
+            assert!(Caller::authenticated(account)
+                .with_hosting_context("catalog-user", route)
+                .with_verified_desktop_app_identity(
+                    desktop_app_ingress_identity(100, 10).await,
+                    now
+                )
+                .is_err());
+        }
+        let caller = Caller::authenticated("acct:alice")
+            .with_hosting_context("catalog-user", "route")
+            .with_verified_desktop_app_identity(desktop_app_ingress_identity(100, 10).await, 100)
+            .unwrap();
+        assert!(!caller
+            .without_host_asserted_app()
+            .check_desktop_app_identity(100)
+            .unwrap());
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[tokio::test]
+    async fn desktop_app_ingress_direct_wrapper_uses_the_same_sealed_gate() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let caller = Caller::authenticated("acct:alice")
+            .with_hosting_context("catalog-user", "route")
+            .with_verified_desktop_app_identity(
+                desktop_app_ingress_identity(now, 60_000).await,
+                now,
+            )
+            .unwrap();
+        let registry = ToolRegistry::new();
+        let meta = json!({STANDBY_APP_META:"docs@1; install=evt"});
+        assert!(crate::mcp::hosted_protocol::check_direct_standby_caller(
+            &registry,
+            caller,
+            Some(&meta)
+        )
+        .is_ok());
+        let cookie = Caller::authenticated("acct:alice").with_host_asserted_app(
+            crate::mcp::app_attribution::AppAttribution::new("docs", "1", "evt").unwrap(),
+        );
+        assert!(crate::mcp::hosted_protocol::check_direct_standby_caller(
+            &registry,
+            cookie,
+            Some(&meta)
+        )
+        .is_err());
     }
 
     #[test]

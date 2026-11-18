@@ -97,6 +97,10 @@
         },
         {
           "kind": "tree",
+          "source": "crates/body-merge"
+        },
+        {
+          "kind": "tree",
           "source": "crates/coedit-core-fixture"
         },
         {
@@ -130,6 +134,10 @@
         {
           "kind": "tree",
           "source": "src/derivation"
+        },
+        {
+          "kind": "file",
+          "source": "src/dispatch_stack.rs"
         },
         {
           "kind": "tree",
@@ -177,11 +185,23 @@
         },
         {
           "kind": "file",
+          "source": "src/mcp/catalogue_v2_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/mcp/counter_fence.rs"
         },
         {
           "kind": "file",
           "source": "src/mcp/deployment_read_only.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/desktop_app_proof.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/host_writer_pause.rs"
         },
         {
           "kind": "file",
@@ -202,6 +222,18 @@
         {
           "kind": "file",
           "source": "src/mcp/named_view_executor_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/saved_tabs_executor_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/tool_enumeration.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/publication_executor_tests.rs"
         },
         {
           "kind": "file",
@@ -265,6 +297,10 @@
         },
         {
           "kind": "file",
+          "source": "src/mcp/bootstrap-core.md"
+        },
+        {
+          "kind": "file",
           "source": "src/mcp/posture-capsule.md"
         },
         {
@@ -274,6 +310,10 @@
         {
           "kind": "file",
           "source": "src/mcp/protocol.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/proposal_run.rs"
         },
         {
           "kind": "file",
@@ -361,6 +401,14 @@
         },
         {
           "kind": "file",
+          "source": "src/async_diagnostics.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/client_compatibility.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/attribution.rs"
         },
         {
@@ -409,6 +457,10 @@
         },
         {
           "kind": "file",
+          "source": "src/body_merge_flag.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/body_task_items.rs"
         },
         {
@@ -446,6 +498,10 @@
         {
           "kind": "file",
           "source": "src/credential_file.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/node_credential.rs"
         },
         {
           "kind": "file",
@@ -505,11 +561,51 @@
         },
         {
           "kind": "file",
+          "source": "src/webhook_contract.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/export.rs"
         },
         {
           "kind": "file",
           "source": "src/facet_value_json_nodes.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/kernel_v2_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/working_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/working_v2/transaction.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/working_v2/manager.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/working_v2/manager/actor.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/working_v2/manager/resume.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/rebase.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/fork/rebase/tests.rs"
         },
         {
           "kind": "file",
@@ -569,6 +665,14 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/access_fence.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/body_evidence.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/hq.rs"
         },
         {
@@ -585,6 +689,38 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/projection_capture.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/working_undo.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/working_undo_schema.rs"
+        },
+        {
+          "kind": "file",
+          "source": "docs/node-v2-working-undo.md"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/projection_capture/tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/projection_set.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/publications.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/publications/tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/historical.rs"
         },
         {
@@ -594,6 +730,26 @@
         {
           "kind": "file",
           "source": "src/kernel/deletion.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/policy_mutations.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/schema_catalogue.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/schema_configuration.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/type_correction.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/kernel/identity_bindings"
         },
         {
           "kind": "file",
@@ -629,6 +785,22 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/sql_event_projection.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/sql_record_projection.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/stored_visibility.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/kernel/stored_visibility"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/read_cache.rs"
         },
         {
@@ -641,6 +813,54 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/saved_tabs.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/webhooks.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/mcp_write_receipts.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/mcp_write_receipts/fences.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/original_settlement.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/original_settlement/installed.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/original_settlement/installed/custody.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/original_settlement/outcome_profile.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/original_settlement/outcome_profile_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/original_settlement_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/original_settlement_contract_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/original_settlement_variant_nine_evidence.json"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/app_state.rs"
         },
         {
@@ -650,6 +870,10 @@
         {
           "kind": "file",
           "source": "src/kernel/imported_content.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/imported_content/preinspection.rs"
         },
         {
           "kind": "file",
@@ -673,6 +897,10 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/generic_links_diagnostics.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/generic_links_tests.rs"
         },
         {
@@ -682,6 +910,10 @@
         {
           "kind": "file",
           "source": "src/kernel/messaging.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/message_guard_depth_tests.rs"
         },
         {
           "kind": "file",
@@ -769,6 +1001,22 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/demand_root_aliases.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/demand_visibility.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/demand_visibility_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/census_parity_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/home_admission_tests.rs"
         },
         {
@@ -824,6 +1072,10 @@
           "source": "src/member_copy_admission.rs"
         },
         {
+          "kind": "tree",
+          "source": "src/member_copy_admission"
+        },
+        {
           "kind": "file",
           "source": "src/member_copy_client.rs"
         },
@@ -856,12 +1108,20 @@
           "source": "src/member_copy_registry.rs"
         },
         {
+          "kind": "tree",
+          "source": "src/member_copy_registry"
+        },
+        {
           "kind": "file",
           "source": "src/member_copy_runtime.rs"
         },
         {
           "kind": "file",
           "source": "src/member_copy_serving.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/member_copy_serving"
         },
         {
           "kind": "file",
@@ -905,6 +1165,10 @@
         },
         {
           "kind": "file",
+          "source": "src/native_cli/legacy_stdio.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/native_cli/call.rs"
         },
         {
@@ -914,6 +1178,14 @@
         {
           "kind": "file",
           "source": "src/native_cli/connect.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/consumer.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/runtime.rs"
         },
         {
           "kind": "file",
@@ -941,6 +1213,14 @@
         },
         {
           "kind": "file",
+          "source": "src/native_cli/maintenance.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/maintenance/keyed_receipt_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/native_cli/init/review.rs"
         },
         {
@@ -957,11 +1237,27 @@
         },
         {
           "kind": "file",
+          "source": "src/native_cli/launch.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/native_cli/login.rs"
         },
         {
           "kind": "file",
+          "source": "src/native_cli/login_node.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/native_cli/node_client.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/recovery.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/replica.rs"
         },
         {
           "kind": "file",
@@ -977,7 +1273,15 @@
         },
         {
           "kind": "file",
+          "source": "src/native_cli/status/discovery.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/native_cli/status/tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/vault.rs"
         },
         {
           "kind": "file",
@@ -1040,6 +1344,10 @@
           "source": "src/provenance.rs"
         },
         {
+          "kind": "tree",
+          "source": "src/provenance"
+        },
+        {
           "kind": "file",
           "source": "src/realtime.rs"
         },
@@ -1054,6 +1362,10 @@
         {
           "kind": "tree",
           "source": "src/record_body"
+        },
+        {
+          "kind": "file",
+          "source": "src/record_id.rs"
         },
         {
           "kind": "file",
@@ -1185,6 +1497,10 @@
         },
         {
           "kind": "file",
+          "source": "src/write_diagnostics.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/bin/asof_fold_time.rs"
         },
         {
@@ -1237,7 +1553,15 @@
         },
         {
           "kind": "file",
+          "source": "examples/v2_preinspection_reuse.rs"
+        },
+        {
+          "kind": "file",
           "source": "examples/v2_digest_bench.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_digest_compare.rs"
         },
         {
           "kind": "file",
@@ -1266,6 +1590,14 @@
         {
           "kind": "file",
           "source": "examples/standby_admit.rs"
+        },
+        {
+          "kind": "file",
+          "source": "web/apps/first-party-catalog.json"
+        },
+        {
+          "kind": "file",
+          "source": "web/apps/src/apps/docs/declaration.json"
         },
         {
           "kind": "tree",
@@ -1358,6 +1690,10 @@
         {
           "kind": "file",
           "source": "experiments/demo-shell/fixtures/folders-browse-sql.mjs"
+        },
+        {
+          "kind": "file",
+          "source": "experiments/demo-shell/public/lib/indexSql.js"
         },
         {
           "kind": "file",

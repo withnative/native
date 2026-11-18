@@ -36,6 +36,9 @@
 //!    that changed nothing still leaves the row a retry finds and replays as
 //!    the same no-op. A handler that commits more than once per call cannot
 //!    be keyed: its second keyed commit would hit the authority index.
+//!    Empty-anchor issuance uses the same shape admission as conformance.
+//!    A newly reachable no-op must extend that shared contract and carry a
+//!    real producer-to-conformance regression before it can be committed.
 //! 5. **Register through [`with_race_replay`],** which turns the authority
 //!    index's unique violation into one replay attempt. Under SQLite's single
 //!    writer step 2 makes that race unreachable; this is the backstop.
@@ -92,8 +95,7 @@ pub(crate) const KEYED_REPLAY_WRITES: &[(&str, Option<&[&str]>)] = &[
     ("claim_unowned_record", None),
     ("manage_citations", Some(&["reanchor"])),
     ("manage_attributions", Some(&["retract", "add_evidence"])),
-    // Accept is not keyed: see `resolve_suggestions`.
-    ("resolve_suggestions", Some(&["reject"])),
+    ("resolve_suggestions", None),
     (
         "manage_participants",
         Some(&["register_persona", "retire_persona"]),

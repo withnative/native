@@ -1,9 +1,8 @@
 //! Consequential-write routes for the test-only executor facade.
 //!
-//! A raw call to a supported high-risk operation is preparation only. Mutation
-//! is reachable exclusively with the opaque plan id and the visible
-//! target/effect fields returned by preparation. Plans and their execution
-//! fences are persisted in a versioned SQLite sidecar before dispatch.
+//! Legacy engines retain explicit preparation and execution. Kernel v2 uses
+//! direct source calls; guarded named-view and publication operations keep
+//! their existing durable execution fences behind that single public call.
 
 use std::sync::Arc;
 
@@ -112,6 +111,16 @@ pub(super) enum PlanPolicy {
 /// `plan_policy_table_rows_are_unique_and_disjoint`, and the whole mapping is
 /// frozen by `plan_policy_table_is_frozen`.
 pub(super) const PLAN_POLICY_TABLE: &[(&str, &str, PlanPolicy)] = &[
+    (
+        RECORDS_WRITE_EXECUTOR,
+        "manage_publication.publish",
+        PlanPolicy::RequiredSupported,
+    ),
+    (
+        RECORDS_WRITE_EXECUTOR,
+        "manage_publication.unpublish",
+        PlanPolicy::RequiredSupported,
+    ),
     (
         RECORDS_WRITE_EXECUTOR,
         "activate_view",
@@ -336,6 +345,40 @@ pub(super) fn requires_plan(executor: &str, operation: &str) -> bool {
     plan_policy(executor, operation) != PlanPolicy::Direct
 }
 
+pub(super) fn is_kernel_v2(engine: super::super::registry::EngineKind) -> bool {
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        engine == super::super::registry::EngineKind::KernelV2
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    {
+        let _ = engine;
+        false
+    }
+}
+
+/// V2's consequential operations execute in one ordinary call. The source
+/// handler remains the authority for authorization and concurrency.
+pub(super) fn requires_plan_for_engine(
+    engine: super::super::registry::EngineKind,
+    executor: &str,
+    operation: &str,
+) -> bool {
+    !is_kernel_v2(engine) && requires_plan(executor, operation)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) fn uses_guarded_v2_execution(source: &str, operation: &str) -> bool {
+    matches!(
+        (source, operation),
+        ("manage_named_views", "activate_view" | "unpublish_view")
+            | (
+                "manage_publication",
+                "manage_publication.publish" | "manage_publication.unpublish"
+            )
+    )
+}
+
 /// True only when a classified operation has a truthful, non-mutating
 /// production-adjacent preparer. Catalogue construction must withhold the
 /// other classified rows until their source modules expose equivalent seams.
@@ -421,7 +464,13 @@ pub(super) fn validate(
             identity_action(operation)?,
             source,
         ),
-        (RECORDS_WRITE_EXECUTOR, "activate_view" | "unpublish_view") => Ok(()),
+        (
+            RECORDS_WRITE_EXECUTOR,
+            "activate_view"
+            | "unpublish_view"
+            | "manage_publication.publish"
+            | "manage_publication.unpublish",
+        ) => Ok(()),
         (RECORDS_WRITE_EXECUTOR, CORRECT_RECORD_TYPE_OPERATION) => Ok(()),
         (RECORDS_DELETE_EXECUTOR, DELETE_RECORD_OPERATION)
         | (RECORDS_DELETE_EXECUTOR, DETACH_ATTACHMENT_OPERATION)
@@ -555,7 +604,7 @@ impl WriteRuntime {
     }
 
     #[cfg(test)]
-    fn with_ttl_ms(store: Arc<PlanStore>, ttl_ms: i64) -> Self {
+    pub(super) fn with_ttl_ms(store: Arc<PlanStore>, ttl_ms: i64) -> Self {
         Self {
             store,
             ttl_ms,
@@ -740,6 +789,8 @@ fn canonical_source_arguments(executor: &str, operation: &str, arguments: Value)
         (RECORDS_WRITE_EXECUTOR, operation @ ("activate_view" | "unpublish_view")) => {
             Some(operation)
         }
+        (RECORDS_WRITE_EXECUTOR, "manage_publication.publish") => Some("publish"),
+        (RECORDS_WRITE_EXECUTOR, "manage_publication.unpublish") => Some("unpublish"),
         (RECORDS_WRITE_EXECUTOR, CORRECT_RECORD_TYPE_OPERATION) => None,
         (RECORDS_DELETE_EXECUTOR, DELETE_RECORD_OPERATION) => None,
         (RECORDS_DELETE_EXECUTOR, DETACH_ATTACHMENT_OPERATION) => Some("detach"),
@@ -2899,6 +2950,46 @@ async fn prepare_operation(
                 }),
             })
         }
+        (
+            RECORDS_WRITE_EXECUTOR,
+            _operation @ ("manage_publication.publish" | "manage_publication.unpublish"),
+        ) => {
+            #[cfg(feature = "v2-kernel-probe")]
+            if let EngineHandle::KernelV2(db) = engine {
+                let (evidence, binding) = crate::mcp::kernel_v2::writes::publication::preview(
+                    db,
+                    caller,
+                    &canonical_source_arguments,
+                )
+                .await?;
+                let id = canonical_source_arguments["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let state = digest(&json!([
+                    evidence["record_revision"],
+                    evidence["publication"]
+                ]))?;
+                return Ok(PreparedWrite {
+                    revalidation_arguments,
+                    canonical_source_arguments,
+                    target_id: id.clone(),
+                    target: format!("public access for {id}"),
+                    state_revision: state.clone(),
+                    target_state_digest: state,
+                    effect: evidence,
+                    effect_summary: if _operation.ends_with(".publish") {
+                        format!("Publish LIVE saved title and body of {id}; future saved edits become public, images show alt text only. This explicit grant persists rehome and private policy tightening until revocation, archive or deletion. Link availability is checked after this operation.")
+                    } else {
+                        format!("Unpublish {id}; revoke this publication's public access. Link availability is checked after this operation.")
+                    },
+                    operation_evidence: json!({"kind":"record_publication","authority":"current_record_manage","binding":binding}),
+                });
+            }
+            Err(Error::engine(
+                "publication_profile_unsupported: publication plans require canonical v2",
+            ))
+        }
         (RECORDS_WRITE_EXECUTOR, operation @ ("activate_view" | "unpublish_view")) => {
             #[cfg(feature = "v2-kernel-probe")]
             if let EngineHandle::KernelV2(db) = engine {
@@ -3101,6 +3192,45 @@ async fn prepare_operation(
     }
 }
 
+/// Render a Ready serving link only from a trusted origin plus the canonical
+/// public ID. Both halves are validated closed-form: the origin must be an
+/// exact HTTPS origin (or HTTP on loopback) with no userinfo, path, query,
+/// or fragment, and the public ID must be 32 lowercase hex. Returns None on
+/// any failure so the caller falls back to an honest retryable state.
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) fn render_ready_link(origin: &str, public_id: &str) -> Option<String> {
+    if public_id.len() != 32
+        || !public_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(origin.trim()).ok()?;
+    let loopback = parsed.scheme() == "http"
+        && matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        );
+    if !(parsed.scheme() == "https" || loopback)
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let mut link = parsed;
+    link.set_path(&format!("/p/{public_id}"));
+    link.set_query(Some("app=agent.docs"));
+    if link.fragment().is_some() {
+        return None;
+    }
+    Some(link.to_string())
+}
+
 fn allowed_fields(arguments: &Value, allowed: &[&str]) -> Result<()> {
     let object = arguments
         .as_object()
@@ -3126,6 +3256,17 @@ fn with_plan_error(mut body: Value, code: &str, continuation: Value) -> Value {
 }
 
 fn describe_then_prepare_continuation(contract: &OperationContract) -> Value {
+    if contract.kernel_v2 {
+        return json!({
+            "action":"describe_operation_then_call",
+            "retry_ready":false,
+            "describe":{"tool":"describe_operation","arguments":{
+                "executor":contract.executor,"operation":contract.operation,
+            }},
+            "operation_input_schema_pointer":"/result/structuredContent/input_schema",
+            "arguments_pointer":"/arguments",
+        });
+    }
     json!({
         "action":"describe_operation_then_prepare",
         "retry_ready":false,
@@ -3202,6 +3343,235 @@ impl<'a> PlanError<'a> {
 }
 
 impl ExecutorPrototypeStdioServer {
+    /// Exercise the internal plan phases independently in the existing race
+    /// and receipt proofs. Public v2 calls use execute_guarded_v2_direct.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(super) async fn handle_guarded_plan_fixture_message(
+        &self,
+        message: Value,
+    ) -> Option<Value> {
+        let params = message.get("params")?;
+        let envelope = params.get("arguments")?;
+        let executor = if params["name"] == "call_executor" {
+            envelope["executor"].as_str()?
+        } else {
+            params["name"].as_str()?
+        };
+        let operation = envelope["operation"].as_str().unwrap_or_default();
+        let Some(contract) = self
+            .contracts
+            .get(&(executor.into(), operation.into()))
+            .cloned()
+        else {
+            return self.handle_message(message).await;
+        };
+        if !uses_guarded_v2_execution(&contract.source_tool, operation) {
+            return self.handle_message(message).await;
+        }
+        let mut arguments = envelope.clone();
+        arguments.as_object_mut()?.remove("executor");
+        Some(
+            self.handle_plan_backed_write(
+                message["id"].clone(),
+                true,
+                message,
+                contract,
+                arguments,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// Retain the source's existing admission and CAS guards without exposing
+    /// a public prepare/plan/execute round trip. A failed preparation never
+    /// dispatches; execution consumes exactly the freshly prepared plan.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(super) async fn execute_guarded_v2_direct(
+        &self,
+        id: Value,
+        modern: bool,
+        message: Value,
+        contract: OperationContract,
+        arguments: Value,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> Value {
+        if self.hosted_authority.is_some()
+            && contract.source_tool == "manage_publication"
+            && !self.hosted_publication_management
+        {
+            return self
+                .write_plan_error(
+                    id,
+                    modern,
+                    &contract,
+                    &arguments,
+                    None,
+                    PlanError::new(
+                        "publication_disabled",
+                        "hosted publication management is not enabled",
+                        false,
+                    ),
+                )
+                .await;
+        }
+        // Stable internal identity lets an uncertain/repeated direct call
+        // recover the original guarded receipt before current-state preview
+        // (which correctly rejects the now-consumed CAS values).
+        let binding = match engine_binding(&self.engine, &self.caller).await {
+            Ok(binding) => binding,
+            Err(error) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &arguments,
+                        None,
+                        PlanError::new("plan_identity_unavailable", &error.to_string(), false),
+                    )
+                    .await
+            }
+        };
+        let plan_id = match digest(&json!([
+            "v2-direct",
+            binding,
+            contract.executor,
+            contract.operation,
+            arguments["arguments"]
+        ])) {
+            Ok(hash) => format!("wpl1:direct:{hash}"),
+            Err(error) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &arguments,
+                        None,
+                        PlanError::new("preparation_failed", &error.to_string(), false),
+                    )
+                    .await
+            }
+        };
+        let Some(runtime) = &self.write_runtime else {
+            return self
+                .standby_read_only_response(id, modern, &arguments)
+                .await;
+        };
+        let existing = match runtime.store.load(&plan_id, now_ms()).await {
+            Ok(existing) => existing,
+            Err(error) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &arguments,
+                        None,
+                        PlanError::new("plan_store_unavailable", &error.to_string(), false),
+                    )
+                    .await
+            }
+        };
+        let telemetry_request = self.telemetry.as_ref().map(|telemetry| {
+            telemetry.request(
+                Some(&contract.executor),
+                Some(&contract.operation),
+                Some(&plan_id),
+            )
+        });
+        let prepared = if existing.is_none() {
+            Some(
+                self.prepare_write_plan(
+                    id.clone(),
+                    modern,
+                    contract.clone(),
+                    arguments.clone(),
+                    telemetry_request.clone(),
+                    Some(plan_id.clone()),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        // A concurrent identical caller may win insertion. Re-read the one
+        // durable identity and let the existing claim/replay checks arbitrate.
+        let stored = match runtime.store.load(&plan_id, now_ms()).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                if let Some(prepared) = prepared {
+                    if prepared["result"]["isError"] == true {
+                        return prepared;
+                    }
+                }
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &arguments,
+                        None,
+                        PlanError::new(
+                            "plan_not_found",
+                            "internal direct execution state disappeared",
+                            false,
+                        ),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &arguments,
+                        None,
+                        PlanError::new("plan_store_unavailable", &error.to_string(), false),
+                    )
+                    .await
+            }
+        };
+        let plan: WritePlan = match serde_json::from_value(stored.payload) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &arguments,
+                        None,
+                        PlanError::new("plan_integrity_failed", &error.to_string(), false),
+                    )
+                    .await
+            }
+        };
+        let mut execution = json!({"operation":contract.operation,
+            "plan_id":plan.id, "target":plan.target,
+            "effect_summary":plan.effect_summary});
+        for key in ["run_key", "parent_key", "format"] {
+            if let Some(value) = arguments.get(key) {
+                execution[key] = value.clone();
+            }
+        }
+        crate::mcp::deployment_read_only::scope_deployment_persistence(
+            persistence_lease.clone(),
+            self.execute_write_plan(
+                id,
+                modern,
+                message,
+                contract,
+                execution,
+                telemetry_request,
+                persistence_lease,
+            ),
+        )
+        .await
+    }
+
     pub(super) async fn handle_plan_backed_write(
         &self,
         id: Value,
@@ -3211,6 +3581,27 @@ impl ExecutorPrototypeStdioServer {
         arguments: Value,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> Value {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.hosted_authority.is_some()
+            && matches!(&self.engine, EngineHandle::KernelV2(_))
+            && contract.source_tool == "manage_publication"
+            && !self.hosted_publication_management
+        {
+            return self
+                .write_plan_error(
+                    id,
+                    modern,
+                    &contract,
+                    &arguments,
+                    None,
+                    PlanError::new(
+                        "publication_disabled",
+                        "hosted publication plans are not enabled",
+                        false,
+                    ),
+                )
+                .await;
+        }
         let telemetry_request = self.telemetry.as_ref().map(|telemetry| {
             telemetry.request(
                 Some(&contract.executor),
@@ -3274,6 +3665,22 @@ impl ExecutorPrototypeStdioServer {
             });
         }
         if arguments.get("plan_id").is_some() {
+            #[cfg(feature = "v2-kernel-probe")]
+            if self.hosted_publication_management && contract.source_tool == "manage_publication" {
+                return crate::mcp::deployment_read_only::scope_deployment_persistence(
+                    persistence_lease.clone(),
+                    self.execute_write_plan(
+                        id,
+                        modern,
+                        message,
+                        contract,
+                        arguments,
+                        telemetry_request,
+                        persistence_lease,
+                    ),
+                )
+                .await;
+            }
             return self
                 .execute_write_plan(
                     id,
@@ -3288,7 +3695,7 @@ impl ExecutorPrototypeStdioServer {
         }
         if arguments.get("arguments").is_some() {
             return self
-                .prepare_write_plan(id, modern, contract, arguments, telemetry_request)
+                .prepare_write_plan(id, modern, contract, arguments, telemetry_request, None)
                 .await;
         }
         let body = self
@@ -3312,13 +3719,14 @@ impl ExecutorPrototypeStdioServer {
         )
     }
 
-    async fn prepare_write_plan(
+    pub(super) async fn prepare_write_plan(
         &self,
         id: Value,
         modern: bool,
         contract: OperationContract,
         envelope: Value,
         telemetry_request: Option<super::telemetry::TelemetryRequest>,
+        direct_plan_id: Option<String>,
     ) -> Value {
         // Dispatch refuses standby mutations before plan access; this fails
         // the same closed refusal if a plan path is ever reached without one.
@@ -3493,7 +3901,7 @@ impl ExecutorPrototypeStdioServer {
             }
         };
         let mut plan = WritePlan {
-            id: format!("wpl1:{}", Uuid::new_v4()),
+            id: direct_plan_id.unwrap_or_else(|| format!("wpl1:{}", Uuid::new_v4())),
             binding,
             executor: contract.executor.clone(),
             operation: contract.operation.clone(),
@@ -4268,6 +4676,88 @@ impl ExecutorPrototypeStdioServer {
                 .await;
         }
         #[cfg(feature = "v2-kernel-probe")]
+        let _publication_execution_permit =
+            if self.hosted_publication_management && plan.source_tool == "manage_publication" {
+                match self.try_acquire_sql_commit_single_flight() {
+                    Ok(permit) => permit,
+                    Err((code, detail, _)) => {
+                        return self
+                            .write_plan_error(
+                                id,
+                                modern,
+                                &contract,
+                                &envelope,
+                                telemetry_request.as_ref(),
+                                PlanError::new(code, &detail, false),
+                            )
+                            .await
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(feature = "v2-kernel-probe")]
+        if plan.source_tool == "manage_publication" {
+            let authorization = async {
+                let EngineHandle::KernelV2(db) = &self.engine else {
+                    return Err(Error::engine("publication_profile_unsupported"));
+                };
+                crate::mcp::kernel_v2::writes::publication::authorize_retry(
+                    db,
+                    &self.caller,
+                    &plan.canonical_source_arguments,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = authorization {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &envelope,
+                        telemetry_request.as_ref(),
+                        PlanError::new("publication_authority_changed", &error.to_string(), false),
+                    )
+                    .await;
+            }
+            if self.hosted_publication_management {
+                let lease = crate::mcp::deployment_read_only::current_job_lease();
+                let check = match (
+                    self.hosted_authority.as_deref(),
+                    lease.as_ref(),
+                    &self.engine,
+                ) {
+                    (Some(authority), Some(lease), EngineHandle::KernelV2(db)) => {
+                        authority
+                            .acquire_publication_authority(&self.caller, db, lease)
+                            .await
+                    }
+                    _ => Err(Error::engine("hosted publication authority unavailable")),
+                };
+                match check {
+                    Ok(guard) => drop(guard),
+                    Err(_) => {
+                        return self
+                            .write_plan_error(
+                                id,
+                                modern,
+                                &contract,
+                                &envelope,
+                                telemetry_request.as_ref(),
+                                PlanError::new(
+                                    "publication_authority_changed",
+                                    "hosted publication authority unavailable",
+                                    false,
+                                ),
+                            )
+                            .await
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "v2-kernel-probe")]
         if plan.source_tool == "manage_named_views" {
             let authorization = async {
                 let EngineHandle::KernelV2(db) = &self.engine else {
@@ -4345,15 +4835,17 @@ impl ExecutorPrototypeStdioServer {
                 result,
                 source_dispatch_count,
             } => {
-                return self.replay_write_plan(
-                    id,
-                    &plan,
-                    result.clone(),
-                    *source_dispatch_count,
-                    telemetry_request.as_ref(),
-                    started,
-                    modern,
-                )
+                return self
+                    .replay_write_plan(
+                        id,
+                        &plan,
+                        result.clone(),
+                        *source_dispatch_count,
+                        telemetry_request.as_ref(),
+                        started,
+                        modern,
+                    )
+                    .await
             }
             StoredState::Executing { started_at_ms, .. }
             | StoredState::Indeterminate { started_at_ms, .. } => {
@@ -4441,14 +4933,15 @@ impl ExecutorPrototypeStdioServer {
         let current = match current {
             Ok(current) => current,
             Err(error) => {
-                // Preview-only SQL writes classify drift by error type, never
-                // by message: the preparer raises `Conflict` for selection,
+                // Publication and preview-only SQL writes classify drift by
+                // error type, never by message: SQL raises `Conflict` for selection,
                 // shape, visibility, authorization, version, bound, and facet
                 // governance drift, while validator, storage, and digest
                 // failures stay non-stale. Every other pair keeps its existing
                 // diagnostic-substring classification untouched.
-                let code = if (plan.executor.as_str(), plan.operation.as_str())
-                    == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION)
+                let code = if plan.source_tool == "manage_publication"
+                    || (plan.executor.as_str(), plan.operation.as_str())
+                        == (SQL_WRITE_EXECUTOR, SQL_WRITE_OPERATION)
                 {
                     if matches!(error, Error::Conflict(_)) {
                         "plan_stale"
@@ -4683,15 +5176,17 @@ impl ExecutorPrototypeStdioServer {
                         result,
                         source_dispatch_count,
                     } => {
-                        return self.replay_write_plan(
-                            id,
-                            &plan,
-                            result,
-                            source_dispatch_count,
-                            telemetry_request.as_ref(),
-                            started,
-                            modern,
-                        )
+                        return self
+                            .replay_write_plan(
+                                id,
+                                &plan,
+                                result,
+                                source_dispatch_count,
+                                telemetry_request.as_ref(),
+                                started,
+                                modern,
+                            )
+                            .await
                     }
                     StoredState::Executing { started_at_ms, .. }
                     | StoredState::Indeterminate { started_at_ms, .. } => {
@@ -4773,6 +5268,113 @@ impl ExecutorPrototypeStdioServer {
                 }
             }
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        let publication_guard =
+            if self.hosted_publication_management && plan.source_tool == "manage_publication" {
+                let authority = self
+                    .hosted_authority
+                    .as_deref()
+                    .expect("qualified hosted authority");
+                let lease = crate::mcp::deployment_read_only::current_job_lease();
+                let check = match (lease.as_ref(), &self.engine) {
+                    (Some(lease), EngineHandle::KernelV2(db)) => {
+                        authority
+                            .acquire_publication_authority(&self.caller, db, lease)
+                            .await
+                    }
+                    _ => Err(Error::engine("publication admission unavailable")),
+                };
+                match check {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        let released = write_runtime
+                            .store
+                            .release_undispatched(&plan_id, &attempt_id, now_ms())
+                            .await;
+                        let failure = if released.is_ok() {
+                            PlanError::new(
+                                "publication_authority_changed",
+                                "hosted publication authority unavailable",
+                                false,
+                            )
+                        } else {
+                            PlanError::indeterminate(
+                                "publication execution claim could not be released",
+                            )
+                        };
+                        return self
+                            .write_plan_error(
+                                id,
+                                modern,
+                                &contract,
+                                &envelope,
+                                telemetry_request.as_ref(),
+                                failure,
+                            )
+                            .await;
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(feature = "v2-kernel-probe")]
+        if publication_guard.is_some() {
+            let current = prepare_operation(
+                &self.engine,
+                &self.caller,
+                self.hosted_authority.as_deref(),
+                &plan.executor,
+                &plan.operation,
+                plan.revalidation_arguments.clone(),
+            )
+            .await;
+            let validation = current.and_then(|current| {
+                let effect_digest = digest(&current.effect)?;
+                Ok(current.target_id == plan.target_id
+                    && current.target == plan.target
+                    && current.state_revision == plan.state_revision
+                    && current.target_state_digest == plan.target_state_digest
+                    && current.canonical_source_arguments == plan.canonical_source_arguments
+                    && current.revalidation_arguments == plan.revalidation_arguments
+                    && current.effect_summary == plan.effect_summary
+                    && current.operation_evidence == plan.operation_evidence
+                    && effect_digest == plan.effect_digest)
+            });
+            if !matches!(validation, Ok(true)) {
+                drop(publication_guard);
+                let released = write_runtime
+                    .store
+                    .release_undispatched(&plan_id, &attempt_id, now_ms())
+                    .await;
+                let failure = if released.is_ok() {
+                    match validation {
+                        Ok(false) | Err(Error::Conflict(_)) => PlanError::new(
+                            "plan_stale",
+                            "publication authority or prepared effect changed",
+                            false,
+                        ),
+                        Err(_) => PlanError::new(
+                            "plan_revalidation_failed",
+                            "publication revalidation is temporarily unavailable",
+                            false,
+                        ),
+                        Ok(true) => unreachable!(),
+                    }
+                } else {
+                    PlanError::indeterminate("publication execution claim could not be released")
+                };
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &envelope,
+                        telemetry_request.as_ref(),
+                        failure,
+                    )
+                    .await;
+            }
+        }
         if !hosted_atomic_membership {
             if let (Some(telemetry), Some(request)) = (&self.telemetry, &telemetry_request) {
                 let counts = super::telemetry::TelemetryCounts {
@@ -4868,6 +5470,8 @@ impl ExecutorPrototypeStdioServer {
                 .dispatch_attempts
                 .fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "v2-kernel-probe")]
+        let publication_completion = std::sync::Arc::new(std::sync::Mutex::new(None));
         let outcome = if view_publication {
             match self
                 .dispatch_view_publication(
@@ -4935,9 +5539,25 @@ impl ExecutorPrototypeStdioServer {
                 }
             }
         } else {
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                super::PUBLICATION_COMPLETION
+                    .scope(
+                        publication_completion.clone(),
+                        self.delegate_with_caller_and_persistence(
+                            message,
+                            caller,
+                            persistence_lease,
+                        ),
+                    )
+                    .await
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
             self.delegate_with_caller_and_persistence(message, caller, persistence_lease)
                 .await
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        drop(publication_guard);
         drop(publication_permit);
         let mut body = outcome_body(outcome).unwrap_or_else(|| {
             protocol::error_response(
@@ -5059,7 +5679,7 @@ impl ExecutorPrototypeStdioServer {
                         telemetry_request.as_ref(),
                         started,
                         modern,
-                    )
+                    ).await
                 }
                 Ok(Some(StoredPlan {
                     state: StoredState::Executing { started_at_ms, .. }
@@ -5142,6 +5762,37 @@ impl ExecutorPrototypeStdioServer {
         // intact for the caller, but persist only a replay-safe terminal
         // result. A later retry must never recover the join URL from the plan
         // store, even after restart.
+        #[cfg(feature = "v2-kernel-probe")]
+        let publication_receipt = publication_completion
+            .lock()
+            .expect("publication completion lock")
+            .clone();
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.hosted_publication_management
+            && plan.source_tool == "manage_publication"
+            && response_succeeded(&body)
+            && publication_receipt.is_none()
+        {
+            let _ = write_runtime
+                .store
+                .mark_indeterminate(
+                    &plan_id,
+                    &attempt_id,
+                    "publication completion witness unavailable",
+                    now_ms(),
+                )
+                .await;
+            return self
+                .write_plan_error(
+                    id,
+                    modern,
+                    &contract,
+                    &envelope,
+                    telemetry_request.as_ref(),
+                    PlanError::indeterminate("publication completion witness unavailable"),
+                )
+                .await;
+        }
         let persisted_result = if contract.operation == MEMBERSHIP_COPY_INVITATION_LINK_OPERATION {
             json!({
                 "isError": true,
@@ -5152,6 +5803,16 @@ impl ExecutorPrototypeStdioServer {
                 }
             })
         } else {
+            #[cfg(feature = "v2-kernel-probe")]
+            if self.hosted_publication_management
+                && plan.source_tool == "manage_publication"
+                && response_succeeded(&body)
+            {
+                json!({"native_hosted_publication_completion_v1": {"result":stored_result, "receipt":publication_receipt}})
+            } else {
+                stored_result.clone()
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
             stored_result.clone()
         };
         if let Err(error) = write_runtime
@@ -5227,11 +5888,143 @@ impl ExecutorPrototypeStdioServer {
             "completed":completed,
             "elapsed_ms":elapsed_ms(started),
         }));
+        #[cfg(feature = "v2-kernel-probe")]
+        let _ = self
+            .attach_publication_delivery(&plan, &mut body, publication_receipt.as_ref(), false)
+            .await;
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let _ = self.attach_publication_delivery(&plan, &mut body).await;
         body
     }
 
+    async fn attach_publication_delivery(
+        &self,
+        plan: &WritePlan,
+        body: &mut Value,
+        #[cfg(feature = "v2-kernel-probe")] original: Option<
+            &crate::kernel::publications::PublicationReceipt,
+        >,
+        #[cfg(feature = "v2-kernel-probe")] require_proof: bool,
+    ) -> Result<()> {
+        #[cfg(feature = "v2-kernel-probe")]
+        {
+            if !self.hosted_publication_management
+                || plan.source_tool != "manage_publication"
+                || !super::response_succeeded(body)
+            {
+                return Ok(());
+            }
+            let current: std::result::Result<_, super::HostedPublicationReconcileError> = async {
+                let EngineHandle::KernelV2(db) = &self.engine else {
+                    return Err(super::HostedPublicationReconcileError::Unavailable);
+                };
+                let authority = self
+                    .hosted_authority
+                    .as_deref()
+                    .ok_or_else(|| Error::engine("publication authority unavailable"))?;
+                let database_id = self
+                    .caller
+                    .hosting_database()
+                    .ok_or_else(|| Error::engine("publication route unavailable"))?;
+                if plan.binding.workspace != database_id {
+                    return Err(super::HostedPublicationReconcileError::Denied);
+                }
+                let lease = crate::mcp::deployment_read_only::current_job_lease()
+                    .ok_or_else(|| Error::engine("publication admission unavailable"))?;
+                let request = crate::mcp::kernel_v2::writes::publication::request(
+                    &plan.canonical_source_arguments,
+                )?;
+                if request.record_id != plan.target_id {
+                    return Err(super::HostedPublicationReconcileError::Denied);
+                }
+                if !matches!(
+                    (&request.action, plan.operation.as_str()),
+                    (
+                        crate::kernel::publications::PublicationAction::Publish,
+                        "manage_publication.publish"
+                    ) | (
+                        crate::kernel::publications::PublicationAction::Revoke { .. },
+                        "manage_publication.unpublish"
+                    )
+                ) {
+                    return Err(super::HostedPublicationReconcileError::Denied);
+                }
+                let binding: crate::kernel::publications::PublicationBinding =
+                    serde_json::from_value(plan.operation_evidence["binding"].clone())
+                        .map_err(|_| super::HostedPublicationReconcileError::Denied)?;
+                let original =
+                    original.ok_or(super::HostedPublicationReconcileError::Unavailable)?;
+                let principal = crate::mcp::kernel_v2::principal(db, &self.caller).await?;
+                authority
+                    .reconcile_publication(super::HostedPublicationContext {
+                        db,
+                        caller: &self.caller,
+                        database_id,
+                        principal: &principal,
+                        request: &request,
+                        original,
+                        database_birth: &binding.database_birth,
+                        record_birth: &binding.record_birth,
+                        plan_id: &plan.id,
+                        lease: &lease,
+                    })
+                    .await
+            }
+            .await;
+            if require_proof {
+                match &current {
+                    Err(super::HostedPublicationReconcileError::Denied) => {
+                        return Err(Error::auth("publication authority unavailable"))
+                    }
+                    Err(super::HostedPublicationReconcileError::Unavailable) => {
+                        return Err(Error::engine(
+                            "publication receipt proof temporarily unavailable",
+                        ))
+                    }
+                    Ok(_) => {}
+                }
+            }
+            let current =
+                current.unwrap_or(super::PublicationRoutingCurrent::TemporarilyUnavailable);
+            // Ready is rendered only from the host-installed trusted origin
+            // plus the canonical receipt public ID. Tool arguments, request
+            // URLs, and arbitrary result JSON never supply either value; any
+            // validation failure falls back to an honest retryable state.
+            if matches!(current, super::PublicationRoutingCurrent::Ready) {
+                let rendered = self
+                    .hosted_authority
+                    .as_deref()
+                    .and_then(|authority| authority.publication_ready_origin())
+                    .and_then(|origin| {
+                        let public_id = original?.state.public_id.clone();
+                        render_ready_link(&origin, &public_id)
+                    });
+                match rendered {
+                    Some(url) => {
+                        body["result"]["_meta"]["routing_current"] =
+                            json!({"status":current,"public_url":url,"retryable":false});
+                    }
+                    None => {
+                        body["result"]["_meta"]["routing_current"] = json!({"status":super::PublicationRoutingCurrent::TemporarilyUnavailable,"public_url":null,"retryable":true});
+                    }
+                }
+                return Ok(());
+            }
+            let retryable = matches!(
+                current,
+                super::PublicationRoutingCurrent::PendingIndex
+                    | super::PublicationRoutingCurrent::TemporarilyUnavailable
+            );
+            body["result"]["_meta"]["routing_current"] =
+                json!({"status":current,"public_url":null,"retryable":retryable});
+        }
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let _ = (plan, body);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn replay_write_plan(
+    async fn replay_write_plan(
         &self,
         id: Value,
         plan: &WritePlan,
@@ -5241,6 +6034,37 @@ impl ExecutorPrototypeStdioServer {
         started: Instant,
         modern: bool,
     ) -> Value {
+        #[cfg(feature = "v2-kernel-probe")]
+        let mut original_receipt = None;
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.hosted_publication_management
+            && plan.source_tool == "manage_publication"
+            && !result["isError"].as_bool().unwrap_or(false)
+        {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Completion {
+                result: Value,
+                receipt: crate::kernel::publications::PublicationReceipt,
+            }
+            let completion = result
+                .get("native_hosted_publication_completion_v1")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Completion>(v).ok());
+            let Some(completion) = completion else {
+                let mut refusal = protocol::call_error_content(
+                    &Error::engine("publication receipt proof unavailable"),
+                    Value::Null,
+                    None,
+                );
+                if modern {
+                    protocol::add_modern_result_fields(&mut refusal);
+                }
+                return json!({"jsonrpc":"2.0","id":id,"result":refusal});
+            };
+            result = completion.result;
+            original_receipt = Some(completion.receipt);
+        }
         if modern {
             protocol::add_modern_result_fields(&mut result);
         }
@@ -5249,7 +6073,33 @@ impl ExecutorPrototypeStdioServer {
             "idempotentReplay":true,
             "sourceDispatchCount":source_dispatch_count,
         });
-        let body = json!({"jsonrpc":"2.0","id":id,"result":result});
+        let mut body = json!({"jsonrpc":"2.0","id":id,"result":result});
+        if let Err(error) = self
+            .attach_publication_delivery(
+                plan,
+                &mut body,
+                #[cfg(feature = "v2-kernel-probe")]
+                original_receipt.as_ref(),
+                #[cfg(feature = "v2-kernel-probe")]
+                true,
+            )
+            .await
+        {
+            let mut refusal = protocol::call_error_content(&error, Value::Null, None);
+            #[cfg(feature = "v2-kernel-probe")]
+            if self.hosted_publication_management
+                && plan.source_tool == "manage_publication"
+                && matches!(error, Error::Engine(_))
+            {
+                refusal["_meta"]["routing_current"] =
+                    json!({"status":"temporarily_unavailable","public_url":null,"retryable":true});
+            }
+            if modern {
+                protocol::add_modern_result_fields(&mut refusal);
+            }
+            body["result"] = refusal;
+            return body;
+        }
         if let (Some(telemetry), Some(request)) = (&self.telemetry, telemetry_request) {
             telemetry.emit(super::telemetry::EventSpec {
                 request: Some(request.clone()),
@@ -5375,7 +6225,7 @@ impl ExecutorPrototypeStdioServer {
                 telemetry_request,
                 started,
                 modern,
-            ),
+            ).await,
             StoredState::Executing { started_at_ms, .. }
             | StoredState::Indeterminate { started_at_ms, .. } => {
                 let diagnostic = format!(
@@ -5437,6 +6287,20 @@ impl ExecutorPrototypeStdioServer {
             continuation,
             source_dispatch_count,
         } = error;
+        let direct_diagnostic;
+        let diagnostic = if contract.kernel_v2 {
+            direct_diagnostic = match code {
+                "plan_expired" => format!("saved operation admission expired; inspect current target state, refresh concurrency tokens and call this operation with a fresh {}", if contract.source_tool == "manage_publication" { "operation_key" } else { "idempotency_key" }),
+                "plan_execution_indeterminate" => "operation entered source execution without a durable terminal result; inspect target state before retrying".into(),
+                "plan_stale" => "operation preconditions changed; inspect current target state and refresh concurrency tokens before retrying".into(),
+                "plan_contract_mismatch" => format!("operation contract changed; inspect current target state, describe the current operation and use a fresh {} when making a new call", if contract.source_tool == "manage_publication" { "operation_key" } else { "idempotency_key" }),
+                "plan_id_required" | "visible_effect_mismatch" | "execution_shape_rejected" => "internal guarded execution envelope failed validation; inspect target state before retrying".into(),
+                _ => diagnostic.to_owned(),
+            };
+            direct_diagnostic.as_str()
+        } else {
+            diagnostic
+        };
         let body = self
             .fixture_error_response(
                 id,
@@ -5454,16 +6318,28 @@ impl ExecutorPrototypeStdioServer {
         let body = with_plan_error(
             body,
             code,
-            continuation.unwrap_or_else(|| {
+            if contract.kernel_v2 {
                 if include_contract_repair {
                     describe_then_prepare_continuation(contract)
+                } else if matches!(code, "plan_expired" | "plan_contract_mismatch") {
+                    json!({"action":"inspect_state_then_call_with_fresh_request_key","retry_ready":false,
+                        "request_key_field":if contract.source_tool == "manage_publication" { "operation_key" } else { "idempotency_key" },
+                        "arguments_pointer":"/arguments"})
                 } else {
-                    json!({
-                        "action":"prepare_again_if_still_authorized",
-                        "retry_ready":false,
-                    })
+                    json!({"action":"inspect_state_before_retry","retry_ready":false})
                 }
-            }),
+            } else {
+                continuation.unwrap_or_else(|| {
+                    if include_contract_repair {
+                        describe_then_prepare_continuation(contract)
+                    } else {
+                        json!({
+                            "action":"prepare_again_if_still_authorized",
+                            "retry_ready":false,
+                        })
+                    }
+                })
+            },
         );
         if code != "plan_preparation_unavailable" {
             if let (Some(telemetry), Some(request)) = (&self.telemetry, telemetry_request) {
@@ -7290,6 +8166,16 @@ mod tests {
         let expected: &[(&str, &str, PlanPolicy)] = &[
             (
                 "records_write",
+                "manage_publication.publish",
+                PlanPolicy::RequiredSupported,
+            ),
+            (
+                "records_write",
+                "manage_publication.unpublish",
+                PlanPolicy::RequiredSupported,
+            ),
+            (
+                "records_write",
                 "activate_view",
                 PlanPolicy::RequiredSupported,
             ),
@@ -7481,13 +8367,13 @@ mod tests {
             ("sql_write", "sql_write", PlanPolicy::RequiredSupported),
         ];
         assert_eq!(PLAN_POLICY_TABLE, expected);
-        assert_eq!(PLAN_POLICY_TABLE.len(), 39);
+        assert_eq!(PLAN_POLICY_TABLE.len(), 41);
         assert_eq!(
             PLAN_POLICY_TABLE
                 .iter()
                 .filter(|(_, _, policy)| *policy == PlanPolicy::RequiredSupported)
                 .count(),
-            37
+            39
         );
         assert_eq!(
             PLAN_POLICY_TABLE
@@ -14219,6 +15105,14 @@ mod tests {
             .unwrap();
         assert!(response_succeeded(&modern), "{modern}");
         let runtime = &modern["result"]["structuredContent"]["tool_exposure"]["runtime"];
+        assert_eq!(runtime["status_scope"], json!("bootstrap_summary"));
+        assert_eq!(runtime["full_status_tool"], json!("standby_status"));
+        assert!(
+            serde_json::to_vec(&modern["result"]["structuredContent"]["tool_exposure"])
+                .unwrap()
+                .len()
+                <= crate::mcp::tools::orientation::MAX_BOOTSTRAP_TOOL_EXPOSURE_BYTES
+        );
         assert_eq!(runtime["read_only"], json!(true));
         assert_eq!(
             runtime["refresh"]["transfer_progress"]["stage"],

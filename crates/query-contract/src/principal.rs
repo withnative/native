@@ -60,6 +60,9 @@ impl ActivityRosterMember {
 /// booleans project to `0`/`1` INTEGER columns. `advertised_directly` is 0
 /// only on a lean executor surface, for an operation reachable through
 /// `call_executor` but not advertised as its own tool operation.
+/// `requires_acceptance` is 1 for a write that is queued and shown as waiting
+/// until hosted accepts it, rather than applied to the local copy straight
+/// away; reads are always 0.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CatalogOperationRow {
     pub executor: String,
@@ -74,6 +77,7 @@ pub struct CatalogOperationRow {
     pub selector_field: Option<String>,
     pub selector_value: Option<String>,
     pub advertised_directly: bool,
+    pub requires_acceptance: bool,
 }
 
 /// Immutable per-execution serving catalogue for `catalog_operations`.

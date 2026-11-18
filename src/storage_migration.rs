@@ -379,6 +379,14 @@ async fn migrate_storage_inner(
 
     let result = async {
         lease.assert_owned()?;
+        // Portable interchange intentionally omits receiver-local authority.
+        // Until a qualified transfer can retain cancellation fences, refuse
+        // conversion rather than resurrect a previously cancelled command.
+        let cancellations: i64 = sqlx::query_scalar("SELECT count(*) FROM provenance_local_command_cancellations")
+            .fetch_one(source_db.write_pool()).await?;
+        if cancellations != 0 {
+            return Err(Error::engine("storage migration cannot discard local command cancellation authority; keep the source database"));
+        }
         let canonical = export_canonical_interchange(&source_db).await?;
         report.canonical_sha256 = Some(sha256(&canonical));
         report.canonical_bytes = Some(canonical.len() as u64);
@@ -2311,6 +2319,56 @@ mod tests {
             rollback_window: Duration::from_secs(3600),
         };
         (directory, options)
+    }
+
+    #[tokio::test]
+    async fn storage_conversion_refuses_to_drop_local_cancellation_authority() {
+        let (_directory, options) = fixture().await;
+        let db = open_existing_database_at(&options.source.path)
+            .await
+            .unwrap();
+        let args = serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"type":"Document","kind":"note","name":"held","idempotency_key":"held-migration","reason":"test"});
+        // Test fixture only; production cannot construct this context.
+        let verified = {
+            crate::provenance::cancellation::VerifiedHeldCommand::for_test_command(
+                &crate::identity::database_id(&db).await.unwrap(),
+                "local",
+                "create_record",
+                &args,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let _staged = crate::provenance::cancellation::cancel_in(&mut tx, &verified)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        db.close().await;
+        let before = read_json::<TargetConfig>(&options.target_config).unwrap();
+        let error = migrate_storage(options.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot discard local command cancellation authority"),
+            "{error}"
+        );
+        assert_eq!(
+            read_json::<TargetConfig>(&options.target_config).unwrap(),
+            before
+        );
+        assert!(!options.destination.path.exists());
+        let source = open_existing_database_at(&options.source.path)
+            .await
+            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM provenance_local_command_cancellations")
+                .fetch_one(source.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

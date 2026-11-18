@@ -129,6 +129,9 @@ const INTENTIONALLY_DROPPED: &[&str] = &[
     "provenance_attestation_validity_events",
     "provenance_interaction_receipts",
     "provenance_local_attestation_authority",
+    // Empty-table compatibility only: run_import rejects any local anchors
+    // in its stable source snapshot before reaching this disposition check.
+    "provenance_local_command_cancellations",
     "read_log_record_ids",
     "read_log_touches",
     "receipt_comparisons",

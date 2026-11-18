@@ -16,7 +16,10 @@ import { pathToFileURL } from "node:url";
 import { LIMITS } from "../src/limits.mjs";
 
 const source = readFileSync(new URL("../src/fake-host/shell.js", import.meta.url), "utf8")
-  .replace('from "/__kit/rules.mjs"', `from ${JSON.stringify(new URL("../src/fake-host/rules.mjs", import.meta.url).href)}`);
+  .replace('from "./app-state.mjs"', `from ${JSON.stringify(new URL("../src/fake-host/app-state.mjs", import.meta.url).href)}`)
+  .replace('from "/__kit/rules.mjs"', `from ${JSON.stringify(new URL("../src/fake-host/rules.mjs", import.meta.url).href)}`)
+  // The same stub server.mjs serves when `bodyDraft` is not offered: these shell tests run without the journal.
+  .replace('from "/__kit/body-drafts.mjs"', `from ${JSON.stringify("data:text/javascript,export const bodyDraftJournal = null;")}`);
 const dir = mkdtempSync(join(tmpdir(), "alpha-tab-kit-shell-"));
 const shellFile = join(dir, "shell.mjs");
 writeFileSync(shellFile, source);

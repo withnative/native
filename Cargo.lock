@@ -2444,7 +2444,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -2965,6 +2965,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "10.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3031,6 +3046,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
+ "bindgen 0.69.5",
  "cc",
  "pkg-config",
  "vcpkg",
@@ -3392,29 +3408,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-body-merge"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "native-ce"
 version = "0.0.0"
 dependencies = [
  "async-stream",
  "axum",
  "base64 0.23.0",
+ "bytes",
  "cel-subset",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
+ "ed25519-dalek",
  "flate2",
  "fs2",
  "futures",
  "hex",
  "hmac",
+ "http",
  "image",
  "indexmap",
  "jsonschema",
+ "jsonwebtoken",
  "libc",
  "libsqlite3-sys",
  "markdown",
  "native-artifact-html",
  "native-artifact-runtime",
+ "native-body-merge",
  "native-federation",
  "native-package-cel-host",
  "native-package-cel-wire",
@@ -3422,6 +3452,7 @@ dependencies = [
  "native-query-contract",
  "native-record-type-correction-kernel",
  "native-relationship-kernel",
+ "num-bigint",
  "percent-encoding",
  "pg_query",
  "proc-macro2",
@@ -4708,7 +4739,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -6531,8 +6562,12 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -6706,6 +6741,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.19",
  "utf-8",
@@ -7546,6 +7583,15 @@ dependencies = [
  "phf_codegen",
  "string_cache",
  "string_cache_codegen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
   "claim": {
     "backend": "sqlite-local",
     "evidence_suite": "sqlite-reference-ci",
-    "scope": "Production MCP dispatch over the SQLite reference profile. Other backend profiles do not inherit this authorization claim. Named-view operations are hosted-v2-only: positive evidence is from the separately gated hosted-v2 suite, with explicit ordinary SQLite refusal evidence; no local-success claim."
+    "scope": "Production MCP dispatch over the SQLite reference profile. Other backend profiles do not inherit this authorization claim. Named-view operations are hosted-v2-only: positive evidence is from the separately gated hosted-v2 suite, with explicit ordinary SQLite refusal evidence; no local-success claim. Saved-tab operations separately qualify account-private hosted-v2 success and explicit legacy/offline refusal; no ordinary SQLite success is claimed."
   },
   "operations": [
     {
@@ -395,6 +395,30 @@
         "claim": "update_record.$tool rejects a caller below edit-or-manage-for-owner-transfer and leaves its governed writes unchanged."
       },
       "rationale": "Ordinary edits require edit; ownership transfer and policy-affecting moves require stronger atomic checks."
+    },
+    {
+      "tool": "merge_body",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "high",
+      "fixture": "merge-body-edit-boundary",
+      "expected_threshold": "edit",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/kernel_v2/merge_body_tests.rs",
+        "test": "a_clean_merge_appends_one_body_event_and_returns_its_exact_pairing",
+        "claim": "Authorized merge_body.$tool merges a held edit into the record at threshold edit."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/kernel_v2/merge_body_tests.rs",
+        "test": "the_caller_needs_edit_and_a_hidden_or_unknown_record_reads_as_missing",
+        "claim": "merge_body.$tool refuses a caller below edit with not_permitted (or record_missing when the record is hidden), leaving the record and its event log unchanged."
+      },
+      "rationale": "A held body edit is an ordinary edit of the record: it needs edit on the record, checked in the write transaction before any keyed replay lookup."
     },
     {
       "tool": "claim_unowned_record",
@@ -1355,23 +1379,93 @@
       "disposition": "specialized",
       "risk_tier": "specialized",
       "fixture": "messaging-reactions",
-      "expected_threshold": "message-author-with-edit",
+      "expected_threshold": "message-author-with-edit-or-manage-on-origin-channel",
       "access": "mutation",
       "non_disclosure": true,
       "no_write_on_deny": true,
-      "positive_evidence": {
-        "status": "test",
-        "file": "src/mcp/tools/messaging_delete_tests.rs",
-        "test": "author_delete_tombstones_hides_withdraws_and_keeps_history",
-        "claim": "Authorized manage_messages.delete tombstones the author's own Message at threshold message-author-with-edit, withdraws its notification candidates and keeps its body in stored history."
-      },
-      "negative_evidence": {
-        "status": "test",
-        "file": "src/mcp/tools/messaging_delete_tests.rs",
-        "test": "only_the_author_can_delete_including_persona_messages",
-        "claim": "manage_messages.delete rejects a caller who is not the Message's author, including a view-only recipient and a Message sent as a persona, refuses an account with no access as missing, and leaves its governed writes unchanged."
-      },
-      "rationale": "Deleting is author-only: the caller must hold Edit on the Message and be the Person who owns it, so another editor of the shared Collection cannot delete someone else's Message."
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/tools/messaging_delete_tests.rs",
+          "test": "author_delete_tombstones_hides_withdraws_and_keeps_history",
+          "claim": "Authorized manage_messages.delete tombstones the author's own Message at the author threshold, withdraws its notification candidates and keeps its body in stored history."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/tools/messaging_delete_tests.rs",
+          "test": "channel_manager_deletes_others_message_actor_is_manager_and_retry_replays",
+          "claim": "Authorized manage_messages.delete also removes another account's Message for a caller holding Manage on its origin channel, attributes the deletion to that moderator, keeps the required reason, and replays an idempotent retry without writing a second event."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_author_tombstones_hides_and_withdraws",
+          "claim": "Kernel v2 manage_messages.delete tombstones the author's own Message at the author threshold, hides it from context, inbox and state reads for author and recipient, withdraws its notification candidates and keeps its stored state through projection replay."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_channel_manager_moderates_and_retry_replays",
+          "claim": "Kernel v2 manage_messages.delete also removes another principal's Message for a caller holding Manage on its origin channel, attributes the tombstone event to that moderator with the required reason, and replays a keyed retry without writing a second deletion event."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_collection_owner_without_message_manage_moderates",
+          "claim": "Kernel v2 manage_messages.delete removes another principal's Message for the Collection's creator, whose Manage on the channel comes only from the owner floor with no Manage on the Message itself, attributes the single tombstone event to the creator with the required reason, and replays projections identically; generic delete_record still refuses that creator because it stays Manage-on-the-record."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/tools/messaging_delete_tests.rs",
+          "test": "non_managers_cannot_delete_including_persona_messages",
+          "claim": "manage_messages.delete rejects a non-author holding Edit but not Manage on the origin channel, including a persona-voiced Message, refuses an account with no access as missing, and leaves its governed writes unchanged."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/tools/messaging_delete_tests.rs",
+          "test": "channel_member_without_manage_and_guest_cannot_delete_others_message",
+          "claim": "manage_messages.delete refuses an Edit-only and a View-only channel member with the channel wording and reports a non-member's Message as missing, leaving it live."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/tools/messaging_delete_tests.rs",
+          "test": "classifying_a_channel_message_into_a_managed_conversation_confers_no_delete",
+          "claim": "manage_messages.delete refuses a non-author who manages a Conversation the Message was filed into, because classification is not a channel, and leaves the Message live."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/tools/messaging_delete_tests.rs",
+          "test": "manager_of_a_conversation_a_direct_message_was_filed_into_cannot_delete_it",
+          "claim": "manage_messages.delete refuses a non-author who manages the Conversation a direct Message was filed into: a direct Message has no origin channel, so delete stays author-only."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_edit_and_view_members_are_refused",
+          "claim": "Kernel v2 manage_messages.delete refuses an Edit-only and a View-only channel member with the channel wording, including for a persona-voiced Message, and leaves the Message live."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_classified_conversation_manager_gets_no_delete",
+          "claim": "Kernel v2 manage_messages.delete refuses a non-author who manages a Conversation the Message was classified into, because classification is not a channel, and leaves the Message live."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_direct_message_is_author_only",
+          "claim": "Kernel v2 manage_messages.delete refuses a direct Message's recipient without mentioning a channel: a direct Message has no origin channel, so delete stays author-only."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/messaging_tests.rs",
+          "test": "kernel_v2_message_delete_second_delete_and_non_viewer_refusals",
+          "claim": "Kernel v2 manage_messages.delete names an already-deleted Message only to its author, reports it as missing to anyone else, refuses key reuse for a different Message, gives a caller who cannot see the Message the same refusal as a missing id, and leaves other Messages live."
+        }
+      ],
+      "rationale": "Deleting is the author's, or a moderator's through Manage on the Message's origin channel. Classification is a filing action an Edit holder controls, so a Conversation the Message was filed into never confers delete authority; a direct Message has no channel and stays author-only."
     },
     {
       "tool": "manage_messages",
@@ -4079,13 +4173,13 @@
       "no_write_on_deny": false,
       "positive_evidence": {
         "status": "test",
-        "file": "web/workbench/e2e/real-server.spec.ts",
+        "file": "web/dev/e2e/real-server.spec.ts",
         "test": "authenticated authorization changes take effect on the next request",
         "claim": "A live member can list the shared roster after the catalog recheck."
       },
       "negative_evidence": {
         "status": "test",
-        "file": "web/workbench/e2e/real-server.spec.ts",
+        "file": "web/dev/e2e/real-server.spec.ts",
         "test": "authenticated authorization changes take effect on the next request",
         "claim": "A removed member cannot list the shared roster on its next request."
       },
@@ -4103,13 +4197,13 @@
       "no_write_on_deny": true,
       "positive_evidence": {
         "status": "test",
-        "file": "web/workbench/e2e/real-server.spec.ts",
+        "file": "web/dev/e2e/real-server.spec.ts",
         "test": "authenticated authorization changes take effect on the next request",
         "claim": "Authorized manage_memberships.set_role succeeds at threshold host-owner-with-live-catalog-recheck."
       },
       "negative_evidence": {
         "status": "test",
-        "file": "web/workbench/e2e/real-server.spec.ts",
+        "file": "web/dev/e2e/real-server.spec.ts",
         "test": "authenticated authorization changes take effect on the next request",
         "claim": "manage_memberships.set_role rejects a caller below host-owner-with-live-catalog-recheck and leaves its governed writes unchanged."
       },
@@ -4127,13 +4221,13 @@
       "no_write_on_deny": true,
       "positive_evidence": {
         "status": "test",
-        "file": "web/workbench/e2e/real-server.spec.ts",
+        "file": "web/dev/e2e/real-server.spec.ts",
         "test": "authenticated authorization changes take effect on the next request",
         "claim": "Authorized manage_memberships.remove succeeds at threshold host-owner-with-live-catalog-recheck."
       },
       "negative_evidence": {
         "status": "test",
-        "file": "web/workbench/e2e/real-server.spec.ts",
+        "file": "web/dev/e2e/real-server.spec.ts",
         "test": "authenticated authorization changes take effect on the next request",
         "claim": "manage_memberships.remove rejects a caller below host-owner-with-live-catalog-recheck and leaves its governed writes unchanged."
       },
@@ -5268,6 +5362,30 @@
       "rationale": "Reset removes the caller's own scoped override; it never reaches a scope the caller cannot edit."
     },
     {
+      "tool": "read_app_bundle",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "caller-owned-adopted-app-bundle",
+      "expected_threshold": "caller-current-adopted-install-and-source-view",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/counter_guard.rs",
+        "test": "non_owner_responses_carry_no_unlisted_counter",
+        "claim": "A non-owner reads its real shell-adopted HTML install, verifies exact source and composed document digests, and receives no workspace counters or content writes."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/alpha_tabs.rs",
+        "test": "read_app_bundle_uses_launch_admission_without_ticket_issuance",
+        "claim": "Unknown packages, another principal's install, stale install pins and non-adopted installs refuse; changing adoption between pages refuses the next read."
+      },
+      "rationale": "Per-call admission derives the install account solely from caller credentials and requires the exact current adopted install plus source visibility. Bundle reads mint no tickets, URLs or grants; app callers are refused."
+    },
+    {
       "tool": "read_hcp_audit",
       "action": "$tool",
       "disposition": "specialized",
@@ -5362,6 +5480,326 @@
         "claim": "Absent and healthy mappings, wrong expected ids, unusable replay winners and advanced mappings are refused; retry refusal leaves effects unchanged."
       },
       "rationale": "Engine-owned caller-account mapping, exact owner-only health predicate, atomic private provisioning and replay-first compare-and-set recovery; request fields never select an account."
+    },
+    {
+      "tool": "manage_saved_tabs",
+      "action": "create",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-private-saved-tab-and-legacy-offline-refusal",
+      "expected_threshold": "authenticated-account-own-private-slot",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Kernel v2 create uses the authenticated account private slot, canonical revision and idempotent operation receipt; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "saved_tab_operations_refuse_legacy_and_offline_without_events_or_disclosure",
+          "claim": "All five valid operations refuse legacy and offline dispatch without canonical events or record identity disclosure."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Another account cannot get or discover the private slot; root owner authority cannot widen its private policy."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_generic_paths_cannot_edit_share_archive_move_or_delete",
+          "claim": "Generic record and private-home mutation cannot bypass scoped authority or terminal retirement."
+        }
+      ],
+      "rationale": "Kernel v2 canonical account-private Configuration authority. Account identity comes from authenticated context, never arguments. Legacy and offline engines refuse all actions; hosted-v2 private success evidence belongs to its separate feature lane."
+    },
+    {
+      "tool": "manage_saved_tabs",
+      "action": "get",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-private-saved-tab-and-legacy-offline-refusal",
+      "expected_threshold": "authenticated-account-own-private-slot",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Kernel v2 get uses the authenticated account private slot, canonical revision and idempotent operation receipt; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "saved_tab_operations_refuse_legacy_and_offline_without_events_or_disclosure",
+          "claim": "All five valid operations refuse legacy and offline dispatch without canonical events or record identity disclosure."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Another account cannot get or discover the private slot; root owner authority cannot widen its private policy."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_generic_paths_cannot_edit_share_archive_move_or_delete",
+          "claim": "Generic record and private-home mutation cannot bypass scoped authority or terminal retirement."
+        }
+      ],
+      "rationale": "Kernel v2 canonical account-private Configuration authority. Account identity comes from authenticated context, never arguments. Legacy and offline engines refuse all actions; hosted-v2 private success evidence belongs to its separate feature lane."
+    },
+    {
+      "tool": "manage_saved_tabs",
+      "action": "list",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-private-saved-tab-and-legacy-offline-refusal",
+      "expected_threshold": "authenticated-account-own-private-slot",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Kernel v2 list uses the authenticated account private slot, canonical revision and idempotent operation receipt; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "saved_tab_operations_refuse_legacy_and_offline_without_events_or_disclosure",
+          "claim": "All five valid operations refuse legacy and offline dispatch without canonical events or record identity disclosure."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Another account cannot get or discover the private slot; root owner authority cannot widen its private policy."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_generic_paths_cannot_edit_share_archive_move_or_delete",
+          "claim": "Generic record and private-home mutation cannot bypass scoped authority or terminal retirement."
+        }
+      ],
+      "rationale": "Kernel v2 canonical account-private Configuration authority. Account identity comes from authenticated context, never arguments. Legacy and offline engines refuse all actions; hosted-v2 private success evidence belongs to its separate feature lane."
+    },
+    {
+      "tool": "manage_saved_tabs",
+      "action": "rename",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-private-saved-tab-and-legacy-offline-refusal",
+      "expected_threshold": "authenticated-account-own-private-slot",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_cas_normalization_reset_replay_and_reconstruction",
+          "claim": "Kernel v2 rename uses the authenticated account private slot, canonical revision and idempotent operation receipt; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "saved_tab_operations_refuse_legacy_and_offline_without_events_or_disclosure",
+          "claim": "All five valid operations refuse legacy and offline dispatch without canonical events or record identity disclosure."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Another account cannot get or discover the private slot; root owner authority cannot widen its private policy."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_generic_paths_cannot_edit_share_archive_move_or_delete",
+          "claim": "Generic record and private-home mutation cannot bypass scoped authority or terminal retirement."
+        }
+      ],
+      "rationale": "Kernel v2 canonical account-private Configuration authority. Account identity comes from authenticated context, never arguments. Legacy and offline engines refuse all actions; hosted-v2 private success evidence belongs to its separate feature lane."
+    },
+    {
+      "tool": "manage_saved_tabs",
+      "action": "retire",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-private-saved-tab-and-legacy-offline-refusal",
+      "expected_threshold": "authenticated-account-own-private-slot",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Kernel v2 retire uses the authenticated account private slot, canonical revision and idempotent operation receipt; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "saved_tab_operations_refuse_legacy_and_offline_without_events_or_disclosure",
+          "claim": "All five valid operations refuse legacy and offline dispatch without canonical events or record identity disclosure."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_private_creation_scoped_paging_and_terminal_idempotency",
+          "claim": "Another account cannot get or discover the private slot; root owner authority cannot widen its private policy."
+        },
+        {
+          "status": "test",
+          "file": "src/mcp/kernel_v2/saved_tabs_tests.rs",
+          "test": "saved_tabs_generic_paths_cannot_edit_share_archive_move_or_delete",
+          "claim": "Generic record and private-home mutation cannot bypass scoped authority or terminal retirement."
+        }
+      ],
+      "rationale": "Kernel v2 canonical account-private Configuration authority. Account identity comes from authenticated context, never arguments. Legacy and offline engines refuse all actions; hosted-v2 private success evidence belongs to its separate feature lane."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "install_link",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "approved-app-catalogue",
+      "expected_threshold": "none",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs_prepare_install.rs",
+        "test": "approved_app_link_requires_no_source_and_changes_no_install_state",
+        "claim": "An authenticated caller obtains an approved package link without a source record or any installation state change."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs_prepare_install.rs",
+        "test": "approved_app_link_requires_no_source_and_changes_no_install_state",
+        "claim": "An unapproved package is refused without changing canonical installation state or exposing any private source."
+      },
+      "rationale": "Read-only release catalogue metadata; the browser retains ordinary human consent. No record or other account installation is read or changed."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "materialize_catalog_update",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "kernel-v2-catalog-personal-update",
+      "expected_threshold": "workspace-owner-own-install-predecessor-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates/materialized_updates.rs",
+        "test": "materialized_catalog_foreign_owner_full_lifecycle_preserves_both_predecessors_and_replays",
+        "claim": "A workspace owner materializes exact trusted host-catalog bytes into a fresh account-only source for their own existing install; fresh person preview and adoption rebind only that install while preserving the foreign source and other principals."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates/materialized_updates.rs",
+        "test": "materialized_catalog_refuses_stale_cas_pending_keys_callers_and_target_substitution_atomically",
+        "claim": "Stale predecessor guards, conflicting pending state or keys, foreign callers and target substitution refuse without creating a source or changing any install."
+      },
+      "rationale": "KernelV2-only trusted catalog materialization. Caller input supplies no code, declaration, owner or target identity. Current membership, workspace-owner footing and the caller own exact installed predecessor are checked before atomic private-source creation. The foreign artifact is never edited. Only a retained source-specific witness permits cross-artifact staging, and fresh person preview/adoption is required even for an unchanged declaration. Ordinary SQLite refuses the action."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "shelf_add",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "kernel-v2-workspace-app-shelf",
+      "expected_threshold": "edit-workspace-root-member",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates/shelf.rs",
+        "test": "shelf_add_stages_one_shared_source_idempotently_and_installs_for_nobody",
+        "claim": "A workspace writer adds a release-catalogue app: one workspace-readable source artifact and one shelf entry, idempotent across keys, and no install, adoption or consent for anyone."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates/shelf.rs",
+        "test": "shelf_writers_only_and_refusals_append_nothing",
+        "claim": "View-only members, non-members and app calls, out-of-catalogue packages and stale or blank guards are refused and append nothing."
+      },
+      "rationale": "KernelV2-only. Membership and Edit on the workspace root are checked before any write, the same gate as record creation; app callers are refused at the handler. The pin comes only from the release catalogue and is re-verified from retained evidence at projection and replay. Ordinary SQLite refuses the action."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "shelf_remove",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "kernel-v2-workspace-app-shelf",
+      "expected_threshold": "edit-workspace-root-member",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates/shelf.rs",
+        "test": "shelf_remove_is_guarded_and_readd_restores_the_same_source",
+        "claim": "A workspace writer removes a live shelf entry by its event id; a retry is a no-op, nothing is deleted, and re-adding restores the same source."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates/shelf.rs",
+        "test": "shelf_writers_only_and_refusals_append_nothing",
+        "claim": "View-only members, non-members and app calls, out-of-catalogue packages and stale or blank guards are refused and append nothing."
+      },
+      "rationale": "KernelV2-only. Membership and Edit on the workspace root are checked before any write and the removal is compare-and-set on the live shelf event id. Removal appends one event and deletes no source, install or consent. Ordinary SQLite refuses the action."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "publish_catalog_update",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "kernel-v2-catalog-update",
+      "expected_threshold": "workspace-owner-artifact-owner-body-and-install-cas",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates.rs",
+        "test": "catalog_update_attests_prepares_adopts_without_interrupting_old_generation_and_replays",
+        "claim": "A V2 workspace owner publishes exact host-catalog bytes onto the existing installed artifact under current-body and install-generation guards; publication preserves the active installation and retained source authority replays."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/owner_updates.rs",
+        "test": "catalog_update_attests_prepares_adopts_without_interrupting_old_generation_and_replays",
+        "claim": "Wrong body and install-generation guards refuse catalog publication without changing the record body or install generation."
+      },
+      "rationale": "KernelV2-only host-catalog publication. The host selects exact compiled bytes and declaration; callers cannot supply code, catalogue URLs or attestation. Current membership, workspace-owner footing, artifact ownership, an existing same-artifact install and no shared active installs are required. Publication grants source authority only; existing consent/adoption rules govern execution. Ordinary SQLite refuses the action."
     },
     {
       "tool": "manage_alpha_tabs",
@@ -5778,6 +6216,30 @@
       "rationale": "Reorder writes only the caller's own account order row: authenticated personal scope plus a reason and a vocabulary-valid order (all four built-ins present, installed-or-disabled packages only, no duplicates). Complete-state last-writer-wins with no CAS token, so there is no token to steal."
     },
     {
+      "tool": "manage_alpha_tabs",
+      "action": "set_scope",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "own-account-install-and-viewable-folders",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/app_scope.rs",
+        "test": "scoped_app_is_refused_or_omitted_outside_its_folders_on_every_surface",
+        "claim": "Authorized manage_alpha_tabs.set_scope by the installing person narrows that person's own install of the package to viewable folders, effective on the app's next call, and can be cleared back to all."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/v1_import/tests/app_state/app_scope.rs",
+        "test": "scoped_app_writes_messages_and_scope_management_are_refused_outside_the_grant",
+        "claim": "An app caller cannot call set_scope, and a grant naming a non-folder or unviewable folder is refused without changing the stored scope."
+      },
+      "rationale": "set_scope writes only the caller's own installed row for the package; it requires an installed generation, validates every folder id as a live folder the caller can view, and is refused for app callers like all consent management."
+    },
+    {
       "tool": "advance_artifact_port_pin",
       "action": "$tool",
       "disposition": "specialized",
@@ -5803,6 +6265,40 @@
     },
     {
       "tool": "manage_named_views",
+      "action": "propose_view",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "bearer-context-and-anchor-View",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/source_proof/tests.rs",
+          "test": "named_view_proposal_is_view_only_closed_deterministic_and_never_admission",
+          "claim": "Hosted v2 View-only caller obtains a deterministic closed candidate with producers off; the proposal does not admit it."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/source_proof/tests.rs",
+          "test": "named_view_proposal_is_view_only_closed_deterministic_and_never_admission",
+          "claim": "Hidden and absent context are uniform; caller SQL/evidence/actor/workspace are refused; stale candidates cannot draft."
+        }
+      ],
+      "rationale": "Hosted read-write v2 selector-only proposal. Current View, not Edit or owner authority. Producer gate does not govern this no-effect read. Run allocation sentinels refuse before ledger allocation. Draft/publication retain independent authority and gate checks."
+    },
+    {
+      "tool": "manage_named_views",
       "action": "get_view_revision",
       "disposition": "specialized",
       "risk_tier": "specialized",
@@ -5824,7 +6320,7 @@
           "status": "test",
           "file": "tests/tools/authorization_contract.rs",
           "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
-          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
         },
         {
           "status": "test",
@@ -5870,7 +6366,7 @@
           "status": "test",
           "file": "tests/tools/authorization_contract.rs",
           "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
-          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
         },
         {
           "status": "test",
@@ -5916,7 +6412,7 @@
           "status": "test",
           "file": "tests/tools/authorization_contract.rs",
           "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
-          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
         },
         {
           "status": "test",
@@ -5962,7 +6458,7 @@
           "status": "test",
           "file": "tests/tools/authorization_contract.rs",
           "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
-          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
         },
         {
           "status": "test",
@@ -6014,7 +6510,7 @@
           "status": "test",
           "file": "tests/tools/authorization_contract.rs",
           "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
-          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
         },
         {
           "status": "test",
@@ -6060,7 +6556,7 @@
           "status": "test",
           "file": "tests/tools/authorization_contract.rs",
           "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
-          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+          "claim": "All seven source operations refuse ordinary SQLite without appending content events."
         },
         {
           "status": "test",

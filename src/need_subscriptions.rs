@@ -136,7 +136,7 @@ pub fn closed_reason_for_refusal(code: &str) -> NeedClosedReason {
             NeedClosedReason::AccessLost
         }
         "disabled" => NeedClosedReason::Disabled,
-        "removed" | "missing_install" => NeedClosedReason::Removed,
+        "removed" | "missing_install" | "workspace_removed" => NeedClosedReason::Removed,
         "cas_mismatch" => NeedClosedReason::Reinstalled,
         "adoption_unverified" | "declaration_mismatch" => NeedClosedReason::AdoptionChanged,
         "digest_mismatch" | "source_revision_unresolved" | "not_renderable" => {

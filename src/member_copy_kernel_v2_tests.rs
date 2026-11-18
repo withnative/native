@@ -159,6 +159,8 @@ async fn native_member_source_cuts_isolate_accounts_and_survive_replay() {
         .await
         .unwrap();
     let facet_pin = crate::named_views::inject_v2_reader_fixture(&db, &bearer).await;
+    let global_pin = crate::named_views::inject_global_reader_fixture(&db, &bearer).await;
+    let named_pin = crate::named_views::inject_global_name_reader_fixture(&db, &bearer).await;
     // Model an older generation. Replay below reinstalls the optional index,
     // but member cuts and their authorization fences must remain identical.
     sqlx::query("DROP INDEX idx_kernel_named_view_admissions")
@@ -213,6 +215,8 @@ async fn native_member_source_cuts_isolate_accounts_and_survive_replay() {
         .await
         .unwrap();
     assert!(state.revisions.contains_key(&facet_pin.revision_id));
+    assert!(state.revisions.contains_key(&global_pin.revision_id));
+    assert!(state.revisions.contains_key(&named_pin.revision_id));
     snapshot.rollback().await.unwrap();
     assert_eq!(a_identity, ready(cut(&db, OWNER).await).profile_identity());
     assert_eq!(b_identity, ready(cut(&db, MEMBER).await).profile_identity());

@@ -13,9 +13,20 @@ pub(super) async fn outcome_on(
     generation: String,
     changed: bool,
 ) -> Result<ManagementOutcome> {
-    let install = entry_on(conn, principal, package)
+    let mut install = entry_on(conn, principal, package)
         .await?
         .ok_or_else(|| invalid("install projection missing after accepted outcome"))?;
+    if install["event_id"] != generation {
+        if let Some(row) = pending_entry_on(conn, principal, package).await? {
+            let pending = string(&row, "event_id")?;
+            if pending == generation {
+                install = row;
+                install["resolves"] = json!(false);
+                install["skip_reason"] = json!("adoption_required");
+                install["pending_update"] = json!(true);
+            }
+        }
+    }
     if install["event_id"] != generation {
         return Err(invalid(
             "accepted install generation does not match projection",
@@ -34,7 +45,7 @@ async fn account_on(conn: &mut SqliteConnection, principal: &str) -> Result<Stri
     if !hosted_identity::account_admitted_before(conn, principal, i64::MAX).await? {
         return Err(Error::engine("database membership not found"));
     }
-    require_activated_on(conn).await?;
+    require_apps_open_on(conn).await?;
     sqlx::query_scalar(
         "SELECT auth_binding FROM kernel_principals WHERE principal_id=? AND kind='account'",
     )
@@ -64,12 +75,17 @@ async fn source_matches(
     let Some(fields) = fields else {
         return Ok(false);
     };
-    let runtime: Option<String> =
+    // A shelf pin is verified from the evidence its add retained; the shared
+    // record's current facets are not part of what a member consented to.
+    let runtime: Option<String> = if row["shelf_event_id"].is_string() {
+        Some("native.html.v1".into())
+    } else {
         sqlx::query_scalar("SELECT value FROM kernel_facets WHERE record_id=? AND key='runtime'")
             .bind(fields[3])
             .fetch_optional(&mut *conn)
             .await?
-            .flatten();
+            .flatten()
+    };
     if runtime.as_deref() != Some("native.html.v1") {
         return Ok(false);
     }
@@ -139,18 +155,48 @@ async fn entry_with_retained_on(
         object.remove("authored_run_key");
     }
     let adoption = row["adoption"].as_str().unwrap_or("caller_asserted");
+    let mut name = Value::Null;
     let target_reason = if status == "removed" {
         Some("removed")
     } else if status == "disabled" {
         Some("disabled")
+    } else if row["shelf_event_id"].is_string() {
+        // A shelf-origin row never blanks because someone edited or archived the
+        // shared record; only the shelf itself (removal) stops it.
+        if shelf::require_not_removed_on(conn, &row, package)
+            .await
+            .is_err()
+        {
+            Some(shelf::WORKSPACE_REMOVED)
+        } else {
+            name = read_record_metadata_on(conn, principal, string(&row, "artifact_id")?)
+                .await?
+                .and_then(|record| {
+                    record
+                        .fields
+                        .get("title")
+                        .or_else(|| record.fields.get("name"))
+                        .cloned()
+                })
+                .unwrap_or(Value::Null);
+            None
+        }
     } else {
-        match read_record_on(conn, principal, string(&row, "artifact_id")?).await? {
+        match read_record_metadata_on(conn, principal, string(&row, "artifact_id")?).await? {
             // Remembered consent does not grant visibility of a hidden
             // source's present existence, type or archival state.
             None => Some("unauthorized"),
             Some(record) if record.archived => Some("archived"),
             Some(record) if !is_artifact_on(conn, &record).await? => Some("wrong_record_type"),
-            Some(_) => None,
+            Some(record) => {
+                name = record
+                    .fields
+                    .get("title")
+                    .or_else(|| record.fields.get("name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                None
+            }
         }
     };
     let epoch: i64 = sqlx::query_scalar(
@@ -206,16 +252,23 @@ async fn entry_with_retained_on(
         None if adoption == "caller_asserted" => Some("requires_adoption"),
         None => None,
     };
-    Ok(Some(json!({
-        "package":package,"version":row["version"],"digest":row["digest"],
+    let mut entry = json!({
+        "package":package,"name":name,"version":row["version"],"digest":row["digest"],
         "artifact_id":row["artifact_id"],"consented_source_revision":row["consented_source_revision"],
         "declaration_digest":row["declaration_digest"],"consented_declaration":declaration,
         "adoption":adoption,"adoption_basis":basis,"adoption_provenance":provenance,
+        "scope":scope::scope_on(conn, principal, package).await?.to_json(),
         "request":row["request"],"status":status,"event_id":generation,"event_seq":seq,
         "target_resolves":target_reason.is_none(),"target_skip_reason":target_reason,
         "resolves":false,"skip_reason":reason,"digest_binding":"stored-not-enforced",
         "launch_binding":launch_binding,
-    })))
+    });
+    // Only rows enabled from the shelf carry this key, so personal rows keep
+    // their exact shape.
+    if let Some(shelf_event_id) = row["shelf_event_id"].as_str() {
+        entry["shelf_event_id"] = json!(shelf_event_id);
+    }
+    Ok(Some(entry))
 }
 
 async fn effective_order(conn: &mut SqliteConnection, principal: &str) -> Result<Vec<String>> {
@@ -246,7 +299,7 @@ pub(crate) async fn list_as(
         return Err(Error::engine("manage_alpha_tabs: invalid list view"));
     }
     let include_removed = include_removed.unwrap_or(view == "full");
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     let account = account_on(&mut tx, principal).await?;
     let packages: Vec<String> = sqlx::query_scalar(
         "SELECT package FROM kernel_app_installs WHERE principal=? ORDER BY package",
@@ -261,7 +314,7 @@ pub(crate) async fn list_as(
     let mut installs = Vec::new();
     let mut removed_hidden = 0;
     for package in packages {
-        let entry = entry_with_retained_on(&mut tx, principal, &package, Some(&retained))
+        let mut entry = entry_with_retained_on(&mut tx, principal, &package, Some(&retained))
             .await?
             .ok_or_else(|| invalid("install projection missing"))?;
         if !include_removed && entry["status"] == "removed" {
@@ -269,23 +322,22 @@ pub(crate) async fn list_as(
             continue;
         }
         if view == "summary" {
-            let name = if entry["target_resolves"] == true {
-                read_record_on(&mut tx, principal, string(&entry, "artifact_id")?)
-                    .await?
-                    .and_then(|record| record.fields.get("name").cloned())
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            };
-            installs.push(json!({"package":entry["package"],"name":name,"version":entry["version"],
+            let mut summary = json!({"package":entry["package"],"name":entry["name"],"version":entry["version"],
                 "status":entry["status"],"artifact_id":entry["artifact_id"],"event_id":entry["event_id"],
+                "scope":entry["scope"],
                 "adoption_basis":entry["adoption_basis"],"request":entry["request"],
-                "target_resolves":entry["target_resolves"],"target_skip_reason":entry["target_skip_reason"]}));
+                "target_resolves":entry["target_resolves"],"target_skip_reason":entry["target_skip_reason"]});
+            if entry["shelf_event_id"].is_string() {
+                summary["shelf_event_id"] = entry["shelf_event_id"].clone();
+            }
+            installs.push(summary);
         } else {
+            entry["pending_update"] = json!(pending_entry_on(&mut tx, principal, &package).await?);
             installs.push(entry);
         }
     }
     let order = effective_order(&mut tx, principal).await?;
+    let shelf = shelf::shelf_view_on(&mut tx, principal).await?;
     let sources = if view == "full" {
         let mut sources = Vec::new();
         for pin in frozen_sources_on(&mut tx, principal, Some(&retained)).await? {
@@ -300,7 +352,8 @@ pub(crate) async fn list_as(
         None
     };
     tx.rollback().await?;
-    let mut result = json!({"account_id":account,"installs":installs,"tab_order":order});
+    let mut result = json!({"account_id":account,"installs":installs,"tab_order":order,
+        "shelf":shelf});
     if view == "summary" {
         result["view"] = json!("summary");
         result["removed_hidden"] = json!(removed_hidden);
@@ -312,15 +365,48 @@ pub(crate) async fn list_as(
 }
 
 pub(crate) async fn inspect_as(db: &Db, principal: &str, package: &str) -> Result<Value> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     account_on(&mut tx, principal).await?;
     let entry = entry_on(&mut tx, principal, package).await?;
+    let pending = pending_entry_on(&mut tx, principal, package).await?;
     let order = effective_order(&mut tx, principal).await?;
     tx.rollback().await?;
     Ok(match entry {
         Some(entry) => {
-            json!({"package":package,"installed":true,"install":entry,"tab_order":order})
+            json!({"package":package,"installed":true,"install":entry,"pending_update":pending,"tab_order":order})
         }
         None => json!({"package":package,"installed":false,"tab_order":order}),
     })
+}
+
+async fn pending_entry_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+    package: &str,
+) -> Result<Option<Value>> {
+    let Some((_, mut row, seq)) = consent::pending_on(conn, principal, package).await? else {
+        return Ok(None);
+    };
+    if sources::require_update_owner_on(
+        conn,
+        principal,
+        string(&row, "artifact_id")?,
+        Some(package),
+        string(&row, "consented_source_revision")?,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(None);
+    }
+    row["consented_declaration"] = serde_json::from_str(string(&row, "consented_declaration")?)?;
+    row["pending_update"] = json!(true);
+    row["event_seq"] = json!(seq);
+    row["target_resolves"] = json!(true);
+    row["target_skip_reason"] = Value::Null;
+    row["resolves"] = json!(false);
+    row["skip_reason"] = json!("adoption_required");
+    row["adoption_basis"] = json!("requires_adoption");
+    row["launch_binding"] = json!({"digest_version":"alpha-tab-digest.v1","verdict":"refused","reason":"adoption_required","receipt":null,"delivery":"reusable.v1"});
+    Ok(Some(row))
 }

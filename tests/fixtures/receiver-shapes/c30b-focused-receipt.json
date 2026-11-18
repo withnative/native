@@ -1,0 +1,63 @@
+{
+  "source": "6d0c0665917398fad9254f4dcb6601d5486f03ee",
+  "base": "c30b39111823db12a648a9d5cdeb1745e4c8440f",
+  "nonshipping_delta": "policy source authority placement and unknown-mutation selection refusal",
+  "tests": [
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver94_constructor_evidence",
+      "exit": 0
+    },
+    {
+      "test": "standby::shapes::tests::frozen_owned_shapes_and_exact_marking_normalization",
+      "exit": 0
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_registered_shapes_export_strip_retains_unknown_attached_drift",
+      "exit": 0
+    },
+    {
+      "test": "standby::kernel_v2_tests::kernel_v2_marked_primary_ships_unmarked_full_and_applicable_deltas",
+      "exit": 0
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl",
+      "exit": 0
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source",
+      "exit": 0
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch",
+      "exit": 0
+    },
+    {
+      "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+      "exit": 0
+    },
+    {
+      "test": "kernel::stored_visibility::principal_tests::the_shared_bindings_match_both_live_literals",
+      "exit": 0
+    },
+    {
+      "test": "kernel::stored_visibility::principal_tests::the_principal_matrix_matches_live_admission_and_transform",
+      "exit": 0
+    },
+    {
+      "test": "kernel::stored_visibility::tests::exports_of_a_marked_workspace_carry_no_accelerators",
+      "exit": 0
+    },
+    {
+      "test": "kernel::stored_visibility::tests::egress_strip_ships_any_drift_unchanged_for_refusal",
+      "exit": 0
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+      "exit": 0
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+      "exit": 0
+    }
+  ]
+}

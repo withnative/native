@@ -1,0 +1,9 @@
+{
+  "result": "pre-ingress compile failure; no new journal or95 runtime",
+  "head": "b5fb1a382890448bfe314dd997aec8bae7799f91",
+  "a_artifact_sha256": "29daf885250f4e2f0383f7781b226068878c299aa07a7d98db7cdbe99653a738",
+  "error": "E0624 private AuthorityActHeadResponseV1::head in manual-only origin assertion",
+  "source_restored": true,
+  "ingress_reached": false,
+  "related_partial_proof": "manual559-partial.json remains separate"
+}

@@ -80,6 +80,8 @@
 //! host without the route answers a bare 404 and the transport falls back to the
 //! MCP tool.
 
+pub(super) mod diagnostics;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -166,10 +168,51 @@ const DELTA_CHUNK_BYTES: u64 = 1024 * 1024;
 /// Poll cadence and total patience while the hosted capture runs.
 const DELTA_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DELTA_POLL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// A dropped cancel can strand hosted's single per-account export lease until
+/// its idle TTL, so the best-effort cancel tries a few times, briefly. Each
+/// attempt is cut off well inside the HTTP client's own 10 s request timeout,
+/// so the whole cancel is bounded to a few seconds.
+const DELTA_CANCEL_ATTEMPTS: u32 = 3;
+const DELTA_CANCEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Exact hosted refusal when this account already runs a delta export for
+/// this database: one export at a time per account and database. The node
+/// treats it as scheduling (back off and retry), never as a network outage.
+pub(crate) const DELTA_EXPORT_BUSY_MESSAGE: &str =
+    "hosted authority act delta export request failed: export_in_progress";
+/// Exact hosted-side timeout while polling a delta capture the node started.
+/// The capture may still be running when this fires, so the next attempt
+/// must back off rather than start a fresh export into the same busy lease.
+pub(crate) const DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE: &str =
+    "hosted authority act delta export request failed: capture timed out";
 /// Spooled file name inside the private export directory.
 const AUTHORITY_ACT_DELTA_SPOOL_FILE: &str = "authority-act-delta.json";
 /// Bounded route identifier length; the catalog owns the real grammar.
 const MAX_ROUTE_DATABASE_ID_BYTES: usize = 200;
+/// Target of the one timing event each hosted delta capture emits (task
+/// 445e3aa): acts, sizes, row counts and milliseconds only, no ids or content.
+const DELTA_CUT_TARGET: &str = "native_ce::standby::delta_cut";
+
+/// Time the hosted caller spent before the capture read started, in ms.
+#[derive(Clone, Copy, Debug)]
+pub struct HostedCutWait {
+    /// Request start to the capture task starting (admission and scheduling).
+    pub queue_ms: u64,
+    /// Opening the database engine for the capture.
+    pub connect_ms: u64,
+}
+
+/// Where one cut's time went. Zero for steps a path does not have.
+#[derive(Default)]
+struct CutSteps {
+    kernel_v2: bool,
+    wire_version: u32,
+    head_ms: u64,
+    sections_ms: u64,
+    projection_ms: u64,
+    /// Sealing the digest (kernel) or building the canonical bytes (act v1).
+    encode_ms: u64,
+    rows: usize,
+}
 
 /// The conservative upper bound on the raw rendered executor response for a
 /// structured payload of `structured_len` bytes. It accounts for the two copies
@@ -246,6 +289,11 @@ pub struct AuthorityActHeadResponseV1 {
     version: u32,
     route_database_id: String,
     head: AuthorityHead,
+    /// Kernel-v2 delta wire versions this authority can cut, advertised only
+    /// when the deployment has turned version 2 on. Absent otherwise, so a
+    /// head is byte-identical to what it always was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel_delta_versions: Option<Vec<u32>>,
     /// The executor annotates every result with run correlation. It is not
     /// authority evidence, but `deny_unknown_fields` must admit it or no real
     /// response parses. Never serialized by the authority itself.
@@ -340,19 +388,62 @@ fn validate_route_database_id(route_database_id: &str) -> Result<()> {
     )
 }
 
-/// The cheap authority head observation. It reads exactly one consistent head
-/// and returns the replicated coordinate set; it does not create a delta,
-/// handle, or snapshot.
+/// Observe one consistent authority head after verifying keyed-outcome
+/// coverage. Returns the replicated coordinates without creating a delta,
+/// handle, snapshot, or canonical maintenance fact.
 pub async fn observe_authority_act_head(
     db: &crate::Db,
     route_database_id: &str,
 ) -> Result<AuthorityActHeadResponseV1> {
+    observe_authority_act_head_advertising(db, route_database_id, false).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+fn advertised_versions(advertise_delta_v2: bool, advertise_delta_v3: bool) -> Option<Vec<u32>> {
+    // Version 1 always; each later version only where the deployment offers it.
+    (advertise_delta_v2 || advertise_delta_v3).then(|| {
+        let mut versions = vec![1];
+        if advertise_delta_v2 {
+            versions.push(2);
+        }
+        if advertise_delta_v3 {
+            versions.push(3);
+        }
+        versions
+    })
+}
+
+/// [`observe_authority_act_head`], optionally advertising that this authority
+/// can cut version-2 kernel deltas (`kernel_delta_versions: [1, 2]`). Hosted
+/// passes its deployment flag, default off; with it off the response is the one
+/// this function has always produced.
+pub async fn observe_authority_act_head_advertising(
+    db: &crate::Db,
+    route_database_id: &str,
+    advertise_delta_v2: bool,
+) -> Result<AuthorityActHeadResponseV1> {
+    observe_authority_act_head_offering(db, route_database_id, advertise_delta_v2, false).await
+}
+
+/// [`observe_authority_act_head_advertising`], also able to advertise wire
+/// version 3 (a delta with no projection digest, which skips the full scan that
+/// dominates a cut). Both default off; with both off the response is the one
+/// this function has always produced.
+pub async fn observe_authority_act_head_offering(
+    db: &crate::Db,
+    route_database_id: &str,
+    advertise_delta_v2: bool,
+    advertise_delta_v3: bool,
+) -> Result<AuthorityActHeadResponseV1> {
+    #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+    let _ = (advertise_delta_v2, advertise_delta_v3);
     validate_route_database_id(route_database_id)?;
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     {
         let mut tx = db.pool().begin().await?;
         if super::kernel_v2::is_v2(&mut tx).await? {
             let generation = super::kernel_v2::coordinates(&mut tx).await?;
+            crate::kernel::mcp_write_receipts::require_head_identity_coverage_on(&mut tx).await?;
             let origin_database_id = super::kernel_v2::origin(&mut tx, &generation).await?;
             tx.rollback().await?;
             return Ok(AuthorityActHeadResponseV1 {
@@ -364,17 +455,22 @@ pub async fn observe_authority_act_head(
                     origin_database_id,
                     generation,
                 }),
+                kernel_delta_versions: advertised_versions(advertise_delta_v2, advertise_delta_v3),
                 _run_context: Value::Null,
             });
         }
         tx.rollback().await?;
     }
-    let head = crate::standby::authority_probe::read_authority_act_head(db).await?;
+    let mut tx = db.pool().begin().await?;
+    crate::provenance::verify_keyed_receipt_anchor_coverage_on(&mut tx).await?;
+    let head = crate::standby::authority_probe::read_authority_act_head_on(&mut tx).await?;
+    tx.rollback().await?;
     Ok(AuthorityActHeadResponseV1 {
         contract: AUTHORITY_ACT_HEAD_RESPONSE_CONTRACT.into(),
         version: AUTHORITY_ACT_RESPONSE_VERSION,
         route_database_id: route_database_id.to_string(),
         head: AuthorityHead::V1(AuthorityActDeltaHeadV1::from_head(&head)),
+        kernel_delta_versions: None,
         _run_context: Value::Null,
     })
 }
@@ -416,6 +512,25 @@ pub async fn observe_authority_act_delta_with_inventory(
     from_exclusive_act: i64,
     blob_inventory: Option<&[String]>,
 ) -> Result<AuthorityActDeltaResponseV1> {
+    observe_authority_act_delta_versioned(
+        db,
+        route_database_id,
+        from_exclusive_act,
+        blob_inventory,
+        1,
+    )
+    .await
+}
+
+/// [`observe_authority_act_delta_with_inventory`] at a kernel-v2 delta wire
+/// version (1 or 2). The version only matters for a kernel-v2 database.
+pub async fn observe_authority_act_delta_versioned(
+    db: &crate::Db,
+    route_database_id: &str,
+    from_exclusive_act: i64,
+    blob_inventory: Option<&[String]>,
+    kernel_delta_version: u32,
+) -> Result<AuthorityActDeltaResponseV1> {
     validate_route_database_id(route_database_id)?;
     require(
         from_exclusive_act >= 0,
@@ -423,9 +538,15 @@ pub async fn observe_authority_act_delta_with_inventory(
     )?;
 
     let mut tx = db.pool().begin().await?;
-    let outcome = read_cut_on(&mut tx, from_exclusive_act, blob_inventory).await;
+    let outcome = read_cut_on(
+        &mut tx,
+        from_exclusive_act,
+        blob_inventory,
+        kernel_delta_version,
+    )
+    .await;
     let rollback = tx.rollback().await;
-    let (head_act, origin_database_id, bytes) = match (outcome, rollback) {
+    let (head_act, origin_database_id, bytes, _) = match (outcome, rollback) {
         (Err(error), _) => return Err(error),
         (Ok(_), Err(error)) => return Err(error.into()),
         (Ok(value), Ok(())) => value,
@@ -503,15 +624,51 @@ pub async fn capture_authority_act_delta_export_with_inventory(
     ceiling: usize,
     blob_inventory: Option<&[String]>,
 ) -> Result<(crate::export::Export, crate::export::BinaryDeltaMeta)> {
+    capture_authority_act_delta_export_versioned(
+        db,
+        route_database_id,
+        from_exclusive_act,
+        export_root,
+        ceiling,
+        blob_inventory,
+        1,
+        None,
+    )
+    .await
+}
+
+/// [`capture_authority_act_delta_export_with_inventory`] at a kernel-v2 delta
+/// wire version (1 or 2). Emits one `native_ce::standby::delta_cut` info event
+/// per successful capture; `wait` adds the hosted caller's queue and connect
+/// time to it.
+#[allow(clippy::too_many_arguments)]
+pub async fn capture_authority_act_delta_export_versioned(
+    db: &crate::Db,
+    route_database_id: &str,
+    from_exclusive_act: i64,
+    export_root: &std::path::Path,
+    ceiling: usize,
+    blob_inventory: Option<&[String]>,
+    kernel_delta_version: u32,
+    wait: Option<HostedCutWait>,
+) -> Result<(crate::export::Export, crate::export::BinaryDeltaMeta)> {
+    let started = std::time::Instant::now();
     validate_route_database_id(route_database_id)?;
     require(
         from_exclusive_act >= 0,
         "authority act delta lower bound must be non-negative",
     )?;
     let mut tx = db.pool().begin().await?;
-    let outcome = read_cut_on(&mut tx, from_exclusive_act, blob_inventory).await;
+    let begin_ms = started.elapsed().as_millis() as u64;
+    let outcome = read_cut_on(
+        &mut tx,
+        from_exclusive_act,
+        blob_inventory,
+        kernel_delta_version,
+    )
+    .await;
     let rollback = tx.rollback().await;
-    let (head_act, origin_database_id, bytes) = match (outcome, rollback) {
+    let (head_act, origin_database_id, bytes, steps) = match (outcome, rollback) {
         (Err(error), _) => return Err(error),
         (Ok(_), Err(error)) => return Err(error.into()),
         (Ok(value), Ok(())) => value,
@@ -519,6 +676,7 @@ pub async fn capture_authority_act_delta_export_with_inventory(
     if bytes.len() > ceiling {
         return Err(Error::engine(crate::export::BINARY_DELTA_TOO_LARGE));
     }
+    let digest_started = std::time::Instant::now();
     let content_sha256 = delta_content_digest(&bytes)?;
     let meta = crate::export::BinaryDeltaMeta {
         route_database_id: route_database_id.to_string(),
@@ -528,25 +686,49 @@ pub async fn capture_authority_act_delta_export_with_inventory(
         content_sha256,
         outer_sha256: hex::encode(Sha256::digest(&bytes)),
     };
+    let digest_ms = digest_started.elapsed().as_millis() as u64;
+    let spool_started = std::time::Instant::now();
     let export = crate::export::spool_bytes_export(
         Some(export_root),
         AUTHORITY_ACT_DELTA_SPOOL_FILE,
         &bytes,
     )
     .await?;
+    tracing::info!(
+        target: DELTA_CUT_TARGET,
+        from_exclusive_act,
+        head_act,
+        gap = head_act - from_exclusive_act,
+        wire_version = steps.wire_version,
+        cut_kind = if steps.kernel_v2 { "kernel_v2" } else { "act_v1" },
+        queue_ms = wait.map(|w| w.queue_ms),
+        connect_ms = wait.map(|w| w.connect_ms),
+        begin_ms,
+        head_ms = steps.head_ms,
+        sections_ms = steps.sections_ms,
+        projection_ms = steps.projection_ms,
+        encode_ms = steps.encode_ms,
+        digest_ms,
+        spool_ms = spool_started.elapsed().as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        rows = steps.rows,
+        delta_bytes = bytes.len(),
+        "authority delta cut captured"
+    );
     Ok((export, meta))
 }
 
 /// Read the head and the exact cut on one open connection inside one read
 /// transaction, then build the canonical delta. Returns the observed head act,
-/// the portable origin, and the exact bytes.
+/// the portable origin, the exact bytes, and the step timings.
 async fn read_cut_on(
     conn: &mut sqlx::SqliteConnection,
     from_exclusive_act: i64,
     blob_inventory: Option<&[String]>,
-) -> Result<(i64, String, Vec<u8>)> {
+    kernel_delta_version: u32,
+) -> Result<(i64, String, Vec<u8>, CutSteps)> {
     #[cfg(not(any(test, feature = "v2-kernel-probe")))]
-    let _ = blob_inventory;
+    let _ = (blob_inventory, kernel_delta_version);
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     if super::kernel_v2::is_v2(conn).await? {
         let inventory = match blob_inventory {
@@ -558,23 +740,59 @@ async fn read_cut_on(
                 ))
             }
         };
-        let delta = super::kernel_v2_delta::cut(conn, from_exclusive_act, inventory).await?;
+        let (delta, timings) = super::kernel_v2_delta::cut_versioned_timed(
+            conn,
+            from_exclusive_act,
+            inventory,
+            kernel_delta_version,
+        )
+        .await?;
+        let steps = CutSteps {
+            kernel_v2: true,
+            wire_version: kernel_delta_version,
+            head_ms: timings.head_ms,
+            sections_ms: timings.sections_ms,
+            projection_ms: timings.projection_ms,
+            encode_ms: timings.seal_ms,
+            rows: timings.rows,
+        };
         return Ok((
             delta.head.head_act,
             delta.origin_database_id.clone(),
             delta.bytes()?,
+            steps,
         ));
     }
+    let started = std::time::Instant::now();
+    crate::provenance::verify_keyed_receipt_anchor_coverage_on(conn).await?;
     let head = crate::standby::authority_probe::read_authority_act_head_on(conn).await?;
+    let head_ms = started.elapsed().as_millis() as u64;
     require(
         from_exclusive_act <= head.head_act,
         "authority act delta lower bound is beyond the observed authority head",
     )?;
+    let started = std::time::Instant::now();
     let cut =
         crate::standby::act_cut::read_authority_act_cut_on(conn, from_exclusive_act, head.head_act)
             .await?;
+    let sections_ms = started.elapsed().as_millis() as u64;
+    let started = std::time::Instant::now();
     let bytes = build_authority_act_delta(&cut)?;
-    Ok((head.head_act, head.origin_database_id, bytes))
+    let steps = CutSteps {
+        kernel_v2: false,
+        wire_version: AUTHORITY_ACT_RESPONSE_VERSION,
+        head_ms,
+        sections_ms,
+        projection_ms: 0,
+        encode_ms: started.elapsed().as_millis() as u64,
+        rows: cut
+            .sections()
+            .iter()
+            .chain(cut.companions())
+            .map(|section| section.rows.len())
+            .sum(),
+    };
+    Ok((head.head_act, head.origin_database_id, bytes, steps))
 }
 
 fn delta_content_digest(bytes: &[u8]) -> Result<String> {
@@ -624,11 +842,52 @@ impl AuthenticatedKernelDelta {
 
 pub(crate) type AuthorityCallFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
 
+pub(crate) struct SelectedResponse {
+    bytes: Vec<u8>,
+    selected: Option<super::shapes::Shape>,
+}
+impl SelectedResponse {
+    pub(crate) fn new(bytes: Vec<u8>, selected: Option<super::shapes::Shape>) -> Self {
+        Self { bytes, selected }
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+pub(crate) type SelectedCallFuture = Pin<Box<dyn Future<Output = Result<SelectedResponse>> + Send>>;
+
+pub(crate) fn selected_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<super::shapes::Shape>> {
+    let mut values = headers.get_all(super::shapes::SELECTED_SHAPE_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() || value.as_bytes().len() > 1024 {
+        return Err(Error::engine("invalid selected receiver shape header"));
+    }
+    let shape: super::shapes::Shape = serde_json::from_slice(value.as_bytes())?;
+    if super::shapes::lookup(&shape).is_none() {
+        return Err(Error::engine(super::shapes::UNSUPPORTED));
+    }
+    Ok(Some(shape))
+}
+
 /// The one injected HTTP seam. Production uses [`HttpAuthorityActClient`]; tests
 /// script it without a socket. It returns the raw response body bytes, and the
 /// caller owns every ceiling and parse decision.
 pub(crate) trait AuthorityActHttpClient: Send + Sync {
     fn call(&self, endpoint: String, bearer: String, body: Value) -> AuthorityCallFuture;
+    fn call_with_shape(&self, endpoint: String, bearer: String, body: Value) -> SelectedCallFuture {
+        let call = self.call(endpoint, bearer, body);
+        Box::pin(async move {
+            Ok(SelectedResponse {
+                bytes: call.await?,
+                selected: None,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -658,16 +917,31 @@ pub(crate) struct DeltaHttpResponse {
     pub(crate) content_type: Option<String>,
     pub(crate) etag: Option<String>,
     pub(crate) content_range: Option<String>,
+    /// Decimal-seconds `retry-after` hint, if the response carried a parseable
+    /// one. Hosted sends `Retry-After: 1` on its retryable export refusals.
+    pub(crate) retry_after_secs: Option<u64>,
     pub(crate) body: Vec<u8>,
 }
 
+/// Decimal-seconds `retry-after` only. Hosted sends a plain `1` on its
+/// retryable export refusals; dates and garbage are not a backoff instruction.
+fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
 pub(crate) type DeltaHttpFuture = Pin<Box<dyn Future<Output = Result<DeltaHttpResponse>> + Send>>;
+type SelectedDeltaFuture =
+    Pin<Box<dyn Future<Output = Result<(DeltaHttpResponse, Option<super::shapes::Shape>)>> + Send>>;
 
 /// The second injected HTTP seam, for the chunked route family. A 401/403 and
 /// the maintenance marker are refused by the implementation, exactly as the
 /// MCP seam does; every other status is returned for the caller to judge.
 pub(crate) trait AuthorityActDeltaHttp: Send + Sync {
     fn send(&self, request: DeltaHttpRequest) -> DeltaHttpFuture;
+    fn send_with_shape(&self, request: DeltaHttpRequest) -> SelectedDeltaFuture {
+        let sent = self.send(request);
+        Box::pin(async move { Ok((sent.await?, None)) })
+    }
 }
 
 /// Stand-in for a host without the chunked routes: always the 404 an older
@@ -683,6 +957,7 @@ impl AuthorityActDeltaHttp for NoChunkedDeltaRoute {
                 content_type: None,
                 etag: None,
                 content_range: None,
+                retry_after_secs: None,
                 body: Vec::new(),
             })
         })
@@ -690,7 +965,9 @@ impl AuthorityActDeltaHttp for NoChunkedDeltaRoute {
 }
 
 struct HttpAuthorityActClient {
+    compatibility: crate::client_compatibility::Monitor,
     client: reqwest::Client,
+    install_key: Option<crate::node_credential::InstallKey>,
 }
 
 impl HttpAuthorityActClient {
@@ -703,20 +980,47 @@ impl HttpAuthorityActClient {
             .map_err(|error| {
                 Error::engine(format!("cannot build authority act client: {error}"))
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            compatibility: Default::default(),
+            install_key: None,
+        })
     }
 }
 
 impl AuthorityActHttpClient for HttpAuthorityActClient {
     fn call(&self, endpoint: String, bearer: String, body: Value) -> AuthorityCallFuture {
+        let call = self.call_with_shape(endpoint, bearer, body);
+        Box::pin(async move { Ok(call.await?.bytes) })
+    }
+
+    fn call_with_shape(&self, endpoint: String, bearer: String, body: Value) -> SelectedCallFuture {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
         Box::pin(async move {
             let tool_name = body
                 .pointer("/params/name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::engine("authority act request omitted its tool name"))?;
-            let response = client
+            let operation = body
+                .pointer("/params/arguments/operation")
+                .and_then(Value::as_str);
+            let diagnostic = diagnostics::RequestDiagnostic::new(match operation {
+                Some(AUTHORITY_ACT_HEAD_OPERATION) => "mcp_head",
+                Some(AUTHORITY_ACT_DELTA_OPERATION) => "mcp_delta",
+                _ => "mcp_other",
+            });
+            let builder = client
                 .post(&endpoint)
+                .header(
+                    super::shapes::ACCEPTED_SHAPES_HEADER,
+                    super::shapes::advertisement(),
+                )
+                .header(
+                    crate::client_compatibility::HEADER,
+                    crate::client_compatibility::advertisement(),
+                )
                 .bearer_auth(&bearer)
                 .header(
                     reqwest::header::ACCEPT,
@@ -726,10 +1030,32 @@ impl AuthorityActHttpClient for HttpAuthorityActClient {
                 .header("MCP-Protocol-Version", crate::mcp::PROTOCOL_VERSION)
                 .header("Mcp-Method", "tools/call")
                 .header("Mcp-Name", tool_name)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|_| Error::engine("hosted authority act request failed"))?;
+                .json(&body);
+            let response =
+                crate::node_credential::send_request(&client, builder, install_key.as_ref())
+                    .await
+                    .map_err(|error| match error {
+                        crate::node_credential::SendError::Http(error) => {
+                            diagnostic.failure("request", &error)
+                        }
+                        crate::node_credential::SendError::Proof => {
+                            Error::engine("authority act install proof unavailable")
+                        }
+                    })?;
+            let response = crate::client_compatibility::inspect(
+                response,
+                &compatibility,
+                "authority",
+                operation.unwrap_or("unknown"),
+            )
+            .await?;
+            diagnostic.response(
+                response.status(),
+                response
+                    .headers()
+                    .get("x-native-read-only")
+                    .is_some_and(|value| value == "true"),
+            );
             if matches!(response.status().as_u16(), 401 | 403) {
                 return Err(Error::auth("hosted authority act credential refused"));
             }
@@ -754,43 +1080,92 @@ impl AuthorityActHttpClient for HttpAuthorityActClient {
             {
                 return Err(Error::engine("hosted authority act response too large"));
             }
+            let selected = selected_header(response.headers())?;
             let mut response = response;
             let mut bytes = Vec::new();
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|_| Error::engine("hosted authority act response was interrupted"))?
+                .map_err(|error| diagnostic.failure("response_body", &error))?
             {
                 if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
                     return Err(Error::engine("hosted authority act response too large"));
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(bytes)
+            Ok(SelectedResponse { bytes, selected })
         })
     }
 }
 
 impl AuthorityActDeltaHttp for HttpAuthorityActClient {
     fn send(&self, request: DeltaHttpRequest) -> DeltaHttpFuture {
+        let sent = self.send_with_shape(request);
+        Box::pin(async move { Ok(sent.await?.0) })
+    }
+
+    fn send_with_shape(&self, request: DeltaHttpRequest) -> SelectedDeltaFuture {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
         Box::pin(async move {
+            let diagnostic = diagnostics::RequestDiagnostic::new(match request.method {
+                DeltaHttpMethod::Post => "delta_start",
+                DeltaHttpMethod::Get if request.range.is_some() => "delta_bytes",
+                DeltaHttpMethod::Get => "delta_poll",
+                DeltaHttpMethod::Delete => "delta_cancel",
+            });
             let mut builder = match request.method {
                 DeltaHttpMethod::Post => client.post(&request.url),
                 DeltaHttpMethod::Get => client.get(&request.url),
                 DeltaHttpMethod::Delete => client.delete(&request.url),
             }
-            .bearer_auth(&request.bearer);
+            .header(
+                crate::client_compatibility::HEADER,
+                crate::client_compatibility::advertisement(),
+            )
+            .bearer_auth(&request.bearer)
+            .header(
+                super::shapes::ACCEPTED_SHAPES_HEADER,
+                super::shapes::advertisement(),
+            );
             if let Some((start, end)) = request.range {
                 builder = builder.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
             }
             if let Some(json) = &request.json {
                 builder = builder.json(json);
             }
-            let mut response = builder
-                .send()
-                .await
-                .map_err(|_| Error::engine("hosted authority act request failed"))?;
+            let response =
+                crate::node_credential::send_request(&client, builder, install_key.as_ref())
+                    .await
+                    .map_err(|error| match error {
+                        crate::node_credential::SendError::Http(error) => {
+                            diagnostic.failure("request", &error)
+                        }
+                        crate::node_credential::SendError::Proof => {
+                            Error::engine("authority act install proof unavailable")
+                        }
+                    })?;
+            let response = crate::client_compatibility::inspect(
+                response,
+                &compatibility,
+                "delta-export",
+                match request.method {
+                    DeltaHttpMethod::Post => "start",
+                    DeltaHttpMethod::Delete => "cancel",
+                    DeltaHttpMethod::Get if request.range.is_some() => "range",
+                    DeltaHttpMethod::Get => "poll",
+                },
+            )
+            .await?;
+            let mut response = response;
+            diagnostic.response(
+                response.status(),
+                response
+                    .headers()
+                    .get("x-native-read-only")
+                    .is_some_and(|value| value == "true"),
+            );
             if matches!(response.status().as_u16(), 401 | 403) {
                 return Err(Error::auth("hosted authority act credential refused"));
             }
@@ -809,10 +1184,20 @@ impl AuthorityActDeltaHttp for HttpAuthorityActClient {
                     .map(str::to_owned)
             };
             let status = response.status().as_u16();
+            let selected = if response.status().is_success() {
+                selected_header(response.headers())?
+            } else {
+                None
+            };
             let api = header(&response, "x-native-export-api");
             let content_type = header(&response, "content-type");
             let etag = header(&response, "etag");
             let content_range = header(&response, "content-range");
+            let retry_after_secs = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_secs);
             if response
                 .content_length()
                 .is_some_and(|length| length > request.max_body as u64)
@@ -823,21 +1208,25 @@ impl AuthorityActDeltaHttp for HttpAuthorityActClient {
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|_| Error::engine("hosted authority act response was interrupted"))?
+                .map_err(|error| diagnostic.failure("response_body", &error))?
             {
                 if body.len().saturating_add(chunk.len()) > request.max_body {
                     return Err(Error::engine("hosted authority act response too large"));
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(DeltaHttpResponse {
-                status,
-                api,
-                content_type,
-                etag,
-                content_range,
-                body,
-            })
+            Ok((
+                DeltaHttpResponse {
+                    status,
+                    api,
+                    content_type,
+                    etag,
+                    content_range,
+                    retry_after_secs,
+                    body,
+                },
+                selected,
+            ))
         })
     }
 }
@@ -846,6 +1235,7 @@ impl AuthorityActDeltaHttp for HttpAuthorityActClient {
 /// authority origin/route/origin identity; it never accepts a route from the
 /// response itself.
 pub(crate) struct AuthorityActTransport {
+    selections: std::sync::Mutex<Selections>,
     endpoint: String,
     /// `{origin}/v1/databases/{route}/standby-delta/exports`.
     export_base: String,
@@ -857,9 +1247,59 @@ pub(crate) struct AuthorityActTransport {
     delta_ceiling: usize,
     poll_interval: Duration,
     poll_timeout: Duration,
+    /// The last head probe advertised kernel-v2 delta wire version 2. Nothing
+    /// is requested at version 2 unless it did, so a host that never advertises
+    /// it (the default) is never sent the field.
+    #[cfg_attr(not(any(test, feature = "v2-kernel-probe")), allow(dead_code))]
+    delta_v2_advertised: std::sync::atomic::AtomicBool,
+    /// A request carrying the field was refused: ask for version 1 only, for
+    /// the rest of this transport's life (one refresh tick).
+    #[cfg_attr(not(any(test, feature = "v2-kernel-probe")), allow(dead_code))]
+    delta_v2_suppressed: std::sync::atomic::AtomicBool,
+    /// The last head probe advertised wire version 3 (the set digest alone).
+    /// Hosted advertises `[1, 2]` today, so nothing is requested at 3 yet.
+    #[cfg_attr(not(any(test, feature = "v2-kernel-probe")), allow(dead_code))]
+    delta_v3_advertised: std::sync::atomic::AtomicBool,
+    /// A request for version 3 was refused: step down to the next version.
+    #[cfg_attr(not(any(test, feature = "v2-kernel-probe")), allow(dead_code))]
+    delta_v3_suppressed: std::sync::atomic::AtomicBool,
+    /// Seconds from the last busy refusal's `retry-after` header, if it
+    /// carried a parseable one. `note_busy_retry_after` records it on every
+    /// refused start; the controller consumes it once via
+    /// `take_busy_retry_after` when it classifies the failure as busy.
+    busy_retry_after_secs: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct Selections {
+    head: Option<super::shapes::Shape>,
+    cut: Option<super::shapes::Shape>,
+    cut_seen: bool,
 }
 
 impl AuthorityActTransport {
+    fn record_selection(&self, head: bool, selected: Option<super::shapes::Shape>) -> Result<()> {
+        let mut state = self.selections.lock().expect("receiver selection");
+        if head {
+            state.head = selected;
+        } else {
+            if state.cut_seen && state.cut != selected {
+                return Err(Error::engine(
+                    "selected receiver shape changed within the delta transfer",
+                ));
+            }
+            state.cut = selected;
+            state.cut_seen = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn selected_shapes(
+        &self,
+    ) -> (Option<super::shapes::Shape>, Option<super::shapes::Shape>) {
+        let state = self.selections.lock().expect("receiver selection");
+        (state.head.clone(), state.cut.clone())
+    }
     /// Bind the transport to an exact hosted origin, route, and portable origin
     /// identity. The origin must be an exact HTTPS origin (HTTP only for
     /// loopback), and the credential must be non-empty with no whitespace.
@@ -868,6 +1308,40 @@ impl AuthorityActTransport {
         hosted_route_database_id: &str,
         expected_origin_database_id: &str,
         bearer: &str,
+    ) -> Result<Self> {
+        Self::new_with_monitor(
+            hosted_origin,
+            hosted_route_database_id,
+            expected_origin_database_id,
+            bearer,
+            Default::default(),
+        )
+    }
+
+    pub(crate) fn new_with_monitor(
+        hosted_origin: &str,
+        hosted_route_database_id: &str,
+        expected_origin_database_id: &str,
+        bearer: &str,
+        compatibility: crate::client_compatibility::Monitor,
+    ) -> Result<Self> {
+        Self::new_with_install_key(
+            hosted_origin,
+            hosted_route_database_id,
+            expected_origin_database_id,
+            bearer,
+            compatibility,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_install_key(
+        hosted_origin: &str,
+        hosted_route_database_id: &str,
+        expected_origin_database_id: &str,
+        bearer: &str,
+        compatibility: crate::client_compatibility::Monitor,
+        install_key: Option<crate::node_credential::InstallKey>,
     ) -> Result<Self> {
         super::refresh::validate_exact_origin(hosted_origin)?;
         validate_route_database_id(hosted_route_database_id)?;
@@ -879,24 +1353,26 @@ impl AuthorityActTransport {
             !bearer.is_empty() && !bearer.chars().any(char::is_whitespace),
             "authority act credential is empty or contains whitespace",
         )?;
-        let endpoint = format!(
-            "{}/mcp/{}",
-            hosted_origin,
-            percent_encoding::utf8_percent_encode(
-                hosted_route_database_id,
-                percent_encoding::NON_ALPHANUMERIC
-            )
+        let database = percent_encoding::utf8_percent_encode(
+            hosted_route_database_id,
+            percent_encoding::NON_ALPHANUMERIC,
         );
-        let export_base = format!(
-            "{}/v1/databases/{}/standby-delta/exports",
-            hosted_origin,
-            percent_encoding::utf8_percent_encode(
-                hosted_route_database_id,
-                percent_encoding::NON_ALPHANUMERIC
-            )
-        );
-        let http = Arc::new(HttpAuthorityActClient::new()?);
+        let endpoint = if install_key.is_some() {
+            format!("{hosted_origin}/internal/node/databases/{database}/mcp")
+        } else {
+            format!("{hosted_origin}/mcp/{database}")
+        };
+        let prefix = install_key
+            .as_ref()
+            .map_or("", |_| crate::node_credential::REFRESH_PATH_PREFIX);
+        let export_base =
+            format!("{hosted_origin}{prefix}/v1/databases/{database}/standby-delta/exports",);
+        let mut http = HttpAuthorityActClient::new()?;
+        http.compatibility = compatibility;
+        http.install_key = install_key;
+        let http = Arc::new(http);
         Ok(Self {
+            selections: Default::default(),
             endpoint,
             export_base,
             bearer: bearer.to_string(),
@@ -907,7 +1383,36 @@ impl AuthorityActTransport {
             delta_ceiling: AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
             poll_interval: DELTA_POLL_INTERVAL,
             poll_timeout: DELTA_POLL_TIMEOUT,
+            delta_v2_advertised: std::sync::atomic::AtomicBool::new(false),
+            delta_v2_suppressed: std::sync::atomic::AtomicBool::new(false),
+            delta_v3_advertised: std::sync::atomic::AtomicBool::new(false),
+            delta_v3_suppressed: std::sync::atomic::AtomicBool::new(false),
+            busy_retry_after_secs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Record a refused export start's `retry-after` hint for one later
+    /// `take_busy_retry_after`. Anything but a busy refusal clears the slot,
+    /// so a stale hint can never leak into an unrelated failure.
+    fn note_busy_retry_after(&self, response: &DeltaHttpResponse) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let busy = response.status == 409
+            && wire_error_code(&response.body).as_deref() == Some("export_in_progress");
+        self.busy_retry_after_secs.store(
+            busy.then_some(response.retry_after_secs)
+                .flatten()
+                .unwrap_or(0),
+            Relaxed,
+        );
+    }
+
+    /// Consume the last busy refusal's `retry-after` hint, if any.
+    pub(crate) fn take_busy_retry_after(&self) -> Option<Duration> {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.busy_retry_after_secs.swap(0, Relaxed) {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
     }
 
     pub(crate) fn with_client(
@@ -968,6 +1473,37 @@ impl AuthorityActTransport {
             "authority act head response origin does not match the pinned authority origin",
         )?;
         response.head.validate()?;
+        if let AuthorityHead::KernelV2(head) = &response.head {
+            let actual = super::shapes::v2(
+                head.generation.reader_format,
+                &head.generation.schema_sha256,
+            )
+            .ok_or_else(|| Error::engine(super::shapes::UNSUPPORTED))?;
+            if self
+                .selected_shapes()
+                .0
+                .as_ref()
+                .is_some_and(|selected| selected != &actual.shape())
+            {
+                return Err(Error::engine(
+                    "selected receiver shape conflicts with the actual head",
+                ));
+            }
+        }
+        self.delta_v2_advertised.store(
+            response
+                .kernel_delta_versions
+                .as_deref()
+                .is_some_and(|versions| versions.contains(&2)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.delta_v3_advertised.store(
+            response
+                .kernel_delta_versions
+                .as_deref()
+                .is_some_and(|versions| versions.contains(&3)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(response)
     }
 
@@ -988,26 +1524,100 @@ impl AuthorityActTransport {
         }
     }
 
-    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
     pub(crate) async fn kernel_delta(
         &self,
         from: i64,
         blob_inventory: &[String],
     ) -> Result<super::kernel_v2_delta::TrustedKernelDelta> {
+        self.kernel_delta_with_proof(from, blob_inventory, false)
+            .await
+    }
+
+    /// [`Self::kernel_delta`], optionally insisting on a delta that carries a
+    /// projection proof (wire version 2, or 1 from a host that cannot do 2).
+    /// The periodic audit asks this way; a wire-version-3 delta carries none.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn kernel_delta_with_proof(
+        &self,
+        from: i64,
+        blob_inventory: &[String],
+        require_proof: bool,
+    ) -> Result<super::kernel_v2_delta::TrustedKernelDelta> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Ask for the newest version the last head probe advertised. A host
+        // that cannot read the field (a mixed fleet, a replica not yet
+        // upgraded) refuses the request itself: step down one version at a
+        // time, and finally ask with no field (version 1), staying below the
+        // refused versions for the rest of this tick.
+        let mut ask = self.requested_delta_version(require_proof);
+        loop {
+            // Boxed like the other halves of `delta`: its state machine is
+            // large in a debug build and this sits inside every refresh attempt.
+            match Box::pin(self.kernel_delta_once(from, blob_inventory, ask, require_proof)).await {
+                Err(error) if ask.is_some() && is_delta_request_refusal(&error) => {
+                    match ask {
+                        Some(3) => self.delta_v3_suppressed.store(true, Relaxed),
+                        _ => self.delta_v2_suppressed.store(true, Relaxed),
+                    }
+                    tracing::info!(
+                        target: "native_ce::standby::delta_transport",
+                        requested = ?ask,
+                        "kernel delta version request refused; retrying at a lower version"
+                    );
+                    ask = self.requested_delta_version(require_proof);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// The `kernel_delta_version` to request: the newest version the last head
+    /// probe advertised and no request has been refused at. `None` (the
+    /// default hosted, which advertises nothing) sends no field at all. When a
+    /// projection proof is required, version 3 (which carries none) is skipped.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn requested_delta_version(&self, require_proof: bool) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !require_proof
+            && self.delta_v3_advertised.load(Relaxed)
+            && !self.delta_v3_suppressed.load(Relaxed)
+        {
+            Some(3)
+        } else if self.delta_v2_advertised.load(Relaxed) && !self.delta_v2_suppressed.load(Relaxed)
+        {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(super) async fn kernel_delta_once(
+        &self,
+        from: i64,
+        blob_inventory: &[String],
+        request_version: Option<u32>,
+        require_proof: bool,
+    ) -> Result<super::kernel_v2_delta::TrustedKernelDelta> {
         super::kernel_v2_delta::validate_blob_inventory(blob_inventory)?;
         if let Some(handle) = self
-            .start_delta_export_with_inventory(from, Some(blob_inventory))
+            .start_delta_export_with_inventory(from, Some(blob_inventory), request_version)
             .await?
         {
             let fetched = self.fetch_delta_export(&handle, from).await;
             self.cancel_delta_export(&handle).await;
             let (claim, bytes) = fetched?;
-            return self.verify_kernel_delta(from, claim, &bytes);
+            return self.verify_kernel_delta(from, claim, &bytes, request_version, require_proof);
+        }
+        let mut arguments = json!({"from_exclusive_act":from,"blob_inventory":blob_inventory});
+        if let Some(version) = request_version {
+            arguments["kernel_delta_version"] = json!(version);
         }
         let response = self
             .call::<AuthorityActDeltaResponseV1>(authority_act_call(
                 AUTHORITY_ACT_DELTA_OPERATION,
-                json!({"from_exclusive_act":from,"blob_inventory":blob_inventory}),
+                arguments,
             ))
             .await?;
         require(
@@ -1027,15 +1637,25 @@ impl AuthorityActTransport {
                 outer_sha256: response.outer_sha256,
             },
             &bytes,
+            request_version,
+            require_proof,
         )
     }
 
+    /// Verify a kernel delta whichever route carried it. `request_version` is
+    /// what this node asked for (`None` is version 1): a response may be at or
+    /// below it (a host deliberately answers lower), never above, so a host
+    /// cannot hand back a proof-less version-3 delta nobody asked for. When
+    /// `require_proof` (an audit), the response must also carry a projection
+    /// proof, which version 3 does not.
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     fn verify_kernel_delta(
         &self,
         from: i64,
         claim: DeltaClaim,
         bytes: &[u8],
+        request_version: Option<u32>,
+        require_proof: bool,
     ) -> Result<super::kernel_v2_delta::TrustedKernelDelta> {
         require(
             claim.route_database_id == self.expected_route_database_id
@@ -1045,6 +1665,26 @@ impl AuthorityActTransport {
             "kernel-v2 delta response binding or digest mismatch",
         )?;
         let delta = super::kernel_v2_delta::KernelDelta::parse(bytes)?;
+        let actual = super::shapes::v2(delta.head.reader_format, &delta.head.schema_sha256)
+            .ok_or_else(|| Error::engine(super::shapes::UNSUPPORTED))?;
+        let (head_selection, cut_selection) = self.selected_shapes();
+        if [head_selection.as_ref(), cut_selection.as_ref()]
+            .iter()
+            .flatten()
+            .any(|selected| **selected != actual.shape())
+        {
+            return Err(Error::engine(
+                "selected receiver shape conflicts with the actual cut",
+            ));
+        }
+        require(
+            delta.version <= request_version.unwrap_or(1),
+            "kernel-v2 delta response is above the requested wire version",
+        )?;
+        require(
+            !require_proof || delta.version != super::kernel_v2_delta::WIRE_VERSION_3,
+            "kernel-v2 delta response carries no projection proof, which the audit requires",
+        )?;
         require(
             delta.origin_database_id == claim.origin_database_id
                 && delta.from_exclusive_act == from
@@ -1184,7 +1824,7 @@ impl AuthorityActTransport {
 
     /// `Ok(None)` only for a 404 that carries no Native error code.
     async fn start_delta_export(&self, from_exclusive_act: i64) -> Result<Option<String>> {
-        self.start_delta_export_with_inventory(from_exclusive_act, None)
+        self.start_delta_export_with_inventory(from_exclusive_act, None, None)
             .await
     }
 
@@ -1192,10 +1832,14 @@ impl AuthorityActTransport {
         &self,
         from_exclusive_act: i64,
         blob_inventory: Option<&[String]>,
+        kernel_delta_version: Option<u32>,
     ) -> Result<Option<String>> {
         let mut body = json!({"contract": AUTHORITY_ACT_DELTA_EXPORT_CONTRACT, "version":1,"from_exclusive_act":from_exclusive_act});
         if let Some(inventory) = blob_inventory {
             body["blob_inventory"] = json!(inventory);
+        }
+        if let Some(version) = kernel_delta_version {
+            body["kernel_delta_version"] = json!(version);
         }
         let response = self
             .delta_http
@@ -1211,6 +1855,7 @@ impl AuthorityActTransport {
             return Ok(None);
         }
         if response.status != 202 {
+            self.note_busy_retry_after(&response);
             return Err(delta_status_error(&response));
         }
         require_delta_api(&response)?;
@@ -1227,7 +1872,10 @@ impl AuthorityActTransport {
         handle: &str,
         from_exclusive_act: i64,
     ) -> Result<(DeltaClaim, Vec<u8>)> {
-        let ready = self.await_delta_export(handle).await?;
+        // One patience budget covers the capture poll and the download, so a
+        // flaky link cannot stretch an attempt past it.
+        let deadline = tokio::time::Instant::now() + self.poll_timeout;
+        let ready = self.await_delta_export(handle, deadline).await?;
         let claim = DeltaClaim {
             route_database_id: ready.route_database_id.ok_or_else(ready_incomplete)?,
             origin_database_id: ready.origin_database_id.ok_or_else(ready_incomplete)?,
@@ -1255,15 +1903,18 @@ impl AuthorityActTransport {
         let mut offset = 0_u64;
         while offset < size {
             let end = (offset + DELTA_CHUNK_BYTES - 1).min(size - 1);
+            // A transient failure retries this same range; the shared deadline
+            // bounds the whole download, so running out is the capture timeout.
             let response = self
-                .delta_http
-                .send(self.delta_request(
-                    DeltaHttpMethod::Get,
-                    url.clone(),
-                    None,
-                    Some((offset, end)),
-                    DELTA_CHUNK_BYTES as usize,
-                ))
+                .send_retrying_transient(deadline, || {
+                    self.delta_request(
+                        DeltaHttpMethod::Get,
+                        url.clone(),
+                        None,
+                        Some((offset, end)),
+                        DELTA_CHUNK_BYTES as usize,
+                    )
+                })
                 .await?;
             if response.status != 206 {
                 return Err(delta_status_error(&response));
@@ -1294,20 +1945,83 @@ impl AuthorityActTransport {
         Ok((claim, bytes))
     }
 
-    /// Poll until the capture is ready, failed, or out of patience.
-    async fn await_delta_export(&self, handle: &str) -> Result<DeltaExportPoll> {
+    /// Send one chunked-route request, treating transient trouble as "try the
+    /// same request again shortly", all within `deadline`.
+    ///
+    /// Transient means a request timeout, connect or interrupted-body error,
+    /// the maintenance marker, or a hosted 5xx. Anything else (auth refusal,
+    /// 4xx, a decodable response of any other status) comes back for the
+    /// caller to judge, and a definite transport error (such as a protocol or
+    /// builder fault) is returned as is.
+    ///
+    /// The deadline is hard: it is checked before every request, each request
+    /// and each backoff is cut off at it, and running out reports the capture
+    /// timeout (the export may still be held on hosted, so the controller backs
+    /// off rather than starting a fresh one). Nothing here can overshoot it.
+    async fn send_retrying_transient(
+        &self,
+        deadline: tokio::time::Instant,
+        make: impl Fn() -> DeltaHttpRequest,
+    ) -> Result<DeltaHttpResponse> {
+        let timed_out = || Error::engine(DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE);
+        let mut failures = 0_u32;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timed_out());
+            }
+            let request_deadline =
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(10));
+            let sent = tokio::time::timeout_at(
+                request_deadline,
+                crate::async_diagnostics::track(
+                    "refresh.hosted_delta_request",
+                    self.delta_http.send_with_shape(make()),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::engine(
+                    "hosted authority act request failed: request_timeout",
+                ))
+            });
+            match sent {
+                Ok((response, _)) if is_transient_status(&response) => {}
+                Ok((response, selected)) => {
+                    if (200..300).contains(&response.status) {
+                        self.record_selection(false, selected)?;
+                    }
+                    return Ok(response);
+                }
+                Err(error) if is_transient_transport_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+            // Back off a little, growing to eight times the poll interval, and
+            // never past the deadline.
+            failures = failures.saturating_add(1);
+            let pause = self.poll_interval.saturating_mul(1 << failures.min(3));
+            tokio::time::sleep_until((tokio::time::Instant::now() + pause).min(deadline)).await;
+        }
+    }
+
+    /// Poll until the capture is ready, failed, or out of patience. A poll that
+    /// hits a transient failure counts as "still pending" on the same handle.
+    async fn await_delta_export(
+        &self,
+        handle: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<DeltaExportPoll> {
         let url = format!("{}/{handle}", self.export_base);
-        let deadline = tokio::time::Instant::now() + self.poll_timeout;
         loop {
             let response = self
-                .delta_http
-                .send(self.delta_request(
-                    DeltaHttpMethod::Get,
-                    url.clone(),
-                    None,
-                    None,
-                    DELTA_CONTROL_MAX_BYTES,
-                ))
+                .send_retrying_transient(deadline, || {
+                    self.delta_request(
+                        DeltaHttpMethod::Get,
+                        url.clone(),
+                        None,
+                        None,
+                        DELTA_CONTROL_MAX_BYTES,
+                    )
+                })
                 .await?;
             if response.status != 200 {
                 return Err(delta_status_error(&response));
@@ -1327,11 +2041,10 @@ impl AuthorityActTransport {
                 }
                 "pending" => {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(Error::engine(
-                            "hosted authority act delta export request failed: capture timed out",
-                        ));
+                        return Err(Error::engine(DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE));
                     }
-                    tokio::time::sleep(self.poll_interval).await;
+                    let next = tokio::time::Instant::now() + self.poll_interval;
+                    tokio::time::sleep_until(next.min(deadline)).await;
                 }
                 _ => {
                     return Err(Error::engine(
@@ -1342,18 +2055,33 @@ impl AuthorityActTransport {
         }
     }
 
-    /// Best effort: the hosted idle TTL reclaims whatever this misses.
+    /// Best effort: the hosted idle TTL reclaims whatever this misses. A
+    /// dropped cancel would strand the account's single export lease, so a
+    /// transient failure is retried a couple of times within a few seconds.
+    /// A definite answer (any non-5xx response, including 404 for a handle
+    /// already gone) ends it.
     async fn cancel_delta_export(&self, handle: &str) {
-        let _ = self
-            .delta_http
-            .send(self.delta_request(
-                DeltaHttpMethod::Delete,
-                format!("{}/{handle}", self.export_base),
-                None,
-                None,
-                DELTA_CONTROL_MAX_BYTES,
-            ))
+        for attempt in 0..DELTA_CANCEL_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(self.poll_interval.min(Duration::from_millis(250))).await;
+            }
+            let sent = tokio::time::timeout(
+                DELTA_CANCEL_ATTEMPT_TIMEOUT,
+                self.delta_http.send(self.delta_request(
+                    DeltaHttpMethod::Delete,
+                    format!("{}/{handle}", self.export_base),
+                    None,
+                    None,
+                    DELTA_CONTROL_MAX_BYTES,
+                )),
+            )
             .await;
+            match sent {
+                Ok(Ok(response)) if !is_transient_status(&response) => return,
+                Ok(Err(error)) if !is_transient_transport_error(&error) => return,
+                _ => {}
+            }
+        }
     }
 
     /// Parse the closed protocol envelope first, then the successful payload
@@ -1361,10 +2089,20 @@ impl AuthorityActTransport {
     /// A lean selection refusal is safe to retry: dispatch has not started.
     async fn call<T: DeserializeOwned>(&self, mut body: Value) -> Result<T> {
         for attempt in 0..=1 {
-            let bytes = self
-                .client
-                .call(self.endpoint.clone(), self.bearer.clone(), body.clone())
-                .await?;
+            let received = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::async_diagnostics::track(
+                    "refresh.hosted_rpc",
+                    self.client.call_with_shape(
+                        self.endpoint.clone(),
+                        self.bearer.clone(),
+                        body.clone(),
+                    ),
+                ),
+            )
+            .await
+            .map_err(|_| Error::engine("hosted authority act request failed: request_timeout"))??;
+            let bytes = received.bytes;
             if bytes.len() > MAX_RESPONSE_BYTES {
                 return Err(Error::engine("hosted authority act response too large"));
             }
@@ -1405,6 +2143,11 @@ impl AuthorityActTransport {
                     if let Some(raw) = result.structured_content {
                         let refusal: Value =
                             serde_json::from_str(raw.get()).map_err(invalid_protocol)?;
+                        if refusal.get("error_code").and_then(Value::as_str)
+                            == Some(super::shapes::UPDATE_REQUIRED)
+                        {
+                            return Err(Error::engine(super::shapes::UPDATE_REQUIRED));
+                        }
                         // The legacy tool's oversize refusal is a typed reason,
                         // not a generic failure: the cut is simply too big for
                         // inline base64 on a host without the chunked route.
@@ -1437,7 +2180,13 @@ impl AuthorityActTransport {
             let raw = result
                 .structured_content
                 .ok_or_else(|| Error::engine("hosted authority act omitted structured content"))?;
-            return serde_json::from_str(raw.get()).map_err(invalid_protocol);
+            let result = serde_json::from_str(raw.get()).map_err(invalid_protocol)?;
+            let is_head = body
+                .pointer("/params/arguments/operation")
+                .and_then(Value::as_str)
+                == Some(AUTHORITY_ACT_HEAD_OPERATION);
+            self.record_selection(is_head, received.selected)?;
+            return Ok(result);
         }
         unreachable!("the second attempt always returns")
     }
@@ -1545,16 +2294,50 @@ fn require_delta_api(response: &DeltaHttpResponse) -> Result<()> {
     )
 }
 
+/// A hosted 5xx on the chunked routes is trouble on their side, not a verdict
+/// on the export. A 5xx that names `delta_too_large` is still definite.
+fn is_transient_status(response: &DeltaHttpResponse) -> bool {
+    (500..=599).contains(&response.status)
+        && wire_error_code(&response.body).as_deref() != Some("delta_too_large")
+}
+
+/// A request that may succeed if simply sent again: a timeout, a connect or
+/// interrupted-body failure, or the maintenance marker. Builder and decode
+/// faults, auth refusals and every other error are definite.
+fn is_transient_transport_error(error: &Error) -> bool {
+    let Error::Engine(message) = error else {
+        return false;
+    };
+    message == MAINTENANCE_SNAPSHOT_ERROR
+        || diagnostics::failure_detail(message)
+            .is_some_and(|detail| !matches!(detail, "builder" | "decode"))
+}
+
 /// Map a refused chunked-route status to an error the controller already
 /// classifies: transient hosted trouble reads as a network failure so it never
 /// buys a whole snapshot, and only a stable code is ever echoed.
+/// Whether `error` is the host refusing the REQUEST itself (an HTTP 400/422 on
+/// the chunked route, or the tool call being refused or reporting failure on
+/// the MCP route) rather than failing to serve a valid one. Authentication,
+/// capacity, busy, too-large and network failures are none of these.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+fn is_delta_request_refusal(error: &Error) -> bool {
+    matches!(error, Error::Engine(message)
+        if message.starts_with("hosted authority act delta export HTTP status 400")
+            || message.starts_with("hosted authority act delta export HTTP status 422")
+            || message == "hosted authority act tool reported failure"
+            || message.starts_with("hosted authority act tool call was refused"))
+}
+
 fn delta_status_error(response: &DeltaHttpResponse) -> Error {
     if matches!(response.status, 401 | 403) {
         return Error::auth("hosted authority act credential refused");
     }
     let code = wire_error_code(&response.body);
     match (response.status, code.as_deref()) {
+        (_, Some(super::shapes::UPDATE_REQUIRED)) => Error::engine(super::shapes::UPDATE_REQUIRED),
         (_, Some("delta_too_large")) => Error::engine(DELTA_TOO_LARGE_ERROR),
+        (409, Some("export_in_progress")) => Error::engine(DELTA_EXPORT_BUSY_MESSAGE),
         (409, _) | (404, Some("handle_not_found")) => {
             Error::engine("hosted authority act delta export request failed: capture unavailable")
         }
@@ -2091,6 +2874,124 @@ mod tests {
         db.close().await;
     }
 
+    /// The spooled capture is the same canonical cut the authority builds
+    /// from its own observation: the timing log changes no bytes.
+    #[tokio::test]
+    async fn capture_export_bytes_are_the_canonical_cut() {
+        let db = real_authority().await;
+        let head = read_authority_act_head(&db).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (export, meta) = capture_authority_act_delta_export(
+            &db,
+            ROUTE,
+            0,
+            dir.path(),
+            AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let cut = crate::standby::act_cut::read_authority_act_cut(&db, 0, head.head_act)
+            .await
+            .unwrap();
+        let expected = build_authority_act_delta(&cut).unwrap();
+        assert_eq!(std::fs::read(export.path()).unwrap(), expected);
+        assert_eq!(meta.outer_sha256, hex::encode(Sha256::digest(&expected)));
+        export.cleanup().await;
+        db.close().await;
+    }
+
+    /// Each successful capture logs exactly one `delta_cut` event, on both cut
+    /// kinds, carrying the hosted wait when the caller supplies it. Runs on one
+    /// thread so the scoped subscriber sees every event.
+    #[test]
+    fn capture_export_logs_one_delta_cut_event_per_capture() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let capture = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        // With a single live dispatcher, tracing decides a callsite's interest
+        // from the registering thread's own dispatcher alone. A parallel test
+        // that fires this event from a thread with no subscriber would then
+        // cache it as disabled for everyone. A second live dispatcher for the
+        // whole test makes every registration consult all of them.
+        let _keep_multiple_dispatchers = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        tracing::dispatcher::with_default(&capture, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let legacy = real_authority().await;
+                    let (v2, _) = crate::kernel::create_v2_database(
+                        ":memory:",
+                        "account",
+                        "Owner",
+                        "acct:owner",
+                    )
+                    .await
+                    .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let wait = Some(HostedCutWait {
+                        queue_ms: 7,
+                        connect_ms: 9,
+                    });
+                    for (db, version, wait) in [(&legacy, 1, None), (&v2, 2, wait), (&v2, 3, None)]
+                    {
+                        let (export, _) = capture_authority_act_delta_export_versioned(
+                            db,
+                            ROUTE,
+                            0,
+                            dir.path(),
+                            AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
+                            None,
+                            version,
+                            wait,
+                        )
+                        .await
+                        .unwrap();
+                        export.cleanup().await;
+                    }
+                    legacy.close().await;
+                    v2.close().await;
+                });
+        });
+        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let events: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains(DELTA_CUT_TARGET))
+            .collect();
+        assert_eq!(events.len(), 3, "{log}");
+        assert!(events[0].contains("cut_kind=\"act_v1\""), "{log}");
+        assert!(!events[0].contains("queue_ms"), "{log}");
+        assert!(events[1].contains("cut_kind=\"kernel_v2\""), "{log}");
+        assert!(events[1].contains("wire_version=2"), "{log}");
+        assert!(events[1].contains("queue_ms=7"), "{log}");
+        assert!(events[1].contains("connect_ms=9"), "{log}");
+        // Version 3 skips the projection scan, so that step takes no time.
+        assert!(events[2].contains("wire_version=3"), "{log}");
+        assert!(events[2].contains("projection_ms=0 "), "{log}");
+        assert!(!log.contains(ROUTE), "{log}");
+    }
+
     #[tokio::test]
     async fn server_refuses_a_lower_bound_beyond_the_head() {
         let db = real_authority().await;
@@ -2521,6 +3422,9 @@ mod tests {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (headers, body) = read_http_request(&mut stream).await;
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("native-client-identity:"));
             if headers.starts_with("POST /v1/databases/") {
                 stream
                     .write_all(
@@ -2704,6 +3608,10 @@ mod tests {
                         key.eq_ignore_ascii_case(name).then(|| value.trim())
                     })
                 };
+                assert_eq!(
+                    header(super::super::shapes::ACCEPTED_SHAPES_HEADER),
+                    Some(super::super::shapes::advertisement().as_str())
+                );
                 if header("mcp-name") != request["params"]["name"].as_str()
                     || header("mcp-method") != request["method"].as_str()
                 {
@@ -2870,7 +3778,14 @@ mod tests {
         start_status: u16,
         pending_polls: Mutex<usize>,
         requests: Mutex<Vec<RecordedRequest>>,
+        /// How long each honest range answer takes.
+        range_delay: Duration,
+        /// Answers a request itself (a transport error or a raw response)
+        /// instead of the honest host. `None` falls through to the host.
+        inject: Inject,
     }
+
+    type Inject = Box<dyn Fn(&DeltaHttpRequest) -> Option<DeltaHttpFuture> + Send + Sync>;
 
     impl ChunkedHost {
         async fn over(db: &crate::Db, from: i64) -> Arc<Self> {
@@ -2893,6 +3808,8 @@ mod tests {
                 start_status: 202,
                 pending_polls: Mutex::new(0),
                 requests: Mutex::new(Vec::new()),
+                range_delay: Duration::ZERO,
+                inject: Box::new(|_| None),
             })
         }
 
@@ -2913,6 +3830,7 @@ mod tests {
                 content_type: Some("application/json".into()),
                 etag: None,
                 content_range: None,
+                retry_after_secs: None,
                 body: serde_json::to_vec(&body).unwrap(),
             }
         }
@@ -2926,6 +3844,9 @@ mod tests {
                 request.range,
             ));
             assert_eq!(request.bearer, "wire-secret");
+            if let Some(injected) = (self.inject)(&request) {
+                return injected;
+            }
             let response = if request.method == DeltaHttpMethod::Post {
                 assert_eq!(
                     request.json.as_ref().unwrap(),
@@ -2956,6 +3877,7 @@ mod tests {
                     content_type: Some(AUTHORITY_ACT_DELTA_EXPORT_MEDIA_TYPE.into()),
                     etag: Some(format!("\"{}\"", self.meta.outer_sha256)),
                     content_range: Some(format!("bytes {start}-{end}/{}", self.bytes.len())),
+                    retry_after_secs: None,
                     body: self.bytes[start as usize..=end as usize].to_vec(),
                 }
             } else {
@@ -2979,7 +3901,15 @@ mod tests {
                 }
             };
             let response = (self.tamper)(&request, response);
-            Box::pin(async move { Ok(response) })
+            let delay = if request.range.is_some() {
+                self.range_delay
+            } else {
+                Duration::ZERO
+            };
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            })
         }
     }
 
@@ -3234,6 +4164,52 @@ mod tests {
         db.close().await;
     }
 
+    #[test]
+    fn retry_after_parses_decimal_seconds_only() {
+        assert_eq!(parse_retry_after_secs("1"), Some(1));
+        assert_eq!(parse_retry_after_secs("  30 "), Some(30));
+        assert_eq!(parse_retry_after_secs("0"), Some(0));
+        assert_eq!(parse_retry_after_secs(""), None);
+        assert_eq!(parse_retry_after_secs("garbage"), None);
+        assert_eq!(
+            parse_retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_start_records_retry_after_for_one_take() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let base = read_authority_act_head(&db).await.unwrap().head_act;
+        append_record(&db, SECOND_RECORD_ID, "busy export").await;
+        let host = ChunkedHost::over(&db, base).await.with(|host| {
+            host.tamper = Box::new(|request, mut response| {
+                if request.method == DeltaHttpMethod::Post {
+                    response.status = 409;
+                    response.retry_after_secs = Some(1);
+                    response.body = serde_json::to_vec(&json!({
+                        "api": AUTHORITY_ACT_DELTA_EXPORT_CONTRACT,
+                        "error_code": "export_in_progress",
+                    }))
+                    .unwrap();
+                }
+                response
+            })
+        });
+        let transport = chunked_transport(&origin, host);
+        let Err(error) = transport.delta(base).await else {
+            panic!("a busy start must fail");
+        };
+        assert_eq!(error.to_string(), DELTA_EXPORT_BUSY_MESSAGE);
+        assert_eq!(
+            transport.take_busy_retry_after(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(transport.take_busy_retry_after(), None);
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn too_large_is_typed_from_the_chunked_code_the_client_ceiling_and_the_legacy_refusal() {
         let db = real_authority().await;
@@ -3333,6 +4309,348 @@ mod tests {
         db.close().await;
     }
 
+    /// The error the real HTTP seam mints for a request that hit its timeout.
+    fn request_timeout_error() -> Error {
+        Error::engine("hosted authority act request failed: request_timeout")
+    }
+
+    /// Fail the first `count` requests matching `matches` with `fail`, then let
+    /// the honest host answer.
+    fn fail_first(
+        count: usize,
+        matches: impl Fn(&DeltaHttpRequest) -> bool + Send + Sync + 'static,
+        fail: impl Fn() -> Result<DeltaHttpResponse> + Send + Sync + 'static,
+    ) -> Inject {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        Box::new(move |request| {
+            (matches(request) && seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < count)
+                .then(|| {
+                    let result = fail();
+                    Box::pin(async move { result }) as DeltaHttpFuture
+                })
+        })
+    }
+
+    fn is_poll(request: &DeltaHttpRequest) -> bool {
+        request.method == DeltaHttpMethod::Get && request.range.is_none()
+    }
+
+    fn count_of(host: &ChunkedHost, method: DeltaHttpMethod) -> usize {
+        host.requests().iter().filter(|r| r.0 == method).count()
+    }
+
+    #[tokio::test]
+    async fn a_poll_timeout_is_still_pending_and_the_attempt_succeeds() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let base = read_authority_act_head(&db).await.unwrap().head_act;
+        append_record(&db, SECOND_RECORD_ID, "poll timeout").await;
+        let host = ChunkedHost::over(&db, base).await.with(|host| {
+            host.inject = fail_first(2, is_poll, || Err(request_timeout_error()));
+        });
+        let trusted = chunked_transport(&origin, host.clone())
+            .delta(base)
+            .await
+            .expect("transient poll timeouts must not abort the attempt");
+        assert_eq!(trusted.canonical_bytes().unwrap(), host.bytes);
+        // One export was started, polled on the same handle and cancelled.
+        assert_eq!(count_of(&host, DeltaHttpMethod::Post), 1);
+        assert_eq!(count_of(&host, DeltaHttpMethod::Delete), 1);
+        assert!(host.requests().iter().all(|r| !r.1.contains("h-2")));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_hosted_5xx_or_maintenance_poll_is_still_pending() {
+        for transient in ["500", "503", "maintenance"] {
+            let db = real_authority().await;
+            let origin = origin(&db).await;
+            let base = read_authority_act_head(&db).await.unwrap().head_act;
+            append_record(&db, SECOND_RECORD_ID, "poll 5xx").await;
+            let host = ChunkedHost::over(&db, base).await.with(|host| {
+                host.inject = fail_first(2, is_poll, move || match transient {
+                    "maintenance" => Err(Error::engine(MAINTENANCE_SNAPSHOT_ERROR)),
+                    status => Ok(ChunkedHost::json(
+                        status.parse().unwrap(),
+                        json!({"error_code": "temporarily_unavailable"}),
+                    )),
+                });
+            });
+            chunked_transport(&origin, host.clone())
+                .delta(base)
+                .await
+                .unwrap_or_else(|error| panic!("{transient}: {error}"));
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_download_range_that_times_out_is_retried_on_the_same_range() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let base = read_authority_act_head(&db).await.unwrap().head_act;
+        append_record(&db, SECOND_RECORD_ID, "range timeout").await;
+        let host = ChunkedHost::over(&db, base).await.with(|host| {
+            host.inject = fail_first(
+                2,
+                |request| request.range.is_some(),
+                || Err(request_timeout_error()),
+            );
+        });
+        let trusted = chunked_transport(&origin, host.clone())
+            .delta(base)
+            .await
+            .expect("transient download failures must not abort the attempt");
+        assert_eq!(trusted.canonical_bytes().unwrap(), host.bytes);
+        let ranges: Vec<_> = host.requests().iter().filter_map(|r| r.2).collect();
+        assert_eq!(ranges.len(), 3, "two failures then the success: {ranges:?}");
+        assert!(ranges.iter().all(|range| *range == ranges[0]), "{ranges:?}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_transient_poll_failures_past_the_deadline_time_out_and_cancel() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let host = ChunkedHost::over(&db, 0).await.with(|host| {
+            host.inject = fail_first(usize::MAX, is_poll, || Err(request_timeout_error()));
+        });
+        let transport = chunked_transport(&origin, host.clone()).with_delta_http(
+            host.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(30),
+            AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
+        );
+        let error = transport.delta(0).await.err().expect("must time out");
+        assert_eq!(error.to_string(), DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE);
+        assert_eq!(host.requests().last().unwrap().0, DeltaHttpMethod::Delete);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn successful_ranges_that_cross_the_deadline_stop_the_download() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let base = read_authority_act_head(&db).await.unwrap().head_act;
+        append_record(&db, SECOND_RECORD_ID, "slow ranges").await;
+        // Two and a half mebibytes of referenced blob forces three ranges.
+        let blob = crate::blob::insert_blob(&db, &vec![9_u8; 2_500_000], None, None)
+            .await
+            .unwrap();
+        crate::store::append(
+            &db,
+            crate::store::AppendSpec {
+                record_id: SECOND_RECORD_ID.into(),
+                event_type: "facet.set".into(),
+                payload: json!({"key": "blob_ref", "value": blob.id}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let host = ChunkedHost::over(&db, base)
+            .await
+            .with(|host| host.range_delay = Duration::from_millis(100));
+        let transport = chunked_transport(&origin, host.clone()).with_delta_http(
+            host.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(150),
+            AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
+        );
+        let started = std::time::Instant::now();
+        let error = transport.delta(base).await.err().expect("must time out");
+        assert_eq!(error.to_string(), DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE);
+        let ranges = host.requests().iter().filter(|r| r.2.is_some()).count();
+        assert!(ranges < 3, "the third range must never start: {ranges}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(host.requests().last().unwrap().0, DeltaHttpMethod::Delete);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_hung_request_and_a_long_backoff_cannot_overshoot_the_deadline() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let deadline = Duration::from_millis(100);
+
+        // A poll that never answers is cut off at the deadline.
+        let host = ChunkedHost::over(&db, 0).await.with(|host| {
+            host.inject = Box::new(|request| {
+                is_poll(request).then(|| Box::pin(std::future::pending()) as DeltaHttpFuture)
+            });
+        });
+        let transport = chunked_transport(&origin, host.clone()).with_delta_http(
+            host.clone(),
+            Duration::from_millis(1),
+            deadline,
+            AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
+        );
+        let started = std::time::Instant::now();
+        let error = transport.delta(0).await.err().expect("must time out");
+        assert_eq!(error.to_string(), DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE);
+        assert!(started.elapsed() < Duration::from_millis(600));
+        assert_eq!(host.requests().last().unwrap().0, DeltaHttpMethod::Delete);
+
+        // With a poll interval far past the deadline, the backoff is clipped
+        // to it rather than sleeping 2x the interval.
+        let host = ChunkedHost::over(&db, 0).await.with(|host| {
+            host.inject = fail_first(usize::MAX, is_poll, || Err(request_timeout_error()));
+        });
+        let transport = chunked_transport(&origin, host.clone()).with_delta_http(
+            host.clone(),
+            Duration::from_millis(400),
+            deadline,
+            AUTHORITY_ACT_DELTA_SPOOL_MAX_BYTES,
+        );
+        let started = std::time::Instant::now();
+        let error = transport.delta(0).await.err().expect("must time out");
+        assert_eq!(error.to_string(), DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE);
+        assert!(started.elapsed() < Duration::from_millis(350));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn definite_poll_answers_are_not_retried() {
+        type Answer = Box<dyn Fn() -> Result<DeltaHttpResponse> + Send + Sync>;
+        let cases: Vec<(&str, Answer)> = vec![
+            (
+                "auth",
+                Box::new(|| Err(Error::auth("hosted authority act credential refused"))),
+            ),
+            (
+                "unknown handle",
+                Box::new(|| {
+                    Ok(ChunkedHost::json(
+                        404,
+                        json!({"error_code": "handle_not_found"}),
+                    ))
+                }),
+            ),
+            (
+                "failed status",
+                Box::new(|| {
+                    Ok(ChunkedHost::json(
+                        200,
+                        json!({"status": "failed", "error_code": "capture_failed"}),
+                    ))
+                }),
+            ),
+            (
+                "too large",
+                Box::new(|| {
+                    Ok(ChunkedHost::json(
+                        200,
+                        json!({"status": "failed", "error_code": "delta_too_large"}),
+                    ))
+                }),
+            ),
+            (
+                "too large on a 5xx",
+                Box::new(|| {
+                    Ok(ChunkedHost::json(
+                        503,
+                        json!({"error_code": "delta_too_large"}),
+                    ))
+                }),
+            ),
+            (
+                "protocol",
+                Box::new(|| {
+                    Ok(DeltaHttpResponse {
+                        body: b"not json".to_vec(),
+                        ..ChunkedHost::json(200, json!({}))
+                    })
+                }),
+            ),
+            (
+                "decode fault",
+                Box::new(|| Err(Error::engine("hosted authority act request failed: decode"))),
+            ),
+        ];
+        for (name, answer) in cases {
+            let db = real_authority().await;
+            let origin = origin(&db).await;
+            let host = ChunkedHost::over(&db, 0).await.with(|host| {
+                host.inject = fail_first(usize::MAX, is_poll, answer);
+            });
+            let started = std::time::Instant::now();
+            let error = chunked_transport(&origin, host.clone())
+                .delta(0)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name}: must refuse"));
+            assert!(started.elapsed() < Duration::from_secs(1), "{name}");
+            assert_ne!(
+                error.to_string(),
+                DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE,
+                "{name}"
+            );
+            assert_eq!(
+                host.requests()
+                    .iter()
+                    .filter(|r| is_poll_recorded(r))
+                    .count(),
+                1,
+                "{name}: exactly one poll"
+            );
+            assert_eq!(count_of(&host, DeltaHttpMethod::Delete), 1, "{name}");
+            db.close().await;
+        }
+    }
+
+    fn is_poll_recorded(request: &RecordedRequest) -> bool {
+        request.0 == DeltaHttpMethod::Get && request.2.is_none()
+    }
+
+    #[tokio::test]
+    async fn a_dropped_cancel_is_retried_a_few_times_then_given_up() {
+        let db = real_authority().await;
+        let origin = origin(&db).await;
+        let base = read_authority_act_head(&db).await.unwrap().head_act;
+        append_record(&db, SECOND_RECORD_ID, "cancel retry").await;
+        let delete = |request: &DeltaHttpRequest| request.method == DeltaHttpMethod::Delete;
+
+        // Two dropped cancels then success: three DELETEs, the attempt succeeds.
+        let host = ChunkedHost::over(&db, base).await.with(|host| {
+            host.inject = fail_first(2, delete, || Err(request_timeout_error()));
+        });
+        chunked_transport(&origin, host.clone())
+            .delta(base)
+            .await
+            .unwrap();
+        assert_eq!(count_of(&host, DeltaHttpMethod::Delete), 3);
+
+        // A cancel that never lands stops at the attempt cap and never fails
+        // the (already complete) attempt.
+        let host = ChunkedHost::over(&db, base).await.with(|host| {
+            host.inject = fail_first(usize::MAX, delete, || Ok(ChunkedHost::json(503, json!({}))));
+        });
+        chunked_transport(&origin, host.clone())
+            .delta(base)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_of(&host, DeltaHttpMethod::Delete),
+            DELTA_CANCEL_ATTEMPTS as usize
+        );
+
+        // A definite answer (the handle is already gone) ends it at once.
+        let host = ChunkedHost::over(&db, base).await.with(|host| {
+            host.inject = fail_first(usize::MAX, delete, || {
+                Ok(ChunkedHost::json(
+                    404,
+                    json!({"error_code": "handle_not_found"}),
+                ))
+            });
+        });
+        chunked_transport(&origin, host.clone())
+            .delta(base)
+            .await
+            .unwrap();
+        assert_eq!(count_of(&host, DeltaHttpMethod::Delete), 1);
+        db.close().await;
+    }
+
     /// The real HTTP seam: refuses redirects, maps 401/403 to Auth, honours the
     /// maintenance marker before any body, and bounds what it reads, on every
     /// method the chunked family uses.
@@ -3429,5 +4747,49 @@ mod tests {
             .err()
             .expect("oversize body refused");
         assert!(error.to_string().contains("too large"), "{error}");
+    }
+    #[tokio::test]
+    async fn update_required_chunked_start_poll_range_cancel_keep_failed_scope() {
+        let app = axum::Router::new().fallback(axum::routing::any(|headers:axum::http::HeaderMap| async move {
+            assert_eq!(headers[crate::client_compatibility::HEADER],crate::client_compatibility::advertisement());
+            (axum::http::StatusCode::UPGRADE_REQUIRED,axum::Json(json!({"error_code":"client_update_required","outcome":"refused","applied":false})))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/databases/db/standby-delta/exports",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpAuthorityActClient::new().unwrap();
+        for (method, range) in [
+            (DeltaHttpMethod::Post, None),
+            (DeltaHttpMethod::Get, None),
+            (DeltaHttpMethod::Get, Some((0, 0))),
+            (DeltaHttpMethod::Delete, None),
+        ] {
+            let error = client
+                .send(DeltaHttpRequest {
+                    method,
+                    url: url.clone(),
+                    bearer: "secret".into(),
+                    json: None,
+                    range,
+                    max_body: MAX_RESPONSE_BYTES,
+                })
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(error,Error::Engine(s) if s == crate::client_compatibility::UPDATE_REQUIRED)
+            );
+        }
+        assert_eq!(
+            client.compatibility.status()["demands"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        server.abort();
     }
 }

@@ -626,6 +626,10 @@ async fn claiming_adds_no_event_type_or_claims_table() {
     assert_eq!(
         EVENT_TYPES,
         [
+            "webhook.configured.v1",
+            "webhook.revoked.v1",
+            "webhook.accepted.v1",
+            "webhook.diagnostic.v1",
             "record.created",
             "record.updated",
             "record.type_corrected.v1",

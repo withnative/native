@@ -59,6 +59,91 @@ async fn pin_on(
 // Owned by one metadata read and caller snapshot, never a permission cache.
 type MetadataContexts = BTreeMap<String, Option<(i64, super::source_proof::Work)>>;
 
+/// Typed global metadata. Mirrors facet-1 context diagnostics; lists skip
+/// advisory comparison via `advisory=false`.
+#[allow(clippy::too_many_arguments)] // One read snapshot shared by metadata/lists.
+async fn metadata_global_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    view: &str,
+    pin: &Pin,
+    revision: &Revision,
+    generated: v2::Definition<v2::GlobalManifest>,
+    head: i64,
+    deadline: Instant,
+    advisory: bool,
+    contexts: &mut MetadataContexts,
+    drifted: bool,
+) -> Result<Value> {
+    let workspace = super::generated::workspace_on(conn).await?;
+    if generated.generated.workspace_id != workspace {
+        return Err(Error::engine(MISSING));
+    }
+    let inputs = super::retained_facets::global_inputs(&generated);
+    super::retained_facets::required_presence_on(conn, &inputs, deadline).await?;
+    if inputs.query.validate_for_preparation().is_err() {
+        return Ok(
+            json!({"pin":pin,"definition":revision.definition,"diagnostic":"view_source_invalidated"}),
+        );
+    }
+    storage::check_deadline(deadline)?;
+    // Workspace and required presence precede archived-bearer diagnostics so
+    // absence is not masked; View privacy was already enforced before this.
+    if drifted {
+        return Ok(
+            json!({"pin":pin,"definition":revision.definition,"diagnostic":"view_context_unavailable"}),
+        );
+    }
+    let anchors: std::collections::BTreeSet<_> = generated
+        .generated
+        .sources
+        .iter()
+        .filter_map(|source| source.anchor.as_deref())
+        .collect();
+    let key =
+        serde_json::to_string(&(head, &generated.generated.context.logical_home_id, anchors))?;
+    let context = if let Some(context) = contexts.get(&key) {
+        *context
+    } else {
+        let result = super::source_proof::retained_context_on(
+            conn,
+            actor,
+            bearer(view)?,
+            &inputs.generated,
+            deadline,
+        )
+        .await;
+        storage::check_deadline(deadline)?;
+        let context = match result {
+            Ok(context) => Some(context),
+            Err(Error::Engine(message))
+                if message == MISSING || message == "named view: view_missing" =>
+            {
+                None
+            }
+            Err(Error::Conflict(_)) => None,
+            Err(error) => return Err(error),
+        };
+        contexts.insert(key, context);
+        context
+    };
+    let Some(context) = context else {
+        return Ok(
+            json!({"pin":pin,"definition":revision.definition,"diagnostic":"view_context_unavailable"}),
+        );
+    };
+    if !advisory {
+        return Ok(
+            json!({"pin":pin,"definition":revision.definition,"diagnostic":null,"advisory_comparison":"not_requested"}),
+        );
+    }
+    let checked =
+        super::retained_facets::compare_global_metadata_on(conn, generated, context, deadline)
+            .await?;
+    Ok(json!({"pin":pin,"definition":checked.definition,
+        "diagnostic":null,"source_drift":checked.drift,"source_drift_unknown_reason":checked.unknown_reason}))
+}
+
 async fn metadata_on(
     conn: &mut SqliteConnection,
     actor: &str,
@@ -75,6 +160,30 @@ async fn metadata_on(
     let roots = BTreeMap::from([("view_detail".into(), pin.clone())]);
     let inspected = closure::inspect_metadata_on(conn, actor, &roots, deadline).await?;
     if let Some(revision) = inspected.retained.get(&pin).filter(|r| r.v == 2) {
+        let format = revision
+            .definition
+            .pointer("/generated/format")
+            .and_then(serde_json::Value::as_str);
+        if format == Some("native.generated-facets.v2") {
+            let generated: v2::Definition<v2::GlobalManifest> =
+                serde_json::from_value(revision.definition.clone())?;
+            generated.validate_global()?;
+            storage::check_deadline(deadline)?;
+            return metadata_global_on(
+                conn,
+                actor,
+                view,
+                &pin,
+                revision,
+                generated,
+                head,
+                deadline,
+                advisory,
+                contexts,
+                inspected.drifted,
+            )
+            .await;
+        }
         let definition: v2::Definition = serde_json::from_value(revision.definition.clone())?;
         let workspace = super::generated::workspace_on(conn).await?;
         if definition.generated.workspace_id != workspace {
@@ -290,8 +399,21 @@ pub(crate) async fn list_on(
                 let pin: Pin = serde_json::from_value(detail["pin"].clone())?;
                 let definition: contract::Definition =
                     if detail["definition"].get("generated").is_some() {
-                        serde_json::from_value::<v2::Definition>(detail["definition"].clone())?
-                            .common()
+                        match detail["definition"]
+                            .pointer("/generated/format")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            Some("native.generated-facets.v2") => {
+                                serde_json::from_value::<v2::Definition<v2::GlobalManifest>>(
+                                    detail["definition"].clone(),
+                                )?
+                                .common()
+                            }
+                            _ => serde_json::from_value::<v2::Definition>(
+                                detail["definition"].clone(),
+                            )?
+                            .common(),
+                        }
                     } else {
                         serde_json::from_value(detail["definition"].clone())?
                     };

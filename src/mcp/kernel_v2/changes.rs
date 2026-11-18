@@ -42,8 +42,17 @@ pub(super) async fn whats_changed(db: &Db, actor: &str, arguments: Value) -> Res
         ));
     }
     let newest = matches!(args.order, Order::NewestFirst);
+    // One read snapshot for the whole call: the head, every scanned row and
+    // every per-subject history disclosure come from the same connection, so a
+    // scanned row can never be judged against a snapshot that predates it (it
+    // would be withheld and the cursor would skip it). Previously each subject
+    // opened its own write-pool transaction — up to one per distinct record in
+    // each 256-event batch — repeating admission, roster and capability work.
+    // Disclosure is unchanged: the same history_page_selected_on runs per
+    // subject, as history_diff already does on a read-pool snapshot.
+    let mut snapshot = db.pool().begin().await?;
     let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM content_events")
-        .fetch_one(db.pool())
+        .fetch_one(&mut *snapshot)
         .await?;
     let high = args.through_local_seq.unwrap_or(head).min(head);
     let after = args
@@ -59,12 +68,20 @@ pub(super) async fn whats_changed(db: &Db, actor: &str, arguments: Value) -> Res
     let direction = if newest { "DESC" } else { "ASC" };
     let mut scanned = 0;
     const SCAN_BUDGET: usize = 1024;
+    // Pin the scan to this one snapshot connection. Every read below
+    // (rows, history_page_in_range_on, messaging::change_on) runs on it, so a
+    // successful app admission is reused only within this actual snapshot
+    // (ReadAdmissions is keyed by connection and refuses any other). Never a
+    // database/event-head cache; each new call admits afresh.
+    let identity = kernel::read_cache::key_on(&mut snapshot, actor, "changes_snapshot").await?;
+    let connection = kernel::read_cache::connection_id(&mut snapshot);
+    kernel::read_cache::in_pinned_snapshot_with_admissions(identity, connection, Default::default(), async {
     'scan: loop {
         // Budget bounds work even when every event is withheld. Only the
         // opaque log cursor advances; no hidden identifiers or counts escape.
         let rows: Vec<(i64, String, String)> = sqlx::query_as(&format!(
-            "SELECT seq,record_id,type FROM content_events WHERE seq {comparison} ? AND seq<=? ORDER BY seq {direction} LIMIT 256"
-        )).bind(cursor).bind(high).fetch_all(db.pool()).await?;
+            "SELECT seq,record_id,type FROM content_events WHERE seq {comparison} ? AND seq<=? AND NOT EXISTS(SELECT 1 FROM kernel_saved_tabs s WHERE s.record_id=content_events.record_id OR s.home_id=content_events.record_id) ORDER BY seq {direction} LIMIT 256"
+        )).bind(cursor).bind(high).fetch_all(&mut *snapshot).await?;
         if rows.is_empty() {
             cursor = if newest { 0 } else { high.max(after) };
             break;
@@ -82,8 +99,8 @@ pub(super) async fn whats_changed(db: &Db, actor: &str, arguments: Value) -> Res
                 // Canonical history owns all disclosure: Message/attachment/
                 // comment bearers, link endpoints, retained v1 dependencies,
                 // private commands and actor/run attribution. Metadata only.
-                let events = kernel::history_page_in_range_as(
-                    db,
+                let events = kernel::history_page_in_range_on(
+                    &mut snapshot,
                     actor,
                     subject,
                     Some(batch_start),
@@ -108,7 +125,7 @@ pub(super) async fn whats_changed(db: &Db, actor: &str, arguments: Value) -> Res
         let fetched = rows.len();
         for (seq, subject, kind) in rows {
             let event = if kind == kernel::messaging::EVENT {
-                kernel::messaging::change_as(db, actor, seq).await?
+                kernel::messaging::change_on(&mut snapshot, actor, seq).await?
             } else {
                 histories
                     .get_mut(&subject)
@@ -140,6 +157,10 @@ pub(super) async fn whats_changed(db: &Db, actor: &str, arguments: Value) -> Res
             break;
         }
     }
+    Ok::<(), Error>(())
+    })
+    .await?;
+    snapshot.rollback().await?;
     let count = matched.len();
     let changes: Vec<Value> = matched
         .into_iter()

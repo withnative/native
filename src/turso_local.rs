@@ -2737,6 +2737,67 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
         version = 92;
     }
 
+    if version == 92 {
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        let migration = async {
+            // Derived, additive index: use the same DDL as fresh SQLite/Turso
+            // databases and the reference engine's 92-to-93 migration.
+            connection
+                .execute(crate::schema::ddl::UNFILED_MESSAGE_OWNER_INDEX_DDL, ())
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            connection
+                .execute("PRAGMA user_version=93", ())
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = migration {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        version = 93;
+    }
+
+    if version == 93 {
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        let migration = async {
+            // Schema-only convergence. Keyed cancellation has no Turso executor.
+            for statement in crate::schema::ddl::HELD_COMMAND_CANCELLATION_DDL {
+                connection
+                    .execute(statement, ())
+                    .await
+                    .map_err(|e| Error::engine(e.to_string()))?;
+            }
+            connection
+                .execute("PRAGMA user_version=94", ())
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = migration {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        version = 94;
+    }
+
     // The ladder above must end at the current schema: a block that runs
     // without advancing `version` silently strands every later block (as
     // 67→68 was stranded until the 66→67 block advanced it).
@@ -16540,6 +16601,116 @@ mod tests {
             scalar_i64(&connection, scan).await.unwrap()
         );
         assert!(db.health().await.unwrap().ready);
+    }
+
+    #[tokio::test]
+    async fn turso_unfiled_message_owner93_migration_preserves_rows_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "unfiled-owner93-migration".into(),
+            data_directory: directory.path().to_path_buf(),
+        };
+        let db = config.open().await.unwrap();
+        let connection = db.connect().unwrap();
+        connection.execute("INSERT INTO records(id,type,kind,body,home_id,policy_anchor_id) VALUES('owner93-preserved','Message','text','unchanged body','native:unfiled','native:root')", ()).await.unwrap();
+        let records = turso_records_snapshot(&connection).await;
+        // Turso normalizes sqlite_master SQL; compare with its fresh-schema
+        // rendering of the authoritative DDL rather than raw source whitespace.
+        let fresh_index_sql = scalar_text(&connection, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_records_unfiled_message_owner'").await.unwrap();
+        for statement in crate::schema::step_down::object_drop_statements(92, true) {
+            connection.execute(&statement, ()).await.unwrap();
+        }
+        connection
+            .execute("PRAGMA user_version=92", ())
+            .await
+            .unwrap();
+        drop(connection);
+        drop(db);
+
+        let db = config.open().await.unwrap();
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            94
+        );
+        assert_eq!(turso_records_snapshot(&connection).await, records);
+        assert_eq!(scalar_text(&connection, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_records_unfiled_message_owner'").await.unwrap(), fresh_index_sql);
+        migrate_existing_engine_schema(&connection).await.unwrap();
+        assert_eq!(turso_records_snapshot(&connection).await, records);
+        assert!(db.health().await.unwrap().ready);
+    }
+
+    #[tokio::test]
+    async fn turso_unfiled_message_owner93_failure_preserves_schema92_and_can_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "unfiled-owner93-rollback".into(),
+            data_directory: directory.path().to_path_buf(),
+        }
+        .open()
+        .await
+        .unwrap();
+        let connection = db.connect().unwrap();
+        let records = turso_records_snapshot(&connection).await;
+        // Step down to a true engine-92 shape first. A fresh install carries
+        // the 93/94 objects, so only dropping the owner index leaves the 94
+        // table behind and the retry below collides with it instead of
+        // recreating it.
+        for statement in crate::schema::step_down::object_drop_statements(92, true) {
+            connection.execute(&statement, ()).await.unwrap();
+        }
+        // A conflicting object must fail; never adopt it or stamp past it.
+        connection
+            .execute(
+                "CREATE INDEX idx_records_unfiled_message_owner ON records(name)",
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA user_version=92", ())
+            .await
+            .unwrap();
+        let schema = scalar_text(
+            &connection,
+            "SELECT sql FROM sqlite_master WHERE name='idx_records_unfiled_message_owner'",
+        )
+        .await
+        .unwrap();
+        assert!(migrate_existing_engine_schema(&connection).await.is_err());
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            92
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT sql FROM sqlite_master WHERE name='idx_records_unfiled_message_owner'"
+            )
+            .await
+            .unwrap(),
+            schema
+        );
+        assert_eq!(turso_records_snapshot(&connection).await, records);
+        // This also proves the failed transaction released its write boundary.
+        connection
+            .execute("DROP INDEX idx_records_unfiled_message_owner", ())
+            .await
+            .unwrap();
+        migrate_existing_engine_schema(&connection).await.unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            94
+        );
+        assert_eq!(turso_records_snapshot(&connection).await, records);
     }
 
     // Engine-77 fixtures must peel this derived table and source trigger

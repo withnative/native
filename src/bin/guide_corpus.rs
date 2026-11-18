@@ -87,6 +87,13 @@ fn render_guide(root: &Path, guide: GuideSpec) -> Result<String> {
             validate_semantic_coverage(guide.topic, &template)?;
             render_template(guide.topic, &template)
         }
+        GuideSource::EngineOrientation => {
+            let mut output = generated_header("`src/mcp/posture-capsule.md`");
+            output.push_str(&fs::read_to_string(
+                root.parent().unwrap().join("posture-capsule.md"),
+            )?);
+            Ok(output)
+        }
         GuideSource::ProductModel => {
             let mut output = generated_header("`mcp::product_model` contract and principles");
             output.push_str(&native_ce::mcp::product_model::guide_markdown());
@@ -112,6 +119,41 @@ fn render_supplied_kit(root: &Path, topic: &str) -> Result<String> {
             "1.1.0",
             include_str!("../../crates/artifact-html/kit-releases/1.1.0/manifest.json"),
             include_str!("../../crates/artifact-html/kit-releases/1.1.0/core.d.ts"),
+        ),
+        "app-kit-core-1.1.1" => (
+            "1.1.1",
+            include_str!("../../crates/artifact-html/kit-releases/1.1.1/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.1.1/core.d.ts"),
+        ),
+        "app-kit-core-1.2.0" => (
+            "1.2.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.2.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.2.0/core.d.ts"),
+        ),
+        "app-kit-core-1.3.0" => (
+            "1.3.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.3.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.3.0/core.d.ts"),
+        ),
+        "app-kit-core-1.4.0" => (
+            "1.4.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.4.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.4.0/core.d.ts"),
+        ),
+        "app-kit-core-1.5.0" => (
+            "1.5.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.5.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.5.0/core.d.ts"),
+        ),
+        "app-kit-core-1.6.0" => (
+            "1.6.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.6.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.6.0/core.d.ts"),
+        ),
+        "app-kit-core-1.7.0" => (
+            "1.7.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.7.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.7.0/core.d.ts"),
         ),
         _ => return Err(Error::engine("unknown supplied kit guide")),
     };

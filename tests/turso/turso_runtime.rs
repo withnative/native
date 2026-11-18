@@ -2150,15 +2150,14 @@ async fn production_comment_threads_cover_aliases_replies_resolution_and_immutab
             json!({
                 "id":"70250000-0000-4000-8000-005000000021",
                 "lifecycle":"open",
-                "summary":null,
-                "reason":"Reopening is deliberately unsupported."
+                "reason":"Reopening requires an explicit summary clear."
             }),
         )
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        reopen.contains("root-only open -> resolved transition"),
+        reopen.contains("comment resolution summary is only valid on a resolved root"),
         "{reopen}"
     );
 
@@ -2632,11 +2631,23 @@ async fn governed_comment_state_machine_matches_sqlite_on_both_registered_engine
         let reopen = registry
             .call_engine(
                 engine.clone(), caller.clone(), "update_record",
-                json!({"id":"70250000-0000-4000-8000-005000000008","lifecycle":"open","summary":null,"reason":"Compare cross-engine reopen refusal."}),
+                json!({"id":"70250000-0000-4000-8000-005000000008","lifecycle":"open","reason":"Compare cross-engine refusal without summary clear."}),
             )
             .await
             .unwrap_err()
             .to_string();
+        let reopened = registry
+            .call_engine(
+                engine.clone(), caller.clone(), "update_record",
+                json!({"id":"70250000-0000-4000-8000-005000000008","lifecycle":"open","summary":null,"reason":"Compare governed cross-engine reopening."}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened["lifecycle_interpretation"]["value"]["canonical"],
+            "open"
+        );
+        assert!(reopened["summary"].is_null());
         let bearer = registry
             .call_engine(
                 engine.clone(),
@@ -2659,7 +2670,9 @@ async fn governed_comment_state_machine_matches_sqlite_on_both_registered_engine
             "nested_error":nested,
             "resolved_lifecycle":resolved["lifecycle_interpretation"]["value"]["canonical"],
             "resolved_summary":resolved["summary"],
-            "reopen_error":reopen,
+            "reopen_without_clear_error":reopen,
+            "reopened_lifecycle":reopened["lifecycle_interpretation"]["value"]["canonical"],
+            "reopened_summary":reopened["summary"],
             "root_count":bearer["records"][0]["comment_count"],
             "root_id":bearer["records"][0]["comments"][0]["id"],
             "reply_count":root["records"][0]["comment_count"],

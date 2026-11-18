@@ -36,33 +36,84 @@ pub(crate) async fn prepare(
     requested: &Value,
     deadline: Instant,
 ) -> Result<Prepared> {
-    let definition: v2::Definition = serde_json::from_value(requested.clone())?;
-    if serde_json::to_value(&definition)? != *requested {
-        return Err(Error::engine("generated candidate must be canonical"));
-    }
-    definition.validate()?;
+    let version = requested.pointer("/origin/version").and_then(Value::as_str);
+    let format = requested
+        .pointer("/generated/format")
+        .and_then(Value::as_str);
+    // The compiler version and the closed retained manifest are one exact pair.
+    // A mismatch refuses; neither profile is a fallback for the other.
+    let profile = match (version, format) {
+        (Some("facet-1"), Some("native.generated-facets.v1")) => {
+            let definition: v2::Definition = serde_json::from_value(requested.clone())?;
+            if serde_json::to_value(&definition)? != *requested {
+                return Err(Error::engine("generated candidate must be canonical"));
+            }
+            definition.validate()?;
+            crate::query::generated_facets::Profile::Facet1
+        }
+        (Some("facet-global-1"), Some("native.generated-facets.v2")) => {
+            let definition: v2::Definition<v2::GlobalManifest> =
+                serde_json::from_value(requested.clone())?;
+            if serde_json::to_value(&definition)? != *requested {
+                return Err(Error::engine("generated candidate must be canonical"));
+            }
+            definition.validate_global()?;
+            crate::query::generated_facets::Profile::Global1
+        }
+        _ => {
+            return Err(Error::engine(
+                "view_profile_unsupported: generated origin/manifest pair mismatch",
+            ))
+        }
+    };
     let workspace = {
         let mut conn = db.pool().acquire().await?;
         workspace_on(&mut conn).await?
     };
-    let manifest = &definition.generated;
-    let selection = match &manifest.selection {
+    let generated = requested
+        .get("generated")
+        .ok_or_else(|| Error::engine("generated manifest missing"))?;
+    let selection: v2::Selection = serde_json::from_value(
+        generated
+            .get("selection")
+            .cloned()
+            .ok_or_else(|| Error::engine("generated selection missing"))?,
+    )?;
+    let selection = match selection {
         v2::Selection::Keys { keys } => crate::query::generated_facets::Selection::Keys(
-            keys.iter().cloned().collect::<BTreeSet<_>>(),
+            keys.into_iter().collect::<BTreeSet<_>>(),
         ),
         v2::Selection::All => crate::query::generated_facets::Selection::All,
     };
-    let candidate = facet_resolver::prepare(
+    let context = generated
+        .get("context")
+        .ok_or_else(|| Error::engine("generated context missing"))?;
+    let record_type = context
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::engine("generated context type missing"))?
+        .to_owned();
+    let kind = context
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let home = context
+        .get("logical_home_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::engine("generated context home missing"))?
+        .to_owned();
+    let candidate = facet_resolver::prepare_profile(
         db,
         actor,
         &workspace,
         bearer,
         facet_resolver::Request {
-            record_type: manifest.context.r#type.clone(),
-            kind: manifest.context.kind.clone(),
-            home: manifest.context.logical_home_id.clone(),
+            record_type,
+            kind,
+            home,
             selection,
         },
+        profile,
         deadline,
     )
     .await?;
@@ -209,7 +260,34 @@ pub(crate) async fn prepare_referenced(
     let mut definitions = Vec::new();
     let mut digests = BTreeSet::new();
     for revision in revisions {
-        let definition: v2::Definition = serde_json::from_value(revision.definition)?;
+        // Exact origin/manifest pair; the global carrier contributes its common
+        // semantic inputs (no anchors, logical home, winning decls/vocabs).
+        let format = revision
+            .definition
+            .pointer("/generated/format")
+            .and_then(Value::as_str);
+        let version = revision
+            .definition
+            .pointer("/origin/version")
+            .and_then(Value::as_str);
+        let definition: v2::Definition = match (version, format) {
+            (Some("facet-1"), Some("native.generated-facets.v1")) => {
+                let typed: v2::Definition = serde_json::from_value(revision.definition.clone())?;
+                typed.validate()?;
+                typed
+            }
+            (Some("facet-global-1"), Some("native.generated-facets.v2")) => {
+                let typed: v2::Definition<v2::GlobalManifest> =
+                    serde_json::from_value(revision.definition.clone())?;
+                typed.validate_global()?;
+                super::retained_facets::global_inputs(&typed)
+            }
+            _ => {
+                return Err(Error::engine(
+                    "view_profile_unsupported: generated origin/manifest pair mismatch",
+                ))
+            }
+        };
         let bearer = revision
             .view_id
             .strip_prefix("native.named-view:")

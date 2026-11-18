@@ -10,6 +10,77 @@ The governing rule is:
 > Test decisions comprehensively where they are made; test passage across each
 > real boundary with a smaller set of representative contracts.
 
+## What a test is for
+
+A test earns its place when its failure usually means something a person
+would care about has broken. Its value is the chance it catches a real
+regression times how bad that regression would be. Its cost is runtime, flake
+rate, and the edits it forces when behaviour changes on purpose. A **brittle**
+test, one that fails when nothing anyone cares about changed, is a defect, not
+extra safety. It costs CI time and teaches agents to ignore red.
+
+Decide how hard to test something by asking *if this broke in production, what
+would happen?*
+
+| If it broke… | Kind | How hard to test | When it goes red |
+| --- | --- | --- | --- |
+| We would lose data or trust, or leak across accounts | **Boundary**: account separation, confirmed access, write admission, truthful saves, data survival, schema, backup/restore, the containment set | Hard, at several layers; release-gated | A real defect. Never weaken it to get green without asking Richard. |
+| Someone would be annoyed, blocked or lose their place | **Experience**: continuity and speed promises ([a10e004](https://n8v.to/a10e004), [22d0148](https://n8v.to/22d0148)) | A few outcome-level tests per promise | A product regression. Fix the code unless the promise itself changed. |
+| Code or an agent depending on it would break | **Contract**: MCP tool shapes, data formats, public APIs | Shape and meaning, not incidental detail | A breaking change. Version it or fix it. |
+| Nobody would notice | **Mechanism**: internals, layout, copy, current algorithms | Lightly, or not at all | Update or delete the test when the change is intended. |
+
+Native is early. UI, flows, copy and internals change constantly, so test them
+at the outcome level. The data model, durability, auth and the MCP contract are
+the stable foundations, so test them hard.
+
+**Tests can be wrong.** A test records a decision made at one point in time.
+When it locks in a trade-off we have since dropped, such as signing out,
+freezing or blanking a screen when unsure, change the test rather than obeying
+it. Deleting or rewriting a mechanism test is ordinary work.
+
+### Avoiding brittleness
+
+Assert the property, not one particular instance of it:
+
+- a size budget, not an exact byte count (the cross-app bundle size checks);
+- "the rows are still visible" or "the error offers a next step", not exact
+  HTML or copy;
+- wait for a condition, not a fixed sleep;
+- set membership, not ordering, unless ordering is the promise;
+- an injected clock, fresh ports and per-test temporary state, not the shared
+  machine.
+
+Keep exact hashes only where identity is the point, such as public-closure pins
+and CSPs.
+
+### Flaky tests and quarantine
+
+A flake is a defect with a short deadline, not a reason to rerun CI. Fix it
+when the cause is quick to find: a race, a shared port, a clock, ordering.
+
+If a flaking **mechanism, experience or contract** test is not a quick fix,
+quarantine it without asking (Richard, 12 Nov 2026):
+
+1. File a Native task naming the test, the failure seen (link the run), its
+   kind, and an owner.
+2. Take it off the required path.
+   - **Rust:** add a single-line `#[ignore = "quarantined flake: <task ref>"]`
+     with no `]` in the text. Add an `[[ignored_tests]]` entry to
+     `ci/test-gates.toml` with exactly `id` and `reason`. The `id` is the test's
+     semantic id, e.g. `test:native-ce:test:tools:<module>::<fn>`; copy the shape
+     of an existing entry. The verifier requires the set of ids to match exactly.
+     Then apply the `ci/test-removal-reviewed` label and put a nonblank
+     `Test inventory change reason:` line in the PR body (see
+     `docs/test-inventory.md`). This waives only the new-ignore review, not any
+     other failure.
+   - **TypeScript:** use `it.skip` / `test.fixme` with the task reference in a
+     comment. No gate enforces this, so it is by convention.
+3. Fix or delete it later. A quarantine is a debt, not a disposal.
+
+**Boundary tests are never quarantined without asking Richard.** When you
+cannot tell whether a boundary test is flaking or catching a real defect, treat
+the red as evidence.
+
 ## Layers and ownership
 
 | Layer | Owns | Preferred proof |

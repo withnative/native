@@ -1154,14 +1154,14 @@ async fn supplied_kit_policy_hosted_preview_metadata_is_exact() {
     let before = state(&db).await;
     let preview = previewed(&db, &caller, &preview_request(&value, &outcome.event_id)).await;
     let release = &preview["preview"]["launch"]["kit_release"];
-    assert_eq!(release["version"], "1.1.0");
+    assert_eq!(release["version"], "1.7.14");
     assert_eq!(
         release["js_sha256"],
-        "060abc96efa6d41cce9889904a23c4861f9f2c1af6619f34a052f8659d35d8db"
+        "6f8b5a0fa6ac845d7bbe3d42a994665f65b653cc61ce25430e4964283f96dd70"
     );
     assert_eq!(
         release["types_sha256"],
-        "64935eb9aa0ef6b1b09b597892240f007cdfc6d3fef36a2c5b9cde73e86161fd"
+        "8ce865812886b04b6b9e4875b78567dfd369888a8e2518d4d515a46b01cf532c"
     );
     assert_eq!(state(&db).await, before);
 }

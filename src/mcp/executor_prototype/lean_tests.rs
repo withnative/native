@@ -348,6 +348,41 @@ fn lean_catalogue_advertises_the_direct_set_and_keeps_every_callable_index() {
     assert_ne!(lean.manifest_digest, full.manifest_digest);
 }
 
+#[tokio::test]
+async fn approved_app_install_link_is_read_only_through_the_lean_surface() {
+    let (_, full, lean) = servers().await;
+    let envelope = json!({"operation":"manage_alpha_tabs.install_link","format":"json","run_key":RUN_KEY,
+        "arguments":{"package":"agent.notion-pages"}});
+    assert_eq!(
+        lean.contracts
+            .get(&(
+                "artifacts_read".into(),
+                "manage_alpha_tabs.install_link".into()
+            ))
+            .unwrap()
+            .access,
+        OperationAccess::Read
+    );
+    let direct = send(&full, 1, "artifacts_read", envelope.clone()).await;
+    let through = send(
+        &lean,
+        1,
+        "call_executor",
+        routed("artifacts_read", envelope),
+    )
+    .await;
+    assert_eq!(through["result"]["isError"], false, "{through}");
+    assert_eq!(observed(&direct), observed(&through));
+    assert_eq!(
+        through["result"]["structuredContent"]["install_path"],
+        "/shell/?install=agent.notion-pages"
+    );
+    assert_eq!(
+        through["result"]["structuredContent"]["installation_changed"],
+        false
+    );
+}
+
 #[test]
 fn lean_hosted_descriptor_budget_is_measured_on_hosted_registrations() {
     let registry = hosted_registry();

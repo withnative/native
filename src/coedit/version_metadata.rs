@@ -32,6 +32,7 @@ use crate::{Error, Result};
 
 pub(crate) const CONTRIBUTORS_KEY: &str = "contributors";
 pub(crate) const SESSION_KEY: &str = "session";
+pub(crate) const OFFLINE_INTERVAL_KEY: &str = "offline_interval";
 pub(crate) const MERGED_OFFLINE_KEY: &str = "merged_offline";
 /// Reserved key for the canonical per-version span map (`span_map` v1):
 /// `{version, offset_kind, authors, spans}` beside `contributors[]`.
@@ -56,6 +57,8 @@ pub(crate) struct VersionMetadata<'a> {
     pub(crate) session_ref: &'a str,
     /// Whether this version includes ops made offline (present `true` only).
     pub(crate) merged_offline: bool,
+    /// Client-clock bounds; advisory, persisted with an explicit source label.
+    pub(crate) offline_interval: Option<super::live::OfflineMerge>,
     /// Canonical span map of the version body, when the version comes from
     /// a live session. `contributors[]` keeps meaning activity since the
     /// last cut; the map names the origin of surviving text instead.
@@ -83,6 +86,7 @@ pub(crate) fn record_updated_payload(
         CONTRIBUTORS_KEY,
         SESSION_KEY,
         MERGED_OFFLINE_KEY,
+        OFFLINE_INTERVAL_KEY,
         SPAN_MAP_KEY,
     ] {
         if base.contains_key(key) {
@@ -146,6 +150,16 @@ pub(crate) fn record_updated_payload(
     if metadata.merged_offline {
         base.insert(MERGED_OFFLINE_KEY.into(), Value::Bool(true));
     }
+    if let Some(interval) = metadata.offline_interval {
+        base.insert(
+            OFFLINE_INTERVAL_KEY.into(),
+            serde_json::json!({
+                "started_at_ms": interval.started_at_ms,
+                "reconnected_at_ms": interval.reconnected_at_ms,
+                "client_reported": true,
+            }),
+        );
+    }
     if let Some(span_map) = metadata.span_map {
         // Defense in depth on top of the prospective prepare-time caps:
         // author count and serialized bytes are re-checked at assembly, so
@@ -180,6 +194,16 @@ pub(crate) fn record_updated_payload(
 /// `span_map`, when present, requires the version metadata and the version
 /// body string, and must parse and tile that body exactly.
 pub(crate) fn validate_version_metadata(payload: &Map<String, Value>) -> Result<()> {
+    if let Some(interval) = payload.get(OFFLINE_INTERVAL_KEY) {
+        let start = interval.get("started_at_ms").and_then(Value::as_u64);
+        let end = interval.get("reconnected_at_ms").and_then(Value::as_u64);
+        if payload.get(MERGED_OFFLINE_KEY) != Some(&Value::Bool(true))
+            || interval.get("client_reported") != Some(&Value::Bool(true))
+            || !matches!((start, end), (Some(a), Some(b)) if a <= b && b <= 9_007_199_254_740_991)
+        {
+            return Err(Error::engine("invalid client-reported offline interval"));
+        }
+    }
     let has_contributors = payload.contains_key(CONTRIBUTORS_KEY);
     let has_session = payload.contains_key(SESSION_KEY);
     let has_merged_offline = payload.contains_key(MERGED_OFFLINE_KEY);
@@ -335,6 +359,102 @@ fn validate_contributor_row(row: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Native kernel body-event extension. This is pure schema validation, with no
+/// v1 record/lifecycle dependency. Unknown version members fail closed.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) fn validate_kernel_metadata(body: &str, metadata: &Map<String, Value>) -> Result<()> {
+    const MAX_METADATA_BYTES: usize = 1024 * 1024;
+    if body.len() > super::registry::MAX_BODY_BYTES
+        || metadata.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "contributors" | "session" | "merged_offline" | "offline_interval" | "span_map"
+            )
+        })
+        || !metadata.contains_key(SESSION_KEY)
+        || !metadata.contains_key(CONTRIBUTORS_KEY)
+        || !metadata.contains_key(SPAN_MAP_KEY)
+        || metadata
+            .get(SESSION_KEY)
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.is_empty() || s.len() > 1024)
+        || metadata
+            .get(CONTRIBUTORS_KEY)
+            .and_then(Value::as_array)
+            .is_none_or(|rows| rows.len() > super::registry::MAX_ATTRIBUTED_IDENTITIES)
+        || serde_json::to_vec(metadata)?.len() > MAX_METADATA_BYTES
+    {
+        return Err(Error::engine(
+            "invalid or over-budget kernel coedit metadata",
+        ));
+    }
+    let rows = metadata[CONTRIBUTORS_KEY]
+        .as_array()
+        .expect("checked above");
+    let mut identity_bytes = 0usize;
+    for row in rows {
+        let row = row
+            .as_object()
+            .ok_or_else(|| Error::engine("invalid kernel contributor"))?;
+        if row.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "principal" | "executor_kind" | "run_key" | "app" | "channel"
+            )
+        }) {
+            return Err(Error::engine("unknown kernel contributor member"));
+        }
+        identity_bytes = identity_bytes.saturating_add(serde_json::to_vec(row)?.len());
+    }
+    if identity_bytes > super::registry::MAX_ATTRIBUTED_IDENTITY_BYTES {
+        return Err(Error::engine("kernel contributors exceed identity budget"));
+    }
+    let span = parse_span_map(&metadata[SPAN_MAP_KEY])
+        .map_err(|_| Error::engine("invalid kernel span map"))?;
+    if serialize_span_map(&span) != metadata[SPAN_MAP_KEY] {
+        return Err(Error::engine(
+            "noncanonical or unknown kernel span map members",
+        ));
+    }
+    let mut payload = metadata.clone();
+    payload.insert("body".into(), Value::String(body.into()));
+    validate_version_metadata(&payload)
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) fn kernel_metadata(snapshot: &super::VersionSnapshot) -> Result<Map<String, Value>> {
+    kernel_metadata_view(
+        snapshot.body(),
+        snapshot.contributors(),
+        snapshot.span_map(),
+        snapshot.session_id(),
+    )
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn kernel_metadata_view(
+    body: &str,
+    contributors: &[AcknowledgedContributor],
+    span_map: &SpanMap,
+    session: &super::SessionId,
+) -> Result<Map<String, Value>> {
+    let mut base = Map::new();
+    base.insert("body".into(), Value::String(body.into()));
+    let mut payload = record_updated_payload(
+        base,
+        Some(&VersionMetadata {
+            contributors,
+            session_ref: &session.0,
+            merged_offline: false,
+            offline_interval: None,
+            span_map: Some(span_map),
+        }),
+    )?;
+    payload.remove("body");
+    validate_kernel_metadata(body, &payload)?;
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +498,7 @@ mod tests {
             contributors: &contributors,
             session_ref: "sess-abc",
             merged_offline: false,
+            offline_interval: None,
             span_map: None,
         };
         let payload = record_updated_payload(base(), Some(&metadata)).unwrap();
@@ -402,6 +523,7 @@ mod tests {
             contributors: &[],
             session_ref: "sess-empty",
             merged_offline: false,
+            offline_interval: None,
             span_map: None,
         };
         let payload = record_updated_payload(base(), Some(&metadata)).unwrap();
@@ -415,6 +537,7 @@ mod tests {
             contributors: &contributors,
             session_ref: "sess-offline",
             merged_offline: true,
+            offline_interval: None,
             span_map: None,
         };
         let payload = record_updated_payload(base(), Some(&metadata)).unwrap();
@@ -435,6 +558,7 @@ mod tests {
                 contributors: &[],
                 session_ref: "sess",
                 merged_offline: false,
+                offline_interval: None,
                 span_map: None,
             };
             let error = record_updated_payload(base, Some(&metadata)).unwrap_err();
@@ -543,6 +667,7 @@ mod tests {
             contributors: &contributors,
             session_ref: "sess",
             merged_offline: false,
+            offline_interval: None,
             span_map: None,
         };
         let payload = record_updated_payload(base(), Some(&metadata)).unwrap();
@@ -564,6 +689,7 @@ mod tests {
             contributors: &contributors,
             session_ref: "sess",
             merged_offline: false,
+            offline_interval: None,
             span_map: None,
         };
         let payload = record_updated_payload(base(), Some(&metadata)).unwrap();
@@ -617,6 +743,7 @@ mod tests {
             contributors: &contributors,
             session_ref: "sess",
             merged_offline: false,
+            offline_interval: None,
             span_map: Some(&map),
         };
         let payload = record_updated_payload(version_base("helloXYZ"), Some(&metadata)).unwrap();
@@ -679,5 +806,30 @@ mod tests {
                 .clone();
         let error = validate_version_metadata(&payload).unwrap_err();
         assert!(error.to_string().contains("serialized budget"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod offline_interval_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn offline_interval_requires_a_flag_and_client_reported_ordered_bounds() {
+        let valid = json!({"session":"s", "contributors":[], "merged_offline":true,
+            "offline_interval":{"started_at_ms":1,"reconnected_at_ms":2,"client_reported":true,"future":42}});
+        validate_version_metadata(valid.as_object().unwrap()).unwrap();
+        for bad in [
+            json!(null),
+            json!({"started_at_ms":3,"reconnected_at_ms":2,"client_reported":true}),
+            json!({"started_at_ms":1,"reconnected_at_ms":2,"client_reported":false}),
+        ] {
+            let mut payload = valid.clone();
+            payload["offline_interval"] = bad;
+            assert!(validate_version_metadata(payload.as_object().unwrap()).is_err());
+        }
+        let mut orphan = valid;
+        orphan.as_object_mut().unwrap().remove("merged_offline");
+        assert!(validate_version_metadata(orphan.as_object().unwrap()).is_err());
     }
 }

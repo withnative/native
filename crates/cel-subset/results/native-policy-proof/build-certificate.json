@@ -34,9 +34,10 @@
     "tree": "e19b0872cd5f7a2a378392ee126be9f82ff2d5ea",
     "status": ""
   },
-  "build_log_sha256": "911094018a8284efceef69ef1e13665734c1f8023281de8e487dd40f6f3fdfaf",
+  "build_log_sha256": "aec4c06cff989d5fb44984c1fc611c944bbff2bf36dbd33ea4834b9455aa62b5",
   "binary": {
     "path": "target/debug/cel-native-evidence",
     "sha256": "5ffa225d4907100a4967f2f60136806352a76c62e4d35cbd2745c77abd95e71e"
-  }
+  },
+  "captured_build_log_sha256": "911094018a8284efceef69ef1e13665734c1f8023281de8e487dd40f6f3fdfaf"
 }

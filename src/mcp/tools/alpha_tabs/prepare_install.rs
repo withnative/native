@@ -145,7 +145,23 @@ pub(super) async fn prepare(db: &Db, caller: &Caller, args: Args) -> Result<Valu
         super::super::artifacts::html_body_limit_in(&mut tx, &args.artifact_id).await?;
     let manifest = match crate::artifact_html::validate_cached_with_limit(&body, body_limit) {
         Ok(manifest) => manifest,
-        Err(failure) => return Ok(invalid(failure.code, &failure.message)),
+        Err(failure) => {
+            // Preparation never mutates the source. Explain the opt-in only
+            // when the same source passes under the package budgets.
+            if body_limit != crate::artifact_html::PACKAGE_BODY_LIMIT
+                && crate::artifact_html::validate_cached_with_limit(
+                    &body,
+                    crate::artifact_html::PACKAGE_BODY_LIMIT,
+                )
+                .is_ok()
+            {
+                return Ok(invalid(
+                    "app_package_marker_required",
+                    "Add facets:{app_package:'true'} to this native.html.v1 source with records_write.update_record, then prepare again. App packages allow 2 MiB of HTML and decoded images/fonts up to 512 KiB each / 1 MiB total.",
+                ));
+            }
+            return Ok(invalid(failure.code, &failure.message));
+        }
     };
     let digest = alpha_tab_digest(&bundle_sha256, &declaration_digest, "native.html.v1");
     if let Some(refusal) = digest_refusal(&manifest.body_digest, &bundle_sha256) {

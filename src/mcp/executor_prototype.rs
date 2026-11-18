@@ -40,6 +40,11 @@ use super::{
     ExperimentalExecutors, EXPERIMENTAL_FRESHNESS_EXECUTOR, EXPERIMENTAL_SQL_WRITE_EXECUTOR,
 };
 
+#[path = "executor_prototype/acceptance.rs"]
+mod acceptance;
+#[cfg(test)]
+#[path = "executor_prototype/acceptance_tests.rs"]
+mod acceptance_tests;
 #[path = "executor_prototype/plan_store.rs"]
 mod plan_store;
 pub use plan_store::{DeploymentPlanKeyring, HostedPlanCatalogue, HostedPlanKeyProvider};
@@ -90,6 +95,25 @@ pub struct HostedMembershipPreparation {
 /// to the plan claim.
 #[doc(hidden)]
 pub trait HostedExecutorAuthority: HostedPlanCatalogue + Send + Sync {
+    #[cfg(feature = "v2-kernel-probe")]
+    fn acquire_publication_authority<'a>(
+        &'a self,
+        _caller: &'a Caller,
+        _db: &'a crate::Db,
+        _lease: &'a DeploymentPersistenceLease,
+    ) -> BoxFuture<'a, Result<HostedPublicationAuthorityGuard>> {
+        Box::pin(async { Err(Error::engine("hosted publication authority is unavailable")) })
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    fn reconcile_publication<'a>(
+        &'a self,
+        _context: HostedPublicationContext<'a>,
+    ) -> BoxFuture<
+        'a,
+        std::result::Result<PublicationRoutingCurrent, HostedPublicationReconcileError>,
+    > {
+        Box::pin(async { Err(HostedPublicationReconcileError::Unavailable) })
+    }
     /// Hold current catalog membership stable across a SQL domain write or
     /// receipt read. The guard must exclude membership/route changes until
     /// dropped. It is acquired after plan claim and released before completion
@@ -112,6 +136,15 @@ pub trait HostedExecutorAuthority: HostedPlanCatalogue + Send + Sync {
     fn sql_commit_single_flight(&self) -> Option<std::sync::Arc<tokio::sync::Semaphore>> {
         None
     }
+    /// Trusted deployment origin for public serving links, installed only by
+    /// explicit host composition. The default is absent, so no executor
+    /// without that composition can render a Ready link. The delivery layer
+    /// never reads an origin from tool arguments, request URLs, or result
+    /// JSON; it uses only this value plus the canonical receipt public ID.
+    #[cfg(feature = "v2-kernel-probe")]
+    fn publication_ready_origin(&self) -> Option<String> {
+        None
+    }
 
     fn validate_membership_write(&self, arguments: Value) -> Result<()>;
 
@@ -121,6 +154,115 @@ pub trait HostedExecutorAuthority: HostedPlanCatalogue + Send + Sync {
         caller: &'a Caller,
         arguments: Value,
     ) -> BoxFuture<'a, Result<HostedMembershipPreparation>>;
+}
+
+/// Trusted, verified-plan context for the narrow hosted publication projection.
+#[cfg(feature = "v2-kernel-probe")]
+pub struct HostedPublicationAuthorityGuard {
+    _inner: Box<dyn Send>,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+impl HostedPublicationAuthorityGuard {
+    #[doc(hidden)]
+    pub fn new<T: Send + 'static>(guard: T) -> Self {
+        Self {
+            _inner: Box::new(guard),
+        }
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub struct HostedPublicationContext<'a> {
+    db: &'a crate::Db,
+    caller: &'a Caller,
+    database_id: &'a str,
+    principal: &'a str,
+    request: &'a crate::kernel::publications::PublicationRequest,
+    original: &'a crate::kernel::publications::PublicationReceipt,
+    database_birth: &'a str,
+    record_birth: &'a str,
+    plan_id: &'a str,
+    lease: &'a DeploymentPersistenceLease,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+impl<'a> HostedPublicationContext<'a> {
+    pub fn db(&self) -> &'a crate::Db {
+        self.db
+    }
+    pub fn caller(&self) -> &'a Caller {
+        self.caller
+    }
+    pub fn database_id(&self) -> &'a str {
+        self.database_id
+    }
+    pub fn principal(&self) -> &'a str {
+        self.principal
+    }
+    pub fn request(&self) -> &'a crate::kernel::publications::PublicationRequest {
+        self.request
+    }
+    pub fn original(&self) -> &'a crate::kernel::publications::PublicationReceipt {
+        self.original
+    }
+    pub fn database_birth(&self) -> &'a str {
+        self.database_birth
+    }
+    pub fn record_birth(&self) -> &'a str {
+        self.record_birth
+    }
+    pub fn plan_id(&self) -> &'a str {
+        self.plan_id
+    }
+    pub fn lease(&self) -> &'a DeploymentPersistenceLease {
+        self.lease
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+tokio::task_local! {
+    pub(crate) static PUBLICATION_COMPLETION: std::sync::Arc<std::sync::Mutex<Option<crate::kernel::publications::PublicationReceipt>>>;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn record_publication_completion(
+    receipt: &crate::kernel::publications::PublicationReceipt,
+) {
+    let _ = PUBLICATION_COMPLETION.try_with(|slot| {
+        *slot.lock().expect("publication completion lock") = Some(receipt.clone());
+    });
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationRoutingCurrent {
+    NotConfigured,
+    PendingIndex,
+    TemporarilyUnavailable,
+    Unavailable,
+    /// A host-installed serving capability observed a currently valid grant.
+    /// The delivery layer renders this only with a trusted origin plus the
+    /// canonical public ID; the variant itself carries no URL.
+    Ready,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[derive(Debug, Clone, Copy)]
+pub enum HostedPublicationReconcileError {
+    Denied,
+    Unavailable,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+impl From<Error> for HostedPublicationReconcileError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Auth(_) => Self::Denied,
+            _ => Self::Unavailable,
+        }
+    }
 }
 
 /// Avoid relying on trait-object upcasting when the plan store needs the
@@ -261,12 +403,123 @@ struct OperationContract {
     /// admission. Missing/custom source kinds and ambiguous selectors remain
     /// mutations until a registered exhaustive classification proves read.
     access: OperationAccess,
+    /// Effective public execution policy, pinned for the selected engine.
+    plan_required: bool,
+    kernel_v2: bool,
     digest: String,
     bytes: usize,
 }
 
 type OperationContracts = BTreeMap<(String, String), OperationContract>;
 type OperationsByExecutor = BTreeMap<String, Vec<String>>;
+
+/// Whether an operation's acceptance declaration says its write is queued and
+/// shown as waiting: `Some(true)` it is, `Some(false)` it is shown as done
+/// straight away, `None` it is not a declared write (a read, or not an operation). For other
+/// crates that keep their own list of writes (the hosted outbox) and check it
+/// against the declaration.
+#[doc(hidden)]
+pub fn declared_requires_acceptance(executor: &str, operation: &str) -> Option<bool> {
+    acceptance::declaration(executor, operation)
+        .map(|declared| matches!(declared, acceptance::Acceptance::Required(_)))
+}
+
+mod node_holding_contract;
+pub(crate) use node_holding_contract::NodeHoldingContract;
+
+/// One operation the replay conformance test may run: how to call its source
+/// tool, and what its declaration and contract say. The test lives in
+/// `tests/tools/replay_conformance.rs`.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ReplayOperation {
+    pub executor: String,
+    pub operation: String,
+    /// The registered tool that executes it, and the selector field and value
+    /// that pick this operation among the tool's actions, if it has one.
+    pub source_tool: String,
+    pub selector: Option<(String, String)>,
+    /// Whether the tool's input schema takes `idempotency_key` and `reason`.
+    pub accepts_idempotency_key: bool,
+    pub accepts_reason: bool,
+    /// The acceptance declaration: `Some(false)` local-first, `Some(true)`
+    /// queued as waiting, `None` undeclared (always a bug for a write).
+    pub requires_acceptance: Option<bool>,
+}
+
+/// Every write operation the ordinary SQLite catalogue serves, with its
+/// declaration, in a stable order. Reads are not included.
+#[doc(hidden)]
+pub fn replay_operations() -> Result<Vec<ReplayOperation>> {
+    let contracts = NodeOperationContracts::local()?;
+    Ok(replay_operations_from(&contracts.contracts))
+}
+
+/// Every write operation the KernelV2 catalogue serves, with its declaration,
+/// in a stable order. Reads are not included. The replay conformance test
+/// drives this catalogue on a v2 database; production hosted runs KernelV2.
+#[doc(hidden)]
+#[cfg(feature = "v2-kernel-probe")]
+pub fn replay_operations_on_kernel_v2() -> Result<Vec<ReplayOperation>> {
+    let mut registry = ToolRegistry::new();
+    super::register_builtin_tools(&mut registry)?;
+    super::tools::register_surface_tools(&mut registry)?;
+    super::kernel_v2::register_kernel_v2_tools(&mut registry)?;
+    let catalogue = build_ordinary_catalogue(
+        &registry,
+        super::registry::EngineKind::KernelV2,
+        false,
+        &ExperimentalExecutors::empty(),
+    )?;
+    Ok(replay_operations_from(&catalogue.contracts))
+}
+
+fn replay_operations_from(contracts: &OperationContracts) -> Vec<ReplayOperation> {
+    let mut operations = Vec::new();
+    for ((executor, operation), contract) in contracts {
+        if contract.access != OperationAccess::Mutation {
+            continue;
+        }
+        // The property may sit under a `oneOf` branch, so search the schema.
+        fn declares(schema: &Value, field: &str) -> bool {
+            match schema {
+                Value::Object(map) => {
+                    map.get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| properties.contains_key(field))
+                        || map.values().any(|value| declares(value, field))
+                }
+                Value::Array(items) => items.iter().any(|value| declares(value, field)),
+                _ => false,
+            }
+        }
+        let takes = |field: &str| declares(&contract.input_schema, field);
+        operations.push(ReplayOperation {
+            executor: executor.clone(),
+            operation: operation.clone(),
+            source_tool: contract.source_tool.clone(),
+            selector: contract
+                .selector
+                .as_ref()
+                .map(|selector| (selector.field.clone(), selector.value.clone())),
+            accepts_idempotency_key: takes("idempotency_key"),
+            accepts_reason: takes("reason"),
+            requires_acceptance: declared_requires_acceptance(executor, operation),
+        });
+    }
+    operations
+}
+
+/// Every operation declared local-first, whether or not the SQLite catalogue
+/// serves it, so the replay test can account for the ones it cannot run.
+#[doc(hidden)]
+pub fn declared_local_first_operations() -> Vec<(String, String)> {
+    acceptance::ACCEPTANCE_TABLE
+        .iter()
+        .filter(|(_, _, declared)| *declared == acceptance::Acceptance::LocalFirst)
+        .map(|(executor, operation, _)| (executor.to_string(), operation.to_string()))
+        .collect()
+}
 
 /// The node's input contracts come from the same registered ordinary surface
 /// as hosted execution and standby operation digests, without opening a DB.
@@ -280,6 +533,20 @@ impl NodeOperationContracts {
         self.contracts
             .get(&(executor.into(), operation.into()))
             .map(|contract| contract.digest.as_str())
+    }
+    /// The operation's acceptance declaration, if it is a declared write the
+    /// node's contracts know. `Some(true)`: it is queued and shown as waiting.
+    /// `Some(false)`: it is shown as done straight away. `None`: a read, or
+    /// not an operation of the ordinary surface.
+    #[cfg(test)]
+    pub(crate) fn declared_requires_acceptance(
+        &self,
+        executor: &str,
+        operation: &str,
+    ) -> Option<bool> {
+        self.contracts.get(&(executor.into(), operation.into()))?;
+        acceptance::declaration(executor, operation)
+            .map(|declared| matches!(declared, acceptance::Acceptance::Required(_)))
     }
     pub(crate) fn local() -> Result<Arc<Self>> {
         static LOCAL: OnceLock<Arc<NodeOperationContracts>> = OnceLock::new();
@@ -300,6 +567,34 @@ impl NodeOperationContracts {
         });
         let _ = LOCAL.set(contracts.clone());
         Ok(LOCAL.get().expect("local contracts initialized").clone())
+    }
+
+    /// The ordinary hosted v2 surface, including its hosted-only validation
+    /// rules. Standby/v1 catalogues must never authorize v2 queued requests.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn hosted_kernel_v2() -> Result<Arc<Self>> {
+        static HOSTED_V2: OnceLock<Arc<NodeOperationContracts>> = OnceLock::new();
+        if let Some(contracts) = HOSTED_V2.get() {
+            return Ok(contracts.clone());
+        }
+        let mut registry = ToolRegistry::new();
+        super::register_builtin_tools(&mut registry)?;
+        super::register_surface_tools(&mut registry)?;
+        super::kernel_v2::register_hosted_kernel_v2_tools(&mut registry)?;
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::registry::EngineKind::KernelV2,
+            true,
+            &ExperimentalExecutors::empty(),
+        )?;
+        let contracts = Arc::new(Self {
+            contracts: catalogue.contracts,
+        });
+        let _ = HOSTED_V2.set(contracts.clone());
+        Ok(HOSTED_V2
+            .get()
+            .expect("hosted v2 contracts initialized")
+            .clone())
     }
 
     /// `None` means no authoritative local contract, not successful validation.
@@ -436,6 +731,14 @@ pub(crate) struct PinnedExecutorCatalogue {
 }
 
 impl PinnedExecutorCatalogue {
+    /// Exact digests used by describe_operation; exposed only to boundary tests.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn contract_digest_for_test(&self, executor: &str, operation: &str) -> Option<&str> {
+        self.contracts
+            .get(&(executor.into(), operation.into()))
+            .map(|contract| contract.digest.as_str())
+    }
+
     pub(crate) fn manifest_digest(&self) -> &str {
         &self.manifest_digest
     }
@@ -699,6 +1002,30 @@ fn build_ordinary_catalogue_projection(
             candidate_plan_policy: "direct".into(),
         });
     }
+    // This source is never registered by a default composition. Like the
+    // configured outbox, its contracts exist only in an explicitly composed
+    // registry, and only on the kernel engine with real handlers.
+    #[cfg(feature = "v2-kernel-probe")]
+    if engine_kind == super::registry::EngineKind::KernelV2
+        && registry.get("manage_publication").is_some()
+    {
+        for (action, executor, policy) in [
+            ("inspect", "records_read", "direct"),
+            ("preview", "records_read", "direct"),
+            ("publish", "records_write", "plan_required"),
+            ("unpublish", "records_write", "plan_required"),
+        ] {
+            audit.audit_rows.push(AuditRow {
+                legacy_tool: "manage_publication".into(),
+                legacy_action: action.into(),
+                stability: "stable".into(),
+                availability: vec!["ordinary".into()],
+                candidate_executor: executor.into(),
+                candidate_operation: format!("manage_publication.{action}"),
+                candidate_plan_policy: policy.into(),
+            });
+        }
+    }
     // Source-owned development contracts exist only with the opt-in runtime
     // and real KernelV2 handlers. Frozen stable audit evidence stays unchanged.
     #[cfg(feature = "package-cel-dev")]
@@ -711,6 +1038,28 @@ fn build_ordinary_catalogue_projection(
                 availability: vec!["ordinary".into()],
                 candidate_executor: "records_read".into(),
                 candidate_operation: name.into(),
+                candidate_plan_policy: "direct".into(),
+            });
+        }
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    if engine_kind == super::registry::EngineKind::KernelV2
+        && registry.get("manage_saved_tabs").is_some()
+    {
+        for (action, executor) in [
+            ("get", "records_read"),
+            ("list", "records_read"),
+            ("create", "records_write"),
+            ("rename", "records_write"),
+            ("retire", "records_write"),
+        ] {
+            audit.audit_rows.push(AuditRow {
+                legacy_tool: "manage_saved_tabs".into(),
+                legacy_action: action.into(),
+                stability: "stable".into(),
+                availability: vec!["ordinary".into()],
+                candidate_executor: executor.into(),
+                candidate_operation: format!("manage_saved_tabs.{action}"),
                 candidate_plan_policy: "direct".into(),
             });
         }
@@ -746,6 +1095,32 @@ fn build_ordinary_catalogue_projection(
         )?);
     }
     let mut descriptors = executable_descriptors(source_descriptors, &operations_by_executor)?;
+    if write_operations::is_kernel_v2(engine_kind) {
+        // Frozen v1 descriptors carry prepare/execute alternatives. V2's
+        // callable envelope always performs the operation in one call.
+        for descriptor in &mut descriptors {
+            let name = descriptor["name"].as_str().unwrap_or_default().to_owned();
+            if matches!(name.as_str(), "bootstrap" | "describe_operation") {
+                continue;
+            }
+            let operations = operations_by_executor
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            descriptor["description"] = json!(format!("Execute {name} operations. Keep operation-specific fields under arguments. Each call executes directly with source authorization, validation and concurrency checks."));
+            descriptor["inputSchema"] = json!({
+                "type":"object", "additionalProperties":false,
+                "properties":{
+                    "operation":{"type":"string","enum":operations},
+                    "arguments":{"type":"object"},
+                    "run_key":{"type":"string"},
+                    "parent_key":{"type":"string"}
+                },
+                "required":["operation","arguments"]
+            });
+        }
+    }
+
     // The lean projection narrows discovery before post-processing, so the
     // format conditions and field listings describe exactly the directly
     // advertised operations. Contracts and the callable index stay whole.
@@ -764,6 +1139,7 @@ fn build_ordinary_catalogue_projection(
         descriptors.push(lean::call_executor_descriptor(
             &operations_by_executor,
             direct,
+            write_operations::is_kernel_v2(engine_kind),
         ));
     }
     // Bytes and digest are always computed over the served projection: a
@@ -799,10 +1175,13 @@ pub(crate) fn standby_read_only_descriptors(registry: &ToolRegistry) -> Result<V
 
 /// The node uses the same advertised read projection and operation digests as
 /// the standby dispatcher; no separate safety catalogue is maintained.
-pub(crate) fn standby_operation_rows(registry: &ToolRegistry) -> Result<Value> {
+pub(crate) fn standby_operation_rows(
+    registry: &ToolRegistry,
+    engine_kind: super::registry::EngineKind,
+) -> Result<Value> {
     let catalogue = build_ordinary_catalogue(
         registry,
-        super::registry::EngineKind::Sqlite,
+        engine_kind,
         false,
         &ExperimentalExecutors::empty(),
     )?;
@@ -884,8 +1263,9 @@ fn standby_read_only_discovery(
             .filter(|operation| {
                 contracts
                     .get(&(executor.clone(), (*operation).clone()))
-                    .is_some_and(|contract| contract.access == OperationAccess::Read)
-                    && !write_operations::requires_plan(executor, operation)
+                    .is_some_and(|contract| {
+                        contract.access == OperationAccess::Read && !contract.plan_required
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -962,7 +1342,7 @@ fn project_catalog_operations_snapshot_with_direct(
             let Some(contract) = contracts.get(&(executor.clone(), operation.clone())) else {
                 continue;
             };
-            let plan_required = write_operations::requires_plan(executor, &operation);
+            let plan_required = contract.plan_required;
             rows.push(CatalogOperationRow {
                 executor: contract.executor.clone(),
                 operation: contract.operation.clone(),
@@ -973,6 +1353,12 @@ fn project_catalog_operations_snapshot_with_direct(
                 },
                 plan_required,
                 direct_execution_enabled: !plan_required,
+                // Declared per operation, not per engine; reads are never
+                // listed and project false.
+                requires_acceptance: acceptance::requires_acceptance(
+                    &contract.executor,
+                    &contract.operation,
+                ),
                 contract_version: CONTRACT_VERSION.to_string(),
                 contract_digest: contract.digest.clone(),
                 source_tool: contract.source_tool.clone(),
@@ -1020,7 +1406,7 @@ impl OperationContract {
     }
 
     fn payload(&self) -> Value {
-        let plan_required = write_operations::requires_plan(&self.executor, &self.operation);
+        let plan_required = self.plan_required;
         let direct_execution_enabled = !plan_required;
         let schema_authority = if self.selector_specific_schema {
             "the registered selector-specific operation schema and exact-name production runtime handler"
@@ -1194,6 +1580,8 @@ pub struct ExecutorPrototypeStdioServer {
     write_runtime: Option<write_operations::WriteRuntime>,
     hosted_authority: Option<Arc<dyn HostedExecutorAuthority>>,
     hosted_membership_plans: bool,
+    #[cfg(feature = "v2-kernel-probe")]
+    hosted_publication_management: bool,
     deployment_mutation_barrier: Option<DeploymentMutationBarrier>,
     /// Transport-held persistence lease for one request. When set, the
     /// `tools/call` contract branch re-validates it against this server's
@@ -1749,6 +2137,8 @@ impl ExecutorPrototypeStdioServer {
             telemetry,
             write_runtime: plan_store.map(write_operations::WriteRuntime::new),
             hosted_membership_plans: hosted_authority.is_some(),
+            #[cfg(feature = "v2-kernel-probe")]
+            hosted_publication_management: false,
             hosted_authority,
             deployment_mutation_barrier,
             persistence_lease: None,
@@ -2007,6 +2397,9 @@ impl ExecutorPrototypeStdioServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if let Err(error) = super::proposal_run::check(lean::CALL_EXECUTOR, &arguments) {
+            return Some(self.deployment_read_only_response(id, modern, error));
+        }
         let (executor, envelope) = match lean::unwrap_envelope(&arguments) {
             Ok(target) => target,
             Err(diagnostic) => {
@@ -2112,6 +2505,9 @@ impl ExecutorPrototypeStdioServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if let Err(error) = super::proposal_run::check(&executor, &arguments) {
+            return Some(self.deployment_read_only_response(id, modern, error));
+        }
         if executor == "describe_operation" {
             return Some(self.describe_response(id, arguments, modern).await);
         }
@@ -2343,8 +2739,7 @@ impl ExecutorPrototypeStdioServer {
         // operations) before deployment admission or any plan/store access.
         // Reads fall through to the pinned exact-name delegation below.
         if self.write_runtime.is_none()
-            && (contract.access == OperationAccess::Mutation
-                || write_operations::requires_plan(&executor, &operation))
+            && (contract.access == OperationAccess::Mutation || contract.plan_required)
         {
             return Some(
                 self.standby_read_only_response(id, modern, &arguments)
@@ -2384,7 +2779,7 @@ impl ExecutorPrototypeStdioServer {
             Some(DeploymentAdmission::Writable(lease)) => Some(lease.clone()),
             Some(DeploymentAdmission::FrozenRead) | None => None,
         };
-        if write_operations::requires_plan(&executor, &operation) {
+        if contract.plan_required {
             return Some(
                 Box::pin(self.handle_plan_backed_write(
                     id,
@@ -2485,6 +2880,25 @@ impl ExecutorPrototypeStdioServer {
                     Some(true),
                     true,
                 )
+                .await,
+            );
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if contract.kernel_v2
+            && write_operations::uses_guarded_v2_execution(
+                &contract.source_tool,
+                &contract.operation,
+            )
+        {
+            return Some(
+                Box::pin(self.execute_guarded_v2_direct(
+                    id,
+                    modern,
+                    message,
+                    contract,
+                    arguments,
+                    deployment_persistence_lease,
+                ))
                 .await,
             );
         }
@@ -2619,12 +3033,26 @@ impl ExecutorPrototypeStdioServer {
         } else {
             self.caller.clone()
         };
-        let outcome = self
-            .delegate_with_caller_and_persistence(
+        let write_context = match (&self.telemetry, &telemetry_request) {
+            (Some(telemetry), Some(request)) => telemetry.write_context(
+                request,
+                &contract.source_tool,
+                operation_arguments
+                    .get("idempotency_key")
+                    .and_then(Value::as_str),
+            ),
+            _ => crate::write_diagnostics::Context::new(
+                crate::write_diagnostics::operation_label(&contract.source_tool),
+                None,
+                None,
+            ),
+        };
+        let outcome = write_context
+            .scope(self.delegate_with_caller_and_persistence(
                 message,
                 delegate_caller,
                 deployment_persistence_lease,
-            )
+            ))
             .await;
         let mut body = outcome_body(outcome)?;
         let success = response_succeeded(&body);
@@ -2776,10 +3204,29 @@ impl ExecutorPrototypeStdioServer {
         caller: Caller,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> RpcOutcome {
-        // This facade observes MCP regardless of how the principal was
-        // authenticated. Preserve that principal while stamping the transport
-        // before the governed first-call identity capture.
-        let caller = caller.with_channel(crate::provenance::Channel::Mcp);
+        // The explicit hosted cookie publication adapter carries genuine Web
+        // authority. Preserve its observed channel through source dispatch;
+        // every other facade retains the historical MCP transport stamp.
+        #[cfg(feature = "v2-kernel-probe")]
+        let cookie_publication = self.hosted_publication_management
+            && caller.channel() == crate::provenance::Channel::Web
+            && caller.hosted_cookie_session().is_some()
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+            && message.pointer("/params/name").and_then(Value::as_str)
+                == Some("manage_publication")
+            && matches!(
+                message
+                    .pointer("/params/arguments/action")
+                    .and_then(Value::as_str),
+                Some("inspect" | "preview" | "publish" | "unpublish")
+            );
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let cookie_publication = false;
+        let caller = if cookie_publication {
+            caller
+        } else {
+            caller.with_channel(crate::provenance::Channel::Mcp)
+        };
         if protocol::is_modern_request(&message) {
             Box::pin(protocol::handle_modern_engine_message_with_persistence(
                 self.registry.clone(),
@@ -3170,7 +3617,12 @@ impl ExecutorPrototypeStdioServer {
     /// Lean fields for bootstrap's exposure summary; `None` off lean.
     fn lean_exposure(&self) -> Option<Value> {
         self.direct_operations.as_ref().map(|direct| {
-            lean::exposure_summary(&self.operations_by_executor, direct, &self.descriptors)
+            lean::exposure_summary(
+                &self.operations_by_executor,
+                direct,
+                &self.descriptors,
+                write_operations::is_kernel_v2(self.engine.kind()),
+            )
         })
     }
 
@@ -3350,6 +3802,14 @@ impl ExecutorPrototypeLensServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if let Err(error) = super::proposal_run::check(&executor, &arguments) {
+            let mut result = protocol::call_error_content(&error, Value::Null, None);
+            if modern {
+                protocol::add_modern_result_fields(&mut result);
+            }
+            result["_meta"]["nativeExecutor"] = self.executor_meta();
+            return Some(json!({"jsonrpc":"2.0","id":id,"result":result}));
+        }
         if let Err(error) = render::reject_format(&arguments, "lens executor") {
             return Some(
                 self.error_response(id, modern, &error, None, &arguments)
@@ -3378,7 +3838,8 @@ impl ExecutorPrototypeLensServer {
             // Lens dispatch selects its own representation and rejects a
             // format argument. Its structured payload is sufficient for the
             // executor's fixed JSON rendering below.
-            let mut body = outcome_body(self.delegate(message).await)?;
+            let diagnostics = crate::write_diagnostics::Context::new("bootstrap", None, None);
+            let mut body = outcome_body(diagnostics.scope(self.delegate(message)).await)?;
             rewrite_executor_bootstrap(
                 &mut body,
                 render::Format::Json,
@@ -3597,7 +4058,21 @@ impl ExecutorPrototypeLensServer {
             });
         }
         let started = Instant::now();
-        let mut body = outcome_body(self.delegate(message).await)?;
+        let write_context = match (&self.telemetry, &telemetry_request) {
+            (Some(telemetry), Some(request)) => telemetry.write_context(
+                request,
+                &contract.source_tool,
+                normalized_arguments
+                    .get("idempotency_key")
+                    .and_then(Value::as_str),
+            ),
+            _ => crate::write_diagnostics::Context::new(
+                crate::write_diagnostics::operation_label(&contract.source_tool),
+                None,
+                None,
+            ),
+        };
+        let mut body = outcome_body(write_context.scope(self.delegate(message)).await)?;
         let success = response_succeeded(&body);
         if !success {
             attach_repair(
@@ -3885,6 +4360,106 @@ impl ExecutorPrototypeLensServer {
     }
 }
 
+/// Reviewed, append-only historical capture contracts. Never replace a digest
+/// when current descriptions/schemas change: qualify an additional row instead.
+#[cfg(feature = "v2-kernel-probe")]
+type OriginalSettlementContractRow = (
+    u32,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    &'static str,
+);
+#[cfg(feature = "v2-kernel-probe")]
+const ORIGINAL_SETTLEMENT_CONTRACTS: &[OriginalSettlementContractRow] = &[
+    (
+        7,
+        "records_write",
+        "update_record",
+        "update_record",
+        None,
+        "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a",
+    ),
+    (
+        8,
+        "records_write",
+        "create_record",
+        "create_record",
+        None,
+        "79c37864d58d7fa2b3e55e2f13cb075658cae8ecd01b2f84b3e8d80b944dfff2",
+    ),
+    // Qualification-fixture evidence (not a live queue):
+    // src/mcp/original_settlement_variant_nine_evidence.json, indices 0/2 and 6
+    // of accepted-cut-restart-D-retained.json from runtime 10 / c9.
+    (
+        9,
+        "records_write",
+        "update_record",
+        "update_record",
+        None,
+        "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a",
+    ),
+    (
+        9,
+        "records_write",
+        "create_record",
+        "create_record",
+        None,
+        "79c37864d58d7fa2b3e55e2f13cb075658cae8ecd01b2f84b3e8d80b944dfff2",
+    ),
+    (
+        9,
+        "records_lifecycle",
+        "archive_record",
+        "archive_record",
+        None,
+        "1a5246b61da5afaa2feb85945b918b45780c9b0b9f15a0c32afc88283831c57f",
+    ),
+    (
+        9,
+        "records_write",
+        "manage_links.add",
+        "manage_links",
+        Some("add"),
+        "fc94ae7c32c84e0a8409fb06b9814ac6f55962835d56b9893f313cfcd758321c",
+    ),
+    (
+        9,
+        "records_write",
+        "manage_links.remove",
+        "manage_links",
+        Some("remove"),
+        "b3df2597d4ea4ce1b0a43a749a85eca5ce6ec9d357394fae6a6d1f08aac7d1dd",
+    ),
+];
+
+/// A submitted digest must match its literal row, not today's contract builder.
+/// None selects a reviewed example for trusted fixture/capture construction;
+/// producer qualification always supplies Some(the retained digest).
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn original_settlement_contract(
+    variant: u32,
+    source: &str,
+    action: Option<&str>,
+    catalog_executor: &str,
+    catalog_operation: &str,
+    retained_digest: Option<&str>,
+) -> Result<Option<String>> {
+    Ok(ORIGINAL_SETTLEMENT_CONTRACTS
+        .iter()
+        .rev()
+        .find(|(v, e, c, s, a, d)| {
+            *v == variant
+                && *e == catalog_executor
+                && *c == catalog_operation
+                && *s == source
+                && *a == action
+                && retained_digest.is_none_or(|submitted| submitted == *d)
+        })
+        .map(|row| row.5.to_owned()))
+}
+
 #[cfg(test)]
 fn build_contracts(
     registry: &ToolRegistry,
@@ -3952,12 +4527,51 @@ fn build_contracts_for_hosting(
         // this environment cannot advertise the operation. Availability is a
         // runtime concern; a broken compatibility mapping is always a build
         // error.
-        let contract = operation_contract(
-            source.input_schema_for_engine(engine_kind),
-            &source.description,
+        if write_operations::is_kernel_v2(engine_kind) {
+            // Validate the complete audited source mapping even when v2 has
+            // no handler for this action. Its truthful engine schema may omit
+            // unsupported actions (for example binding observations), so
+            // availability must precede projection of that engine schema.
+            let source_contract = operation_contract(
+                &source.input_schema,
+                &source.description,
+                row,
+                surface,
+                source.operation_schema(&row.legacy_action),
+            )?;
+            if !registry.has_engine_operation(
+                &row.legacy_tool,
+                engine_kind,
+                source_contract
+                    .selector
+                    .as_ref()
+                    .map(|selector| (selector.field.as_str(), selector.value.as_str())),
+            ) {
+                continue;
+            }
+        }
+        let engine_schema = source.input_schema_for_engine(engine_kind);
+        // An explicit v2 engine schema owns its accepted shape. Project the
+        // selected action from it instead of hydrating a legacy operation
+        // schema which may omit v2 concurrency guards or package fields.
+        let engine_schema_override = write_operations::is_kernel_v2(engine_kind)
+            && !std::ptr::eq(engine_schema, &source.input_schema);
+        let selector_schema = if engine_schema_override {
+            None
+        } else {
+            source.operation_schema(&row.legacy_action)
+        };
+        let mut contract = operation_contract(
+            engine_schema,
+            if write_operations::is_kernel_v2(engine_kind) {
+                kernel_v2_tool_description(&row.legacy_tool)
+                    .unwrap_or_else(|| source.description_for_engine(engine_kind))
+            } else {
+                source.description_for_engine(engine_kind)
+            },
             row,
             surface,
-            source.operation_schema(&row.legacy_action),
+            selector_schema,
         )?
         .with_registered_access(registry);
         if !registry.has_engine_operation(
@@ -3972,34 +4586,31 @@ fn build_contracts_for_hosting(
             // in this environment and therefore must not be advertised.
             continue;
         }
-        #[cfg(feature = "v2-kernel-probe")]
-        let retained_view_plan = engine_kind == super::registry::EngineKind::KernelV2
-            && row.legacy_tool == "manage_named_views"
-            && matches!(
-                row.candidate_operation.as_str(),
-                "activate_view" | "unpublish_view"
-            );
-        #[cfg(not(feature = "v2-kernel-probe"))]
-        let retained_view_plan = false;
-        if engine_kind != super::registry::EngineKind::Sqlite
-            && !retained_view_plan
-            && write_operations::requires_plan(&row.candidate_executor, &row.candidate_operation)
-        {
-            // The signed plan store is currently SQLite-qualified. A source
-            // handler or preparer on another backend is not by itself an
-            // executable plan route, so withhold every plan-required contract
-            // before tools/list and selection.
-            continue;
-        }
-        if !operation_has_execution_path_for_hosting(
-            surface,
+        contract.kernel_v2 = write_operations::is_kernel_v2(engine_kind);
+        contract.plan_required = write_operations::requires_plan_for_engine(
+            engine_kind,
             &row.candidate_executor,
             &row.candidate_operation,
-            hosted_membership_plans,
-        ) {
-            // The dogfood policy forbids raw execution for these high-risk
-            // operations. Until a truthful non-mutating preparer exists, the
-            // production handler alone is not an executable executor route.
+        );
+        if contract.kernel_v2 {
+            contract.digest = jcs_sha256(&json!({
+                "source_contract_digest": contract.digest,
+                "engine": "kernel-v2",
+                "plan_required": contract.plan_required,
+            }))?;
+        }
+        if engine_kind != super::registry::EngineKind::Sqlite && contract.plan_required {
+            // Legacy signed plans are qualified only on SQLite.
+            continue;
+        }
+        if !contract.kernel_v2
+            && !operation_has_execution_path_for_hosting(
+                surface,
+                &row.candidate_executor,
+                &row.candidate_operation,
+                hosted_membership_plans,
+            )
+        {
             continue;
         }
         operations_by_executor
@@ -4128,6 +4739,29 @@ fn validate_candidate_plan_policy(row: &AuditRow) -> Result<()> {
     Ok(())
 }
 
+/// V2 source descriptions disclose the direct handler contract without the
+/// legacy public planning ceremony. Keep these separate from v1 registration.
+fn kernel_v2_tool_description(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "correct_record_type" => "Correct a live record's mistaken spine type in one direct call. Requires Manage on the target and an explicit target kind. Source validation and supplied concurrency guards apply atomically.",
+        "manage_canvas" => "Manage a canvas and promote provisional objects into records in one direct call. Requires Edit on the canvas; promotion also checks destination and relationship permissions. An optional dry run previews promotion, and an optional digest binds execution to that preview.",
+        "manage_record_policy" => "Inspect or change a record's explicit or inherited access policy in one direct call. Mutations require Manage on the target, subject to the host-verified workspace-owner root exception. Source identity checks, owner protections, revision guards, and atomic batch validation apply.",
+        "manage_publication" => "Inspect or change public publication state in one direct call. Source authorization, publication eligibility, source-version guards, and idempotency keys apply atomically.",
+        "manage_named_views" => "Manage named views in one direct call. Activation and unpublication require source generation and idempotency keys; source authorization, package validation and concurrency checks apply atomically.",
+        "activate_view" => "Activate a named view in one direct call using its source generation and idempotency key. Source authorization, package validation, and concurrency checks apply atomically.",
+        "unpublish_view" => "Unpublish a named view in one direct call using its source generation and idempotency key. Source authorization and concurrency checks apply atomically.",
+        "manage_bindings" => "Inspect or change record identity bindings in one direct call. Source authorization, binding ownership and collision checks, and supplied concurrency guards apply atomically.",
+        "manage_memberships" => "Manage workspace memberships and member invitations in one direct call. The host verifies the caller's authority and enforces role, ownership, and invitation constraints. Guest links require separate v2 support.",
+        "manage_vocabularies" => "Inspect or change vocabulary definitions and values in one direct call. Source authorization, usage constraints, and supplied revision guards apply atomically.",
+        "manage_schema_config" => "Read or change workspace schema configuration in one direct call. Source authorization, configuration validation, and supplied revision guards apply atomically.",
+        "delete_record" => "Delete a record in one direct call. Source authorization, lifecycle constraints, and supplied concurrency guards apply atomically.",
+        "manage_attachments" => "Inspect or change record attachments in one direct call. Source authorization, attachment ownership, and supplied concurrency guards apply atomically.",
+        "manage_citations" => "Inspect or change record citations in one direct call. Source authorization, citation identity, and supplied concurrency guards apply atomically.",
+        "manage_artifact_module_grants" => "Inspect or change artifact module grants in one direct call. Source authorization, module identity, and grant constraints apply atomically.",
+        _ => return None,
+    })
+}
+
 fn operation_contract(
     source_schema: &Value,
     source_description: &str,
@@ -4148,7 +4782,9 @@ fn operation_contract(
     let selector = if row.legacy_action == "call" {
         None
     } else {
-        find_selector(source_schema, &row.legacy_action)
+        find_selector(source_schema, &row.legacy_action).or_else(|| {
+            selector_specific_schema.and_then(|schema| find_selector(schema, &row.legacy_action))
+        })
     };
     if row.legacy_action != "call" && selector.is_none() {
         return Err(Error::engine(format!(
@@ -4160,7 +4796,11 @@ fn operation_contract(
         Some(schema) => schema.clone(),
         None => project_operation_schema(source_schema, selector.as_ref(), surface)?,
     };
-    strip_routing_fields(&mut input_schema, None, surface);
+    strip_routing_fields(
+        &mut input_schema,
+        selector.as_ref().map(|s| s.field.as_str()),
+        surface,
+    );
     if surface == ExecutorSurface::Ordinary
         && row.candidate_executor == "records_read"
         && row.candidate_operation == "query_record"
@@ -4208,6 +4848,11 @@ fn operation_contract(
         input_schema,
         selector_specific_schema: selector_specific_schema.is_some(),
         access: OperationAccess::Mutation,
+        plan_required: write_operations::requires_plan(
+            &row.candidate_executor,
+            &row.candidate_operation,
+        ),
+        kernel_v2: false,
         digest,
         bytes,
     })
@@ -4372,9 +5017,7 @@ fn add_ordinary_executor_format_contracts(
             if executor != &name {
                 continue;
             }
-            if !write_operations::requires_plan(executor, operation)
-                && render::has_renderer(&contract.source_tool)
-            {
+            if !contract.plan_required && render::has_renderer(&contract.source_tool) {
                 text_operations.push(operation.clone());
             } else {
                 json_operations.push(operation.clone());
@@ -5258,6 +5901,11 @@ fn validate_enabled_operation(
     arguments: Value,
     hosted_authority: Option<&dyn HostedExecutorAuthority>,
 ) -> Result<()> {
+    if contract.kernel_v2 {
+        // The selected v2 schema and exact source handler own validation;
+        // legacy preparer parsers describe a different backend contract.
+        return Ok(());
+    }
     if read_operations::supports(&contract.executor, &contract.operation) {
         return read_operations::validate(&contract.executor, &contract.operation, arguments);
     }
@@ -5958,7 +6606,7 @@ fn repair_cue(
         });
     if routing_rejected.is_none()
         && contract.surface == ExecutorSurface::Ordinary
-        && !write_operations::requires_plan(&contract.executor, &contract.operation)
+        && !contract.plan_required
     {
         let mut format_arguments = envelope.clone();
         if render::take_format(&contract.source_tool, &mut format_arguments).is_err() {
@@ -6162,7 +6810,7 @@ fn repair_cue(
     }
     if routing_rejected.is_none()
         && contract.surface == ExecutorSurface::Ordinary
-        && !write_operations::requires_plan(&contract.executor, &contract.operation)
+        && !contract.plan_required
         && failing_pointer == "/arguments/format"
     {
         expected_shape["description"] = json!(
@@ -6355,9 +7003,7 @@ fn minimal_corrected_envelope(
     {
         return None;
     }
-    if contract.surface == ExecutorSurface::Ordinary
-        && !write_operations::requires_plan(&contract.executor, &contract.operation)
-    {
+    if contract.surface == ExecutorSurface::Ordinary && !contract.plan_required {
         // A moved selector must be executable, not merely absent from the
         // operation arguments. Do not advertise an invalid format as retry-ready.
         let mut translated = translate_arguments(contract, &corrected).ok()?;
@@ -7057,7 +7703,7 @@ mod tests {
                     assert!(view.descriptor["description"]
                         .as_str()
                         .unwrap()
-                        .contains("gated off by default"));
+                        .contains("default off except proposals"));
                     assert_eq!(
                         view.descriptor["inputSchema"]["oneOf"]
                             .as_array()
@@ -7765,6 +8411,70 @@ mod tests {
         patched
     }
 
+    #[tokio::test]
+    async fn named_view_proposal_lens_refusal_precedes_run_allocation_even_when_unavailable() {
+        struct CountingLens(std::sync::atomic::AtomicUsize);
+        impl LensDispatch for CountingLens {
+            fn exposure_policy(
+                &self,
+                registry: &ToolRegistry,
+            ) -> super::super::ResolvedToolExposure {
+                BootstrapLensDispatch.exposure_policy(registry)
+            }
+            fn tools_list(&self, _: &ToolRegistry, _: bool) -> Result<Value> {
+                Ok(json!({"tools":[]}))
+            }
+            fn run_context<'a>(
+                &'a self,
+                _: &'a ToolRegistry,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Value> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Value::Null })
+            }
+            fn tools_call<'a>(
+                &'a self,
+                _: &'a ToolRegistry,
+                _: &'a serde_json::Map<String, Value>,
+                _: bool,
+            ) -> BoxFuture<'a, std::result::Result<Value, (i64, String)>> {
+                Box::pin(async { panic!("unsupported proposal must not reach source dispatch") })
+            }
+            fn revision(&self) -> i64 {
+                1
+            }
+        }
+        let registry = registry();
+        let dispatcher = Arc::new(CountingLens(std::sync::atomic::AtomicUsize::new(0)));
+        let catalogue = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let server = ExecutorPrototypeLensServer::new_with_pinned_catalogue(
+            registry,
+            dispatcher.clone(),
+            catalogue,
+            None,
+        )
+        .unwrap();
+        for run in ["new", "new:scout-chair"] {
+            let response=server.handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"records_read","arguments":{"operation":"propose_view","run_key":run,"format":"bad"}
+            }})).await.unwrap();
+            assert!(
+                response.to_string().contains("cannot allocate"),
+                "{response}"
+            );
+            assert_eq!(dispatcher.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        // Preserve unrelated read error decoration, including its normal allocation seam.
+        let _ = server.handle_message(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"records_read","arguments":{"operation":"get_record","run_key":"new","format":"bad"}
+        }})).await.unwrap();
+        assert_eq!(dispatcher.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     struct BootstrapLensDispatch;
 
     impl LensDispatch for BootstrapLensDispatch {
@@ -8374,7 +9084,7 @@ mod tests {
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            44_228
+            44_714
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -8391,7 +9101,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            50_458
+            50_944
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -14433,6 +15143,13 @@ mod tests {
                     surface,
                     &row.candidate_executor,
                     &row.candidate_operation,
+                ) && registry.has_engine_operation(
+                    &row.legacy_tool,
+                    super::super::registry::EngineKind::Sqlite,
+                    contract
+                        .selector
+                        .as_ref()
+                        .map(|s| (s.field.as_str(), s.value.as_str())),
                 ) {
                     assert_eq!(contracts.get(&key).unwrap().digest, contract.digest);
                     assert!(operations[&row.candidate_executor].contains(&row.candidate_operation));
@@ -16053,6 +16770,8 @@ mod tests {
 
     fn test_contract(operation: &str, input_schema: Value) -> OperationContract {
         OperationContract {
+            plan_required: false,
+            kernel_v2: false,
             surface: ExecutorSurface::Ordinary,
             executor: "test".into(),
             operation: operation.into(),
@@ -17450,21 +18169,22 @@ mod tests {
             default["result"].get("structuredContent").is_none(),
             "safe default Text must not duplicate the handler payload: {default}"
         );
-        for key in [
-            "version",
-            "body_digest",
-            "created_at",
-            "updated_at",
-            "custody_boundary",
-            "containment_path_visible",
-            "lifecycle_interpretation",
-        ] {
-            let expected = format!("\"{key}\":");
+        // Lean text keeps the write-guard tokens and points at JSON once for
+        // the bookkeeping it leaves out.
+        for kept in ["version rec:", "body_digest "] {
             assert!(
-                default_text.contains(&expected),
-                "default prose lost {key}: {default_text}"
+                default_text.contains(kept),
+                "default prose lost {kept}: {default_text}"
             );
         }
+        for left in ["created_at", "updated_at", "lifecycle_interpretation"] {
+            assert!(!default_text.contains(left), "{left}: {default_text}");
+        }
+        assert!(
+            default_text
+                .contains("More fields: get_record with the same arguments and format:\"json\""),
+            "{default_text}"
+        );
         assert!(!default_text.contains("Read scope:"), "{default_text}");
         assert!(default_text.contains("Kind governance:"), "{default_text}");
         assert!(default_text.contains("Contribution:"), "{default_text}");
@@ -20503,3 +21223,19 @@ pub(crate) mod named_views;
 #[cfg(all(test, feature = "package-cel-dev"))]
 #[path = "package_delivery_tests.rs"]
 mod package_delivery_tests;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[path = "publication_executor_tests.rs"]
+mod publication_tests;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[path = "saved_tabs_executor_tests.rs"]
+mod saved_tabs_tests;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[path = "catalogue_v2_tests.rs"]
+mod catalogue_v2_tests;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[path = "original_settlement_contract_tests.rs"]
+mod original_settlement_contract_tests;

@@ -35,6 +35,7 @@ type ExportedDeltas = Arc<Mutex<HashMap<String, (Vec<u8>, BinaryDeltaMeta)>>>;
 pub(super) struct Calls {
     mcp_delta: AtomicUsize,
     starts: AtomicUsize,
+    polls: AtomicUsize,
     reads: AtomicUsize,
     cancels: AtomicUsize,
 }
@@ -149,6 +150,13 @@ pub(super) async fn serve_host(
                 (db.clone(), served.clone(), spool.clone(), exports.clone());
             tokio::spawn(async move {
                 let request = read_raw_request(&mut stream).await;
+                assert_eq!(
+                    header_value(
+                        &request.headers,
+                        crate::standby::shapes::ACCEPTED_SHAPES_HEADER
+                    ),
+                    Some(crate::standby::shapes::advertisement())
+                );
                 assert!(request
                     .headers
                     .to_ascii_lowercase()
@@ -257,6 +265,7 @@ pub(super) async fn serve_host(
                     meta.outer_sha256.clone()
                 };
                 if !bytes_route {
+                    calls.polls.fetch_add(1, Ordering::SeqCst);
                     respond_json(
                         &mut stream,
                         "200 OK",
@@ -421,6 +430,7 @@ async fn stale_copy_catches_up_through_a_multi_megabyte_cut_over_the_chunked_rou
     assert_eq!(no_full.calls.load(Ordering::SeqCst), 0, "no FULL attempted");
     assert_eq!(calls.mcp_delta.load(Ordering::SeqCst), 0);
     assert_eq!(calls.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.polls.load(Ordering::SeqCst), 1);
     assert!(
         calls.reads.load(Ordering::SeqCst) >= 8,
         "an ~8.6 MB cut takes many one-MiB ranges, got {}",

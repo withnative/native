@@ -1,0 +1,86 @@
+[
+  {
+    "key": "prism.records",
+    "label": "Your 120 most recent tasks, 40 epics and 40 decisions: status, area, priority, epic and counts (no bodies)",
+    "need": "sql.snapshot.v1",
+    "sql": "WITH shared_records AS NOT MATERIALIZED (SELECT id, type, kind, name, lifecycle, summary, created_at, last_activity_at, deleted_at FROM records), shared_links AS NOT MATERIALIZED (SELECT id, source_id, target_id, relationship FROM links)  SELECT r.id, r.type, r.kind, r.name, r.lifecycle, substr(r.summary, 1, 280) AS summary, (SELECT f.value FROM facet_values f WHERE f.record_id = r.id AND f.key = 'area') AS area, (SELECT f.value FROM facet_values f WHERE f.record_id = r.id AND f.key = 'priority') AS priority, (SELECT e.id FROM shared_links l JOIN shared_records e ON e.id = l.target_id WHERE l.source_id = r.id AND l.relationship = 'part_of' AND e.kind = 'epic' ORDER BY e.id LIMIT 1) AS epic_id, (SELECT e.name FROM shared_links l JOIN shared_records e ON e.id = l.target_id WHERE l.source_id = r.id AND l.relationship = 'part_of' AND e.kind = 'epic' ORDER BY e.id LIMIT 1) AS epic_name, (SELECT COUNT(*) FROM shared_links l JOIN shared_records c ON c.id = l.source_id WHERE l.target_id = r.id AND l.relationship = 'part_of' AND c.kind = 'comment') AS comments, (SELECT COUNT(*) FROM shared_links l WHERE l.source_id = r.id OR l.target_id = r.id) AS links, NULL AS events, r.created_at, r.last_activity_at FROM shared_records r WHERE r.id IN (SELECT id FROM (SELECT t.id FROM shared_records t WHERE t.deleted_at IS NULL AND t.type = 'WorkItem' AND t.kind = 'task' ORDER BY t.last_activity_at DESC, t.id LIMIT 120) UNION ALL SELECT id FROM (SELECT p.id FROM shared_records p WHERE p.deleted_at IS NULL AND p.type = 'WorkItem' AND p.kind = 'epic' ORDER BY p.last_activity_at DESC, p.id LIMIT 40) UNION ALL SELECT id FROM (SELECT d.id FROM shared_records d WHERE d.deleted_at IS NULL AND d.type = 'Resolution' AND d.kind = 'decision' ORDER BY d.last_activity_at DESC, d.id LIMIT 40)) ORDER BY r.last_activity_at DESC, r.id LIMIT 200"
+  },
+  {
+    "key": "prism.body",
+    "label": "The body of the task, epic or decision you pick, read when you pick it",
+    "need": "sql.snapshot.v1",
+    "params": [
+      {
+        "max_len": 64,
+        "name": "id",
+        "type": "text"
+      }
+    ],
+    "sql": "SELECT id, body FROM records WHERE id = ?1 AND ((type = 'WorkItem' AND kind IN ('task', 'epic')) OR (type = 'Resolution' AND kind = 'decision'))"
+  },
+  {
+    "key": "prism.facets",
+    "label": "Every field (facet) on the record you pick",
+    "need": "sql.snapshot.v1",
+    "params": [
+      {
+        "max_len": 64,
+        "name": "id",
+        "type": "text"
+      }
+    ],
+    "sql": "SELECT f.key, substr(f.value, 1, 240) AS value, f.value_num, f.vocab_ref, f.created_at FROM facet_values f WHERE f.record_id = ?1 AND EXISTS (SELECT 1 FROM records s WHERE s.id = ?1 AND ((s.type = 'WorkItem' AND s.kind IN ('task', 'epic')) OR (s.type = 'Resolution' AND s.kind = 'decision'))) ORDER BY f.key, f.id LIMIT 100"
+  },
+  {
+    "key": "prism.links",
+    "label": "Records linked to the one you pick, either direction, with link type and note (comments excluded)",
+    "need": "sql.snapshot.v1",
+    "params": [
+      {
+        "max_len": 64,
+        "name": "id",
+        "type": "text"
+      }
+    ],
+    "sql": "SELECT l.id, CASE WHEN l.source_id = ?1 THEN 'out' ELSE 'in' END AS direction, l.relationship, substr(l.note, 1, 200) AS note, o.id AS other_id, o.type AS other_type, o.kind AS other_kind, o.name AS other_name, o.lifecycle AS other_lifecycle, l.created_at FROM links l JOIN records o ON o.id = CASE WHEN l.source_id = ?1 THEN l.target_id ELSE l.source_id END WHERE (l.source_id = ?1 OR l.target_id = ?1) AND o.deleted_at IS NULL AND NOT (o.kind = 'comment' AND l.relationship = 'part_of') AND EXISTS (SELECT 1 FROM records s WHERE s.id = ?1 AND ((s.type = 'WorkItem' AND s.kind IN ('task', 'epic')) OR (s.type = 'Resolution' AND s.kind = 'decision'))) ORDER BY l.created_at, l.id LIMIT 200"
+  },
+  {
+    "key": "prism.comments",
+    "label": "Comments on the record you pick: title, first 1,200 characters, time, and the account and run behind each",
+    "need": "sql.snapshot.v1",
+    "params": [
+      {
+        "max_len": 64,
+        "name": "id",
+        "type": "text"
+      }
+    ],
+    "sql": "SELECT c.id, c.name, substr(c.body, 1, 1200) AS body, length(c.body) AS body_length, c.lifecycle, c.created_at, (SELECT e.actor FROM content_events e WHERE e.record_id = c.id AND e.type = 'record.created' ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = c.id AND e.type = 'record.created' ORDER BY e.local_seq LIMIT 1) AS run_key FROM links l JOIN records c ON c.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' AND c.kind = 'comment' AND c.deleted_at IS NULL AND EXISTS (SELECT 1 FROM records s WHERE s.id = ?1 AND ((s.type = 'WorkItem' AND s.kind IN ('task', 'epic')) OR (s.type = 'Resolution' AND s.kind = 'decision'))) ORDER BY c.created_at, c.id LIMIT 200"
+  },
+  {
+    "key": "prism.history",
+    "label": "Latest 200 history events on the record you pick: what happened, which account and run, when, which field",
+    "need": "sql.snapshot.v1",
+    "params": [
+      {
+        "max_len": 64,
+        "name": "id",
+        "type": "text"
+      }
+    ],
+    "sql": "SELECT e.local_seq, e.type, e.actor, e.run_key, e.parent_key, e.created_at, (SELECT o.key FROM facet_observations o WHERE o.record_id = e.record_id AND o.event_seq = e.local_seq ORDER BY o.id LIMIT 1) AS facet_key, (SELECT substr(o.value, 1, 120) FROM facet_observations o WHERE o.record_id = e.record_id AND o.event_seq = e.local_seq ORDER BY o.id LIMIT 1) AS facet_value FROM content_events e WHERE e.record_id = ?1 AND EXISTS (SELECT 1 FROM records s WHERE s.id = ?1 AND ((s.type = 'WorkItem' AND s.kind IN ('task', 'epic')) OR (s.type = 'Resolution' AND s.kind = 'decision'))) ORDER BY e.local_seq DESC LIMIT 200"
+  },
+  {
+    "key": "prism.runs",
+    "label": "What the agent runs that touched the record said they were doing, where still known (last 24 hours)",
+    "need": "sql.snapshot.v1",
+    "params": [
+      {
+        "max_len": 64,
+        "name": "id",
+        "type": "text"
+      }
+    ],
+    "sql": "SELECT a.run_key, substr(a.declared_intent, 1, 200) AS intent, a.started_at FROM agent_activity a WHERE a.run_key IN (SELECT e.run_key FROM content_events e WHERE e.record_id = ?1 AND e.run_key IS NOT NULL) AND EXISTS (SELECT 1 FROM records s WHERE s.id = ?1 AND ((s.type = 'WorkItem' AND s.kind IN ('task', 'epic')) OR (s.type = 'Resolution' AND s.kind = 'decision'))) ORDER BY a.started_at DESC, a.activity_id LIMIT 50"
+  }
+]

@@ -402,6 +402,64 @@ async fn strip_read_log_from_snapshot(target: &std::path::Path) -> Result<u64> {
     strip_tables_from_snapshot(target, READ_LOG_TABLES).await
 }
 
+/// Remove the compiled stored-visibility marking objects from a completed,
+/// owned snapshot, then VACUUM and verify it (decision fb924ec Q4: derived
+/// `p_*` state is stripped from every export and rebuilt on restore).
+///
+/// The strip is whole-set ([`crate::kernel::stored_visibility::strip_exact_on`]):
+/// it removes the objects only when the copy's complete accelerator inventory
+/// is exactly the compiled set. Any drifted or unknown object, including one
+/// attached to a marking table, leaves the copy unchanged, so the receiver's
+/// exact schema check refuses the file exactly as it does today. Runs before any manifest is derived,
+/// so the manifest still describes the shipped bytes. A snapshot without the
+/// objects (every file today) is not reopened for writing.
+#[doc(hidden)]
+pub async fn strip_marking_from_snapshot(target: &std::path::Path) -> Result<u64> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    {
+        let mut probe =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", target.to_string_lossy()))?
+                .read_only(true)
+                .connect()
+                .await?;
+        let present = crate::kernel::stored_visibility::object_state_on(&mut probe).await?
+            != crate::kernel::stored_visibility::ObjectState::Absent;
+        probe.close().await?;
+        if present {
+            let mut conn =
+                SqliteConnectOptions::from_str(&format!("sqlite:{}", target.to_string_lossy()))?
+                    .read_only(false)
+                    .connect()
+                    .await?;
+            let mut tx = sqlx::Connection::begin(&mut conn).await?;
+            let dropped = crate::kernel::stored_visibility::strip_exact_on(&mut tx).await?;
+            tx.commit().await?;
+            if dropped == 0 {
+                // Drifted or unknown accelerator DDL: shipped unchanged so the
+                // receiver's exact schema check refuses it, as it does today.
+                tracing::warn!(
+                    diagnostic = "export_accelerator_drift",
+                    "export carries unrecognised accelerator schema; receivers will refuse it"
+                );
+                conn.close().await?;
+                return Ok(tokio::fs::metadata(target).await?.len());
+            }
+            sqlx::query("VACUUM").execute(&mut conn).await?;
+            let verdict: String = sqlx::query("PRAGMA integrity_check")
+                .fetch_one(&mut conn)
+                .await?
+                .get(0);
+            conn.close().await?;
+            if verdict != "ok" {
+                return Err(Error::engine(format!(
+                    "export failed verification after the accelerator strip: integrity_check reported '{verdict}'"
+                )));
+            }
+        }
+    }
+    Ok(tokio::fs::metadata(target).await?.len())
+}
+
 /// Delete every row of `tables` from a completed snapshot, then VACUUM and
 /// verify the result.
 ///
@@ -514,7 +572,10 @@ async fn export_connection_snapshot(
     // standby context is attached later, so this cannot be deferred to it.
     let result = async {
         snapshot_into(conn, &snapshot_path).await?;
-        strip_read_log_from_snapshot(&snapshot_path).await
+        strip_read_log_from_snapshot(&snapshot_path).await?;
+        // Local stored-visibility accelerators never leave this process
+        // (fb924ec Q4), whatever the destination: they are rebuilt locally.
+        strip_marking_from_snapshot(&snapshot_path).await
     }
     .await;
     match result {
@@ -643,14 +704,32 @@ pub async fn export_database_file(
 /// checkpoint, `VACUUM INTO`, portability guard, verification, ownership, and
 /// off-thread cleanup machinery as the HTTP export.
 pub async fn export_connected_db(db: &Db, export_root: Option<&std::path::Path>) -> Result<Export> {
+    crate::write_diagnostics::Context::background("snapshot_export")
+        .scope(export_connected_db_inner(db, export_root))
+        .await
+}
+async fn export_connected_db_inner(
+    db: &Db,
+    export_root: Option<&std::path::Path>,
+) -> Result<Export> {
+    let acquisition = crate::write_diagnostics::Timer::new("export_pool_acquire");
     let mut pooled = db.write_pool().acquire().await?;
+    acquisition.finish("acquired");
+    let lease = crate::write_diagnostics::Timer::new("export_lease_use");
     let conn: &mut SqliteConnection = &mut pooled;
     refuse_non_portable_artifacts(conn, "export").await?;
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .fetch_optional(&mut *conn)
         .await?;
 
-    export_connection_snapshot(conn, export_root, "native-ce-export.db".to_string()).await
+    let result =
+        export_connection_snapshot(conn, export_root, "native-ce-export.db".to_string()).await;
+    lease.finish(if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    });
+    result
 }
 
 /// Filesystem-owned snapshot source for `mcp-stdio`.

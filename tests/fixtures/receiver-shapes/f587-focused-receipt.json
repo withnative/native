@@ -1,0 +1,79 @@
+{
+  "source": "c17447761bfbaac00a8fbd89d54f02ae381c8155",
+  "test_only_delta": "actual T12 wire header assertions and poll counter",
+  "binary": "/fixtures/receiver/target/debug/deps/native_ce-9dd1640e9412816c",
+  "tests": [
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver94_constructor_evidence",
+      "exit": 0
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+      "exit": 0
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+      "exit": 0
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery",
+      "exit": 0
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::installed_working_retained_create_append_share_one_target_and_check_each_digest",
+      "exit": 0
+    },
+    {
+      "test": "fork::kernel_v2_tests::working_append_published_retry_retains_transport_uncertainty_and_strict_exclusions",
+      "exit": 0
+    },
+    {
+      "test": "fork::kernel_v2_tests::working_append_startup_reconstructs_retained_original_before_first_view",
+      "exit": 0
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl",
+      "exit": 0
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::http_page_client_sends_the_scoped_modern_contract_and_parses_pages",
+      "exit": 0
+    },
+    {
+      "test": "standby::delta_transport::tests::client_retries_real_lean_calls_with_matching_http_routing_headers",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::chunked::stale_copy_catches_up_through_a_multi_megabyte_cut_over_the_chunked_route_without_a_full",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::chunked::older_host_without_the_chunked_route_falls_back_to_the_mcp_delta",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::binary_capture_and_transfer_observe_rotated_credentials",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::gzip_http::gzip_http_download_admits_decoded_sqlite_and_refuses_wire_drift",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::receiver_fresh_poll_selections_bind_to_ready_manifest_before_transfer",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::gzip_http::receiver_legacy94_full_rejects_contradictory_poll_and_range_selection",
+      "exit": 0
+    },
+    {
+      "test": "standby::refresh::tests::live_resume_loss_can_replace_when_capture_is_eligible",
+      "exit": 0
+    }
+  ]
+}

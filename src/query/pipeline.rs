@@ -41,6 +41,7 @@ pub(crate) const MAX_LIMIT: i64 = 500;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct HiddenVisibility {
+    native_member: bool,
     suggestions: bool,
     citations: bool,
     comments: bool,
@@ -254,6 +255,8 @@ pub struct FacetOrder {
 /// Paging + ordering for a record-returning pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
+    /// Avoid loading record bodies for the direct structured-list projection.
+    pub metadata_only: bool,
     pub facet_order: Option<FacetOrder>,
     pub order: Order,
     pub limit: i64,
@@ -263,6 +266,7 @@ pub struct PipelineOptions {
 impl Default for PipelineOptions {
     fn default() -> Self {
         PipelineOptions {
+            metadata_only: false,
             facet_order: None,
             order: Order::default(),
             limit: 50,
@@ -525,6 +529,24 @@ pub(crate) fn facet_filter_sql(
     Ok((clauses, binds))
 }
 
+fn member_hidden_predicate(alias: &str, visibility: HiddenVisibility) -> String {
+    #[cfg(feature = "v2-kernel-probe")]
+    if visibility.native_member {
+        let families = [
+            ("comment", visibility.comments),
+            ("suggestion", visibility.suggestions),
+            ("citation", visibility.citations),
+        ]
+        .into_iter()
+        .filter_map(|(token, include)| include.then_some(token))
+        .collect::<Vec<_>>();
+        return crate::mcp::kernel_v2::native_query_hidden_predicate(alias, &families);
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let _ = visibility.native_member;
+    super::member_not_hidden_predicate(alias)
+}
+
 fn filter_sql(
     filter: &Filter,
     visibility: HiddenVisibility,
@@ -546,7 +568,7 @@ fn filter_sql(
     // Member slice holds only E(m); the generic predicate names the excluded
     // `semantic_units` table, so the member path uses the constant instead.
     clauses.push(if member {
-        super::member_not_hidden_predicate("r")
+        member_hidden_predicate("r", visibility)
     } else {
         super::hidden_visibility_predicate(
             "r",
@@ -597,7 +619,11 @@ fn filter_sql(
     clauses.extend(facet_clauses);
     binds.extend(facet_binds);
     if !filter.include_archived {
-        clauses.push(NOT_ARCHIVED.into());
+        clauses.push(if visibility.native_member {
+            "r.archived=0".into()
+        } else {
+            NOT_ARCHIVED.into()
+        });
     }
     Ok((clauses.join(" AND "), binds))
 }
@@ -625,7 +651,16 @@ async fn apply_filter_on(
     let (where_sql, binds) = filter_sql(filter, visibility, member)?;
     let ancestor_set: Option<HashSet<String>> = match &filter.ancestor_id {
         Some(root) => Some(
-            if member {
+            if visibility.native_member {
+                #[cfg(feature = "v2-kernel-probe")]
+                {
+                    tree::native_member_subtree_ids_in(conn, root, filter.include_archived).await?
+                }
+                #[cfg(not(feature = "v2-kernel-probe"))]
+                {
+                    unreachable!("native member mode is feature-gated")
+                }
+            } else if member {
                 tree::member_subtree_ids_in(conn, root, filter.include_archived).await?
             } else {
                 tree::subtree_ids_with_hidden_in(
@@ -725,7 +760,7 @@ async fn apply_traverse_on(
         return Ok(Vec::new());
     }
     let hidden_filter = if member {
-        "AND 1".to_string()
+        format!("AND {}", member_hidden_predicate("r", visibility))
     } else {
         format!(
             "AND {}",
@@ -935,11 +970,16 @@ async fn fetch_records_on(
         Order::LastActivityDesc => "r.last_activity_at DESC, r.id",
         Order::NameAsc => "r.name, r.id",
     };
+    let columns = if opts.metadata_only {
+        RECORD_COLUMNS.replace("name, body,", "name, NULL AS body,")
+    } else {
+        RECORD_COLUMNS.to_owned()
+    };
     let mut rows = Vec::new();
     for chunk in ids.chunks(CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM records r WHERE r.id IN ({placeholders}) ORDER BY {order_sql}"
+            "SELECT {columns} FROM records r WHERE r.id IN ({placeholders}) ORDER BY {order_sql}"
         );
         let mut query = sqlx::query(&sql);
         for id in chunk {
@@ -984,7 +1024,7 @@ async fn fetch_records_on(
     for record in &mut records {
         // Excluded companions have no member answer as row content; the MCP
         // layer injects `unavailable_offline` markers for Message rows.
-        if !member {
+        if !member && !opts.metadata_only {
             super::hydrate_communication_origin_on(conn, record).await?;
             super::hydrate_federation_provenance_on(conn, record).await?;
         }
@@ -1374,6 +1414,16 @@ async fn authorize_ids_in(
 /// Member-copy authorization: every row in the slice is E(m), so visibility
 /// is slice presence. Never reads the excluded policy/Unit tables.
 async fn member_authorize_ids(pool: &sqlx::SqlitePool, ids: Vec<String>) -> Vec<String> {
+    let Ok(mut connection) = pool.acquire().await else {
+        return Vec::new();
+    };
+    member_authorize_ids_on(&mut connection, ids).await
+}
+
+async fn member_authorize_ids_on(
+    connection: &mut SqliteConnection,
+    ids: Vec<String>,
+) -> Vec<String> {
     if ids.is_empty() {
         return Vec::new();
     }
@@ -1385,7 +1435,7 @@ async fn member_authorize_ids(pool: &sqlx::SqlitePool, ids: Vec<String>) -> Vec<
         for id in chunk {
             query = query.bind(id);
         }
-        let Ok(rows) = query.fetch_all(pool).await else {
+        let Ok(rows) = query.fetch_all(&mut *connection).await else {
             return Vec::new();
         };
         for row in rows {
@@ -1463,6 +1513,7 @@ async fn numeric_lane_misses_for_filter_in(
     filter: &Filter,
     visibility: HiddenVisibility,
     principal: Option<crate::authorization::Principal<'_>>,
+    member: bool,
 ) -> Result<Vec<(String, i64)>> {
     let numeric_keys: Vec<String> = dedup(
         filter
@@ -1481,10 +1532,20 @@ async fn numeric_lane_misses_for_filter_in(
             facet.op = FacetOp::Exists;
         }
     }
-    let candidate_ids = apply_filter_on(tx, current, &diagnostic_filter, visibility, false).await?;
-    let candidate_ids = authorize_ids_in(tx, candidate_ids, principal).await;
+    let candidate_ids =
+        apply_filter_on(tx, current, &diagnostic_filter, visibility, member).await?;
+    let candidate_ids = if member {
+        member_authorize_ids_on(tx, candidate_ids).await
+    } else {
+        authorize_ids_in(tx, candidate_ids, principal).await
+    };
     let mut totals = Vec::new();
     for key in numeric_keys {
+        let num_null = if member {
+            format!("({}) IS NULL", facet_num_operand(true, "f"))
+        } else {
+            "f.value_num IS NULL".into()
+        };
         let hits = per_chunk_on(
             tx,
             &candidate_ids,
@@ -1492,7 +1553,7 @@ async fn numeric_lane_misses_for_filter_in(
                 format!(
                     "SELECT r.id FROM records r \
                      JOIN facet_values f ON f.record_id = r.id \
-                     WHERE f.key = ? AND f.value_num IS NULL \
+                     WHERE f.key = ? AND {num_null} \
                        AND r.id IN ({placeholders})"
                 )
             },
@@ -1508,6 +1569,10 @@ async fn numeric_lane_misses_for_filter_in(
 }
 
 enum SelectionSession<'a, 'db, 'principal> {
+    #[cfg(feature = "v2-kernel-probe")]
+    Member {
+        tx: &'a mut Transaction<'db, Sqlite>,
+    },
     Lens {
         lens: &'a ReadLens<'db>,
         principal: Option<crate::authorization::Principal<'principal>>,
@@ -1518,7 +1583,29 @@ enum SelectionSession<'a, 'db, 'principal> {
     },
 }
 
+async fn valid_pipeline_comment_in(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT type, kind, body, lifecycle, summary FROM records WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else { return Ok(false) };
+    let record_type: String = row.try_get("type")?;
+    let kind: Option<String> = row.try_get("kind")?;
+    Ok(
+        !crate::comments::is_governed_comment_on(tx, &record_type, kind.as_deref()).await?
+            || super::read::valid_comment_live_in(tx, id, &row).await?,
+    )
+}
+
 impl SelectionSession<'_, '_, '_> {
+    fn native_member(&self) -> bool {
+        match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { .. } => true,
+            _ => false,
+        }
+    }
+
     async fn identity_tokens(&mut self, family: CoreKind) -> Result<Vec<String>> {
         match self {
             Self::Lens { lens, .. } => {
@@ -1529,6 +1616,12 @@ impl SelectionSession<'_, '_, '_> {
                 )
                 .await
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { .. } => Ok(crate::mcp::kernel_v2::NATIVE_QUERY_OPT_IN_FAMILIES
+                .into_iter()
+                .filter(|token| *token == family.token())
+                .map(str::to_owned)
+                .collect()),
             Self::Live { tx, .. } => {
                 crate::meta::kind::active_identity_tokens_on(
                     tx,
@@ -1581,6 +1674,8 @@ impl SelectionSession<'_, '_, '_> {
                 )
                 .await
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { tx } => apply_filter_on(tx, current, filter, visibility, true).await,
             Self::Live { tx, .. } => apply_filter_on(tx, current, filter, visibility, false).await,
         }
     }
@@ -1602,6 +1697,8 @@ impl SelectionSession<'_, '_, '_> {
                 )
                 .await
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { tx } => apply_traverse_on(tx, current, traverse, visibility, true).await,
             Self::Live { tx, .. } => {
                 apply_traverse_on(tx, current, traverse, visibility, false).await
             }
@@ -1618,6 +1715,8 @@ impl SelectionSession<'_, '_, '_> {
                     authorize_ids(lens.meta().snapshot_pool(), ids, *principal).await
                 }
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { tx } => member_authorize_ids_on(tx, ids).await,
             Self::Live { tx, principal } => authorize_ids_in(tx, ids, *principal).await,
         };
         super::stage_timing::add_authorization(started);
@@ -1654,6 +1753,31 @@ impl SelectionSession<'_, '_, '_> {
                 .await?;
                 let mut candidates =
                     lifecycle_candidates(lens.projection().snapshot_pool(), &ids).await?;
+                let mut matched = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let Some((record_type, kind, home_id, lifecycle)) = candidates.remove(&id)
+                    else {
+                        continue;
+                    };
+                    if interpreter.matches_filter(
+                        &record_type,
+                        kind.as_deref(),
+                        home_id.as_deref(),
+                        lifecycle.as_deref(),
+                        requested,
+                    ) {
+                        matched.push(id);
+                    }
+                }
+                Ok(matched)
+            }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { tx } => {
+                let schema_rows = super::cascade::schema_config_rows_on(tx).await?;
+                let interpreter =
+                    super::lifecycle::LifecycleInterpreter::load_from_connection(tx, schema_rows)
+                        .await?;
+                let mut candidates = lifecycle_candidates_in(tx, &ids).await?;
                 let mut matched = Vec::with_capacity(ids.len());
                 for id in ids {
                     let Some((record_type, kind, home_id, lifecycle)) = candidates.remove(&id)
@@ -1727,20 +1851,12 @@ impl SelectionSession<'_, '_, '_> {
                     !super::read::resolves_comment(lens, &record_type, kind.as_deref()).await?
                         || super::read::valid_comment_with_lens(lens, &id).await?
                 }
-                Self::Live { tx, .. } => {
-                    let row = sqlx::query(
-                        "SELECT type, kind, body, lifecycle, summary FROM records WHERE id = ?",
-                    )
-                    .bind(&id)
-                    .fetch_optional(&mut ***tx)
-                    .await?;
-                    let Some(row) = row else { continue };
-                    let record_type: String = row.try_get("type")?;
-                    let kind: Option<String> = row.try_get("kind")?;
-                    !crate::comments::is_governed_comment_on(tx, &record_type, kind.as_deref())
-                        .await?
-                        || super::read::valid_comment_live_in(tx, &id, &row).await?
+                #[cfg(feature = "v2-kernel-probe")]
+                Self::Member { tx } => {
+                    !super::read::native_member_comment_identity_on(tx, &id).await?
+                        || super::read::valid_native_member_comment_on(tx, &id).await?
                 }
+                Self::Live { tx, .. } => valid_pipeline_comment_in(tx, &id).await?,
             };
             if keep {
                 valid.push(id);
@@ -1768,8 +1884,15 @@ impl SelectionSession<'_, '_, '_> {
                 )
                 .await
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { tx } => {
+                numeric_lane_misses_for_filter_in(tx, current, filter, visibility, None, true).await
+            }
             Self::Live { tx, principal } => {
-                numeric_lane_misses_for_filter_in(tx, current, filter, visibility, *principal).await
+                numeric_lane_misses_for_filter_in(
+                    tx, current, filter, visibility, *principal, false,
+                )
+                .await
             }
         }
     }
@@ -1811,6 +1934,18 @@ impl SelectionSession<'_, '_, '_> {
                 )
                 .await
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            (Self::Member { tx }, Some(axis)) => {
+                Ok((count_records_on(tx, ids, &axis).await?, None))
+            }
+            #[cfg(feature = "v2-kernel-probe")]
+            (Self::Member { tx }, None) => {
+                let schema_rows = super::cascade::schema_config_rows_on(tx).await?;
+                let interpreter =
+                    super::lifecycle::LifecycleInterpreter::load_from_connection(tx, schema_rows)
+                        .await?;
+                fetch_records_on(tx, ids, opts, &interpreter, true).await
+            }
             (Self::Live { tx, .. }, Some(axis)) => {
                 Ok((count_records_on(tx, ids, &axis).await?, None))
             }
@@ -1836,6 +1971,8 @@ impl SelectionSession<'_, '_, '_> {
                 )
                 .await
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Member { tx } => aggregate_records_on(tx, ids, spec, true).await,
             Self::Live { tx, .. } => aggregate_records_on(tx, ids, spec, false).await,
         }
     }
@@ -1857,6 +1994,7 @@ async fn select_ids_with_diagnostics_from(
     let comment_tokens = source.identity_tokens(CoreKind::AnnotationComment).await?;
     let shape_capability_ids = source.historical_shape_ids(steps).await?;
     let visibility = HiddenVisibility {
+        native_member:source.native_member(),
         suggestions: steps.iter().any(|step| {
             matches!(step, Step::Filter(filter) if filter.kinds.iter().any(|kind| suggestion_tokens.contains(kind)))
         }),
@@ -2066,6 +2204,50 @@ pub(crate) async fn run_aggregate_with_diagnostics_in_as(
         },
         steps,
         aggregate,
+    )
+    .await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn member_visible_ids(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    ids: Vec<String>,
+) -> HashSet<String> {
+    member_authorize_ids_on(session.transaction(), ids)
+        .await
+        .into_iter()
+        .collect()
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn run_member_with_diagnostics(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    steps: &[Step],
+    count_by: Option<CountAxis>,
+    opts: &PipelineOptions,
+) -> Result<(PipelineOutput, Vec<(String, i64)>)> {
+    run_with_session(
+        &mut SelectionSession::Member {
+            tx: session.transaction(),
+        },
+        steps,
+        count_by,
+        opts,
+    )
+    .await
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn run_member_aggregate_with_diagnostics(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    steps: &[Step],
+    spec: &AggregateSpec,
+) -> Result<(AggregateOutput, Vec<(String, i64)>)> {
+    run_aggregate_with_session(
+        &mut SelectionSession::Member {
+            tx: session.transaction(),
+        },
+        steps,
+        spec,
     )
     .await
 }

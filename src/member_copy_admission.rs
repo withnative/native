@@ -74,6 +74,9 @@ use crate::schema::member_schema::{
 };
 use crate::standby_snapshot::StandbyConsumerIdentity;
 
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod native;
+
 const CACHE_DIR_NAME: &str = "generations";
 const POINTER_FILENAME: &str = "current.json";
 pub(crate) const SNAPSHOT_FILENAME: &str = "snapshot.db";
@@ -304,11 +307,10 @@ pub(crate) fn validate_manifest(bytes: &[u8]) -> Result<ValidatedManifest, Admis
         ReplicaProfile::MemberReadV1 {
             member_schema_digest,
         } => member_schema_digest.clone(),
-        ReplicaProfile::MemberReadKernelV2 { .. } => {
-            return Err(AdmissionError::ManifestRejected {
-                detail: "kernel-v2 member profile requires native member admission".to_owned(),
-            })
-        }
+        ReplicaProfile::MemberReadKernelV2 {
+            member_schema_digest,
+            ..
+        } => member_schema_digest.clone(),
         ReplicaProfile::CanonicalEngine => {
             return Err(AdmissionError::ManifestRejected {
                 detail: "member admission needs the member-read-v1 profile".to_owned(),
@@ -895,6 +897,15 @@ pub fn admit_member_copy(
     expected: &ExpectedFooting,
     lifecycle: &mut MemberCopyLifecycle,
 ) -> Result<AdmittedGeneration, AdmissionError> {
+    let declaration: ReplicaGenerationManifest =
+        serde_json::from_slice(manifest_json).map_err(|e| AdmissionError::ManifestMalformed {
+            detail: e.to_string(),
+        })?;
+    if !matches!(declaration.profile, ReplicaProfile::MemberReadV1 { .. }) {
+        return Err(AdmissionError::ManifestRejected {
+            detail: "native member profile requires native admission".into(),
+        });
+    }
     let manifest = validate_manifest(manifest_json)?;
 
     if manifest.origin_database_id != expected.origin_database_id {
@@ -1024,6 +1035,15 @@ pub fn revalidate_installed(
     manifest_json: &[u8],
     expected: &ExpectedFooting,
 ) -> Result<AdmittedGeneration, AdmissionError> {
+    let declaration: ReplicaGenerationManifest =
+        serde_json::from_slice(manifest_json).map_err(|e| AdmissionError::ManifestMalformed {
+            detail: e.to_string(),
+        })?;
+    if !matches!(declaration.profile, ReplicaProfile::MemberReadV1 { .. }) {
+        return Err(AdmissionError::ManifestRejected {
+            detail: "native member profile requires native admission".into(),
+        });
+    }
     let manifest = validate_manifest(manifest_json)?;
     if manifest.origin_database_id != expected.origin_database_id {
         return Err(AdmissionError::OriginMismatch);
@@ -1150,6 +1170,7 @@ mod tests {
 
     fn consumer_identity() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -1399,7 +1420,7 @@ mod tests {
         assert_eq!(
             error,
             AdmissionError::ManifestRejected {
-                detail: "kernel-v2 member profile requires native member admission".to_owned(),
+                detail: "native member profile requires native admission".to_owned(),
             }
         );
         assert_clean(&error);

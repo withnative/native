@@ -187,7 +187,8 @@ pub fn exit_code(report: &Report) -> u8 {
 /// Runner indirection so unit tests can use fake `claude`/`codex` scripts
 /// on a temporary PATH instead of the real tools.
 pub struct Deps<'a> {
-    pub current_exe: PathBuf,
+    /// Absolute verified launcher to persist in client registrations.
+    pub launch_exe: PathBuf,
     pub run: &'a dyn Fn(&str, &[&str]) -> CmdOutput,
     pub find_on_path: &'a dyn Fn(&str) -> Option<PathBuf>,
 }
@@ -249,7 +250,7 @@ pub fn resolve_db(requested: Option<&Path>) -> PathBuf {
     }
 }
 
-/// The MCP server command to register: the current exe plus args.
+/// The MCP server command to register: the verified launcher plus args.
 pub fn desired_command(exe: &Path, db: &Path) -> Vec<String> {
     vec![
         exe.to_string_lossy().into_owned(),
@@ -748,7 +749,7 @@ pub fn run(opts: &Options, deps: &Deps) -> Result<Report, String> {
             db.display()
         ));
     }
-    let desired = desired_command(&deps.current_exe, &db);
+    let desired = desired_command(&deps.launch_exe, &db);
     let mut vault = Vec::new();
     let mut vault_failed = false;
     if let Some(dir) = opts.vault.as_deref() {
@@ -1021,7 +1022,11 @@ mod tests {
 
     fn try_run_with(env: &FakeEnv, exe: &Path, opts: &Options) -> Result<Report, String> {
         let (current_exe, path_env, state) = deps_for(env);
-        let _ = exe;
+        let launch_exe = if exe.is_absolute() {
+            exe.to_path_buf()
+        } else {
+            current_exe
+        };
         let execute = |prog: &str, args: &[&str]| -> CmdOutput {
             let out = std::process::Command::new(prog)
                 .env("PATH", &path_env)
@@ -1040,7 +1045,7 @@ mod tests {
             candidate.is_file().then(|| candidate.clone())
         };
         let deps = Deps {
-            current_exe,
+            launch_exe,
             run: &execute,
             find_on_path: &find,
         };
@@ -1367,6 +1372,40 @@ esac
         assert!(!log.contains(" mcp remove "));
         assert!(log.contains("claude mcp get native-local"));
         assert!(log.contains("codex mcp get native-local"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_persists_verified_stable_launcher_in_both_client_configs() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        let env = setup();
+        let version = env.root.join("versions/one/native");
+        std::fs::create_dir_all(version.parent().unwrap()).unwrap();
+        std::fs::write(&version, "version one").unwrap();
+        std::fs::set_permissions(&version, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = env.bin.join("native");
+        symlink(&version, &launcher).unwrap();
+        let selected = super::super::launch::resolve_saved_launch_exe(
+            &version,
+            Some(launcher.as_os_str()),
+            Some(&env.root),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected, launcher);
+        let report = run_with(&env, &selected, &test_opts(&env));
+        assert!(report
+            .clients
+            .iter()
+            .all(|client| client.status == "registered"));
+        let claude = std::fs::read_to_string(env.state.join("claude.native-local.state")).unwrap();
+        assert_eq!(claude.lines().nth(1), launcher.to_str());
+        let codex: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(env.state.join("codex.native-local.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(codex["transport"]["command"], launcher.to_str().unwrap());
+        assert!(!calls(&env).contains(version.to_str().unwrap()));
     }
 
     #[test]

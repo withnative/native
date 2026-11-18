@@ -974,6 +974,25 @@ async fn loosens(
     pack: &Value,
     user: &Value,
 ) -> Result<Option<String>> {
+    let pack_vocab = match governing_vocab(pack) {
+        Some(reference) => Some(canonical_vocab(conn, reference).await?),
+        None => None,
+    };
+    let user_vocab = match governing_vocab(user) {
+        Some(reference) => Some(canonical_vocab(conn, reference).await?),
+        None => None,
+    };
+    schema_spine_loosening(pack, user, pack_vocab.as_deref(), user_vocab.as_deref())
+}
+
+/// Shared interop floor predicate. Each engine resolves vocabulary designators
+/// to identities in its own catalogue before invoking this pure comparison.
+pub(crate) fn schema_spine_loosening(
+    pack: &Value,
+    user: &Value,
+    canonical_pack_vocab: Option<&str>,
+    canonical_user_vocab: Option<&str>,
+) -> Result<Option<String>> {
     // No object on the pack side is no floor: nothing to be looser than.
     if !pack.is_object() {
         return Ok(None);
@@ -1017,7 +1036,7 @@ async fn loosens(
         // row (`get_vocabulary` matches id OR name), so comparing the strings
         // would reject a legitimate restatement of the pack's own vocabulary
         // as a swap — a floor that fires on the honest case.
-        if canonical_vocab(conn, user_vocab).await? != canonical_vocab(conn, pack_vocab).await? {
+        if canonical_user_vocab != canonical_pack_vocab {
             return Ok(Some(format!(
                 "the user layer re-points it from vocabulary '{pack_vocab}' to '{user_vocab}'"
             )));
@@ -1041,7 +1060,10 @@ async fn loosens(
 /// The type/kind views whose spine floors an incoming user row can affect.
 /// Every type gets its base view (`None`), plus every `T:k` key appearing in
 /// either the pack floor or incoming data.
-fn shape_targets(pack: &Value, data: &Value) -> BTreeMap<String, BTreeSet<Option<String>>> {
+pub(crate) fn shape_targets(
+    pack: &Value,
+    data: &Value,
+) -> BTreeMap<String, BTreeSet<Option<String>>> {
     let mut targets: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
     for view in [pack, data] {
         for shape_key in view
@@ -1069,7 +1091,7 @@ fn shape_targets(pack: &Value, data: &Value) -> BTreeMap<String, BTreeSet<Option
 /// Reject unknown declarations rather than storing a promise no supported
 /// writer understands. `disambiguation` (`compatible` or `reject`) is
 /// admitted only beside `zoned` or `when`, the types that resolve wall times.
-fn assert_known_facet_types(data: &Value) -> Result<()> {
+pub(crate) fn assert_known_facet_types(data: &Value) -> Result<()> {
     assert_no_spine_declared_types(data)?;
     let shapes = data.get("shapes").and_then(Value::as_object);
     for (shape_key, shape) in shapes.into_iter().flatten() {
@@ -1114,7 +1136,7 @@ fn assert_known_facet_types(data: &Value) -> Result<()> {
 /// it must restate the exact pack type. Spine facets are skipped because v1
 /// rejects their type declarations rather than promising numeric validation
 /// over string carriers.
-fn assert_no_type_loosening(pack: &Value, data: &Value) -> Result<()> {
+pub(crate) fn assert_no_type_loosening(pack: &Value, data: &Value) -> Result<()> {
     for (record_type, kinds) in shape_targets(pack, data) {
         for kind in kinds {
             let pack_floor = cascade::facets_for_type(pack, &record_type, kind.as_deref());
@@ -1211,7 +1233,7 @@ mod object_contract_tests {
     }
 }
 
-fn assert_no_object_contract_loosening(pack: &Value, data: &Value) -> Result<()> {
+pub(crate) fn assert_no_object_contract_loosening(pack: &Value, data: &Value) -> Result<()> {
     for (record_type, kinds) in shape_targets(pack, data) {
         for kind in kinds {
             let pack_floor = cascade::facets_for_type(pack, &record_type, kind.as_deref());
@@ -1261,45 +1283,8 @@ async fn count_nonconforming_declared_values(
     for (record_type, kind, key, value, value_num) in rows {
         let shape =
             cascade::facets_for_record_context(prospective, &record_type, kind.as_deref(), None);
-        let declared_type = shape
-            .get(&key)
-            .and_then(|facet| facet.get("type"))
-            .and_then(Value::as_str);
-        let nonconforming = match declared_type {
-            Some("number") => value_num.is_none(),
-            Some("object") => value
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .is_none_or(|value| {
-                    !value.is_object()
-                        || shape.get(&key).is_some_and(|facet| {
-                            crate::meta::schema_config::validate_object_facet_value(facet, &value)
-                                .is_err()
-                        })
-                }),
-            Some(other) => match crate::typed_time::TimeFacetType::parse(other) {
-                // A historical typed time value conforms when it would be
-                // accepted as written today: the stored text of a date or
-                // instant, or the JSON of a zoned or when value.
-                Some(time_type) => value.as_deref().is_none_or(|raw| {
-                    let candidate = match time_type {
-                        crate::typed_time::TimeFacetType::Date
-                        | crate::typed_time::TimeFacetType::Instant => Value::String(raw.into()),
-                        _ => serde_json::from_str(raw).unwrap_or(Value::Null),
-                    };
-                    crate::typed_time::normalise_facet_value(
-                        time_type,
-                        &candidate,
-                        crate::domain_transaction::declared_disambiguation(
-                            shape.get(&key).unwrap_or(&Value::Null),
-                        ),
-                    )
-                    .is_err()
-                }),
-                None => false,
-            },
-            None => false,
-        };
+        let nonconforming =
+            schema_declared_value_nonconforming(&shape, &key, value.as_deref(), value_num);
         if nonconforming {
             count += 1;
         }
@@ -1307,7 +1292,54 @@ async fn count_nonconforming_declared_values(
     Ok(count)
 }
 
-fn scoped_shape_targets(
+/// Same forward-only historical-value report predicate for both storage engines.
+pub(crate) fn schema_declared_value_nonconforming(
+    shape: &serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<&str>,
+    value_num: Option<f64>,
+) -> bool {
+    let declared_type = shape
+        .get(key)
+        .and_then(|facet| facet.get("type"))
+        .and_then(Value::as_str);
+    match declared_type {
+        Some("number") => value_num.is_none(),
+        Some("object") => value
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_none_or(|value| {
+                !value.is_object()
+                    || shape.get(key).is_some_and(|facet| {
+                        crate::meta::schema_config::validate_object_facet_value(facet, &value)
+                            .is_err()
+                    })
+            }),
+        Some(other) => match crate::typed_time::TimeFacetType::parse(other) {
+            // A historical typed time value conforms when it would be
+            // accepted as written today: the stored text of a date or
+            // instant, or the JSON of a zoned or when value.
+            Some(time_type) => value.is_none_or(|raw| {
+                let candidate = match time_type {
+                    crate::typed_time::TimeFacetType::Date
+                    | crate::typed_time::TimeFacetType::Instant => Value::String(raw.into()),
+                    _ => serde_json::from_str(raw).unwrap_or(Value::Null),
+                };
+                crate::typed_time::normalise_facet_value(
+                    time_type,
+                    &candidate,
+                    crate::domain_transaction::declared_disambiguation(
+                        shape.get(key).unwrap_or(&Value::Null),
+                    ),
+                )
+                .is_err()
+            }),
+            None => false,
+        },
+        None => false,
+    }
+}
+
+pub(crate) fn scoped_shape_targets(
     rows: &[cascade::SchemaConfigRow],
     data: &Value,
     bearer_id: &str,
@@ -1339,7 +1371,7 @@ fn scoped_shape_targets(
     targets
 }
 
-fn assert_no_type_loosening_scoped(
+pub(crate) fn assert_no_type_loosening_scoped(
     rows: &[cascade::SchemaConfigRow],
     data: &Value,
     bearer_id: &str,
@@ -1378,7 +1410,7 @@ fn assert_no_type_loosening_scoped(
     Ok(())
 }
 
-fn assert_no_object_contract_loosening_scoped(
+pub(crate) fn assert_no_object_contract_loosening_scoped(
     rows: &[cascade::SchemaConfigRow],
     data: &Value,
     bearer_id: &str,
@@ -1554,7 +1586,7 @@ async fn assert_kind_shapes_enumerated(
 /// Two consequences of not being a limb: it needs no pack view (an inert claim
 /// is inert whether or not the pack shapes the key), and kind-discriminated
 /// (`T:k`) shapes need no special handling because every shape key is scanned.
-fn assert_no_facet_cardinality(data: &Value) -> Result<()> {
+pub(crate) fn assert_no_facet_cardinality(data: &Value) -> Result<()> {
     let shapes = data.get("shapes").and_then(Value::as_object);
     for (shape_type, shape) in shapes.into_iter().flatten() {
         let Some(facets) = shape.get("facets").and_then(Value::as_object) else {

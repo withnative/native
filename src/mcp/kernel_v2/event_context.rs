@@ -49,7 +49,25 @@ fn logical_payload(typ: &str, payload: &Value) -> Option<(String, Value)> {
         "kernel.record_revised.v1" | "kernel.record_revised.v2" => {
             Some(("record.updated".into(), fields))
         }
-        "kernel.body_set.v1" => Some(("record.updated".into(), json!({"body":payload["body"]}))),
+        "kernel.body_set.v1" => {
+            let mut logical = json!({"body":payload["body"]});
+            if let Some(basis) = payload.get("basis") {
+                logical["basis"] = basis.clone();
+            }
+            if let Some(metadata) = payload.get("coedit").and_then(Value::as_object) {
+                logical.as_object_mut()?.extend(metadata.clone());
+            }
+            Some(("record.updated".into(), logical))
+        }
+        "kernel.facet_observed.v1" => Some((
+            if payload["value"].is_null() {
+                "facet.unset"
+            } else {
+                "facet.set"
+            }
+            .into(),
+            payload.clone(),
+        )),
         "kernel.metadata_set.v1" | "kernel.archive_changed.v1" => {
             Some(("record.updated".into(), payload.clone()))
         }
@@ -95,7 +113,17 @@ pub(super) async fn shaped(
         .map(serde_json::from_str)
         .transpose()?
         .unwrap_or(Value::Null);
-    let canonical = logical_payload(&event.event_type, &raw);
+    let mut logical_raw = raw.clone();
+    if event.event_type == "kernel.body_set.v1"
+        && !kernel::kernel_effective_capability_on(conn, actor, crate::events::KERNEL_ROOT_ID)
+            .await?
+            .allows(crate::authorization::Capability::View)
+    {
+        if let Some(object) = logical_raw.as_object_mut() {
+            object.remove("coedit");
+        }
+    }
+    let canonical = logical_payload(&event.event_type, &logical_raw);
     event.actor = disclosed.actor;
     event.run_key = disclosed.run_key;
     if event.run_key.is_none() {

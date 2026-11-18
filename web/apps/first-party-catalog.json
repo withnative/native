@@ -1,0 +1,26 @@
+[
+  {
+    "app": "catch-up",
+    "package": "agent.catch-up"
+  },
+  {
+    "app": "docs",
+    "package": "agent.docs"
+  },
+  {
+    "app": "linear",
+    "package": "agent.linear"
+  },
+  {
+    "proof": "miro-board",
+    "package": "agent.miro-board"
+  },
+  {
+    "app": "notion",
+    "package": "agent.notion-pages"
+  },
+  {
+    "proof": "slack-workspace",
+    "package": "agent.slack-workspace"
+  }
+]

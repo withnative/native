@@ -49,7 +49,9 @@ use super::stdio::dispatch_engine_message;
 #[derive(Clone)]
 pub struct MemberServedSnapshot {
     registry: Arc<ToolRegistry>,
-    database: crate::db::Db,
+    database: Option<crate::db::Db>,
+    #[cfg(feature = "v2-kernel-probe")]
+    native: Option<crate::member_copy_serving::native::NativeReader>,
     caller: Caller,
     generation_id: String,
 }
@@ -70,6 +72,21 @@ impl MemberServedSnapshot {
         if !owner.is_serving() {
             return Err(Error::copy_unavailable());
         }
+        #[cfg(feature = "v2-kernel-probe")]
+        if let Some(native) = owner.native_reader() {
+            return Ok(Self {
+                registry: Arc::new(registry),
+                database: None,
+                native: Some(native),
+                caller: Caller::authenticated(
+                    owner.account_token().ok_or_else(Error::copy_unavailable)?,
+                ),
+                generation_id: owner
+                    .generation_id()
+                    .ok_or_else(Error::copy_unavailable)?
+                    .into(),
+            });
+        }
         let database = owner.database().ok_or_else(Error::copy_unavailable)?;
         let account_token = owner.account_token().ok_or_else(Error::copy_unavailable)?;
         let generation_id = owner
@@ -81,7 +98,9 @@ impl MemberServedSnapshot {
         }
         Ok(Self {
             registry: Arc::new(registry),
-            database,
+            database: Some(database),
+            #[cfg(feature = "v2-kernel-probe")]
+            native: None,
             caller: Caller::authenticated(account_token)
                 .with_channel(crate::provenance::Channel::Mcp),
             generation_id,
@@ -97,7 +116,9 @@ impl MemberServedSnapshot {
     ) -> Self {
         Self {
             registry,
-            database,
+            database: Some(database),
+            #[cfg(feature = "v2-kernel-probe")]
+            native: None,
             caller,
             generation_id,
         }
@@ -112,9 +133,22 @@ impl MemberServedSnapshot {
     /// Dispatch one message through the shared modern/legacy protocol, render
     /// and framing. `None` means no response goes out.
     pub async fn dispatch(&self, message: Value) -> Option<Value> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if let Some(native) = &self.native {
+            let call: Arc<dyn protocol::NoHeldToolCall> = Arc::new(native.clone());
+            let outcome = if protocol::is_modern_request(&message) {
+                protocol::handle_modern_member_message(self.registry.clone(), call, message).await
+            } else {
+                protocol::handle_legacy_member_message(self.registry.clone(), call, message).await
+            };
+            return match outcome {
+                protocol::RpcOutcome::Notification => None,
+                protocol::RpcOutcome::Response { body, .. } => Some(body),
+            };
+        }
         dispatch_engine_message(
             self.registry.clone(),
-            EngineHandle::Sqlite(self.database.clone()),
+            EngineHandle::Sqlite(self.database.clone()?),
             self.caller.clone(),
             message,
         )
@@ -393,6 +427,7 @@ mod tests {
 
     fn consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -1179,7 +1214,7 @@ mod tests {
         let bootstrap = snapshot
             .registry
             .call_engine_detailed(
-                EngineHandle::Sqlite(snapshot.database.clone()),
+                EngineHandle::Sqlite(snapshot.database.clone().expect("v1 fixture database")),
                 snapshot.caller.clone(),
                 "bootstrap",
                 json!({}),
@@ -1213,7 +1248,7 @@ mod tests {
             let outcome = snapshot
                 .registry
                 .call_engine_detailed(
-                    EngineHandle::Sqlite(snapshot.database.clone()),
+                    EngineHandle::Sqlite(snapshot.database.clone().expect("v1 fixture database")),
                     snapshot.caller.clone(),
                     name,
                     arguments,

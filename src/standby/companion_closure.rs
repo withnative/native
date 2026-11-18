@@ -26,6 +26,9 @@
 //!   the interaction receipts those attestations reference, are pulled, with
 //!   the app attribution rows keyed by those same attestations. The closure
 //!   never fans out from a receipt, attestation or app into all history.
+//! * Output-less keyed attestations are selected by their explicit
+//!   `provenance.keyed_command_receipt.v1` control-event payload reference.
+//!   SQL command anchors keep their existing act-stamped receipt reference.
 //! * `provenance_local_attestation_authority` follows those same attestations.
 //!   This authority-local evidence is retained by whole snapshots and copied
 //!   only by authenticated, same-database standby replication. It remains
@@ -61,7 +64,7 @@ use crate::interchange::{Section, SelectionBind};
 /// list and the classified [`crate::schema::standby_classification::StandbyTableKind::ImmutableCanonicalCompanion`]
 /// set ever diverge, so a new companion cannot ship uncarried and a removed
 /// one cannot ship carried.
-pub(crate) const COMPANION_TABLES: [&str; 15] = [
+pub(crate) const COMPANION_TABLES: [&str; 16] = [
     "content_event_causal_frontier",
     "content_event_sources",
     "replicated_message_provenance",
@@ -70,6 +73,7 @@ pub(crate) const COMPANION_TABLES: [&str; 15] = [
     "provenance_interaction_receipts",
     "provenance_action_attestations",
     "provenance_local_attestation_authority",
+    "provenance_local_command_cancellations",
     "provenance_action_events",
     "provenance_action_outputs",
     "provenance_action_app_attributions",
@@ -133,6 +137,7 @@ pub(crate) async fn read_companion_section_on(
 fn companion_selection(table: &str, from: i64, to: i64) -> Result<(String, Vec<i64>)> {
     let bounds = vec![from, to];
     let selection = match table {
+        "provenance_local_command_cancellations" => ("event_id IN (SELECT id FROM control_events WHERE act > ? AND act <= ?)".to_string(), bounds),
         "content_event_causal_frontier" | "content_event_sources" => (
             "event_id IN (SELECT id FROM content_events WHERE act > ? AND act <= ?)".to_string(),
             bounds,
@@ -179,12 +184,13 @@ fn companion_selection(table: &str, from: i64, to: i64) -> Result<(String, Vec<i
         ),
         "provenance_action_attestations" => (
             format!(
-                "id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?)",
+                "id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ? UNION {})",
                 provenance_action_events_selection(),
                 provenance_action_outputs_selection(),
                 validity_attestation_selection(),
+                keyed_receipt_anchor_selection(),
             ),
-            vec![from, to, from, to, from, to, from, to, from, to],
+            vec![from, to, from, to, from, to, from, to, from, to, from, to],
         ),
         // This is authenticated same-database standby replication, not portable
         // interchange. Copy only anchors the authority actually holds; never
@@ -192,33 +198,36 @@ fn companion_selection(table: &str, from: i64, to: i64) -> Result<(String, Vec<i
         // retain these rows too. Imported/foreign attestations have no anchor.
         "provenance_local_attestation_authority" => (
             format!(
-                "attestation_id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?)",
+                "attestation_id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ? UNION {})",
                 provenance_action_events_selection(),
                 provenance_action_outputs_selection(),
                 validity_attestation_selection(),
+                keyed_receipt_anchor_selection(),
             ),
-            vec![from, to, from, to, from, to, from, to, from, to],
+            vec![from, to, from, to, from, to, from, to, from, to, from, to],
         ),
         // App attributions follow exactly the attestations selected above;
         // the closure never fans out from an app into its history.
         "provenance_action_app_attributions" => (
             format!(
-                "action_attestation_id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?)",
+                "action_attestation_id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ? UNION {})",
                 provenance_action_events_selection(),
                 provenance_action_outputs_selection(),
                 validity_attestation_selection(),
+                keyed_receipt_anchor_selection(),
             ),
-            vec![from, to, from, to, from, to, from, to, from, to],
+            vec![from, to, from, to, from, to, from, to, from, to, from, to],
         ),
         "provenance_interaction_receipts" => (
             format!(
                 "id IN (SELECT interaction_receipt_id FROM provenance_action_attestations \
-                 WHERE interaction_receipt_id IS NOT NULL AND id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?))",
+                 WHERE interaction_receipt_id IS NOT NULL AND id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ? UNION {}))",
                 provenance_action_events_selection(),
                 provenance_action_outputs_selection(),
                 validity_attestation_selection(),
+                keyed_receipt_anchor_selection(),
             ),
-            vec![from, to, from, to, from, to, from, to, from, to],
+            vec![from, to, from, to, from, to, from, to, from, to, from, to],
         ),
         // The relationship companions are selected by the exact
         // `(issuer_origin_db_id, id)` and
@@ -272,6 +281,11 @@ fn provenance_action_outputs_selection() -> &'static str {
               AND output_event_id IN (SELECT id FROM content_events WHERE act > ? AND act <= ?)) \
         OR (output_domain = 'relationship' \
               AND output_event_id IN (SELECT id FROM relationship_events WHERE act > ? AND act <= ?))"
+}
+
+fn keyed_receipt_anchor_selection() -> &'static str {
+    "SELECT json_extract(payload,'$.attestation_id') FROM control_events \
+     WHERE type='provenance.keyed_command_receipt.v1' AND act > ? AND act <= ?"
 }
 
 fn validity_attestation_selection() -> &'static str {
@@ -431,7 +445,10 @@ mod tests {
                 !crate::act::ACT_STAMPED_TABLES.contains(&table),
                 "companion {table} is also act-stamped"
             );
-            if table == "provenance_local_attestation_authority" {
+            if matches!(
+                table,
+                "provenance_local_attestation_authority" | "provenance_local_command_cancellations"
+            ) {
                 assert!(
                     !crate::interchange::SECTION_NAMES.contains(&table),
                     "authority-local anchors must never become portable"

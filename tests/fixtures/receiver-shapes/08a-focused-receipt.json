@@ -1,0 +1,120 @@
+{
+  "source": "86213140c5e94c647f28429202f68767c0269da2",
+  "base": "08a2766bc616b5050dd9dfb615f40704067161ad",
+  "binary_sha256": "e5e73e5b41e1020869ff90b0c4fac6c0f18e8098d82718ce576e43e9700c3dfe",
+  "features": [
+    "v2-kernel-probe"
+  ],
+  "tests": [
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver94_constructor_evidence",
+      "exit": 0,
+      "log_sha256": "298425da39e8b2107ac2df5757d015fb386a710d803fe6857dd76af489f81fab"
+    },
+    {
+      "test": "standby::shapes::tests::frozen_owned_shapes_and_exact_marking_normalization",
+      "exit": 0,
+      "log_sha256": "b438c663d9c94e770a0a80c6a767f904b603c7d322910bcf93451478406f05ea"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_registered_shapes_export_strip_retains_unknown_attached_drift",
+      "exit": 0,
+      "log_sha256": "c466b69e96fa8e8a933539a63be27e8ad49bcdd36f1fb2136f826de6cfee0220"
+    },
+    {
+      "test": "standby::kernel_v2_tests::kernel_v2_marked_primary_ships_unmarked_full_and_applicable_deltas",
+      "exit": 0,
+      "log_sha256": "f076feb410c2c54effd6dafb6b1c416c72ccd0377303aa45263f7bad46952d5b"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl",
+      "exit": 0,
+      "log_sha256": "4717c848e313e88fa1479cf58a50e5f609aea91278108d2b05b831ebb9471725"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source",
+      "exit": 0,
+      "log_sha256": "430144bb14092a0112a4bdcbc6b2e903005325495d08524c7e323551c2cc452d"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch",
+      "exit": 0,
+      "log_sha256": "f1759fc440dcd18ad3255b590012768baa9ba41d5f1b64b0a882450d644a8c7b"
+    },
+    {
+      "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+      "exit": 0,
+      "log_sha256": "ae817f21ebbd4f3568118b4dc0454791670f30bedde24a90340ec227e9ccafbe"
+    },
+    {
+      "test": "kernel::stored_visibility::principal_tests::the_shared_bindings_match_both_live_literals",
+      "exit": 0,
+      "log_sha256": "ab0c5dec40964dec78eb2c3ecbbebcee1fcda15c365c43ad8171d5c884b3bdbf"
+    },
+    {
+      "test": "kernel::stored_visibility::principal_tests::the_principal_matrix_matches_live_admission_and_transform",
+      "exit": 0,
+      "log_sha256": "d9265f98ace0e3d03396fcd9713515466ebb1d88f074e269f89fb0c9db43a255"
+    },
+    {
+      "test": "kernel::stored_visibility::tests::exports_of_a_marked_workspace_carry_no_accelerators",
+      "exit": 0,
+      "log_sha256": "45b3aaceca7f6d4988b7549b73a542cecfb9aa28db7fe5d67ca38cd83f82f8d1"
+    },
+    {
+      "test": "kernel::stored_visibility::tests::egress_strip_ships_any_drift_unchanged_for_refusal",
+      "exit": 0,
+      "log_sha256": "0e249916191afa46eda7bd943b8db35ed452a2c849be6a34f2001ff24d1fb4ca"
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+      "exit": 0,
+      "log_sha256": "d7ca3cb2b303738a85c5dafec935f1769bb2293f74c256cb2b9e7d9d9236c578"
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+      "exit": 0,
+      "log_sha256": "b56a474839c65414522e246cc1e498c6f679bc4002f8b4705dfb5cb90107598c"
+    },
+    {
+      "test": "standby::kernel_v2_tests::kernel_v2_incompatible_schema_or_reader_format_never_rebinds",
+      "exit": 0,
+      "log_sha256": "9b49e01a39999a90f13007b9bfdd27a16d5137240016ec229b73f78c17082454"
+    },
+    {
+      "test": "kernel::stored_visibility::scope_tests::skipped_escalation_and_a_continued_pair_cursor_are_caught",
+      "exit": 0,
+      "log_sha256": "d0c363267ec94f1e9dc07c3ea4766c664e8d536ea6f289ad002a8e08c5b74f28"
+    },
+    {
+      "test": "kernel::stored_visibility::scope_tests::the_principal_matrix_matches_the_live_evaluator_at_every_anchor",
+      "exit": 0,
+      "log_sha256": "147ce89bc2f20396f7ba95dced8cb1f157628bffbc7e7c9f74ba309331a6f097"
+    },
+    {
+      "test": "kernel::stored_visibility::scope_tests::transitions_keep_every_trusted_pair_live_through_partial_batches",
+      "exit": 0,
+      "log_sha256": "9d0fbc261e0d5dfc941b954b41fd541562150b680a1240b13c614ceb92212e81"
+    },
+    {
+      "test": "kernel::stored_visibility::tests::certification_exempts_exactly_the_compiled_objects",
+      "exit": 0,
+      "log_sha256": "b87aba0b37a30b79cc1139aa6785e00ad4472cf7dee368ee4dae1b8a8a978260"
+    }
+  ],
+  "patch_equivalence": "all29 range-diff entries identical; no conflicts/manual resolutions",
+  "checks": {
+    "default_lib": "passed",
+    "probe_lib": "passed",
+    "format": "passed",
+    "live_policy": "106 jobs,14361 source tests,9 doctests passed",
+    "live_census_units": "15 passed; no skips"
+  },
+  "frozen_contract_fixtures_sha256": {
+    "contracts94.json": "700c1c235b7877a79666f5889a4c8bfd4b3db92db2f7d644119f9f6dcf5467c0",
+    "contracts95.json": "44c4becd3424db48c30a0388e9229a40783ecddada67a180398477954a7a6cab"
+  },
+  "backend_input_facts": "both db/projector facts still match the rebased source exactly; no regeneration needed",
+  "mutation_guard_files": "all21 source files match their recorded post-restoration hashes across the rebase; historical capture heads retained",
+  "limits": "library/component tests only; actual8578/f587 process/T9 evidence retains those identities. Final CI is separate."
+}

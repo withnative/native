@@ -202,6 +202,15 @@ pub async fn open_marked_v2_database_read_only_at(path: &Path) -> Result<Db> {
     open_marked_v2_with_options(path, options).await
 }
 
+/// Observe a marked kernel file without creating WAL/SHM coordination files.
+/// Like the current-engine WAL observer, this requires retained sidecars for
+/// WAL-mode files. Restored rollback-journal snapshots need no sidecars.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub async fn open_marked_v2_database_wal_read_only_at(path: &Path) -> Result<Db> {
+    let (path, options) = literal_options(path, true)?;
+    open_marked_v2_with_options(path, options).await
+}
+
 /// Developer export only. The operator owns a quiescent, self-contained copy;
 /// immutable mode is never appropriate for an active writer or retained WAL.
 #[cfg(all(feature = "v2-kernel-probe", any(test, feature = "dev-tools")))]
@@ -281,6 +290,8 @@ async fn open_read_only_handle(path: PathBuf, options: SqliteConnectOptions) -> 
         execution_jobs: Arc::new(enrolled::HandleJobs::default()),
         body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
         body_retirement: Arc::new(OnceLock::new()),
+        #[cfg(feature = "v2-kernel-probe")]
+        kernel_lifecycle: None,
         capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         pending_commit_probes: None,
         write_pool,
@@ -293,16 +304,26 @@ async fn open_read_only_handle(path: PathBuf, options: SqliteConnectOptions) -> 
             open_mode: DatabaseOpenMode::StandbyReadOnly,
         }),
         handle_id: uuid::Uuid::new_v4(),
+        #[cfg(feature = "v2-kernel-probe")]
+        demand_root_aliases: Arc::default(),
         embedder: None,
         advisors: AdvisorRegistry::default(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
         )),
+        access_generation: Arc::default(),
+        access_exclusive_owner: Arc::default(),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
         workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_handle: Arc::default(),
         workspace_index_refused: Arc::new(Mutex::new(None)),
         workspace_snapshots: Arc::new(Mutex::new(
             crate::workspace_snapshot::SnapshotStore::default(),
@@ -727,5 +748,96 @@ mod tests {
         assert!(error.to_string().contains("lossless UTF-8"), "{error}");
         assert!(!directory.path().join("candidate-�.db").exists());
         assert_eq!(std::fs::read(path).unwrap(), [0_u8; 100]);
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    #[tokio::test]
+    async fn v2_wal_observer_requires_sidecars_and_keeps_every_pool_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v2.db");
+        let (writer, _) = crate::kernel::create_v2_database(
+            path.to_str().unwrap(),
+            "account",
+            "Owner",
+            "owner-binding",
+        )
+        .await
+        .unwrap();
+        // Db closes its read-only and writable pools concurrently. SQLite
+        // leaves sidecars behind if a read-only connection closes last, so
+        // retain an explicit writable keeper to own the fixture's final close.
+        let mut keeper = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut keeper)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        // A retained writer owns WAL/SHM; the reader observes its committed
+        // head without creating a new journal lifecycle.
+        let reader = open_marked_v2_database_wal_read_only_at(&path)
+            .await
+            .unwrap();
+        for pool in [reader.pool(), reader.write_pool(), reader.governed_pool()] {
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert!(count > 0);
+            sqlx::query("PRAGMA query_only=OFF")
+                .execute(pool)
+                .await
+                .unwrap();
+            let error = sqlx::query("DELETE FROM content_events")
+                .execute(pool)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("8")
+            );
+        }
+        reader.close().await;
+        writer.close().await;
+        let (busy, log_frames, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&mut keeper)
+                .await
+                .unwrap();
+        assert_eq!((busy, log_frames, checkpointed), (0, 0, 0));
+        keeper.close().await.unwrap();
+        assert!(!sidecar(&path, "-wal").exists());
+        assert!(!sidecar(&path, "-shm").exists());
+        assert!(open_marked_v2_database_wal_read_only_at(&path)
+            .await
+            .is_err());
+        assert!(!sidecar(&path, "-wal").exists());
+        assert!(!sidecar(&path, "-shm").exists());
+        // The same marked file in rollback-journal mode models a restored
+        // self-contained snapshot and needs no retained sidecars.
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA journal_mode=DELETE")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let reader = open_marked_v2_database_wal_read_only_at(&path)
+            .await
+            .unwrap();
+        assert_eq!(reader.open_mode(), DatabaseOpenMode::StandbyReadOnly);
+        reader.close().await;
+        assert!(!sidecar(&path, "-wal").exists());
+        assert!(!sidecar(&path, "-shm").exists());
     }
 }

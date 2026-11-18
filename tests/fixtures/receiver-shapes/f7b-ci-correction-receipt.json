@@ -1,0 +1,111 @@
+{
+  "code_commit": "f7b51475f0e48640ca8ed45f94990a9e06dbf9eb",
+  "failed_before_fix": {
+    "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+    "ci_run": 43666315341,
+    "jobs": [
+      132666516436,
+      132666516747,
+      132666516771,
+      132666516825,
+      132669053382
+    ],
+    "defects": [
+      "stale db/projector backend input facts",
+      "receiver-only registry validation accidentally refused the exact qualified release floor",
+      "binary cancellation omitted accepted-shapes advertisement"
+    ]
+  },
+  "code_sha256": {
+    "src/standby/kernel_v2.rs": "9764396909a91defb2ced020b36fdc8e78d549401970e05d86fe72c53fd679e1",
+    "src/standby/release_head.rs": "5a531409bad97e1037822a12e0210043887c4f7b0f8de83dfdf37739ba69a310",
+    "src/standby/release_head_v2_tests.rs": "c70d82eb773667f7ab296bef3eeb0717b85dd346004818b6ee999a4ef11d73a0",
+    "src/standby/refresh/binary.rs": "c1b82ad2cfa5bd5bf76904daa8d8974eb20e69b1fdf8f41ef1f248c90ae5afad",
+    "src/standby/refresh.rs": "a5556212f07485e1d112cb0b1d3699419c14beb991d9ca182f07f3c9d0b5bdbe"
+  },
+  "default": {
+    "binary": "/fixtures/receiver/target/debug/deps/native_ce-4f333b7e5c545198",
+    "binary_sha256": "c89ea6ab129a44a65f869f028f1f56fbee7ec86509c0111380e9db0d0dd5e054",
+    "source_hashes": {
+      "src/standby/kernel_v2.rs": "954b452d93fb83b5e69b92f64f2b108d39e62a6f985ce56cdab7ebaf9339fe01",
+      "src/standby/release_head.rs": "5a531409bad97e1037822a12e0210043887c4f7b0f8de83dfdf37739ba69a310",
+      "src/standby/refresh/binary.rs": "c1b82ad2cfa5bd5bf76904daa8d8974eb20e69b1fdf8f41ef1f248c90ae5afad",
+      "src/standby/refresh.rs": "a5556212f07485e1d112cb0b1d3699419c14beb991d9ca182f07f3c9d0b5bdbe",
+      "src/standby/release_head_v2_tests.rs": "c70d82eb773667f7ab296bef3eeb0717b85dd346004818b6ee999a4ef11d73a0"
+    },
+    "tests": [
+      {
+        "test": "standby::release_head::v2_tests::release_v2_preparation_floor_preserves_actual_hash_and_strict_admission",
+        "exit": 0
+      },
+      {
+        "test": "standby::release_head::v2_tests::release_v2_preparation_floor_refuses_partial_unrelated_and_data_drift",
+        "exit": 0
+      },
+      {
+        "test": "standby::release_head::v2_tests::release_v2_preparation_floor_observes_changed_wal_coordinates",
+        "exit": 0
+      },
+      {
+        "test": "standby::release_head::v2_tests::release_v2_preparation_floor_matches_actual_unique_index_constraints",
+        "exit": 0
+      },
+      {
+        "test": "standby::refresh::tests::binary_first_install_uses_raw_ranges_and_verified_generation_store",
+        "exit": 0
+      },
+      {
+        "test": "standby::refresh::tests::binary_first_install_rejects_invalid_wire_without_promotion",
+        "exit": 0
+      },
+      {
+        "test": "standby::refresh::tests::binary_interrupted_range_retries_same_handle_and_offset_boundedly",
+        "exit": 0
+      }
+    ]
+  },
+  "probe": {
+    "binary": "/fixtures/receiver/target/debug/deps/native_ce-9dd1640e9412816c",
+    "binary_sha256": "b536cc5a99467f2c879185c8da8fe91ea60a3a21cd7618b4e9ab055ef8ff593a",
+    "tests": [
+      {
+        "test": "standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl",
+        "exit": 0
+      },
+      {
+        "test": "standby::refresh::tests::kernel_v2_refresh::receiver_unknown_owned_shape_goes_full_without_opening_local_writer",
+        "exit": 0
+      },
+      {
+        "test": "standby::shapes::tests::frozen_owned_shapes_and_exact_marking_normalization",
+        "exit": 0
+      },
+      {
+        "test": "standby::release_head::v2_tests::release_v2_preparation_floor_preserves_actual_hash_and_strict_admission",
+        "exit": 0
+      }
+    ]
+  },
+  "held": {
+    "test": "hosting::prepared_release::tests::mixed_fleet_adopts_pre_webhook_floor_and_binds_retiring_heads",
+    "features": [
+      "v2-kernel-probe"
+    ],
+    "exit": 0,
+    "log_sha256": "460204b4e8945e713181cce6eac8d90ed36e09e1f00bcbadc50b557e7fda6538"
+  },
+  "default_source_note": "After the default run, only the frozen-floor invariant comment was restored before the probe/held builds. No behavior changed. Test artifacts are not shipping artifacts.",
+  "checks": {
+    "default_lib": "passed",
+    "probe_lib": "passed",
+    "format": "passed",
+    "live_policy": "106 jobs, 14350 source tests, 9 doctests passed",
+    "backend_generator": "regenerated exactly db/projector input facts; --check passed; correction paths have no backend input facts"
+  },
+  "limits": [
+    "Independent f7b code review pending",
+    "Required CI on the new pushed head pending",
+    "Sixteen functional mutation cases pending",
+    "Authentic old-journal/95 runtime drain/retry/one-effect remains partial and is a blocking B rollout prerequisite"
+  ]
+}

@@ -1,0 +1,211 @@
+{
+  "code_commit": "c85dc20345f8cec4db1b59585b9173d4b530e3e0",
+  "base": "3c0f7f64b94e4ebfab85df41e010f2f45ac8660a",
+  "rebase": {
+    "old_head": "f31d17e4cc2b70c2684d50efa68061d1670011dd",
+    "new_pre_fix_head": "f046c68088317bb044c419d7bf2f84fd23c609bd",
+    "conflicts": [],
+    "range_diff": "all30 patches equal",
+    "pre_fix_tree_equals_actual_ci_merge": "273f3c51463e69245115dc2238a4d9b22561adf2"
+  },
+  "review": {
+    "verdict": "APPROVE code, read only; reviewer ran no tests",
+    "native_record": "e3540d1e-1380-441a-a866-37705bb154bc",
+    "revision": "rec:503978"
+  },
+  "fresh_ingress": {
+    "base": "3c0f7f64b94e4ebfab85df41e010f2f45ac8660a",
+    "pre_fix_rebase_head": "f046c68088317bb044c419d7bf2f84fd23c609bd",
+    "working_diff_sha256": "47114d1b694f38acc755e52e76879cd4b7303fa2b0866f5b378d5a2321e380b4",
+    "binary": "/fixtures/receiver/target/debug/deps/native_ce-9dd1640e9412816c",
+    "binary_sha256": "d5a6396163326d55ef0ad30d422c84dda56041710b121d8e894fe1f5dd3cf99d",
+    "features": [
+      "v2-kernel-probe"
+    ],
+    "tests": [
+      {
+        "test": "node::failover::tests::default_reads::receiver_working_ingress_pairs_only_the_actual_legacy_note_codec",
+        "exit": 0,
+        "log_sha256": "d00db6e25bcfb2bdf797e35dcb4d23b33571afa694990ec1909129d9f423f21a"
+      }
+    ]
+  },
+  "neighbor_tests_before_fixture_only_correction": {
+    "base": "3c0f7f64b94e4ebfab85df41e010f2f45ac8660a",
+    "pre_fix_rebase_head": "f046c68088317bb044c419d7bf2f84fd23c609bd",
+    "working_diff_sha256": "903c2aa0ecb918000470ccd804b6a8ae1a36e6eb95b9dcb21f5f036bf46ca7e4",
+    "binary": "/fixtures/receiver/target/debug/deps/native_ce-9dd1640e9412816c",
+    "binary_sha256": "a24b514f71a7e04adae753ca919b2c344af281afc55de50336950c5b28d6c382",
+    "features": [
+      "v2-kernel-probe"
+    ],
+    "tests": [
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_retained_v9_update_cannot_use_v7_digest_pair",
+        "exit": 0,
+        "log_sha256": "5a43337a346166fc3111cb7a8100c8d7a6a8ebc1b695d8aaca1bd82d9b638c19"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_fresh95_discovery_admits_only_local94_no_observation_original",
+        "exit": 0,
+        "log_sha256": "5058ca421880f5e226f1e8d63024b1e0a34b76973bdd4e801d770760fc004225"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery",
+        "exit": 0,
+        "log_sha256": "32d26153b071e994d7dd34d6646598911b55e7c7af74cbafbd47c9870c26e7bf"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+        "exit": 0,
+        "log_sha256": "cc830a1a16762e6d46d19a164da4cc7617912480868d2acbcc2c81dcf25d3eae"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::installed_working_v7_exact_contract_does_not_inherit_prose_only_custody",
+        "exit": 0,
+        "log_sha256": "786ddc598629133a2651a5447d1e1d4fa0a1d05f5bd26613220ac55f8c72024b"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver94_constructor_evidence",
+        "exit": 0,
+        "log_sha256": "0edb9ca9b2fdaf8b8fb1ba6e5415aee1b0a64caf4379f11f7d0236a06978402d"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+        "exit": 0,
+        "log_sha256": "6412e767bac7185a363db3e578fff63c741200cf1220ff80f37fbef3366cc3d8"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::installed_working_records_reverse_barrier_covers_archive_links_and_secondary_targets",
+        "exit": 0,
+        "log_sha256": "0dfb5b05286db52bdabb74948fce83690a91706a080f959571ce677eb4597fe6"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::installed_working_retained_create_append_share_one_target_and_check_each_digest",
+        "exit": 0,
+        "log_sha256": "540e2f14e67171656c70b539e6c61fe3b15a4d16f5ee7b7d201757ec9cfb1a36"
+      },
+      {
+        "test": "fork::kernel_v2_tests::working_records_one_workspace_native_edits_links_and_pinned_reads",
+        "exit": 0,
+        "log_sha256": "09b054e577a227f0dbb5bb2a99a331a329246ccff6eaa4a660a39d58b9eca1fe"
+      },
+      {
+        "test": "node::failover::tests::default_reads::saved_state_unconfirmed_working_account_recovers_without_pausing",
+        "exit": 0,
+        "log_sha256": "036b32119aa87a766b085a7bf89694c9425e3bf965f6098e3e0b5f5c2ef1db2e"
+      }
+    ]
+  },
+  "normal_source": {
+    "source": "c85dc20345f8cec4db1b59585b9173d4b530e3e0",
+    "binary_sha256": "d5a6396163326d55ef0ad30d422c84dda56041710b121d8e894fe1f5dd3cf99d",
+    "source_files": {
+      "docs/receiver-shapes-qualification.md": "b9fce705deee177fbfbefd909324fbb1005e6828ff24b6d5f00fb981771afed0",
+      "src/fork/working_v2/manager.rs": "78c53db370c024be5177209423d234d451df612ba3e8079f6b9dbbb484d9aeb2",
+      "src/node/failover/default_reads_tests.rs": "900472464c96329b6fa8200d96e6004757f641046564a440d23c66e0ed502532",
+      "src/node/failover/tests.rs": "5e5c87be186a6e7a8ba0f6a074f088466c8d7796d7d7c572c4b61fb5ec1975b5",
+      "src/node/failover/working_append.rs": "aca4549690a9b7486a0cb385f0052023293de15f278b790bb17bf783945919de",
+      "src/node/gate.rs": "4dc367fcce4c2780d1cadd6c9a669c35951c29031657c327ae9a0fdfd4433efb",
+      "src/node/gate/v2_holding.rs": "e38fa9f4e27b1f92eff74516c35ff55c233cf71f1e0a889e6e57526009feb5e3",
+      "src/node/gate/v2_holding_tests.rs": "8241306d153f4f1aa2fbb0b945a891691e1ccac718d58952cc56e2621e050bc4",
+      "tests/fixtures/receiver-shapes/mutate.py": "27806a8132c7fd2e71eb602878d20920b40a5b5aa542a561d44d27f5e9bc8bcc"
+    },
+    "qualification": "library test binary, dev build identity; not a shipping process artifact"
+  },
+  "mutations": [
+    {
+      "mutation": "installed-fresh-codec-bypass",
+      "head": "c85dc20345f8cec4db1b59585b9173d4b530e3e0",
+      "path": "src/node/gate.rs",
+      "original_sha256": "4dc367fcce4c2780d1cadd6c9a669c35951c29031657c327ae9a0fdfd4433efb",
+      "mutant_sha256": "cadf969c90b2ab4198cdaf0a7d929a87e6a3a4aacbff70e62354370ec117c98e",
+      "tests": [
+        {
+          "test": "node::failover::tests::default_reads::receiver_working_ingress_pairs_only_the_actual_legacy_note_codec",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::failover::tests::default_reads::receiver_working_ingress_pairs_only_the_actual_legacy_note_codec stdout ----\n[native-ce-outbox-fork] preparation_started\n[native-ce-outbox-fork] preparation_stage stage=vacuum\n[native-ce-outbox-fork] preparation_stage stage=verify_partial\n[native-ce-outbox-fork] preparation_stage stage=open_published\n[native-ce-outbox-fork] preparation_finished elapsed_ms=25\n[native-ce-outbox-fork] footprint_checked fits=true reservation_bytes=19054592\nworking_append_fsync_to_ack_us=140501\nreceiver_ingress_case operation=update_record note=false hosted95=false passed\n[native-ce-outbox-fork] preparation_started\n[native-ce-outbox-fork] preparation_stage stage=vacuum\n[native-ce-outbox-fork] preparation_stage stage=verify_partial\n[native-ce-outbox-fork] preparation_stage stage=open_published\n[native-ce-outbox-fork] preparation_finished elapsed_ms=24\n[native-ce-outbox-fork] footprint_checked fits=true reservation_bytes=19054592\nworking_append_fsync_to_ack_us=145836\nreceiver_ingress_case operation=manage_links.add note=false hosted95=false passed\n[native-ce-outbox-fork] preparation_started\n[native-ce-outbox-fork] preparation_stage stage=vacuum\n[native-ce-outbox-fork] preparation_stage stage=verify_partial\n[native-ce-outbox-fork] preparation_stage stage=open_published\n[native-ce-outbox-fork] preparation_finished elapsed_ms=23\n[native-ce-outbox-fork] footprint_checked fits=true reservation_bytes=19054592\nworking_append_fsync_to_ack_us=120402\n\nthread 'node::failover::tests::default_reads::receiver_working_ingress_pairs_only_the_actual_legacy_note_codec' (3574380) panicked at src/node/failover/default_reads_tests.rs:2718:13:\nassertion `left == right` failed: update_record: {\"jsonrpc\":\"2.0\",\"id\":91,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Accepted pending: the edit is visible in this node's working copy and is waiting for canonical acceptance.\"}],\"structuredContent\":{\"outcome\":\"accepted_pending\",\"id\":\"d2bb85e9-1285-4e29-ab88-f6607fa4225a\",\"operation\":\"update_record\",\"journal_entry\":\"73cdaaba-1133-4ee6-8074-da97fe1c5108\",\"idempotency_key\":\"receiver-codec\",\"local_visibility\":\"working_applied\",\"publication\":{\"binding\":{\"account_id\":\"acct_receiver\",\"database_id\":\"route-1\",\"origin_database_id\":\"ndb_1f75431239704d058dc7d1ed947a13d2\",\"history_lineage\":\"v2:ndb_1f75431239704d058dc7d1ed947a13d2:1f754312-3970-4d05-8dc7-d1ed947a13d2\",\"resource_origin\":\"http://127.0.0.1:39235\"},\"generation\":\"9c1e7934-4806-4353-ad31-d2053ea9c2f3\",\"publication\":1,\"accepted_frontier\":17,\"journal_revision\":\"8e328d11685c57dfe9252898c43f51923869ec147f4300e6ecadb528d9fee80a\"},\"canonical\":\"pending\"},\"isError\":false}}\n  left: Null\n right: \"not_sent\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::failover::tests::default_reads::receiver_working_ingress_pairs_only_the_actual_legacy_note_codec\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7913 filtered out; finished in 5.41s\n\n",
+          "raw_log_sha256": "a4b95cf124af2c55baf7775b4dbd0a43beac9e96726f506e9b1a0e3b12e77827"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_exit": 0,
+      "compile_jsonl_sha256": "2f1f323d8ec67d89e024ee473cb99a4c55b3a40da8d9dd98dd345894f714a613",
+      "compile_log_sha256": "da66659e6a03338905cfea7134460a54d591cf4e2d37d639bf9ae46b152a1e34"
+    },
+    {
+      "mutation": "installed-retained-version-bypass",
+      "head": "c85dc20345f8cec4db1b59585b9173d4b530e3e0",
+      "path": "src/node/gate/v2_holding.rs",
+      "original_sha256": "e38fa9f4e27b1f92eff74516c35ff55c233cf71f1e0a889e6e57526009feb5e3",
+      "mutant_sha256": "4b121ec92092d131a06ac3ea9b80ab16618dc19bd5050388139764fbcb7d0b6a",
+      "tests": [
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_retained_v9_update_cannot_use_v7_digest_pair",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_retained_v9_update_cannot_use_v7_digest_pair stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_retained_v9_update_cannot_use_v7_digest_pair' (3599090) panicked at src/node/gate/v2_holding_tests.rs:2946:5:\nassertion failed: matches!(scoped.v2_contract_block(&entry, Some(rig.verified.as_ref())).await,\n    Some(crate::node::journal::CompatibilityBlock::LegacyDigestDrift))\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_retained_v9_update_cannot_use_v7_digest_pair\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7913 filtered out; finished in 0.33s\n\n",
+          "raw_log_sha256": "f17ca4dfed69a4d19a6a591d271aecaf1ddcf1a3119ba4e9cf2b28c2ff8b61b2"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_exit": 0,
+      "compile_jsonl_sha256": "e6589c4c05b82bd294ef5d6132bdc01b59f054586c7c45fad5c289c02883eb8e",
+      "compile_log_sha256": "97a469302ff21a69287fe2fe80661740cd0d338a7e801912e3a5e5a3c7fdb923"
+    }
+  ],
+  "restored_normal": {
+    "code_commit": "c85dc20345f8cec4db1b59585b9173d4b530e3e0",
+    "binary_sha256": "d5a6396163326d55ef0ad30d422c84dda56041710b121d8e894fe1f5dd3cf99d",
+    "method": "preserved unmixed normal test binary, exact committed source hashes checked after both mutations; not a new build/product-process claim",
+    "tests": [
+      {
+        "test": "node::failover::tests::default_reads::receiver_working_ingress_pairs_only_the_actual_legacy_note_codec",
+        "exit": 0,
+        "log_sha256": "3c3b338b0544832abc69e94ba8ade276c9d7c1e40489b9f9e7d95ea0c0372165"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_retained_v9_update_cannot_use_v7_digest_pair",
+        "exit": 0,
+        "log_sha256": "f1a3d088695d7e5aa137d3c928b14c1a28e03bf4b947b8e93760d3063107881d"
+      }
+    ]
+  },
+  "checks": {
+    "default_library_check": {
+      "exit": 0,
+      "log_sha256": "d6b7b0a530a92cc97244b5c351129daa8448745c27859a198695714670685ab6"
+    },
+    "probe_library_check": {
+      "exit": 0,
+      "log_sha256": "466db072483daa28a667c74c6315eca34eda6397e9244c3f85664382389b6b50"
+    },
+    "probe_test_typecheck": {
+      "exit": 0,
+      "log_sha256": "fd001bdc6f7f912a8a1a589169588cbb438232209ae3930f4745140549b59a23"
+    },
+    "live_policy": {
+      "exit": 0,
+      "log_sha256": "d4c3c3eb376666f5df3df3562dd49ad0a9aa69d4a7cdced0d8cde8b8845eb462"
+    },
+    "format": {
+      "exit": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "limitations": [
+    "Library tests use dev build identity, not a new packaged/process artifact.",
+    "The eleven neighbor tests used the first normal binary; only the new ingress fixture changed afterward, shipping source stayed identical.",
+    "Initial fresh fixture attempt failed at missing discovery before ingress; it is not boundary evidence.",
+    "Frozen95 descriptors are served through the coherent private authenticated HTTP fixture; this does not prove the authentic795 journal recovery cell.",
+    "Historical f31 CI43680192191 passed against merge273f but its blocked code is superseded. New exact-head required CI remains necessary.",
+    "Richard moved the authentic old-journal-to-hosted95 restart/drain/retry/one-effect cell to a blocking B rollout prerequisite; it is partial, not passed. B rollout and A2 remain held."
+  ],
+  "initial_setup_failure": {
+    "exit": 101,
+    "phase": "before ingress at missing discovery",
+    "log_sha256": "2e9faa6f9ab279e2159e76c27f6c3b275d882c40af965a17c11d9fb6ca1b53b0",
+    "excluded_from_boundary_witnesses": true
+  }
+}

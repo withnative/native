@@ -746,6 +746,31 @@ pub(crate) const SQL_WRITE_RECEIPTS_DDL: [&str; 4] = [
        BEGIN SELECT RAISE(ABORT, 'sql_write_receipts is append-only'); END"#,
 ];
 
+/// Engine 94: receiver-local authority for canonical command cancellation.
+/// The control event is portable evidence; only this locally issued anchor
+/// fences execution. Same-database backup/standby preserves it, interchange does not.
+pub(crate) const HELD_COMMAND_CANCELLATION_DDL: [&str; 4] = [
+    r#"CREATE TABLE provenance_local_command_cancellations (
+     event_id TEXT PRIMARY KEY REFERENCES control_events(id),
+     origin_db_id TEXT NOT NULL,
+     principal TEXT NOT NULL,
+     operation TEXT NOT NULL CHECK (operation IN ('create_record','update_record')),
+     command_identity_digest TEXT NOT NULL CHECK (length(command_identity_digest)=64),
+     action_digest TEXT NOT NULL CHECK (length(action_digest)=64),
+     intent_digest TEXT CHECK (intent_digest IS NULL OR length(intent_digest)=64),
+     app_context_digest TEXT NOT NULL CHECK (length(app_context_digest)=64),
+     UNIQUE(principal,operation,command_identity_digest)
+   )"#,
+    r#"CREATE TRIGGER provenance_local_command_cancellations_no_update
+       BEFORE UPDATE ON provenance_local_command_cancellations
+       BEGIN SELECT RAISE(ABORT, 'provenance_local_command_cancellations is append-only'); END"#,
+    r#"CREATE TRIGGER provenance_local_command_cancellations_no_delete
+       BEFORE DELETE ON provenance_local_command_cancellations
+       BEGIN SELECT RAISE(ABORT, 'provenance_local_command_cancellations is append-only'); END"#,
+    r#"CREATE INDEX idx_local_command_cancellations_event
+       ON provenance_local_command_cancellations(event_id)"#,
+];
+
 /// Engine 93: the viewer's own Messages in Unfiled (notes to self) as a keyed
 /// read. `DDL_STATEMENTS` embeds it, and the 92 → 93 migration installs the
 /// same text.
@@ -899,7 +924,7 @@ pub(crate) const CONTENT_EVENT_HEADS_DDL: [&str; 6] = [
        END"#,
 ];
 
-pub const DDL_STATEMENTS: [&str; 402] = [
+pub const DDL_STATEMENTS: [&str; 406] = [
     r#"CREATE TABLE content_events (
      seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
      id                      TEXT NOT NULL UNIQUE,
@@ -3165,7 +3190,11 @@ pub const DDL_STATEMENTS: [&str; 402] = [
     CONTENT_EVENT_HEADS_DDL[3],
     CONTENT_EVENT_HEADS_DDL[4],
     CONTENT_EVENT_HEADS_DDL[5],
-    r#"PRAGMA user_version = 93"#,
+    HELD_COMMAND_CANCELLATION_DDL[0],
+    HELD_COMMAND_CANCELLATION_DDL[1],
+    HELD_COMMAND_CANCELLATION_DDL[2],
+    HELD_COMMAND_CANCELLATION_DDL[3],
+    r#"PRAGMA user_version = 94"#,
 ];
 
 /// The six triggers that keep the two external-content FTS5 indexes

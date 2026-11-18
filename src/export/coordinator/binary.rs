@@ -512,15 +512,16 @@ impl ExportCoordinator {
         let capture_handle = handle.clone();
         let capture_principal = principal.clone();
         let capture_db_key = db_key.clone();
+        let diagnostics = crate::write_diagnostics::Context::background("snapshot_export");
         tokio::spawn(async move {
-            let captured = AssertUnwindSafe(coordinator.run_binary_capture(
+            let captured = AssertUnwindSafe(diagnostics.scope(coordinator.run_binary_capture(
                 capture_handle.clone(),
                 slot,
                 principal,
                 db_key,
                 activity,
                 create,
-            ))
+            )))
             .catch_unwind()
             .await;
             if captured.is_err() {
@@ -1398,6 +1399,7 @@ mod tests {
 
     fn consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,

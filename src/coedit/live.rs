@@ -45,6 +45,29 @@ use crate::authorization::Capability;
 use crate::db::Db;
 use crate::mcp::Caller;
 
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "kernel_lifecycle.rs"]
+#[allow(dead_code)] // L1 only: no Db pool/host lifecycle activation.
+pub(crate) mod kernel_lifecycle;
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "kernel_reads.rs"]
+pub(crate) mod kernel_reads;
+#[cfg(feature = "v2-kernel-probe")]
+#[allow(unused_imports)] // Explicit L2 opt-in facade; no constructor call in L1.
+pub(crate) use kernel_lifecycle::{
+    register_kernel_lifecycle, seal_kernel_retirement, KernelBlockedReason,
+    KernelLifecycleRegistration, KernelRetirementState, KernelRetirementWitness,
+};
+/// Key-scoped Fleet admission for explicit inactive lifecycle fixture proofs.
+/// Opaque guard removes this key's hook on Drop; no production/global setter.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) fn test_kernel_fleet_admission(db: &Db, hook: WriteAdmission) -> impl Drop {
+    kernel_lifecycle::test_admission_hook(db, kernel_lifecycle::AdmissionKind::Fleet, hook)
+}
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "kernel_writes.rs"]
+pub(crate) mod kernel_writes;
+
 /// The contributor's own record of an app, taken from the host-asserted
 /// attribution the engine admitted for the call.
 impl From<&crate::mcp::app_attribution::AppAttribution> for AppAttribution {
@@ -80,6 +103,13 @@ pub fn set_dirty_write_admission(hook: Option<WriteAdmission>) {
 }
 
 fn admit_dirty_write(db: &Db) -> Result<Option<Box<dyn Send>>, Refused> {
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    if let Some(hook) = kernel_lifecycle::test_admission(db, kernel_lifecycle::AdmissionKind::Dirty)
+    {
+        return hook(db)
+            .map(Some)
+            .ok_or_else(|| Refused::new(RefusalCode::Unavailable, WRITES_FROZEN));
+    }
     match DIRTY_WRITE_ADMISSION
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -122,6 +152,13 @@ pub fn set_write_admission(hook: Option<WriteAdmission>) {
 /// Ask the hook to admit a cut. `Err` = refused (frozen); `Ok(guard)` must
 /// be held until the cut has committed or failed (`Ok(None)` = no hook).
 fn admit_write(db: &Db) -> Result<Option<Box<dyn Send>>, Refused> {
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    if let Some(hook) = kernel_lifecycle::test_admission(db, kernel_lifecycle::AdmissionKind::Fleet)
+    {
+        return hook(db)
+            .map(Some)
+            .ok_or_else(|| Refused::new(RefusalCode::Unavailable, WRITES_FROZEN));
+    }
     let hook = WRITE_ADMISSION
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -473,6 +510,11 @@ fn spawn_grace_loop(session: Arc<LiveSession>) {
 
 #[inline(never)]
 fn spawn_close_if_unsupported(session: Arc<LiveSession>, db: Db) {
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        kernel_lifecycle::schedule_recheck(db, session);
+        return;
+    }
     tokio::spawn(Box::pin(async move {
         let _ops = session.ops.lock().await;
         close_if_unsupported(&session, &db).await;
@@ -493,6 +535,21 @@ fn spawn_cut(
 
 #[inline(never)]
 fn spawn_recheck(runtime: &tokio::runtime::Handle, db: Db, flagged: Vec<Arc<LiveSession>>) {
+    #[cfg(feature = "v2-kernel-probe")]
+    let flagged = flagged
+        .into_iter()
+        .filter_map(|room| {
+            if room.backend == super::backend::SessionBackend::KernelV2 {
+                kernel_lifecycle::schedule_recheck(db.clone(), room);
+                None
+            } else {
+                Some(room)
+            }
+        })
+        .collect::<Vec<_>>();
+    if flagged.is_empty() {
+        return;
+    }
     runtime.spawn(Box::pin(async move {
         for session in flagged {
             match load_supported(&db, &session.record_id).await {
@@ -517,6 +574,16 @@ struct DbSessions {
     /// fresh session seeds from the committed body holding it exclusively, so
     /// no ordinary write can commit underneath a seed.
     open_gate: Arc<RwLock<()>>,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_lane: Arc<AsyncMutex<()>>,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_lifecycle: kernel_lifecycle::Admission,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_jobs: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_quarantine: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_quarantine_identity: StdMutex<Option<String>>,
     records: StdMutex<HashMap<String, Arc<LiveSession>>>,
 }
 
@@ -549,6 +616,18 @@ fn db_sessions(db: &Db) -> Arc<DbSessions> {
     Arc::clone(service.entry(key).or_insert_with(|| {
         Arc::new(DbSessions {
             open_gate: Arc::new(RwLock::new(())),
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_lane: Arc::new(AsyncMutex::new(())),
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_lifecycle: kernel_lifecycle::Admission::new(),
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_jobs: Arc::new(tokio::sync::Semaphore::new(
+                kernel_writes::MAX_OWNED_KERNEL_JOBS_PER_DATABASE,
+            )),
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_quarantine: tokio::sync::watch::channel(false).0,
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_quarantine_identity: StdMutex::new(None),
             records: StdMutex::new(HashMap::new()),
         })
     }))
@@ -561,6 +640,34 @@ fn db_sessions(db: &Db) -> Arc<DbSessions> {
 pub fn release_idle_database(db: &Db) -> bool {
     let mut service = lock(&SERVICE);
     let key = session_key(db);
+    #[cfg(feature = "v2-kernel-probe")]
+    if let Some(owner) = service.get_mut(&key) {
+        // Exclusive-detach protocol: SERVICE lookup publishes an Arc pin before
+        // releasing SERVICE. Do not wait for admission.serial under SERVICE:
+        // normal admissions may hold that ledger while revalidating SERVICE.
+        // get_mut requires no other strong OR weak references, so registration,
+        // pre-spawn reservations, witnesses and room custody cannot be detached
+        // between lookup and ledger publication. With unique access, get_mut on
+        // the mutex reads the ledger without acquiring a reverse-order lock.
+        let Some(owner) = Arc::get_mut(owner) else {
+            return false;
+        };
+        let ledger = owner
+            .kernel_lifecycle
+            .serial
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !ledger.registered.is_empty()
+            || ledger.accepted_jobs != 0
+            || ledger.cleanup_running
+            || ledger.quiescent
+            || ledger.driver_unknown.is_some()
+            || *owner.kernel_quarantine.borrow()
+            || *owner.kernel_lifecycle.sealed.borrow()
+        {
+            return false;
+        }
+    }
     if service
         .get(&key)
         .is_some_and(|owner| !lock(&owner.records).is_empty())
@@ -579,6 +686,17 @@ fn existing_session(db: &Db, record_id: &str) -> Option<Arc<LiveSession>> {
     existing_db_sessions(db).and_then(|owner| lock(&owner.records).get(record_id).cloned())
 }
 
+/// Whether the record currently has an open (not closed) live body session.
+///
+/// Constrained transaction-owned replays consult this before touching a body:
+/// a live room owns the body's write path (flush, candidate, routed append),
+/// so replaying around it would bypass live-body ownership. A closed room is
+/// quiescent and needs no such fence. Only the replay seam calls this today.
+#[allow(dead_code)]
+pub(crate) fn record_has_open_live_room(db: &Db, record_id: &str) -> bool {
+    existing_session(db, record_id).is_some_and(|room| !room.state().closed)
+}
+
 /// Poison is not an expected state here (no code panics while holding these
 /// locks); recover the data rather than cascading the panic.
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -591,11 +709,34 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// including a version or routed write across its SQLite transaction;
 /// `state` is held only briefly and never across an await.
 struct LiveSession {
+    /// Actual native seed handle, immutable across joins and read observations.
+    /// V1 rooms carry no native origin. This is not physical-generation proof.
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_origin: Option<Db>,
+    backend: super::backend::SessionBackend,
+    /// Immutable origin of the seeded body, read in its admission snapshot.
+    /// Only sessions originally admitted as Documents retain the historical
+    /// Document final-cut exception after a scope change.
+    admitted_as_document: bool,
     record_id: String,
     owner: Weak<DbSessions>,
     ops: Arc<AsyncMutex<()>>,
     state: StdMutex<State>,
     events: broadcast::Sender<SessionEvent>,
+}
+
+/// Advisory client-clock bounds of re-authored offline intent. Never authority.
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct OfflineMerge {
+    pub started_at_ms: u64,
+    pub reconnected_at_ms: u64,
+}
+
+impl OfflineMerge {
+    fn valid(self) -> bool {
+        self.started_at_ms <= self.reconnected_at_ms
+            && self.reconnected_at_ms <= 9_007_199_254_740_991
+    }
 }
 
 struct State {
@@ -613,6 +754,7 @@ struct State {
     callers: HashMap<String, Caller>,
     /// Registry mutation epoch at the last committed version.
     versioned_epoch: u64,
+    offline_merge: Option<OfflineMerge>,
     dirty_admission: Option<Box<dyn Send>>,
     last_op: Instant,
     /// [`IDLE_VERSION_AFTER`], overridable per session in tests only (a
@@ -646,6 +788,10 @@ struct State {
     /// An unguarded writer appended a scope-leaving event; re-check the
     /// record after the next commit ([`after_commit`]).
     pending_recheck: bool,
+    /// Non-authorizing native availability latch; only complete installation
+    /// of a different known-durable body event under ops can clear it.
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_finalization_blocked: bool,
     base: BaseVersion,
     next_incarnation: u64,
 }
@@ -765,6 +911,13 @@ impl LiveSession {
             records.is_empty()
         };
         if empty {
+            #[cfg(feature = "v2-kernel-probe")]
+            if self.backend == super::backend::SessionBackend::KernelV2 {
+                // Kernel owner removal must use release_idle_database's exclusive
+                // detach protocol. A last-room close must not erase registration,
+                // accepted jobs or a terminal seal after its marker was dropped.
+                return;
+            }
             // Drop the database's entry once it holds no sessions and nobody
             // else holds it or its gate (an in-flight writer keeps both).
             let mut service = lock(&SERVICE);
@@ -778,7 +931,7 @@ impl LiveSession {
     }
 }
 
-fn unavailable(error: impl std::fmt::Display) -> Refused {
+pub(super) fn unavailable(error: impl std::fmt::Display) -> Refused {
     Refused::new(RefusalCode::Unavailable, error.to_string())
 }
 
@@ -828,7 +981,7 @@ fn version_token(seq: i64) -> String {
 ///   an `authenticated_principal`; contribution metadata renders the same
 ///   case as `likely_agent`);
 /// - anything else (a web or workbench Save, a websocket peer) is a person.
-fn author_for(caller: &Caller) -> Author {
+pub(super) fn author_for(caller: &Caller) -> Author {
     let (executor_kind, _, _) = crate::provenance::verified_executor_attribution(caller);
     let app = caller.host_asserted_app().map(AppAttribution::from);
     let channel = caller.channel();
@@ -872,14 +1025,20 @@ pub(crate) fn author_kind(
     }
 }
 
+pub(crate) struct LoadedBody {
+    pub(crate) body: String,
+    pub(crate) base: BaseVersion,
+    pub(crate) admitted_as_document: bool,
+}
+
 /// Check `caller` may open `record_id` in `mode`, and that the body is a
-/// live-editable Markdown body. Returns the committed body and its version.
-async fn load_committed(
+/// live-editable Markdown body. Returns its body, version and admission type.
+pub(super) async fn load_committed(
     db: &Db,
     caller: &Caller,
     record_id: &str,
     mode: SessionMode,
-) -> Result<(String, BaseVersion), Refused> {
+) -> Result<LoadedBody, Refused> {
     if !crate::mcp::tools::can_record(db, caller, record_id, capability(mode))
         .await
         .map_err(unavailable)?
@@ -896,7 +1055,7 @@ async fn load_committed(
 /// authorization: `forbidden` if it is missing or deleted,
 /// `record_unsupported` if its body is not live-editable Markdown,
 /// `unavailable` on a storage error.
-async fn load_supported(db: &Db, record_id: &str) -> Result<(String, BaseVersion), Refused> {
+async fn load_supported(db: &Db, record_id: &str) -> Result<LoadedBody, Refused> {
     let mut tx = db.pool().begin().await.map_err(unavailable)?;
     let row = sqlx::query(
         "SELECT type, kind, body, deleted_at,
@@ -912,35 +1071,13 @@ async fn load_supported(db: &Db, record_id: &str) -> Result<(String, BaseVersion
     .ok_or_else(|| Refused::new(RefusalCode::Forbidden, "record does not exist"))?;
     let get = |e: sqlx::Error| unavailable(e);
     let stored = stored_body(&mut *tx, record_id).await.ok().flatten();
-    let record_type: String = row.try_get("type").map_err(get)?;
-    let kind: Option<String> = row.try_get("kind").map_err(get)?;
-    let deleted: Option<String> = row.try_get("deleted_at").map_err(get)?;
-    let runtime: bool = row.try_get("runtime_present").map_err(get)?;
     let body: Option<String> = row.try_get("body").map_err(get)?;
     let seq: Option<i64> = row.try_get("seq").map_err(get)?;
-    let (artifact, instruction) = match kind.as_deref() {
-        Some(kind) if record_type == "Document" => {
-            let resolved = crate::meta::kind::resolve_on(&mut tx, "Document", kind)
-                .await
-                .map_err(unavailable)?;
-            (
-                kind == "artifact"
-                    || crate::generated::kinds::CoreKind::DocumentArtifact.matches(&resolved),
-                kind == "instruction" || resolved.canonical_kind.as_deref() == Some("instruction"),
-            )
-        }
-        _ => (false, false),
-    };
+    let admitted_as_document = row.try_get::<String, _>("type").map_err(get)? == "Document";
+    check_supported_row(&mut tx, &row).await?;
     let _ = tx.rollback().await;
-    if deleted.is_some() {
-        return Err(Refused::new(RefusalCode::Forbidden, "record is deleted"));
-    }
-    if record_type != "Document" || runtime || artifact || instruction {
-        return Err(Refused::new(
-            RefusalCode::RecordUnsupported,
-            "live sessions need a Markdown Document body (not an artifact, instruction or runtime body)",
-        ));
-    }
+    // An absent body is an editable empty Markdown body, including WorkItems
+    // created without a description. Opening alone does not persist a body.
     let body = body.unwrap_or_default();
     let body_sha256 = sha256_hex(&body);
     let base = BaseVersion {
@@ -955,7 +1092,62 @@ async fn load_supported(db: &Db, record_id: &str) -> Result<(String, BaseVersion
         ),
         body_sha256,
     };
-    Ok((body, base))
+    Ok(LoadedBody {
+        body,
+        base,
+        admitted_as_document,
+    })
+}
+
+/// Check only the metadata needed for eligibility. Heartbeats must not read
+/// or hash the body (potentially 1 MiB per peer), nor reconstruct cut proofs.
+async fn revalidate_supported(db: &Db, record_id: &str) -> Result<(), Refused> {
+    let mut tx = db.pool().begin().await.map_err(unavailable)?;
+    let row = sqlx::query(
+        "SELECT type, kind, deleted_at,
+                EXISTS(SELECT 1 FROM facet_values
+                        WHERE record_id = records.id AND key = 'runtime') AS runtime_present
+           FROM records WHERE id = ?",
+    )
+    .bind(record_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(unavailable)?
+    .ok_or_else(|| Refused::new(RefusalCode::Forbidden, "record does not exist"))?;
+    check_supported_row(&mut tx, &row).await?;
+    let _ = tx.rollback().await;
+    Ok(())
+}
+
+async fn check_supported_row(
+    connection: &mut sqlx::SqliteConnection,
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<(), Refused> {
+    if row
+        .try_get::<Option<String>, _>("deleted_at")
+        .map_err(unavailable)?
+        .is_some()
+    {
+        return Err(Refused::new(RefusalCode::Forbidden, "record is deleted"));
+    }
+    let record_type: String = row.try_get("type").map_err(unavailable)?;
+    let kind: Option<String> = row.try_get("kind").map_err(unavailable)?;
+    let runtime: bool = row.try_get("runtime_present").map_err(unavailable)?;
+    if !super::eligibility::markdown_body_supported(
+        connection,
+        &record_type,
+        kind.as_deref(),
+        runtime,
+    )
+    .await
+    .map_err(unavailable)?
+    {
+        return Err(Refused::new(
+            RefusalCode::RecordUnsupported,
+            "live sessions need a Markdown Document or governed task/epic body (not an artifact, instruction or runtime body)",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1179,50 @@ pub async fn open(
             "live sessions are not available on enrolled custody storage yet",
         ));
     }
+    // V1 API only. Kernel callers require engine-aware refusal; never discover
+    // a backend by probing V1 tables or fall back from native admission here.
+    open_backend(db, caller, request, super::backend::SessionBackend::V1).await
+}
+
+/// Explicit internal kernel primitive. No hosted ingress or public backend
+/// detection. Existing bounded owned completion outlives a cancelled waiter.
+#[cfg(feature = "v2-kernel-probe")]
+#[allow(dead_code)] // Inactive until a separately reviewed host adapter exists.
+pub(crate) async fn open_kernel_inactive(
+    db: &Db,
+    caller: &Caller,
+    request: OpenRequest,
+) -> Result<(SessionPeer, Opened), Refused> {
+    let (db, caller) = (db.clone(), caller.clone());
+    kernel_writes::owned_result(db.clone(), async move {
+        Ok(open_backend(
+            &db,
+            &caller,
+            request,
+            super::backend::SessionBackend::KernelV2,
+        )
+        .await)
+    })
+    .await
+    .map_err(unavailable)?
+}
+
+async fn open_backend(
+    db: &Db,
+    caller: &Caller,
+    request: OpenRequest,
+    backend: super::backend::SessionBackend,
+) -> Result<(SessionPeer, Opened), Refused> {
+    if shutting_down(db) || db.is_enrolled() {
+        return Err(Refused::new(
+            RefusalCode::Unavailable,
+            "live backend admission unavailable",
+        ));
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    if backend == super::backend::SessionBackend::KernelV2 {
+        kernel_writes::ensure_available(db).map_err(unavailable)?;
+    }
     let OpenRequest {
         record_id,
         mode,
@@ -994,16 +1230,43 @@ pub async fn open(
     } = request;
     // An app claim must name a current adopted v2 install of this account,
     // exactly as a tool call's does (`app_attribution::admit`).
-    admit_app(db, caller).await?;
+    if backend == super::backend::SessionBackend::V1 {
+        admit_app(db, caller).await?;
+    }
     // Authorise (and check support) up front, whether joining or seeding.
-    load_committed(db, caller, &record_id, mode).await?;
+    backend.revalidate(db, caller, &record_id, mode).await?;
     let owner = db_sessions(db);
-    let author = author_for(caller);
+    let author = backend.author(db, caller).await?;
     loop {
         let existing = lock(&owner.records).get(&record_id).cloned();
         let session = match existing {
-            Some(session) => session,
+            Some(session) => {
+                if session.backend != backend {
+                    return Err(Refused::new(
+                        RefusalCode::Unavailable,
+                        "live session backend mismatch",
+                    ));
+                }
+                session
+            }
             None => {
+                #[cfg(feature = "v2-kernel-probe")]
+                if backend == super::backend::SessionBackend::KernelV2 {
+                    match kernel_writes::seed_or_join(
+                        db,
+                        caller,
+                        OpenRequest {
+                            record_id: record_id.clone(),
+                            mode,
+                            resume_peer: resume_peer.clone(),
+                        },
+                    )
+                    .await?
+                    {
+                        Some(opened) => return Ok(opened),
+                        None => continue,
+                    }
+                }
                 let gate = Arc::clone(&owner.open_gate).write_owned().await;
                 if lock(&owner.records).contains_key(&record_id) {
                     drop(gate);
@@ -1011,7 +1274,13 @@ pub async fn open(
                 }
                 // Re-read under the gate: no ordinary body write can commit
                 // between this read and the seed.
-                let (body, base) = load_committed(db, caller, &record_id, mode).await?;
+                let LoadedBody {
+                    body,
+                    base,
+                    admitted_as_document,
+                } = super::backend::SessionBackend::V1
+                    .load_committed(db, caller, &record_id, mode)
+                    .await?;
                 let mut registry = SessionRegistry::new();
                 reserve_client_ids(&mut registry);
                 let opened = registry.open(OpenParams {
@@ -1040,6 +1309,10 @@ pub async fn open(
                 };
                 let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
                 let session = Arc::new(LiveSession {
+                    #[cfg(feature = "v2-kernel-probe")]
+                    kernel_origin: None,
+                    backend,
+                    admitted_as_document,
                     record_id: record_id.clone(),
                     owner: Arc::downgrade(&owner),
                     ops: Arc::new(AsyncMutex::new(())),
@@ -1052,6 +1325,7 @@ pub async fn open(
                         departed: HashMap::new(),
                         callers: HashMap::new(),
                         versioned_epoch: 0,
+                        offline_merge: None,
                         dirty_admission: None,
                         last_op: Instant::now(),
                         idle_after: IDLE_VERSION_AFTER,
@@ -1069,6 +1343,8 @@ pub async fn open(
                         absorbing: None,
                         scope_change: false,
                         pending_recheck: false,
+                        #[cfg(feature = "v2-kernel-probe")]
+                        kernel_finalization_blocked: false,
                         base: base.clone(),
                         next_incarnation: 1,
                     }),
@@ -1097,10 +1373,47 @@ pub async fn open(
                 return Ok((peer, opened));
             }
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        let _join_gate = if backend == super::backend::SessionBackend::KernelV2 {
+            Some(
+                kernel_writes::acquire_read_gate(db, &owner)
+                    .await
+                    .map_err(unavailable)?,
+            )
+        } else {
+            None
+        };
+        #[cfg(feature = "v2-kernel-probe")]
+        let _ops = if backend == super::backend::SessionBackend::KernelV2 {
+            kernel_writes::acquire_peer_ops(&session).await?
+        } else {
+            Arc::clone(&session.ops).lock_owned().await
+        };
+        #[cfg(not(feature = "v2-kernel-probe"))]
         let _ops = session.ops.lock().await;
+        #[cfg(feature = "v2-kernel-probe")]
+        if backend == super::backend::SessionBackend::KernelV2 {
+            backend.revalidate(db, caller, &record_id, mode).await?;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        let _kernel_admission = (backend == super::backend::SessionBackend::KernelV2)
+            .then(|| lock(&owner.kernel_lifecycle.serial));
+        #[cfg(feature = "v2-kernel-probe")]
+        if backend == super::backend::SessionBackend::KernelV2 {
+            kernel_writes::ensure_available(db).map_err(unavailable)?;
+        }
         let mut state = session.state();
         if state.closed {
             continue;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if backend == super::backend::SessionBackend::KernelV2
+            && !session
+                .kernel_origin
+                .as_ref()
+                .is_some_and(|origin| origin.same_handle(db))
+        {
+            return Err(unavailable("native room belongs to another seed handle"));
         }
         state.db = db.clone();
         state.grace_until = None;
@@ -1263,6 +1576,18 @@ impl SessionPeer {
     }
 
     #[cfg(test)]
+    pub(crate) async fn leave_and_expire_grace_for_test(self) {
+        let session = Arc::clone(&self.inner.session);
+        self.leave().await;
+        {
+            let mut state = session.state();
+            assert!(state.peers.is_empty());
+            state.grace_until = Some(Instant::now());
+        }
+        grace_loop(session).await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_idle_after_for_test(&self, idle_after: Duration) {
         self.inner.session.state().idle_after = idle_after;
     }
@@ -1288,8 +1613,36 @@ impl SessionPeer {
     /// broadcast to every subscriber as [`SessionEvent::Remote`] with
     /// `origin = Some(self.peer())`.
     pub async fn apply(&self, update_id: &str, update: &[u8]) -> Result<PeerAck, Refused> {
+        self.apply_with_offline_merge(update_id, update, None).await
+    }
+
+    /// The hint is accepted only with an Edit peer's successful, mutating update.
+    pub async fn apply_with_offline_merge(
+        &self,
+        update_id: &str,
+        update: &[u8],
+        offline_merge: Option<OfflineMerge>,
+    ) -> Result<PeerAck, Refused> {
         let session = &self.inner.session;
+        #[cfg(feature = "v2-kernel-probe")]
+        let _ops = if session.backend == super::backend::SessionBackend::KernelV2 {
+            kernel_writes::acquire_peer_ops(session).await?
+        } else {
+            Arc::clone(&session.ops).lock_owned().await
+        };
+        #[cfg(not(feature = "v2-kernel-probe"))]
         let _ops = session.ops.lock().await;
+        #[cfg(feature = "v2-kernel-probe")]
+        let kernel_owner = (session.backend == super::backend::SessionBackend::KernelV2)
+            .then(|| db_sessions(&session.state().db));
+        #[cfg(feature = "v2-kernel-probe")]
+        let _kernel_admission = kernel_owner
+            .as_ref()
+            .map(|owner| lock(&owner.kernel_lifecycle.serial));
+        #[cfg(feature = "v2-kernel-probe")]
+        if kernel_owner.is_some() {
+            kernel_writes::ensure_available(&session.state().db).map_err(unavailable)?;
+        }
         let mut state = session.state();
         let entry = state.peer(&self.inner.peer, self.inner.incarnation)?;
         if entry.mode != PeerKind::Edit {
@@ -1301,12 +1654,24 @@ impl SessionPeer {
         let author = entry.author.clone();
         let dirty_admission = admit_dirty_write(&state.db)?;
         let session_id = state.session.clone();
+        let before_epoch = state.epoch();
         let ack = state.registry.apply_update_attributed(
             &session_id,
             &self.inner.peer,
             update,
             &author.contributor,
         )?;
+        if state.epoch() != before_epoch {
+            if let Some(hint) = offline_merge.filter(|hint| hint.valid()) {
+                state.offline_merge = Some(match state.offline_merge {
+                    Some(old) => OfflineMerge {
+                        started_at_ms: old.started_at_ms.min(hint.started_at_ms),
+                        reconnected_at_ms: old.reconnected_at_ms.max(hint.reconnected_at_ms),
+                    },
+                    None => hint,
+                });
+            }
+        }
         if state.dirty() && state.dirty_admission.is_none() {
             state.dirty_admission = dirty_admission;
         }
@@ -1333,6 +1698,17 @@ impl SessionPeer {
     /// Everything the live doc has beyond `state_vector` (Yjs sync step 2).
     /// An empty `state_vector` means "everything".
     pub async fn sync(&self, state_vector: &[u8]) -> Result<Vec<u8>, Refused> {
+        #[cfg(feature = "v2-kernel-probe")]
+        let kernel_owner = (self.inner.session.backend == super::backend::SessionBackend::KernelV2)
+            .then(|| db_sessions(&self.inner.session.state().db));
+        #[cfg(feature = "v2-kernel-probe")]
+        let _kernel_admission = kernel_owner
+            .as_ref()
+            .map(|owner| lock(&owner.kernel_lifecycle.serial));
+        #[cfg(feature = "v2-kernel-probe")]
+        if kernel_owner.is_some() {
+            kernel_writes::ensure_available(&self.inner.session.state().db).map_err(unavailable)?;
+        }
         let state = self.inner.session.state();
         state.peer(&self.inner.peer, self.inner.incarnation)?;
         let since: Vec<u8>;
@@ -1355,6 +1731,10 @@ impl SessionPeer {
     /// is also broadcast as [`SessionEvent::Versioned`] to every subscriber,
     /// the requester included; the return value is a convenience.
     pub async fn version(&self, reason: &str) -> Result<Option<Versioned>, Refused> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.inner.session.backend == super::backend::SessionBackend::KernelV2 {
+            kernel_writes::ensure_available(&self.inner.session.state().db).map_err(unavailable)?;
+        }
         if reason.trim().is_empty() {
             return Err(Refused::new(
                 RefusalCode::InvalidRequest,
@@ -1459,6 +1839,10 @@ impl SessionPeer {
                 .insert(caller.credential().to_owned(), caller.clone());
             (state.db.clone(), mode)
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.inner.session.backend == super::backend::SessionBackend::KernelV2 {
+            return kernel_writes::recheck_peer(self, caller, &db, mode).await;
+        }
         let record = &self.inner.session.record_id;
         // The install behind the app can lapse mid-session; that ends the
         // peer like any other loss of authority.
@@ -1472,7 +1856,21 @@ impl SessionPeer {
                 .await
                 .map_err(unavailable)?;
         if allowed {
-            return Ok(());
+            // Governed kind support can be revoked without a content event
+            // (for example, retiring a task kind). Revalidate on the same
+            // heartbeat as authorization, using the admission policy.
+            let _ops = self.inner.session.ops.lock().await;
+            return match revalidate_supported(&db, record).await {
+                Ok(()) => Ok(()),
+                Err(refused) if refused.code == RefusalCode::Unavailable => Err(refused),
+                Err(_) => {
+                    final_cut_and_close(&self.inner.session, &db).await;
+                    Err(Refused::new(
+                        RefusalCode::AccessLost,
+                        "record no longer supports live Markdown editing",
+                    ))
+                }
+            };
         }
         if !self.inner.left.swap(true, Ordering::AcqRel) {
             leave_peer(
@@ -1500,6 +1898,13 @@ async fn leave_peer(
     reason: CloseReason,
 ) -> Option<Versioned> {
     let (cut_needed, actor, db, empty) = {
+        #[cfg(feature = "v2-kernel-probe")]
+        let _ops = if session.backend == super::backend::SessionBackend::KernelV2 {
+            kernel_writes::acquire_peer_ops(session).await.ok()?
+        } else {
+            Arc::clone(&session.ops).lock_owned().await
+        };
+        #[cfg(not(feature = "v2-kernel-probe"))]
         let _ops = session.ops.lock().await;
         let mut state = session.state();
         if state.closed {
@@ -1568,6 +1973,16 @@ async fn run_cut(
     reason: &str,
     actor_hint: Option<Caller>,
 ) -> Result<Option<Versioned>, Refused> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        return kernel_writes::cut_session_owned(
+            Arc::clone(session),
+            db.clone(),
+            reason.to_owned(),
+            actor_hint,
+        )
+        .await;
+    }
     let outcome = crate::storage_profile::with_operation(
         db,
         "session.version",
@@ -1724,6 +2139,12 @@ fn log_unsaved(session: &Arc<LiveSession>, error: &dyn std::fmt::Display, messag
 /// M8b). If even that fails it is logged (metadata only, never the text).
 /// Then the session closes for everyone with `access_lost`.
 async fn abandon_locked(session: &Arc<LiveSession>, db: &Db) {
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        // Native pending contributors require current authority. Retain dirty
+        // text/admissions on refusal; no v1 local-service recovery impersonation.
+        return;
+    }
     if admit_write(db).is_err() {
         // Never give up on unsaved text during a freeze; retry later.
         return;
@@ -1777,6 +2198,10 @@ async fn cut_by_contributor(
         if state.closed || !state.dirty() {
             return Ok(None);
         }
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        return kernel_writes::cut_by_contributor(session, db, reason, actor_hint).await;
     }
     // A record that is no longer versionable (deleted, or no longer a
     // Markdown body) is a policy failure, not a transient one.
@@ -1990,6 +2415,7 @@ async fn write_cut(
         }
         state.registry.version_snapshot(&state.session)?
     };
+    let offline_merge = session.state().offline_merge;
     let actor = match uniform_app(snapshot.contributors()) {
         Some((principal, app)) if actor.credential() == principal => actor
             .without_host_asserted_app()
@@ -2024,6 +2450,36 @@ async fn write_cut(
     let receipt = dispatch
         .scope(async {
             let mut tx = crate::db::enrolled::begin_document_write(db).await?;
+            // Support can be revoked by governance or a type correction.
+            // Recheck inside the write lock, including recovery cuts.
+            // Preserve established Document final-cut behavior only for
+            // sessions originally admitted as Documents. A WorkItem corrected
+            // into a special Document body must not inherit that exception.
+            let row = sqlx::query(
+                "SELECT type, kind,
+                        EXISTS(SELECT 1 FROM facet_values
+                                WHERE record_id = records.id AND key = 'runtime') AS runtime_present
+                   FROM records WHERE id = ?",
+            )
+            .bind(&record)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| crate::Error::engine("live record does not exist"))?;
+            let record_type: String = row.try_get("type")?;
+            let kind: Option<String> = row.try_get("kind")?;
+            if !(session.admitted_as_document && record_type == "Document")
+                && !super::eligibility::markdown_body_supported(
+                    &mut tx,
+                    &record_type,
+                    kind.as_deref(),
+                    row.try_get("runtime_present")?,
+                )
+                .await?
+            {
+                return Err(crate::Error::engine(
+                    "record no longer supports live Markdown editing",
+                ));
+            }
             // Read inside the write transaction, which holds the write lock:
             // nothing can commit between these two reads and the append.
             let before = record_updated_at_in(&mut tx, &record).await?;
@@ -2037,6 +2493,7 @@ async fn write_cut(
                 &session_ref,
                 reason,
                 Some(snapshot.span_map()),
+                offline_merge,
             )
             .await
             {
@@ -2067,6 +2524,7 @@ async fn write_cut(
         // `ops` is held, so nothing moved the epoch since the snapshot.
         let _ = state.registry.drain_version_snapshot(&snapshot);
         state.versioned_epoch = state.epoch();
+        state.offline_merge = None;
         state.dirty_admission.take();
         state.base = BaseVersion {
             version: version_token(receipt.version),
@@ -2090,6 +2548,17 @@ async fn write_cut(
 
 /// Cut a version once the session has been idle for [`IDLE_VERSION_AFTER`]
 /// since its last accepted op. Exits when the session is clean or closed.
+async fn wait_session_until(_session: &Arc<LiveSession>, until: Instant) -> Result<(), ()> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if _session.backend == super::backend::SessionBackend::KernelV2 {
+        return kernel_lifecycle::wait_until(_session, until)
+            .await
+            .map_err(|_| ());
+    }
+    tokio::time::sleep_until(until).await;
+    Ok(())
+}
+
 async fn idle_loop(session: Arc<LiveSession>) {
     loop {
         let (deadline, db) = {
@@ -2100,7 +2569,10 @@ async fn idle_loop(session: Arc<LiveSession>) {
             }
             (state.last_op + state.idle_after, state.db.clone())
         };
-        tokio::time::sleep_until(deadline).await;
+        if wait_session_until(&session, deadline).await.is_err() {
+            session.state().idle_timer = false;
+            return;
+        }
         let due = {
             let state = session.state();
             state.last_op + state.idle_after <= Instant::now()
@@ -2113,7 +2585,13 @@ async fn idle_loop(session: Arc<LiveSession>) {
             // after transient failures); the loop exits if access failures
             // closed the session.
             let backoff = retry_backoff(&session);
-            tokio::time::sleep(backoff).await;
+            if wait_session_until(&session, Instant::now() + backoff)
+                .await
+                .is_err()
+            {
+                session.state().idle_timer = false;
+                return;
+            }
         }
     }
 }
@@ -2132,7 +2610,10 @@ fn retry_backoff(session: &Arc<LiveSession>) -> Duration {
 /// Cut coalesced requested versions, one per allowed slot.
 async fn requested_version_loop(session: Arc<LiveSession>, mut slot: Instant) {
     loop {
-        tokio::time::sleep_until(slot).await;
+        if wait_session_until(&session, slot).await.is_err() {
+            session.state().request_timer = false;
+            return;
+        }
         let (request, db) = {
             let mut state = session.state();
             let request = state.pending_request.take();
@@ -2178,7 +2659,10 @@ async fn grace_loop(session: Arc<LiveSession>) {
                 }
             }
         };
-        tokio::time::sleep_until(until).await;
+        if wait_session_until(&session, until).await.is_err() {
+            session.state().grace_timer = false;
+            return;
+        }
         let (expired, dirty) = {
             let state = session.state();
             (
@@ -2190,6 +2674,29 @@ async fn grace_loop(session: Arc<LiveSession>) {
         };
         if !expired {
             continue;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if session.backend == super::backend::SessionBackend::KernelV2 {
+            let outcome = kernel_lifecycle::finalize(
+                db.clone(),
+                kernel_lifecycle::Target::new(&db, Arc::clone(&session)),
+                kernel_lifecycle::Intent::GraceExpire,
+                "session ended".into(),
+                None,
+            )
+            .await;
+            if matches!(outcome, kernel_lifecycle::Outcome::RetainedBlocked { .. }) {
+                session.state().grace_until = Some(Instant::now() + GRACE_AFTER_LAST_LEAVE);
+                continue;
+            }
+            {
+                let mut state = session.state();
+                if !state.closed && state.peers.is_empty() && state.grace_until.is_some() {
+                    continue;
+                }
+                state.grace_timer = false;
+            }
+            return;
         }
         if dirty && run_cut(&session, &db, "session ended", None).await.is_err() {
             // Logged and counted in `cut_locked`; retry after another grace
@@ -2303,6 +2810,14 @@ async fn shutdown_sessions(owner: &Arc<DbSessions>) {
     let sessions: Vec<Arc<LiveSession>> = lock(&owner.records).values().cloned().collect();
     for session in sessions {
         let db = session.state().db.clone();
+        #[cfg(feature = "v2-kernel-probe")]
+        if session.backend == super::backend::SessionBackend::KernelV2 {
+            let outcome = kernel_lifecycle::shutdown_room(db, session).await;
+            if outcome != kernel_lifecycle::KernelRetirementState::Quiescent {
+                tracing::warn!(?outcome, "kernel shutdown retains unresolved custody; pool retirement is not acknowledged");
+            }
+            continue;
+        }
         // The final cut and the close happen under ONE ops hold, so no op
         // can be acknowledged between them and then dropped with the doc.
         let admitted = crate::storage_profile::with_operation(
@@ -2485,10 +3000,31 @@ async fn begin_body_write_inner(
     caller: &Caller,
     refuse_routed: Option<&str>,
 ) -> crate::Result<BodyWrite> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if existing_session(db, record_id)
+        .is_some_and(|room| room.backend == super::backend::SessionBackend::KernelV2)
+    {
+        return Err(crate::Error::engine(
+            "kernel body writers require kernel ownership",
+        ));
+    }
     let authorized = !record_id.is_empty()
         && crate::mcp::tools::can_record(db, caller, record_id, Capability::Edit).await?;
     let owner = db_sessions(db);
-    let gate = Arc::clone(&owner.open_gate).read_owned().await;
+    let waiting = Arc::clone(&owner.open_gate).read_owned();
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    let gate = {
+        tokio::pin!(waiting);
+        match futures::poll!(waiting.as_mut()) {
+            std::task::Poll::Ready(gate) => gate,
+            std::task::Poll::Pending => {
+                kernel_writes::test_checkpoint(db, kernel_writes::TestStage::V1GateQueued).await?;
+                waiting.await
+            }
+        }
+    };
+    #[cfg(not(all(test, feature = "v2-kernel-probe")))]
+    let gate = waiting.await;
     let plain = |gate| BodyWrite {
         _gate: gate,
         live: None,
@@ -2500,6 +3036,14 @@ async fn begin_body_write_inner(
     let Some(session) = session else {
         return Ok(plain(gate));
     };
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        // The initial no-room check preceded awaited admission/open-gate work.
+        // An unported V1 writer must never rebind a newly published native room.
+        return Err(crate::Error::engine(
+            "kernel body writers require kernel ownership",
+        ));
+    }
     let ops = Arc::clone(&session.ops).lock_owned().await;
     let (closed, grace, dirty) = {
         let mut state = session.state();
@@ -2533,6 +3077,12 @@ async fn begin_body_write_inner(
     if let Some(refusal) = refuse_routed {
         return Err(crate::Error::engine(refusal));
     }
+    // A clean session has no flush-first cut to notice governance revocation.
+    // Do not route an ordinary write through an unsupported live body while
+    // waiting for the next transport heartbeat to close the session.
+    revalidate_supported(db, record_id)
+        .await
+        .map_err(|refused| crate::Error::engine(format!("live body write refused: {refused}")))?;
     // Every routed write starts from a clean session: unsaved live edits are
     // versioned first, as their own version, so the routed write's version
     // holds only its own change and its action row (the app, the agent's run,
@@ -2639,6 +3189,7 @@ impl BodyWrite {
                         contributors: &version.contributors,
                         session_ref: &version.session_ref,
                         merged_offline: false,
+                        offline_interval: None,
                         span_map: Some(&version.span_map),
                     }),
                 )
@@ -2881,6 +3432,7 @@ impl BodyWrite {
                         let contributors = snapshot.contributors().to_vec();
                         let _ = state.registry.drain_version_snapshot(&snapshot);
                         state.versioned_epoch = state.epoch();
+                        state.offline_merge = None;
                         state.dirty_admission.take();
                         state.base = BaseVersion {
                             version: version_token(seq),
@@ -3036,6 +3588,7 @@ impl BodyWrite {
                 let contributors = snapshot.contributors().to_vec();
                 let _ = state.registry.drain_version_snapshot(&snapshot);
                 state.versioned_epoch = state.epoch();
+                state.offline_merge = None;
                 state.dirty_admission.take();
                 state.base = BaseVersion {
                     version: version_token(version_seq),
@@ -3269,6 +3822,11 @@ pub(crate) fn live_text(db: &Db, record_id: &str) -> Option<String> {
 /// version any edits acknowledged since, then close (`access_lost`); on a
 /// storage error, re-check after the next commit. The caller holds `ops`.
 async fn close_if_unsupported(session: &Arc<LiveSession>, db: &Db) {
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        kernel_writes::recheck_room(session, db).await;
+        return;
+    }
     match load_supported(db, &session.record_id).await {
         Ok(_) => {}
         Err(refused) if refused.code == RefusalCode::Unavailable => {
@@ -3287,6 +3845,11 @@ async fn close_if_unsupported(session: &Arc<LiveSession>, db: &Db) {
 /// no longer Markdown) refuses it; that is logged (metadata only) and the
 /// peers keep their pending edits as recovery drafts. The caller holds `ops`.
 async fn final_cut_and_close(session: &Arc<LiveSession>, db: &Db) {
+    #[cfg(feature = "v2-kernel-probe")]
+    if session.backend == super::backend::SessionBackend::KernelV2 {
+        kernel_writes::recheck_room(session, db).await;
+        return;
+    }
     let dirty = {
         let state = session.state();
         !state.closed && state.dirty()

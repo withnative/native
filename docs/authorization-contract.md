@@ -9,11 +9,11 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **90 registered tools / 247 operations**.
-- **13 ordinary, 87 high-risk, and 147 specialized operations**.
-- **105 read-only and 142 mutating operations**.
-- **242 operations carry a non-disclosure obligation**.
-- All **142 mutating operations** carry an explicit no-write-on-deny obligation
+- **93 registered tools / 261 operations**.
+- **13 ordinary, 88 high-risk, and 160 specialized operations**.
+- **110 read-only and 151 mutating operations**.
+- **256 operations carry a non-disclosure obligation**.
+- All **151 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:
   `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and
@@ -21,8 +21,9 @@ without a top-level action discriminator.
   each still has positive executable evidence.
 - Complete-coverage claim: **SQLite local**, exercised by
   `sqlite-reference-ci`. Postgres and Turso contract profiles do not inherit
-  this claim. Named-view rows separately qualify hosted-v2 success and
-  ordinary-SQLite refusal; they do not claim local success.
+  this claim. Named-view, saved-tab and catalog-publication rows separately qualify
+  Kernel V2 success and ordinary-SQLite refusal; they do not claim legacy local
+  success.
 
 Each operation independently declares its production disposition, risk tier,
 fixture owner, expected threshold, read/mutation nature, non-disclosure and
@@ -96,3 +97,13 @@ opaque event identities from that same snapshot. Foreign, unknown and malformed
 cursors receive a uniform refusal; payloads cannot select another account. This
 JSON-only audit is unavailable offline, where a partial workspace history cannot
 establish a complete personal audit.
+
+The `read_app_bundle.$tool` operation is owned positively by
+`non_owner_responses_carry_no_unlisted_counter` in
+`tests/tools/counter_guard.rs`: a non-owner reads its real adopted install,
+verifies source and document digests, and receives no counters or content writes.
+Its refusal evidence is
+`read_app_bundle_uses_launch_admission_without_ticket_issuance` in
+`src/mcp/tools/alpha_tabs.rs`, covering missing and foreign installs, stale pins,
+and adoption changes between pages. Every page rechecks caller-derived install
+authority and source visibility; the operation grants no delivery authority.

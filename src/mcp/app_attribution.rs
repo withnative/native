@@ -51,13 +51,14 @@ pub const ASSERTION_HOST: &str = "host";
 ///
 /// Names are registered tool names. Every path into a handler, including an
 /// executor's inner operation, reaches [`admit`] with the source tool name.
-pub const APP_REFUSED_OPERATIONS: [(&str, Option<&str>); 11] = [
+pub const APP_REFUSED_OPERATIONS: [(&str, Option<&str>); 12] = [
     ("attach_from_url", None),
     ("resolve_external", None),
     ("observe_external", None),
     ("reach_connect", None),
     ("reach_read", None),
     ("manage_alpha_tabs", None),
+    ("read_app_bundle", None),
     ("manage_artifact_module_grants", None),
     ("manage_artifact_inputs", None),
     ("close_run", None),
@@ -203,13 +204,39 @@ pub(crate) fn admit<'a>(
     })
 }
 
+/// Mint-time identity preflight for trusted hosting. This grants no authority;
+/// dispatch and write transactions still repeat their canonical app checks.
+#[doc(hidden)]
+pub async fn admit_hosted_app_identity(
+    engine: &crate::mcp::registry::EngineHandle,
+    caller: &crate::mcp::Caller,
+    app: &AppAttribution,
+) -> Result<()> {
+    match engine {
+        #[cfg(feature = "v2-kernel-probe")]
+        crate::mcp::registry::EngineHandle::KernelV2(db) => {
+            crate::kernel::app_installs::admit_account_app_as(db, caller.credential(), app).await?;
+            Ok(())
+        }
+        _ => {
+            let db = engine.sqlite().ok_or_else(unknown_install)?;
+            if !install_is_current(db, caller.credential(), app).await? {
+                return Err(unknown_install());
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Whether `account_id` holds a current, adopted v2 install of exactly this
 /// package, version and install generation: the predicate [`admit`] enforces,
 /// for callers that need the verdict rather than the tool-call error (a live
 /// session classifies a lapsed install itself). Boxed for the same reason as
-/// [`admit`].
+/// [`admit`]. This boolean is not authenticated authority; hosted custody
+/// must separately verify the credential, origin, workspace and author.
+#[doc(hidden)]
 #[inline(never)]
-pub(crate) fn install_is_current<'a>(
+pub fn install_is_current<'a>(
     db: &'a Db,
     account_id: &'a str,
     attribution: &'a AppAttribution,
@@ -250,15 +277,18 @@ pub(crate) fn admit_kernel_v2<'a>(
                 "{operation} is not available to apps (app_operation_refused)"
             )));
         }
-        // Each admitted write below owns native atomic attribution. Inbox
-        // reads re-admit on their snapshot and derive the viewer from the
-        // authenticated principal, preserving ordinary member visibility.
+        // Each admitted message write below owns native atomic attribution.
+        // Message and hosted roster reads re-admit on their final snapshot
+        // and derive the viewer from the authenticated principal.
         // Keep unported handlers closed rather than returning un-attributed success.
         let messaging = operation == "manage_messages"
             && matches!(
                 arguments["action"].as_str(),
                 Some(
                     "send"
+                        | "add_reaction"
+                        | "remove_reaction"
+                        | "delete"
                         | "list_inbox"
                         | "list_message_state"
                         | "set_preference"
@@ -269,12 +299,17 @@ pub(crate) fn admit_kernel_v2<'a>(
                         | "unmark_no_longer_relevant"
                 )
             );
+        // The hosted catalogue owns the roster. Apps may use its ordinary
+        // read-only list, but no membership or invitation mutation.
+        let membership_read =
+            operation == "manage_memberships" && arguments["action"].as_str() == Some("list");
         let package_read = cfg!(feature = "package-cel-dev")
             && matches!(
                 operation,
                 "describe_package_operations" | "call_package_operation"
             );
         if !messaging
+            && !membership_read
             && !package_read
             && !matches!(
                 operation,
@@ -293,6 +328,7 @@ pub(crate) fn admit_kernel_v2<'a>(
                     | "attach_text"
                     | "create_record"
                     | "update_record"
+                    | "merge_body"
                     | "manage_links"
                     | "archive_record"
             )
@@ -301,7 +337,16 @@ pub(crate) fn admit_kernel_v2<'a>(
                 "{operation} is not yet available to native apps (app_operation_unsupported_on_v2)"
             )));
         }
-        crate::kernel::app_installs::admit_account_app_as(db, account, attribution).await?;
+        let admitted =
+            crate::kernel::app_installs::admit_account_app_as(db, account, attribution).await?;
+        // A folder-scoped app gets no messages or workspace-wide roster:
+        // messages follow audience rules rather than folders, and a send can
+        // reach agents outside the grant. Unscoped apps are unchanged.
+        if admitted.scope.is_scoped()
+            && matches!(operation, "manage_messages" | "manage_memberships")
+        {
+            return Err(Error::engine(crate::kernel::OUTSIDE_APP_SCOPE));
+        }
         Ok(())
     })
 }

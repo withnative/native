@@ -45,7 +45,7 @@ use crate::schema::DDL_STATEMENTS;
 
 use super::error::contract_violation;
 
-const CONTROLLED_ACCESSORS: [&str; 57] = [
+const CONTROLLED_ACCESSORS: [&str; 58] = [
     "_query_sql_bearer_walk",
     "_query_sql_authorization_subjects",
     "_query_sql_visible_records",
@@ -78,6 +78,7 @@ const CONTROLLED_ACCESSORS: [&str; 57] = [
     "_query_sql_agent_activity_admitted",
     "_query_sql_agent_activity_claim_events",
     "actors",
+    "viewer",
     "_query_sql_disclosable_persons",
     "_query_sql_visible_person",
     "_query_sql_run_principals",
@@ -150,6 +151,7 @@ pub(crate) const MEMBER_QUERY_SQL_SERVED_RELATIONS: &[&str] = &[
     "facet_times",
     "facet_keys",
     "bindings",
+    "viewer",
     "blobs",
     "vocabularies",
     "vocabulary_values",
@@ -1381,6 +1383,16 @@ SELECT disclosed.actor, disclosed.person_id, person.name AS display_name
  WHERE disclosed.actor IS NOT NULL
    AND disclosed.actor IN (SELECT history.actor FROM temp.content_events AS history);
 
+-- Exactly one row for the caller, including before any visible history.
+-- Keep the principal column in use for column-free statement shapes.
+CREATE TEMP VIEW IF NOT EXISTS viewer AS
+SELECT disclosed.person_id, person.name AS display_name
+  FROM temp._query_sql_principal AS principal
+  LEFT JOIN temp._query_sql_disclosable_actors AS disclosed
+    ON disclosed.actor = principal.account_id
+  LEFT JOIN main.records AS person ON person.id = disclosed.person_id
+ WHERE principal.singleton = 1;
+
 -- Every account this execution may attribute under the `get_history` rule,
 -- with the caller-visible person bound to it: the caller's own account, plus
 -- each account bound to a person record the caller can see. This is the rule
@@ -1512,6 +1524,12 @@ SELECT numbered.run_key,
 -- The protected helper contributes disposable capture when it is available;
 -- its absence leaves the durable subset intact. Claim tuple updates are
 -- excluded here so hiding a claim can never alter presence or ordering.
+-- The durable CTE reads only runs the window can show. The prepared helper
+-- inserts a row for every run with recent observed, content, start or end
+-- evidence, and the date test on start and end keeps a run visible when the
+-- helper did not run. A run with older evidence on every axis falls outside
+-- the 24 hour filter below anyway, so it is never opened, and its content
+-- range scan is never paid.
 -- Declared intent is caller-authored disclosure, not verified fact: the view
 -- surfaces the latest `set_intent` text only to the declaring account and
 -- reports an engine-authored disclosure state beside it, so a withheld intent
@@ -1537,6 +1555,9 @@ WITH _query_sql_agent_activity_durable AS (
              coalesce(observed.last_observed_at, run.started_at)) AS last_observed_activity_at
     FROM main.agent_runs run
     LEFT JOIN temp._query_sql_activity_observations observed ON observed.run_key=run.run_key
+   WHERE observed.run_key IS NOT NULL
+      OR run.started_at>=(SELECT coalesce(date(observed_at,'-2 days'),'') FROM temp._query_sql_principal)
+      OR run.ended_at>=(SELECT coalesce(date(observed_at,'-2 days'),'') FROM temp._query_sql_principal)
 ), _query_sql_agent_activity_admitted AS (
   SELECT durable.*,
          member.member_ref,
@@ -1939,7 +1960,8 @@ CREATE TEMP TABLE IF NOT EXISTS catalog_operations (
   executor TEXT, operation TEXT, surface TEXT, access TEXT,
   plan_required INTEGER, direct_execution_enabled INTEGER,
   contract_version TEXT, contract_digest TEXT, source_tool TEXT,
-  selector_field TEXT, selector_value TEXT, advertised_directly INTEGER
+  selector_field TEXT, selector_value TEXT, advertised_directly INTEGER,
+  requires_acceptance INTEGER
 );
 "#;
 
@@ -2189,7 +2211,7 @@ async fn populate_facet_keys(
         .lock_handle()
         .await?
         .set_progress_handler(PROGRESS_OPS, move || Instant::now() < deadline);
-    let result = populate_facet_keys_inner(transaction, deadline).await;
+    let result = populate_facet_keys_on(transaction, deadline).await;
     transaction.lock_handle().await?.remove_progress_handler();
     #[cfg(test)]
     if result.is_ok()
@@ -2212,8 +2234,8 @@ async fn populate_facet_keys(
     }
 }
 
-async fn populate_facet_keys_inner(
-    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+pub(crate) async fn populate_facet_keys_on(
+    transaction: &mut sqlx::SqliteConnection,
     deadline: Instant,
 ) -> Result<()> {
     use super::field_definitions::{build_fields, BuildError, BuildLimits};
@@ -2230,7 +2252,7 @@ async fn populate_facet_keys_inner(
         "SELECT count(*), coalesce(sum(length(CAST(data AS BLOB))),0),
                 coalesce(max(length(CAST(data AS BLOB))),0) FROM temp.schema_config",
     )
-    .fetch_one(&mut **transaction)
+    .fetch_one(&mut *transaction)
     .await?;
     if n > limits.input_rows as i64
         || bytes > limits.input_bytes as i64
@@ -2238,7 +2260,7 @@ async fn populate_facet_keys_inner(
     {
         return Err(too_large());
     }
-    let rows = super::cascade::schema_config_rows_in(transaction).await?;
+    let rows = super::cascade::schema_config_rows_on(transaction).await?;
     let fields = build_fields(&rows, &[], &[], limits, deadline).map_err(|error| match error {
         BuildError::Timeout => sql_contract::categorized_error(
             QuerySqlErrorCategory::Timeout,
@@ -2278,7 +2300,7 @@ async fn populate_facet_keys_inner(
     // Group by home so an anchored declaration counts only direct members.
     // NULL kind in discovery deliberately means a type-wide aggregate, not
     // only records whose stored kind happens to be NULL.
-    let mut groups = sqlx::query(facet_key_groups_sql()).fetch(&mut **transaction);
+    let mut groups = sqlx::query(facet_key_groups_sql()).fetch(&mut *transaction);
     let mut group_count = 0;
     let mut input_bytes = 0;
     let mut type_counts: BTreeMap<(String, String), i64> = BTreeMap::new();
@@ -2365,7 +2387,7 @@ async fn populate_facet_keys_inner(
         sqlx::query("INSERT INTO temp._query_sql_facet_keys(scope_id,type,kind,key,record_count,declared,value_type,vocab_ref,required) VALUES (?,?,?,?,?,?,?,?,?)")
             .bind(scope).bind(record_type).bind(kind).bind(key).bind(count)
             .bind(required.is_some()).bind(value_type).bind(vocab_ref).bind(required)
-            .execute(&mut **transaction).await?;
+            .execute(&mut *transaction).await?;
     }
     Ok(())
 }
@@ -2635,6 +2657,7 @@ CREATE TEMP TABLE agent_activity_claims (
   claimed_at TEXT, claimed_at_ms INTEGER,
   released_at TEXT, released_at_ms INTEGER, is_current INTEGER
 );
+CREATE TEMP TABLE viewer (person_id TEXT, display_name TEXT);
 CREATE TEMP TABLE actors (
   actor TEXT, person_id TEXT, display_name TEXT
 );
@@ -2692,7 +2715,8 @@ CREATE TEMP TABLE catalog_operations (
   executor TEXT, operation TEXT, surface TEXT, access TEXT,
   plan_required INTEGER, direct_execution_enabled INTEGER,
   contract_version TEXT, contract_digest TEXT, source_tool TEXT,
-  selector_field TEXT, selector_value TEXT, advertised_directly INTEGER
+  selector_field TEXT, selector_value TEXT, advertised_directly INTEGER,
+  requires_acceptance INTEGER
 );
 "#;
 
@@ -2712,6 +2736,64 @@ pub(crate) struct GovernedSqlObservation {
     pub transient_available: bool,
 }
 
+/// The oldest `ended_at`/`started_at`/`created_at` text the activity
+/// preparation reads: the observation instant minus two days, as a bare
+/// `YYYY-MM-DD`. The relation shows a run only when the latest of its start,
+/// end, content and observed evidence is within 24 hours of the observation
+/// instant, so evidence stamped before this floor can never admit a run or
+/// change a visible row. Two days, not one, so that a plain text comparison
+/// against any ISO-8601 spelling (`Z`, a numeric offset up to 14 hours, or a
+/// space instead of `T`) is a superset of the exact `julianday` window. The
+/// exact window is still applied by the relation itself; the floor only
+/// stops the preparation reading history that cannot matter.
+const ACTIVITY_FLOOR_SQL: &str =
+    "(SELECT coalesce(date(observed_at,'-2 days'),'') FROM temp._query_sql_principal)";
+
+/// Runs the caller may see: members of the activity roster, plus the
+/// trusted-local operator's own runs. The relation applies the same test.
+const ACTIVITY_ELIGIBLE_RUN_SQL: &str =
+    "(EXISTS (SELECT 1 FROM temp._query_sql_activity_members member
+               WHERE member.account_id=run.account_id)
+      OR ((SELECT trusted_local_bypass FROM temp._query_sql_principal)=1
+          AND run.account_id=(SELECT account_id FROM temp._query_sql_principal)))";
+
+/// The run's latest declared intent. It is looked up through the run index
+/// and deliberately carries no time bound: a long-lived run keeps an old
+/// intent for as long as the run is shown.
+const ACTIVITY_DECLARED_INTENT_SQL: &str =
+    "(SELECT intent_calls.intent
+        FROM main.read_log_calls intent_calls
+       WHERE intent_calls.run_key=run.run_key
+         AND intent_calls.tool='set_intent'
+         AND intent_calls.outcome='ok'
+         AND intent_calls.intent IS NOT NULL
+         AND intent_calls.actor=run.account_id
+         AND julianday(intent_calls.ended_at)<=julianday((SELECT observed_at FROM temp._query_sql_principal))
+         AND (run.ended_at IS NULL OR julianday(intent_calls.ended_at)<=julianday(run.ended_at))
+       ORDER BY intent_calls.seq DESC
+       LIMIT 1)";
+
+/// Runs whose start, end or content evidence is recent but which have no
+/// recent observed call. They still need a row so the relation shows them
+/// with their declared intent. `last_observed_at` is the run's own start,
+/// which is exactly what the relation falls back to without an observation.
+fn activity_durable_candidates_sql(floor: &str, intent: &str) -> String {
+    format!(
+        "INSERT INTO temp._query_sql_activity_observations(run_key,last_observed_at,declared_intent)
+         SELECT run.run_key,run.started_at,{intent}
+           FROM main.agent_runs run
+          WHERE run.run_key NOT IN (SELECT run_key FROM temp._query_sql_activity_observations)
+            AND {eligible}
+            AND (run.started_at>={floor}
+                 OR run.ended_at>={floor}
+                 OR run.run_key IN (SELECT event.run_key
+                                      FROM main.content_events event
+                                     WHERE event.created_at>={floor}
+                                       AND event.run_key IS NOT NULL))",
+        eligible = ACTIVITY_ELIGIBLE_RUN_SQL,
+    )
+}
+
 async fn prepare_activity_observations(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
 ) -> Result<(bool, Option<i64>)> {
@@ -2721,12 +2803,16 @@ async fn prepare_activity_observations(
     sqlx::query("DELETE FROM temp._query_sql_activity_capture")
         .execute(&mut **transaction)
         .await?;
+    let floor = ACTIVITY_FLOOR_SQL;
     let available: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='read_log_calls')",
     )
     .fetch_one(&mut **transaction)
     .await?;
     if !available {
+        sqlx::query(&activity_durable_candidates_sql(floor, "NULL"))
+            .execute(&mut **transaction)
+            .await?;
         sqlx::query(
             "INSERT INTO temp._query_sql_activity_capture(singleton,available) VALUES(1,0)",
         )
@@ -2734,56 +2820,60 @@ async fn prepare_activity_observations(
         .await?;
         return Ok((false, None));
     }
-    sqlx::query(
+    // Runs with a recent observed call. Calls older than the floor cannot
+    // raise a visible run's latest activity, so they are never aggregated.
+    // CROSS JOIN pins the call table as the outer loop and `+` stops the
+    // GROUP BY from walking the whole `(run_key, seq)` index to avoid a sort:
+    // either would visit every call ever made, whatever the floor says.
+    sqlx::query(&format!(
         "INSERT INTO temp._query_sql_activity_observations(run_key,last_observed_at,declared_intent)
-         SELECT calls.run_key,max(calls.ended_at),
-                (SELECT intent_calls.intent
-                   FROM main.read_log_calls intent_calls
-                  WHERE intent_calls.run_key=calls.run_key
-                    AND intent_calls.tool='set_intent'
-                    AND intent_calls.outcome='ok'
-                    AND intent_calls.intent IS NOT NULL
-                    AND intent_calls.actor=run.account_id
-                    AND julianday(intent_calls.ended_at)<=julianday((SELECT observed_at FROM temp._query_sql_principal))
-                    AND (run.ended_at IS NULL OR julianday(intent_calls.ended_at)<=julianday(run.ended_at))
-                  ORDER BY intent_calls.seq DESC
-                  LIMIT 1)
+         SELECT calls.run_key,max(calls.ended_at),{intent}
            FROM main.read_log_calls calls
-           JOIN main.agent_runs run ON run.run_key=calls.run_key
-          WHERE calls.run_key IS NOT NULL AND calls.outcome='ok'
+          CROSS JOIN main.agent_runs run ON run.run_key=calls.run_key
+          WHERE calls.ended_at>={floor}
+            AND calls.run_key IS NOT NULL AND calls.outcome='ok'
             AND calls.tool!='start_work'
             AND calls.actor=run.account_id
-            AND (EXISTS (SELECT 1 FROM temp._query_sql_activity_members member
-                          WHERE member.account_id=run.account_id)
-                 OR ((SELECT trusted_local_bypass FROM temp._query_sql_principal)=1
-                     AND run.account_id=(SELECT account_id FROM temp._query_sql_principal)))
+            AND {eligible}
             AND julianday(calls.ended_at)<=julianday((SELECT observed_at FROM temp._query_sql_principal))
             AND (run.ended_at IS NULL OR julianday(calls.ended_at)<=julianday(run.ended_at))
-          GROUP BY calls.run_key",
-    )
+          GROUP BY +calls.run_key",
+        intent = ACTIVITY_DECLARED_INTENT_SQL,
+        eligible = ACTIVITY_ELIGIBLE_RUN_SQL,
+    ))
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(&activity_durable_candidates_sql(
+        floor,
+        ACTIVITY_DECLARED_INTENT_SQL,
+    ))
     .execute(&mut **transaction)
     .await?;
     sqlx::query("INSERT INTO temp._query_sql_activity_capture(singleton,available) VALUES(1,1)")
         .execute(&mut **transaction)
         .await?;
-    let watermark = sqlx::query_scalar(
+    // Highest qualifying call of any run the window can show. A lone
+    // `max(seq)` is answered by walking the call table newest first and
+    // stopping at the first qualifying row, so the cost follows how far back
+    // the newest qualifying call is, not how many calls exist. The floor test
+    // comes first so a call that cannot qualify is rejected on a text compare.
+    let watermark = sqlx::query_scalar(&format!(
         "SELECT max(calls.seq)
            FROM main.read_log_calls calls
            JOIN main.agent_runs run ON run.run_key=calls.run_key
-          WHERE calls.outcome='ok'
+          WHERE (calls.ended_at>={floor} OR run.started_at>={floor} OR run.ended_at>={floor})
+            AND calls.outcome='ok'
             AND calls.tool!='start_work'
             AND calls.actor=run.account_id
-            AND (EXISTS (SELECT 1 FROM temp._query_sql_activity_members member
-                          WHERE member.account_id=run.account_id)
-                 OR ((SELECT trusted_local_bypass FROM temp._query_sql_principal)=1
-                     AND run.account_id=(SELECT account_id FROM temp._query_sql_principal)))
+            AND {eligible}
             AND julianday(calls.ended_at)<=julianday((SELECT observed_at FROM temp._query_sql_principal))
             AND (run.ended_at IS NULL OR julianday(calls.ended_at)<=julianday(run.ended_at))
             AND julianday(max(run.started_at,coalesce(run.ended_at,run.started_at),calls.ended_at))
                 >=julianday((SELECT observed_at FROM temp._query_sql_principal),'-24 hours')",
-    )
-        .fetch_one(&mut **transaction)
-        .await?;
+        eligible = ACTIVITY_ELIGIBLE_RUN_SQL,
+    ))
+    .fetch_one(&mut **transaction)
+    .await?;
     Ok((true, watermark))
 }
 
@@ -3375,7 +3465,7 @@ fn authorize_view_expansion_legacy_saved_sql(context: AuthContext<'_>) -> Author
     }
 }
 
-fn portable_function_allowed(function_name: &str) -> bool {
+pub(crate) fn portable_function_allowed(function_name: &str) -> bool {
     sql_contract::is_portable_function(function_name) || function_name.eq_ignore_ascii_case("like")
 }
 
@@ -3857,7 +3947,7 @@ fn build_strict_validator() -> Result<rusqlite::Connection> {
 /// non-UTF8 blob; integers and reals coerced to text as Turso's
 /// `to_text_coerced` formats them) so any future stepping agrees with
 /// Turso. Compiled patterns are cached per connection and bounded.
-fn register_regexp_function(conn: &rusqlite::Connection) -> Result<()> {
+pub(crate) fn register_regexp_function(conn: &rusqlite::Connection) -> Result<()> {
     use rusqlite::functions::FunctionFlags;
     use rusqlite::types::Value;
     use std::collections::HashMap;
@@ -5291,6 +5381,9 @@ async fn query_sql_member_slice(
     )
     .execute(&mut *transaction)
     .await?;
+    if relation_dependencies.contains("viewer") {
+        prepare_disclosable_actors(&mut transaction, true).await?;
+    }
     let facet_deadline = relation_dependencies
         .contains("facet_keys")
         .then(|| Instant::now() + QUERY_DEADLINE);
@@ -5654,7 +5747,8 @@ async fn query_sql_request_owned_observed(
         .any(|name| matches!(name.as_str(), "agent_activity" | "agent_activity_claims"));
     let needs_claims = relation_dependencies.contains("agent_activity_claims");
     // `actors` additionally resolves each disclosed actor's visible person.
-    let needs_actor_persons = relation_dependencies.contains("actors");
+    let needs_actor_persons =
+        relation_dependencies.contains("actors") || relation_dependencies.contains("viewer");
     let needs_disclosure = relation_dependencies.contains("content_events") || needs_actor_persons;
     let pool = db.governed_pool().clone();
     let mut connection = pool.acquire().await?;
@@ -6284,7 +6378,8 @@ async fn query_sql_request_in_with_row_limit_scoped(
         .any(|name| matches!(name.as_str(), "agent_activity" | "agent_activity_claims"));
     let needs_claims = relation_dependencies.contains("agent_activity_claims");
     // `actors` additionally resolves each disclosed actor's visible person.
-    let needs_actor_persons = relation_dependencies.contains("actors");
+    let needs_actor_persons =
+        relation_dependencies.contains("actors") || relation_dependencies.contains("viewer");
     let needs_disclosure = relation_dependencies.contains("content_events") || needs_actor_persons;
     let presence_only =
         relation_dependencies.len() == 1 && relation_dependencies.contains("agent_activity");
@@ -7342,12 +7437,13 @@ async fn populate_catalog_operations(
     }
     let payload = serde_json::to_string(snapshot.as_slice())?;
     sqlx::query(
-        "INSERT INTO temp.catalog_operations(executor, operation, surface, access, plan_required, direct_execution_enabled, contract_version, contract_digest, source_tool, selector_field, selector_value, advertised_directly)
+        "INSERT INTO temp.catalog_operations(executor, operation, surface, access, plan_required, direct_execution_enabled, contract_version, contract_digest, source_tool, selector_field, selector_value, advertised_directly, requires_acceptance)
          SELECT value ->> 'executor', value ->> 'operation', value ->> 'surface', value ->> 'access',
                 json_extract(value, '$.plan_required'), json_extract(value, '$.direct_execution_enabled'),
                 value ->> 'contract_version', value ->> 'contract_digest', value ->> 'source_tool',
                 value ->> 'selector_field', value ->> 'selector_value',
-                json_extract(value, '$.advertised_directly')
+                json_extract(value, '$.advertised_directly'),
+                json_extract(value, '$.requires_acceptance')
          FROM json_each(?)",
     )
     .bind(payload)
@@ -8361,6 +8457,7 @@ mod catalog_operations_tests {
                 selector_field: None,
                 selector_value: None,
                 advertised_directly: true,
+                requires_acceptance: false,
             },
             CatalogOperationRow {
                 executor: "a_write".to_string(),
@@ -8375,6 +8472,7 @@ mod catalog_operations_tests {
                 selector_field: Some("kind".to_string()),
                 selector_value: Some("task".to_string()),
                 advertised_directly: false,
+                requires_acceptance: true,
             },
         ])
     }
@@ -8417,6 +8515,39 @@ mod catalog_operations_tests {
             ]
         );
         assert!(!result.truncated);
+        db.close().await;
+    }
+
+    /// The acceptance declaration is an INTEGER 0/1 like the other catalogue
+    /// booleans, and filterable.
+    #[tokio::test]
+    async fn projects_requires_acceptance_as_an_integer_marker() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let result = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT executor, operation, requires_acceptance FROM catalog_operations ORDER BY executor, operation",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                json!({"executor": "a_write", "operation": "put", "requires_acceptance": 1}),
+                json!({"executor": "b_read", "operation": "get", "requires_acceptance": 0}),
+            ]
+        );
+        let waiting = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT executor, operation FROM catalog_operations WHERE requires_acceptance = 1 ORDER BY executor, operation",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            waiting.rows,
+            vec![json!({"executor": "a_write", "operation": "put"})]
+        );
         db.close().await;
     }
 
@@ -8567,10 +8698,15 @@ mod catalog_operations_tests {
             .map(|row| row["column_name"].as_str().unwrap().to_string())
             .collect();
         // The declared relation appends the lean direct-advertisement marker
-        // after the original columns, so their positions are unchanged.
+        // and the acceptance declaration after the original columns, so their
+        // positions are unchanged.
         assert_eq!(
             names,
-            [COLUMNS.as_slice(), &["advertised_directly"]].concat()
+            [
+                COLUMNS.as_slice(),
+                &["advertised_directly", "requires_acceptance"]
+            ]
+            .concat()
         );
         let relation = query_sql(
             &db,
@@ -12640,7 +12776,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caller_tx_governed_warm_reuse_and_cancel_sanitizes() {
         use sql_contract::FunctionAllowance;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','viewer','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let (db, alice, bea) = protected_fixture().await;
         // Warm the governed pool through the ordinary owned path first.
@@ -12755,7 +12891,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test]
     async fn governed_same_connection_gate_after_sql_sees_no_temp_shadows() {
         use sql_contract::FunctionAllowance;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','viewer','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let (db, alice, _) = protected_fixture().await;
         // Baseline from the write pool: the unqualified gate-style read
@@ -13559,6 +13695,94 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         (Some(actor.to_owned()), None, None)
     }
 
+    #[tokio::test]
+    async fn viewer_matches_raw_author_identity_without_history_and_across_callers() {
+        const PERSON: &str = "9e795ac7-0000-4000-8000-000000000091";
+        let db = crate::create_database(":memory:").await.unwrap();
+        let alice = QueryPrincipal::authenticated("alice", true);
+        let bea = QueryPrincipal::authenticated("bea", true);
+        let sql = "SELECT person_id, display_name FROM viewer";
+        let empty = json!({"person_id": null, "display_name": null});
+        assert_eq!(
+            query_sql(&db, &alice, sql).await.unwrap().rows.as_slice(),
+            std::slice::from_ref(&empty)
+        );
+        assert_eq!(
+            query_sql(&db, &alice, "SELECT count(*) AS n FROM viewer")
+                .await
+                .unwrap()
+                .rows[0]["n"],
+            1
+        );
+        actors_person(&db, PERSON, "Alice", &["alice"], Some("alice")).await;
+        // This actor still has no history; identity does not depend on events.
+        assert!(actor_directory(&db, &alice).await.is_empty());
+        // SQLite records.name is NOT NULL: the empty string is its unnamed
+        // bound-person state. Kernel v2 separately covers a NULL title.
+        for name in [
+            Some("Alice".to_owned()),
+            Some(String::new()),
+            Some("x".repeat(1501)),
+            Some("  Alice \t ".to_owned()),
+        ] {
+            sqlx::query("UPDATE records SET name=? WHERE id=?")
+                .bind(&name)
+                .bind(PERSON)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            let expected = json!({"person_id": PERSON, "display_name": name});
+            assert_eq!(
+                query_sql(&db, &alice, sql).await.unwrap().rows.as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            actors_event(&db, PERSON, "alice").await;
+            let author = actor_directory(&db, &alice).await;
+            assert_eq!(author[0].1.as_deref(), Some(PERSON));
+            assert_eq!(author[0].2, name);
+            // Reusing the governed pool must not carry another caller's identity.
+            assert_eq!(
+                query_sql(&db, &bea, sql).await.unwrap().rows.as_slice(),
+                std::slice::from_ref(&empty)
+            );
+        }
+        const SHARED: &str = "9e795ac7-0000-4000-8000-000000000092";
+        actors_person(&db, SHARED, "Shared", &["alice", "bea"], None).await;
+        actors_event(&db, SHARED, "alice").await;
+        replace_explicit_policy(
+            &db,
+            "test:viewer",
+            PERSON,
+            vec![AllowEntry::account("bea", Capability::View)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            query_sql(&db, &alice, sql).await.unwrap().rows.as_slice(),
+            std::slice::from_ref(&empty)
+        );
+        assert_eq!(actor_directory(&db, &alice).await, [unnamed("alice")]);
+        replace_explicit_policy(
+            &db,
+            "test:viewer",
+            PERSON,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        crate::store::delete_record(&db, PERSON).await.unwrap();
+        let viewer = query_sql(&db, &alice, sql).await.unwrap();
+        // Match actors' visibility rule exactly, including deleted persons.
+        let author = actor_directory(&db, &alice).await;
+        assert_eq!(viewer.rows[0]["person_id"], json!(author[0].1));
+        assert_eq!(viewer.rows[0]["display_name"], json!(author[0].2));
+        sqlx::query("DELETE FROM bindings WHERE system='account' AND identifier='alice'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(query_sql(&db, &alice, sql).await.unwrap().rows, [empty]);
+    }
+
     /// `actors` re-derives from current state on every execution: archive
     /// keeps a person visible, deletion and binding removal withdraw the
     /// name, and a transferred binding follows the new person's visibility.
@@ -14192,6 +14416,8 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             "SELECT id FROM records",
             "SELECT count(*) AS c FROM records",
             "SELECT * FROM records WHERE 0 LIMIT 0",
+            "SELECT person_id, display_name FROM viewer",
+            "SELECT count(*) AS n FROM viewer",
             "SELECT id FROM links",
             "SELECT count(*) AS c FROM facet_values",
             "SELECT * FROM facet_times",
@@ -18297,7 +18523,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         )
         .await
         .unwrap();
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','viewer','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let count: i64 = sqlx::query_scalar(TEMP_COUNT_SQL)
             .fetch_one(&mut *tx)
@@ -18330,7 +18556,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             sql: "SELECT now_ms() AS a, now_ms() AS b".to_string(),
             parameters: Vec::new(),
         };
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','viewer','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let mut first_rows = Vec::new();
         let mut first_columns = Vec::new();
@@ -18528,7 +18754,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         .await
         .unwrap();
         assert!(callbacks.load(Ordering::Relaxed) > 0);
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','viewer','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let count: i64 = sqlx::query_scalar(TEMP_COUNT_SQL)
             .fetch_one(&mut *tx)
@@ -18560,7 +18786,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test]
     async fn caller_tx_portable_row_limit200_first_delivered_membership_cap_cleanup() {
         let (db, alice, _) = protected_fixture().await;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','viewer','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let mut connection = db.write_pool().acquire().await.unwrap();
         let mut tx = connection.begin().await.unwrap();
@@ -21945,6 +22171,24 @@ mod vocabulary_json_node_tests {
         );
     }
 }
+
+/// Admit a fixture run with the default reported identity. Sibling test
+/// modules call this so they never name `ReportedRunIdentity` themselves.
+#[cfg(test)]
+async fn admit_fixture_run(db: &Db, run_key: &str, account: &str) {
+    crate::control::ensure_agent_run(
+        db,
+        run_key,
+        account,
+        crate::control::ReportedRunIdentity::default(),
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(test)]
+#[path = "sql_activity_bound_tests.rs"]
+mod sql_activity_bound_tests;
 
 #[cfg(test)]
 #[path = "schema_config_json_node_tests.rs"]

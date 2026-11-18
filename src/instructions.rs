@@ -25,8 +25,15 @@ pub const MAX_BOOTSTRAP_INSTRUCTION_ENTRIES: usize = 128;
 pub const MAX_BOOTSTRAP_PENDING_OBLIGATIONS: usize = 64;
 pub const MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES: usize = 64 * 1024;
 pub const ENGINE_ORIENTATION_TEMPLATE_KEY: &str = "engine-orientation";
-pub const ENGINE_ORIENTATION_TEMPLATE_VERSION: i64 = 11;
+pub const ENGINE_ORIENTATION_TEMPLATE_VERSION: i64 = 14;
 pub const ENGINE_ORIENTATION: &str = include_str!("mcp/posture-capsule.md");
+/// Compact kernel-v2 entry; the full built-in reference remains callable.
+#[cfg(feature = "v2-kernel-probe")]
+pub const COMPACT_ORIENTATION: &str = include_str!("mcp/bootstrap-core.md");
+#[cfg(feature = "v2-kernel-probe")]
+pub const COMPACT_ORIENTATION_VERSION: i64 = 2;
+pub const BOOTSTRAP_CONTRACT: &str = "native.bootstrap.v1";
+pub const RUN_CONTINUATION_GUIDANCE: &str = "Reuse this exact run_key on every call, reads included: top-level, outside arguments. Bootstrap once per conversation. Release claims and close_run when handing back work with nothing pending (always at autonomous/worker exit); keep the key during continuing interactive work.";
 pub const DURABLE_ORIENTATION_GUIDANCE: &str = "Bootstrap is read-only. Repeating or ending a session does not complete, decline, reopen, or otherwise consume an onboarding obligation; it remains pending until an explicit member action changes it.";
 pub const NEUTRAL_PRECEDENCE_GUIDANCE: &str = "Consider all active instructions together. Their scopes describe where they came from, not an automatic priority. If they materially conflict, exercise judgement and ask the user when necessary.";
 

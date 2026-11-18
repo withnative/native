@@ -684,7 +684,7 @@ mod tests {
         // audit belongs only to Native; materialization belongs only to lens.
         let (ordinary, lens) = rendered.split_once("## Federated lens projection").unwrap();
         assert!(ordinary.contains("- **focused**: 27 tools,"));
-        assert!(ordinary.contains("- **complete**: 90 tools,"));
+        assert!(ordinary.contains("- **complete**: 93 tools,"));
         assert!(
             ordinary.contains("| `read_hcp_audit` | history | correctness-under-ignorance | — |")
         );
@@ -692,7 +692,7 @@ mod tests {
         assert!(ordinary.contains("| `workspace_read` | identity | bounded-context-or-calls | — |"));
         assert!(!ordinary.contains("| `materialize_record` |"));
         assert!(lens.contains("- **focused**: 28 tools,"));
-        assert!(lens.contains("- **complete**: 90 tools,"));
+        assert!(lens.contains("- **complete**: 93 tools,"));
         assert!(lens.contains("| `materialize_record` | identity | atomicity | yes |"));
         assert!(!lens.contains("| `read_hcp_audit` |"));
     }

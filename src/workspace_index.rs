@@ -9,7 +9,9 @@
 //! the held rows equal a fresh read at `built_at_seq` when it returns.
 //! Catch-up ([`refresh_from`]) folds committed content events above the
 //! cursor off the same commit wake that drives the realtime hub, re-reading
-//! only the rows those events name. The read-only pool is used on every
+//! the named record and, for a source-named `supersedes` link or a source
+//! tombstone, the affected target head. That re-read copies physical
+//! currency. It does not derive it from held links. The read-only pool is used on every
 //! path: there is no write-pool acquisition, no `BEGIN IMMEDIATE`, and no
 //! expiry — freshness is bounded by invalidation latency, never by a TTL.
 //!
@@ -76,6 +78,22 @@ pub const MAX_CONTENT_WINDOW_EVENTS: usize = 512;
 /// contract this epic rests on.
 pub const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
 
+/// A copied cell. `Absent` means the column was not read. `Present` is the
+/// physical value, and `Present(None)` is a proven SQL NULL — not the same
+/// claim as absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Covered<T> {
+    #[default]
+    Absent,
+    Present(T),
+}
+
+impl<T> Covered<T> {
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
 /// One `records` row minus `body`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHead {
@@ -97,6 +115,16 @@ pub struct RecordHead {
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
+    /// Physical `records.is_current` when that column was read: 1, reserved 0,
+    /// or SQL NULL. `Absent` when the column is not in this index. Member
+    /// copies drop it, so their index must not name it.
+    pub is_current: Covered<Option<i64>>,
+    /// Governed `updated_at_ms` expression when currency was read. `Present(None)`
+    /// is a `strftime` failure. `Absent` when the expression was not selected.
+    pub updated_at_ms: Covered<Option<i64>>,
+    /// Physical `records.archived` when that column was read. `Absent` is not
+    /// archived 0.
+    pub archived: Covered<i64>,
 }
 
 /// One `facet_values` row, including the generated numeric projection.
@@ -218,6 +246,10 @@ pub struct WorkspaceIndex {
     pub facets: HashMap<String, FacetRow>,
     pub links: HashMap<String, LinkRow>,
     content_window: VecDeque<ContentEventRef>,
+    /// Whether head reads copied physical currency. Member copies drop
+    /// `records.is_current` and keep this false so the index SELECT never
+    /// names that column.
+    currency_held: bool,
 }
 
 /// M4 point-read result for one record's facet surface: the held head plus
@@ -351,6 +383,7 @@ impl WorkspaceIndex {
             facets: HashMap::new(),
             links: HashMap::new(),
             content_window: VecDeque::new(),
+            currency_held: false,
         }
     }
 
@@ -441,12 +474,34 @@ impl WorkspaceIndex {
     }
 }
 
-/// `records` columns held by the index: every column except `body`.
+/// `records` columns held by the index: every ordinary column except `body`.
 const RECORD_HEAD_COLUMNS: &str = "id, type, kind, name, home_id, lifecycle, \
     owner_id, claimed_by_account, claimed_run_key, claimed_at, policy_anchor_id, \
     persistence, maturity, summary, last_activity_at, created_at, updated_at, deleted_at";
 
-fn record_head_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::Result<RecordHead> {
+/// Physical currency plus the governed timestamp expression. Same expression
+/// as the hosted `records` view in `query/sql.rs`. Not used when the physical
+/// currency column is absent (member copies).
+const RECORD_HEAD_CURRENCY_COLUMNS: &str = ", is_current, \
+    CAST(strftime('%s', updated_at) AS INTEGER) * 1000 + CAST(substr(strftime('%f', updated_at), 4, 3) AS INTEGER) AS updated_at_ms";
+
+/// `records.archived` is shipped on member copies. It is not part of the
+/// dropped currency pair, so an index that omits `is_current` still copies it.
+const RECORD_HEAD_ARCHIVED_COLUMN: &str = ", archived";
+
+pub(crate) fn record_head_select(currency: bool, tail: &str) -> String {
+    let columns = if currency {
+        format!("{RECORD_HEAD_COLUMNS}{RECORD_HEAD_CURRENCY_COLUMNS}{RECORD_HEAD_ARCHIVED_COLUMN}")
+    } else {
+        format!("{RECORD_HEAD_COLUMNS}{RECORD_HEAD_ARCHIVED_COLUMN}")
+    };
+    format!("SELECT {columns} FROM records {tail}")
+}
+
+pub(crate) fn record_head_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    currency: bool,
+) -> crate::Result<RecordHead> {
     Ok(RecordHead {
         id: row.try_get("id")?,
         record_type: row.try_get("type")?,
@@ -466,6 +521,17 @@ fn record_head_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::Result<RecordHe
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         deleted_at: row.try_get("deleted_at")?,
+        is_current: if currency {
+            Covered::Present(row.try_get("is_current")?)
+        } else {
+            Covered::Absent
+        },
+        updated_at_ms: if currency {
+            Covered::Present(row.try_get("updated_at_ms")?)
+        } else {
+            Covered::Absent
+        },
+        archived: Covered::Present(row.try_get("archived")?),
     })
 }
 
@@ -522,6 +588,17 @@ fn content_ref_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::Result<ContentE
 /// write-pool slot — so this cannot join the writer serialization the 16 Sep
 /// campaign mapped.
 pub async fn build_on(pool: &sqlx::SqlitePool) -> crate::Result<WorkspaceIndex> {
+    build_on_with_currency(pool, true).await
+}
+
+/// `currency` is false only for a member-copy pool, whose `records` table
+/// drops `is_current`. That path must not name the dropped column. It still
+/// copies `archived`, which member copies ship. Snapshot open adds no second
+/// refusal: the parent visibility read already fails on the missing log tables.
+pub(crate) async fn build_on_with_currency(
+    pool: &sqlx::SqlitePool,
+    currency: bool,
+) -> crate::Result<WorkspaceIndex> {
     let mut tx = pool.begin().await.map_err(crate::Error::from)?;
     // Read the stamp first: the first read of a deferred transaction fixes the
     // snapshot, so the stamp can never name an event the table reads below lack.
@@ -530,6 +607,7 @@ pub async fn build_on(pool: &sqlx::SqlitePool) -> crate::Result<WorkspaceIndex> 
         .await
         .map_err(crate::Error::from)?;
     let mut index = WorkspaceIndex::new(stamp);
+    index.currency_held = currency;
     index.authorization_epoch =
         sqlx::query_scalar("SELECT epoch FROM authorization_revision WHERE id = 1")
             .fetch_one(&mut *tx)
@@ -541,14 +619,12 @@ pub async fn build_on(pool: &sqlx::SqlitePool) -> crate::Result<WorkspaceIndex> 
             .await
             .map_err(crate::Error::from)?;
 
-    let record_rows = sqlx::query(&format!(
-        "SELECT {RECORD_HEAD_COLUMNS} FROM records ORDER BY id"
-    ))
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(crate::Error::from)?;
+    let record_rows = sqlx::query(&record_head_select(currency, "ORDER BY id"))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(crate::Error::from)?;
     for row in &record_rows {
-        let head = record_head_from_row(row)?;
+        let head = record_head_from_row(row, currency)?;
         index.records.insert(head.id.clone(), head);
     }
 
@@ -615,9 +691,14 @@ impl WorkspaceIndex {
 ///
 /// For every event with `seq` in `(cursor, fence]`, re-reads the named
 /// record's head row, its facet rows, and its touching links, then advances
-/// the cursor past it. Idempotent: re-folding an already-folded event
-/// re-reads the same rows. Returns the number of events folded. Plain
-/// `SELECT`s only: no `BEGIN IMMEDIATE`, no write-pool slot.
+/// the cursor past it. A source-named `link.added` or `link.removed` whose
+/// relationship is `supersedes`, and a source `record.deleted`, also re-read
+/// each affected target head: those commits change the target's physical
+/// currency without an ordinary target head change. The re-read copies the
+/// physical columns. It does not derive currency from held links. Idempotent:
+/// re-folding an already-folded event re-reads the same rows. Returns the
+/// number of events folded. Plain `SELECT`s only: no `BEGIN IMMEDIATE`, no
+/// write-pool slot.
 pub async fn refresh_from(
     pool: &sqlx::SqlitePool,
     index: &mut WorkspaceIndex,
@@ -644,6 +725,9 @@ pub async fn refresh_from(
         for row in &rows {
             let event = content_ref_from_row(row)?;
             refresh_record(pool, index, &event.record_id).await?;
+            if index.currency_held {
+                refresh_currency_targets(pool, index, &event).await?;
+            }
             index.push_content_event(event);
             folded += 1;
         }
@@ -659,13 +743,11 @@ async fn refresh_record(
     index: &mut WorkspaceIndex,
     record_id: &str,
 ) -> crate::Result<()> {
-    let head = sqlx::query(&format!(
-        "SELECT {RECORD_HEAD_COLUMNS} FROM records WHERE id = ?"
-    ))
-    .bind(record_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(crate::Error::from)?;
+    let head = sqlx::query(&record_head_select(index.currency_held, "WHERE id = ?"))
+        .bind(record_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(crate::Error::from)?;
     let Some(head) = head else {
         index.records.remove(record_id);
         index.facets.retain(|_, facet| facet.record_id != record_id);
@@ -674,7 +756,7 @@ async fn refresh_record(
             .retain(|_, link| link.source_id != record_id && link.target_id != record_id);
         return Ok(());
     };
-    let head = record_head_from_row(&head)?;
+    let head = record_head_from_row(&head, index.currency_held)?;
     index.records.insert(head.id.clone(), head);
 
     let facet_rows = sqlx::query(
@@ -723,6 +805,81 @@ async fn refresh_record(
     for id in touching {
         if !seen_links.contains(&id) {
             index.links.remove(&id);
+        }
+    }
+    Ok(())
+}
+
+/// Re-read one head only. Used for a target whose physical currency changed
+/// because of a source-named commit. Does not walk the target's links.
+async fn refresh_record_head(
+    pool: &sqlx::SqlitePool,
+    index: &mut WorkspaceIndex,
+    record_id: &str,
+) -> crate::Result<()> {
+    let head = sqlx::query(&record_head_select(index.currency_held, "WHERE id = ?"))
+        .bind(record_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(crate::Error::from)?;
+    let Some(head) = head else {
+        index.records.remove(record_id);
+        return Ok(());
+    };
+    let head = record_head_from_row(&head, index.currency_held)?;
+    index.records.insert(head.id.clone(), head);
+    Ok(())
+}
+
+/// Source-named supersedes edges and source tombstones change the target's
+/// physical `is_current` without a target content event. Re-read those
+/// target heads. Other relationships are ignored. The target id comes from
+/// the event payload (the link row is already gone on remove) or, for a
+/// tombstone, from the links the soft delete leaves in place.
+async fn refresh_currency_targets(
+    pool: &sqlx::SqlitePool,
+    index: &mut WorkspaceIndex,
+    event: &ContentEventRef,
+) -> crate::Result<()> {
+    let targets: Vec<String> = match event.event_type.as_str() {
+        "link.added" | "link.removed" => {
+            let payload: Option<String> =
+                sqlx::query_scalar("SELECT payload FROM content_events WHERE id = ?")
+                    .bind(&event.id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(crate::Error::from)?;
+            let Some(payload) = payload else {
+                return Ok(());
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&payload).map_err(|error| {
+                crate::Error::engine(format!(
+                    "workspace index: link payload is not json: {error}"
+                ))
+            })?;
+            if parsed.get("relationship").and_then(serde_json::Value::as_str) != Some("supersedes")
+            {
+                return Ok(());
+            }
+            let Some(target) = parsed.get("target_id").and_then(serde_json::Value::as_str) else {
+                return Err(crate::Error::engine(
+                    "workspace index: supersedes link payload has no target_id",
+                ));
+            };
+            vec![target.to_string()]
+        }
+        "record.deleted" => sqlx::query_scalar(
+            "SELECT DISTINCT target_id FROM links WHERE source_id = ? AND relationship = 'supersedes'",
+        )
+        .bind(&event.record_id)
+        .fetch_all(pool)
+        .await
+        .map_err(crate::Error::from)?,
+        _ => return Ok(()),
+    };
+    for target in targets {
+        if target != event.record_id {
+            refresh_record_head(pool, index, &target).await?;
         }
     }
     Ok(())

@@ -79,12 +79,15 @@ mod batch_read;
 mod bundle_delivery;
 pub use bundle_delivery::AppBundleDelivery;
 mod gate_cache;
+pub(crate) mod install_link;
 mod prepare_install;
 pub use batch_read::LiveReadItem;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use batch_read::{item_result as live_read_item_result, LIVE_READ_BATCH_MAX};
 #[doc(hidden)]
 pub mod hosted_producer;
+#[doc(hidden)]
+pub use gate_cache::hits as gate_cache_hits;
 #[doc(hidden)]
 pub use gate_cache::holds as gate_cache_holds;
 
@@ -3748,7 +3751,23 @@ struct LiveReadOptions {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "action", rename_all = "snake_case")]
 pub enum ManageAlphaTabsArgs {
+    InstallLink {
+        package: String,
+    },
+    /// Add a release-catalogue app to the shared workspace shelf. Never
+    /// installs, adopts or consents for anyone.
+    ShelfAdd {
+        package: String,
+        idempotency_key: String,
+    },
+    /// Take an app off the shelf for everyone; nothing is deleted.
+    ShelfRemove {
+        package: String,
+        expected_shelf_event_id: String,
+    },
     PrepareInstall(prepare_install::Args),
+    PublishCatalogUpdate(crate::mcp::tools::catalog_assets::PublishRequest),
+    MaterializeCatalogUpdate(crate::mcp::tools::catalog_assets::MaterializeRequest),
     Inspect {
         package: String,
     },
@@ -3757,6 +3776,10 @@ pub enum ManageAlphaTabsArgs {
         view: Option<String>,
         #[serde(default)]
         include_removed: Option<bool>,
+        /// Shell hint that the caller wants the workspace shelf. The shelf
+        /// block is always part of a v2 reply; accepted so hosts may say so.
+        #[serde(default)]
+        workspace_apps: Option<bool>,
     },
     Launch {
         package: String,
@@ -3833,6 +3856,14 @@ pub enum ManageAlphaTabsArgs {
         reason: String,
         #[serde(default)]
         idempotency_key: Option<String>,
+        /// Optional folder grant applied atomically with adoption (v2 only):
+        /// `{"kind":"all"}` or `{"kind":"folders","folder_ids":[...]}`.
+        #[serde(default)]
+        scope: Option<Value>,
+    },
+    SetScope {
+        package: String,
+        scope: Value,
     },
     AdoptAuthored {
         package: String,
@@ -5456,16 +5487,54 @@ async fn resolve_alpha_tab_source_in(
     .transpose()
 }
 
+/// Which `gate_cache` entries a launch verdict may use: the entries of this
+/// database and account. Without one, the verdict runs its full chain.
+#[derive(Clone, Copy)]
+struct GateCacheScope<'a> {
+    database: Uuid,
+    account_id: &'a str,
+}
+
+impl<'a> GateCacheScope<'a> {
+    fn new(db: &Db, account_id: &'a str) -> Self {
+        Self {
+            database: db.handle_id(),
+            account_id,
+        }
+    }
+}
+
 /// Read-only launch verdict for one install row (`launch_binding` on the
 /// entry). Fail-closed with the named reasons of
 /// `docs/alpha-tab-install-slice2.md` §3 plus the terminal
 /// `launch_request_required` refusal; mints no frame ticket and performs the
 /// source/digest I/O only when the install and authority gates already pass.
+///
+/// The source and digest checks are answered from `gate_cache` where `cache`
+/// is given.
+///
+/// The verdict reads these inputs, and only these:
+///
+/// - the install row: `status`, `adoption`, `artifact_id`, `digest`,
+///   `consented_source_revision`, `declaration_digest`,
+///   `consented_declaration`;
+/// - the target artifact's state and the caller's View on it;
+/// - the artifact's `runtime` facet;
+/// - the body of the source content event the row pins, which is immutable.
+///
+/// Everything but the last is read again on every call. The cache stands in
+/// for the last one alone: a hit means this process already hashed that
+/// event's body, and recomputed the declaration digest, for a row whose pin
+/// inputs equal this row's (`gate_cache::VerifiedInstall::covers`). The hit
+/// still checks that the source event exists and recomputes the pin digest
+/// with the current runtime, so it takes the same refusals the full chain
+/// does. Only a verdict that passed the source gates is remembered.
 async fn launch_binding_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     row: &InstallRow,
     target: TargetState,
     can_view: bool,
+    cache: Option<GateCacheScope<'_>>,
 ) -> Result<Value> {
     let refused = |reason: &'static str| {
         json!({
@@ -5487,33 +5556,64 @@ async fn launch_binding_in(
             .await?
             .flatten();
     let runtime_present = runtime.as_deref() == Some("native.html.v1");
-    let source =
-        resolve_alpha_tab_source_in(tx, &row.artifact_id, &row.consented_source_revision).await?;
-    // Fail closed: a stored declaration the canonical form refuses can never
-    // match its pin. Refuse explicitly with `digest_mismatch` (the code a
-    // non-matching pin produces) rather than comparing against a default
-    // that is only safe because `""` is never a real digest.
-    let Ok(recomputed_declaration_digest) =
-        alpha_tab_declaration_digest(&row.consented_declaration)
-    else {
-        return Ok(refused("digest_mismatch"));
-    };
-    let digest_matches = match (&runtime, &source) {
-        (Some(runtime), Some(source))
-            if row.declaration_digest == recomputed_declaration_digest =>
-        {
-            alpha_tab_digest(
-                &alpha_tab_bundle_digest(&source.body),
-                &recomputed_declaration_digest,
-                runtime,
-            ) == row.digest
-        }
-        _ => false,
+    let verified = cache
+        .and_then(|scope| gate_cache::lookup(scope.database, scope.account_id, &row.package, row));
+    // The bundle hash of a source this call hashed itself.
+    let mut fresh_bundle_sha256: Option<String> = None;
+    let (source_resolved, digest_matches) = if let Some(verified) = &verified {
+        let present = gate_cache::source_event_present_in(
+            tx,
+            &row.artifact_id,
+            &row.consented_source_revision,
+        )
+        .await?;
+        (
+            present,
+            present && verified.pin_digest_matches(runtime.as_deref(), &row.digest),
+        )
+    } else {
+        let source =
+            resolve_alpha_tab_source_in(tx, &row.artifact_id, &row.consented_source_revision)
+                .await?;
+        // Fail closed: a stored declaration the canonical form refuses can never
+        // match its pin. Refuse explicitly with `digest_mismatch` (the code a
+        // non-matching pin produces) rather than comparing against a default
+        // that is only safe because `""` is never a real digest.
+        let Ok(recomputed_declaration_digest) =
+            alpha_tab_declaration_digest(&row.consented_declaration)
+        else {
+            return Ok(refused("digest_mismatch"));
+        };
+        let digest_matches = match (&runtime, &source) {
+            (Some(runtime), Some(source))
+                if row.declaration_digest == recomputed_declaration_digest =>
+            {
+                let bundle_sha256 = alpha_tab_bundle_digest(&source.body);
+                let matches =
+                    alpha_tab_digest(&bundle_sha256, &recomputed_declaration_digest, runtime)
+                        == row.digest;
+                fresh_bundle_sha256 = Some(bundle_sha256);
+                matches
+            }
+            _ => false,
+        };
+        (source.is_some(), digest_matches)
     };
     if let Err(reason) =
-        evaluate_alpha_tab_source_gates(runtime_present, source.is_some(), digest_matches)
+        evaluate_alpha_tab_source_gates(runtime_present, source_resolved, digest_matches)
     {
         return Ok(refused(reason));
+    }
+    if let (Some(scope), Some(bundle_sha256)) = (cache, fresh_bundle_sha256) {
+        // Every source gate passed on this very row, so the entry is exactly
+        // what `live_read` would have remembered for it.
+        gate_cache::remember(
+            scope.database,
+            scope.account_id,
+            &row.package,
+            &row.event_id,
+            Arc::new(gate_cache::VerifiedInstall::new(row, bundle_sha256)),
+        );
     }
     // Inspection never mints a ticket, even when every earlier gate passes.
     if let Err(reason) = evaluate_alpha_tab_ticket_gate() {
@@ -5616,13 +5716,29 @@ async fn entry_in(
     caller: &Caller,
     row: &InstallRow,
 ) -> Result<Value> {
-    let target = target_state_in(tx, &row.artifact_id).await?;
-    let can_view = if target == TargetState::Resolvable {
-        super::can_record_in(tx, caller, &row.artifact_id, Capability::View).await?
+    entry_cached_in(tx, caller, row, None).await
+}
+
+/// [`entry_in`], with the launch verdict's source and digest checks served
+/// from `gate_cache` where `cache` is given.
+async fn entry_cached_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    row: &InstallRow,
+    cache: Option<GateCacheScope<'_>>,
+) -> Result<Value> {
+    // A disabled or removed install is decided by its status before the
+    // target or the viewer's View is consulted (`evaluate_alpha_tab_install_gates`,
+    // `entry_json`), so reading them would only cost two queries per row.
+    let (target, can_view) = if matches!(row.status.as_str(), "disabled" | "removed") {
+        (TargetState::Missing, false)
     } else {
-        false
+        let target = target_state_in(tx, &row.artifact_id).await?;
+        let can_view = target == TargetState::Resolvable
+            && super::can_record_in(tx, caller, &row.artifact_id, Capability::View).await?;
+        (target, can_view)
     };
-    let launch_binding = launch_binding_in(tx, row, target, can_view).await?;
+    let launch_binding = launch_binding_in(tx, row, target, can_view, cache).await?;
     Ok(entry_json(row, target, can_view, launch_binding))
 }
 /// Same-key retry: `instructions.rs::prior_event` precedent. When the caller
@@ -6484,6 +6600,7 @@ async fn do_list(
     }
     let include_removed = include_removed.unwrap_or(view == "full");
     let account_id = require_account(caller)?;
+    let gate_scope = GateCacheScope::new(db, &account_id);
     let mut tx = db.pool().begin().await?;
     let rows: Vec<InstallRowTuple> = sqlx::query_as(
         "SELECT package,version,digest,artifact_id,consented_source_revision,
@@ -6530,7 +6647,7 @@ async fn do_list(
             removed_hidden += 1;
             continue;
         }
-        let entry = entry_in(&mut tx, caller, &row).await?;
+        let entry = entry_cached_in(&mut tx, caller, &row, Some(gate_scope)).await?;
         if view == "summary" {
             let name = if entry["target_resolves"].as_bool() == Some(true) {
                 let name: Option<String> =
@@ -6704,6 +6821,28 @@ async fn admit_installed_app_source_in(
         runtime,
         body_limit,
     })
+}
+
+/// Read the same consented source as launch without taking write admission.
+pub(crate) async fn read_bundle_source(
+    db: &Db,
+    caller: &Caller,
+    package: &str,
+    event: &str,
+) -> Result<(String, String, String, usize)> {
+    require_package(package)?;
+    let account = require_account(caller)?;
+    let mut tx = db.pool().begin().await?;
+    let admitted =
+        admit_installed_app_source_in(&mut tx, caller, &account, package, Some(event), None)
+            .await?;
+    tx.rollback().await?;
+    Ok((
+        admitted.source.body,
+        admitted.row.artifact_id,
+        admitted.row.version,
+        admitted.body_limit,
+    ))
 }
 
 /// Minimal held-transport boundary; install rows and source provenance stay private.
@@ -7045,6 +7184,66 @@ mod admitted_app_source_tests {
             digest,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn read_app_bundle_uses_launch_admission_without_ticket_issuance() {
+        let (db, registry) = fixture().await;
+        let (event, _) = adopted_install(&db, &registry).await;
+        let args = json!({"package":ADMIT_PACKAGE,"expected_install_event_id":event,"parent_origin":"native-ui://app","length":524288});
+        let read = |caller, args| registry.call(db.clone(), caller, "read_app_bundle", args);
+        let result = read(Caller::authenticated(ADMIT_ACCOUNT), args.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["source_sha256"], alpha_tab_bundle_digest(ADMIT_BODY));
+        assert_eq!(result["artifact_id"], ADMIT_ARTIFACT);
+        assert!(result.get("url").is_none());
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+        let bytes = STANDARD
+            .decode(result["content"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            result["document_sha256"],
+            hex::encode(Sha256::digest(&bytes))
+        );
+        let mut page = args.clone();
+        page["offset"] = json!(17);
+        page["length"] = json!(23);
+        page["expected_document_sha256"] = result["document_sha256"].clone();
+        let next = read(Caller::authenticated(ADMIT_ACCOUNT), page.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            STANDARD.decode(next["content"].as_str().unwrap()).unwrap(),
+            bytes[17..40]
+        );
+        assert_eq!(next["document_sha256"], result["document_sha256"]);
+        for (caller, package, event_id, code) in [
+            (
+                ADMIT_ACCOUNT,
+                "unknown.package",
+                event.as_str(),
+                "missing_install",
+            ),
+            ("bob", ADMIT_PACKAGE, event.as_str(), "missing_install"),
+            (ADMIT_ACCOUNT, ADMIT_PACKAGE, "old-event", "cas_mismatch"),
+        ] {
+            let mut request = args.clone();
+            request["package"] = json!(package);
+            request["expected_install_event_id"] = json!(event_id);
+            let error = read(Caller::authenticated(caller), request)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(code), "{error}");
+        }
+        sqlx::query("UPDATE alpha_tab_installs SET adoption='caller_asserted' WHERE account_id=? AND package=?")
+            .bind(ADMIT_ACCOUNT).bind(ADMIT_PACKAGE).execute(db.write_pool()).await.unwrap();
+        // Page 2 rechecks adoption even with a matching document pin.
+        let error = read(Caller::authenticated(ADMIT_ACCOUNT), page)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("adoption_unverified"), "{error}");
     }
 
     #[tokio::test]
@@ -10910,9 +11109,18 @@ async fn manage_alpha_tabs(
     caller: Caller,
     arguments: Value,
     bundle_delivery: Option<AppBundleDelivery>,
+    public_origin: Option<String>,
 ) -> Result<Value> {
     let args: ManageAlphaTabsArgs = parse_args(TOOL, arguments)?;
     match args {
+        ManageAlphaTabsArgs::PublishCatalogUpdate(_)
+        | ManageAlphaTabsArgs::MaterializeCatalogUpdate(_) => {
+            Err(Error::engine("catalog publication requires v2"))
+        }
+        ManageAlphaTabsArgs::InstallLink { package } => {
+            require_account(&caller)?;
+            install_link::prepare(&package, public_origin.as_deref())
+        }
         ManageAlphaTabsArgs::PrepareInstall(args) => {
             alpha_action_future(|| prepare_install::prepare(&db, &caller, args)).await
         }
@@ -10922,6 +11130,7 @@ async fn manage_alpha_tabs(
         ManageAlphaTabsArgs::List {
             view,
             include_removed,
+            ..
         } => alpha_action_future(|| do_list(&db, &caller, view, include_removed)).await,
         ManageAlphaTabsArgs::Launch {
             package,
@@ -11051,7 +11260,12 @@ async fn manage_alpha_tabs(
             expected_install_event_id,
             reason,
             idempotency_key,
+            scope,
         } => {
+            // Folder scoping is v2-only; never silently drop a requested grant.
+            if scope.is_some() {
+                return Err(Error::engine("manage_alpha_tabs: scope unsupported_on_v1"));
+            }
             alpha_action_future(|| {
                 do_adopt(
                     &db,
@@ -11229,28 +11443,97 @@ async fn manage_alpha_tabs(
             alpha_action_future(|| do_reorder(&db, &caller, tab_order, reason, idempotency_key))
                 .await
         }
+        ManageAlphaTabsArgs::SetScope { .. } => Err(Error::engine(
+            "manage_alpha_tabs: set_scope unsupported_on_v1",
+        )),
+        ManageAlphaTabsArgs::ShelfAdd { .. } | ManageAlphaTabsArgs::ShelfRemove { .. } => Err(
+            Error::engine("manage_alpha_tabs: workspace shelf unsupported_on_v1"),
+        ),
     }
 }
 
 /// Register `manage_alpha_tabs`.
 pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
     let bundle_delivery = registry.app_bundle_delivery();
+    let public_origin = registry.public_origin().map(str::to_owned);
     registry.register(
         ToolKind::ManageAlphaTabs,
-        "Personal alpha tabs pin artifact/source/digest and consent. Before install/update call \
+        "For approved Native apps use read-only install_link and give the person its browser link. \
+         Personal alpha tabs pin artifact/source/digest and consent. Before authored install/update call \
          read-only prepare_install with a source guard; follow next_call. ready means prepared; \
          adoption is carried or requires_person_preview_adopt: tell the person to Preview/Adopt. \
          Argument-shape/authority errors throw; source/declaration refusals return ready:false. \
-         Guide: read_guide topic app-kit-core-1.1.0. Install is caller_asserted; update carries \
+         Guide: read_guide topic app-kit-core-1.7.0. Install is caller_asserted; update carries \
          proven adoption only for unchanged canonical declarations. Transitions use event CAS. \
          Preview/adopt require hosted cookie+trusted-Origin, never Bearer. Launch checks adoption \
          and View. Disabled/removed tabs stop reads/actions. live_read/subscribe expose only \
          consented inputs; unsubscribe is connection-scoped. Reveal is consented, push-only. \
          List before reorder; it replaces strip order. List view summary finds a package \
-         (removed hidden by default); inspect gives one package's full detail.",
+         (removed hidden by default); inspect gives one package's full detail. In a shared \
+         workspace list also reports shelf, the workspace's apps, each with my_status for the caller \
+         alone; shelf_add and shelf_remove need edit access, never install or consent for anyone, and \
+         are refused to app callers. install with from_shelf and shelf_event_id enables a shelf app \
+         for the caller only (any member, view-only included; the pin comes from the shelf) and still \
+         needs the person's Preview/Adopt. Removal from the workspace stops it for everyone at their \
+         next check with workspace_removed; nothing is deleted.",
         json!({
             "type": "object",
             "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "install_link" },
+                        "package": { "type": "string", "enum": install_link::packages() }
+                    },
+                    "required": ["action", "package"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "shelf_add" },
+                        "package": { "type": "string", "enum": install_link::packages() },
+                        "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 }
+                    },
+                    "required": ["action", "package", "idempotency_key"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "shelf_remove" },
+                        "package": { "type": "string", "enum": install_link::packages() },
+                        "expected_shelf_event_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["action", "package", "expected_shelf_event_id"],
+                    "additionalProperties": false
+                },
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"const":"materialize_catalog_update"},
+                        "package":{"type":"string"},"version":{"type":"string"},
+                        "expected_install_event_id":{"type":"string","minLength":1},
+                        "predecessor_artifact_id":{"type":"string","minLength":1},
+                        "reason":{"type":"string","minLength":1,"maxLength":1024},
+                        "idempotency_key":{"type":"string","minLength":1,"maxLength":200}
+                    },
+                    "required":["action","package","version","expected_install_event_id","predecessor_artifact_id","reason","idempotency_key"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"const":"publish_catalog_update"},
+                        "artifact_id":{"type":"string"}, "package":{"type":"string"}, "version":{"type":"string"},
+                        "expected_body_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                        "expected_install_event_id":{"type":["string","null"],"minLength":1,"description":"Current install generation for updates; explicit null for initial publication of an exact private, never-installed host catalog source. Initial publication also requires idempotency_key."},
+                        "idempotency_key":{"type":"string","maxLength":200},
+                        "reason":{"type":"string","minLength":1,"maxLength":1024}
+                    },
+                    "required":["action","artifact_id","package","version","expected_body_digest","expected_install_event_id","reason"],
+                    "additionalProperties":false
+                },
                 {
                     "type": "object",
                     "properties": {
@@ -11282,7 +11565,8 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "properties": {
                         "action": { "const": "list" },
                         "view": { "type": "string", "enum": ["full", "summary"] },
-                        "include_removed": { "type": "boolean" }
+                        "include_removed": { "type": "boolean" },
+                        "workspace_apps": { "type": "boolean" }
                     },
                     "required": ["action"],
                     "additionalProperties": false
@@ -11384,9 +11668,20 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                         "preview_session": { "type": "string" },
                         "expected_install_event_id": { "type": "string" },
                         "reason": { "type": "string" },
-                        "idempotency_key": { "type": ["string", "null"] }
+                        "idempotency_key": { "type": ["string", "null"] },
+                        "scope": { "type": "object", "properties": { "kind": { "enum": ["all", "folders"] }, "folder_ids": { "type": "array", "items": { "type": "string" } } } }
                     },
                     "required": ["action", "package", "version", "digest", "artifact_id", "source_revision", "declaration", "receipt_id", "nonce", "preview_session", "expected_install_event_id", "reason"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "set_scope" },
+                        "package": { "type": "string" },
+                        "scope": { "type": "object", "properties": { "kind": { "enum": ["all", "folders"] }, "folder_ids": { "type": "array", "items": { "type": "string" } } } }
+                    },
+                    "required": ["action", "package", "scope"],
                     "additionalProperties": false
                 },
                 {
@@ -11424,6 +11719,19 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                         "expected_install_event_id": { "type": ["string", "null"] }
                     },
                     "required": ["action", "package", "version", "digest", "artifact_id", "source_revision", "declaration", "reason"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "install" },
+                        "package": { "type": "string", "enum": install_link::packages() },
+                        "from_shelf": { "const": true },
+                        "shelf_event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                        "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 }
+                    },
+                    "required": ["action", "package", "from_shelf", "shelf_event_id"],
                     "additionalProperties": false
                 },
                 {
@@ -11497,7 +11805,7 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                 }
             ]
         }),
-        move |db, caller, arguments| manage_alpha_tabs(db, caller, arguments, bundle_delivery.clone()),
+        move |db, caller, arguments| manage_alpha_tabs(db, caller, arguments, bundle_delivery.clone(), public_origin.clone()),
     )?;
     Ok(())
 }

@@ -59,3 +59,19 @@ test("accessibility rules: errors by default (hosted 28 Sep behaviour), warnings
   assert.deepEqual(warnings(doc("<main><h1>T</h1><h1>U</h1></main>"), { strict: false }), ["single-h1"]);
   assert.deepEqual(warnings(doc('<main><h1>T</h1><img src="data:image/png;base64,aQ=="><div tabindex="2">x</div></main>')), ["image-alt", "positive-tabindex"]);
 });
+
+
+test("package images and CSS fonts get larger budgets, ordinary documents retain theirs", () => {
+  const image = size => `<img alt="" src="data:image/png,${"A".repeat(size)}">`;
+  const font = size => `<style>@font-face{font-family:test;src:url(data:font/woff2,${"A".repeat(size)})}</style>`;
+  const source = (...assets) => doc(`<main><h1>T</h1>${assets.join("")}</main>`);
+  assert.deepEqual(rules(source(image(262144))), []);
+  assert.deepEqual(rules(source(image(262145))), ["data-asset-size"]);
+  assert.deepEqual(rules(source(image(262145)), { package: true }), []);
+  assert.deepEqual(rules(source(image(262144), font(131072))), []);
+  assert.deepEqual(rules(source(image(262144), font(131073))), ["data-asset-total"]);
+  assert.deepEqual(rules(source(image(262144), font(131073)), { package: true }), []);
+  assert.deepEqual(rules(source(image(524288), font(524288)), { package: true }), []);
+  assert.deepEqual(rules(source(image(524289)), { package: true }), ["data-asset-size"]);
+  assert.deepEqual(rules(source(image(524288), font(524288), image(1)), { package: true }), ["data-asset-total"]);
+});

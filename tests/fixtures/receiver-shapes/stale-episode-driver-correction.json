@@ -1,0 +1,12 @@
+{
+  "qualification": "not a witness: mutation failed compilation",
+  "head": "dbb30b94b46a0cb565610442161c2d6cf1e1310a",
+  "error": "E0624 transition_episode private to child module",
+  "correction": "Mutator only: use accessible transition_eligible on actual current94. Its validated durable94->95 receipt returns Some while a later unrelated unknown head requests FULL. No production visibility or guard changes.",
+  "preserved_files": {
+    "stale-episode-private-helper-compile-failure.json": "6521aa80ad1d04ff694bebfa95ade075492340c0ed4ba7ac0dda664c44c3bc1f",
+    "stale-episode-private-helper-compile-failure-compile.log": "ad92d1e95ff75de718de62752f1aee9a1b2b9b466b061246d7cb4c5a854ed676",
+    "stale-episode-private-helper-compile-failure-compile.jsonl": "a27e9daa4295e409685f5eb98f31e8077392dba1bab3be39a3129ed35fc62cde"
+  },
+  "functional_rerun": "passed: successfully compiled mutant enters FULL network path instead of cooldown deferral; exact receipt in functional-mutations-complete.json"
+}

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "app_state/metadata.rs"]
+mod metadata;
+
 // Trusted test ingress mints the same exact invocation binding as hosted H2.
 fn gesture_caller(caller: crate::mcp::Caller, request: &Value) -> crate::mcp::Caller {
     use crate::awareness::{
@@ -2181,6 +2184,73 @@ async fn canvas_app_tool(db: &Db, tool: &str, args: Value) -> crate::Result<Valu
 }
 
 #[tokio::test]
+async fn empty_canvas_import_retains_custody_for_activation_and_resume() {
+    for resume in [false, true] {
+        let f = Fixture::new().await;
+        if resume {
+            // Older imports omitted initial empty custody. A plain note gives
+            // us that same absent-capsule starting point without corrupting it.
+            run(f.options(&["note"], false)).await.unwrap();
+        }
+        let mut source = SqliteConnection::connect(f.source.to_str().unwrap())
+            .await
+            .unwrap();
+        source.execute("UPDATE records SET kind='canvas' WHERE id='note'; INSERT INTO content_events(id,record_id,type,payload,actor,created_at) VALUES('canvas-kind','note','record.updated','{}','account-a','2026-01-01T00:00:00Z')")
+            .await.unwrap();
+        source.close().await.unwrap();
+
+        let report = run(f.options(&["note"], resume)).await.unwrap();
+        assert!(report.refusals.is_empty());
+        assert!(report.app_state.capture_complete);
+        let db = f.db().await;
+        let (seq, raw): (i64, String) =
+            sqlx::query_as("SELECT event_seq,payload FROM kernel_app_state WHERE record_id='note'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let state: k::app_state::RetainedAppState = serde_json::from_str(&raw).unwrap();
+        assert!(state.is_empty());
+        assert!(state.custody.is_some());
+        let before = k::dump_all_kernel_tables(&db).await.unwrap();
+        db.close().await;
+        // Repeating the unchanged import neither loses custody nor adds events.
+        run(f.options(&["note"], true)).await.unwrap();
+        let db = f.db().await;
+        assert_eq!(before, k::dump_all_kernel_tables(&db).await.unwrap());
+        let host = k::resolve_principal_by_binding(&db, k::HOST_IMPORT_BINDING)
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        app_roster(&db, "account-a", &["account-a", "account-b"]).await;
+        let head: String = sqlx::query_scalar("SELECT payload FROM content_events WHERE type='kernel.import_source_head.v1' ORDER BY seq DESC LIMIT 1")
+            .fetch_one(db.pool()).await.unwrap();
+        // SAFETY: complete frozen synthetic import, no concurrent writers.
+        let proof = unsafe {
+            k::canvas_v2::VerifiedFrozenCanvas::from_verified_import_unchecked(
+                "note".into(),
+                serde_json::from_str(&head).unwrap(),
+                "a".repeat(64),
+                seq,
+            )
+        };
+        k::canvas_v2::activate_as(&db, &host, proof).await.unwrap();
+        assert!(crate::canvas::load_scene(
+            &mut db.write_pool().acquire().await.unwrap(),
+            "note",
+            true,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        let before = k::dump_all_kernel_tables(&db).await.unwrap();
+        k::replay_all_projections(&db).await.unwrap();
+        assert_eq!(before, k::dump_all_kernel_tables(&db).await.unwrap());
+        db.close().await;
+    }
+}
+
+#[tokio::test]
 async fn frozen_canvas_activation_retains_source_clock_and_rebuilds_exact_scene() {
     let f = Fixture::new().await;
     native_install_source(&f, r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Canvas app</title></head><body><main>Sample</main></body></html>"#).await;
@@ -2690,14 +2760,19 @@ async fn frozen_canvas_activation_retains_source_clock_and_rebuilds_exact_scene(
     assert_eq!(borrowed["outcome"], "rejected");
     assert_eq!(borrowed["error"]["code"], "batch_id_reused");
     assert!(borrowed.get("app_attribution").is_none());
-    // Promotion keeps the existing v1 plan contract, but all native effects
-    // and app attribution share one act. A stale plan cannot mint anything.
+    // Preview is optional. All native effects and app attribution share one
+    // act, and supplied stale preconditions cannot mint anything.
     let promotion = json!({"action":"promote","canvas_id":fresh_id,"dry_run":true,
         "items":[{"object_id":"note-object","type":"WorkItem","kind":"task","name":"Promoted card"}],
         "reason":"Promote a canvas note"});
+    let before_preview = k::dump_all_kernel_tables(&db).await.unwrap();
     let planned = canvas_app_call(&db, promotion.clone()).await.unwrap();
     assert_eq!(planned["outcome"], "planned", "{planned}");
     assert_eq!(planned["items"][0]["status"], "would_accept");
+    assert_eq!(
+        before_preview,
+        k::dump_all_kernel_tables(&db).await.unwrap()
+    );
     let mut commit_promotion = promotion.clone();
     commit_promotion["dry_run"] = json!(false);
     commit_promotion["plan_digest"] = planned["plan_digest"].clone();
@@ -2716,8 +2791,24 @@ async fn frozen_canvas_activation_retains_source_clock_and_rebuilds_exact_scene(
         .unwrap_err();
     assert!(error.to_string().contains("revision conflict"), "{error}");
     assert_eq!(pre_stale, k::dump_all_kernel_tables(&db).await.unwrap());
-    let fresh_plan = canvas_app_call(&db, promotion.clone()).await.unwrap();
-    commit_promotion["plan_digest"] = fresh_plan["plan_digest"].clone();
+    // The same request without a digest uses the current assessment. Link
+    // authority and explicit versions still apply before any record is minted.
+    commit_promotion
+        .as_object_mut()
+        .unwrap()
+        .remove("plan_digest");
+    commit_promotion.as_object_mut().unwrap().remove("dry_run");
+    let mut denied = commit_promotion.clone();
+    denied["links"] =
+        json!([{"from":"note-object","to":"missing-promotion-target","relationship":"relates_to"}]);
+    assert!(canvas_app_call(&db, denied).await.is_err());
+    assert_eq!(pre_stale, k::dump_all_kernel_tables(&db).await.unwrap());
+    let mut stale_version = commit_promotion.clone();
+    stale_version["expected"] = json!({"canvas_version":planned["canvas_version"]});
+    assert!(canvas_app_call(&db, stale_version).await.is_err());
+    assert_eq!(pre_stale, k::dump_all_kernel_tables(&db).await.unwrap());
+    assert!(commit_promotion.get("plan_digest").is_none());
+    assert!(commit_promotion.get("dry_run").is_none());
     let promoted = canvas_app_call(&db, commit_promotion.clone())
         .await
         .unwrap();
@@ -2765,6 +2856,8 @@ async fn frozen_canvas_activation_retains_source_clock_and_rebuilds_exact_scene(
     assert_eq!(card["props"]["record_id"], promoted_id);
     assert!(card["props"].get("text").is_none());
     let before_duplicate = k::dump_all_kernel_tables(&db).await.unwrap();
+    // A direct retry sees the record card and refuses without duplicating
+    // records, provenance, canvas batches or app-action attribution.
     assert!(canvas_app_call(&db, commit_promotion.clone())
         .await
         .unwrap_err()
@@ -3597,6 +3690,7 @@ async fn native_apps_hosted_review_adopts_new_member_with_live_delivery_guards()
         receipt_id: preview.receipt.receipt_id.clone(),
         nonce: preview.receipt.nonce.clone(),
         preview_session: preview.receipt.preview_session.clone(),
+        scope: None,
     };
     adopt.pin.idempotency_key = Some("member-adopt".into());
     let adopt_caller = native_app_hosted_caller("account-c", &pin, true);
@@ -4283,6 +4377,7 @@ async fn native_apps_hosted_review_uses_h3_catalogue_to_imported_account_mapping
                 receipt_id: preview.receipt.receipt_id,
                 nonce: preview.receipt.nonce,
                 preview_session: preview.receipt.preview_session,
+                scope: None,
             },
         ))
         .await
@@ -4819,6 +4914,15 @@ async fn imported_app_custody_standby_delta_matches_hosted_and_full_replay() {
 
 #[tokio::test]
 async fn native_app_query_record_rechecks_consent_roster_source_and_visibility() {
+    native_app_query_record_authority_matrix(false).await;
+}
+
+#[tokio::test]
+async fn native_app_query_record_metadata_rechecks_consent_roster_source_and_visibility() {
+    native_app_query_record_authority_matrix(true).await;
+}
+
+async fn native_app_query_record_authority_matrix(metadata_only: bool) {
     use crate::mcp::{app_attribution::AppAttribution, Caller, EngineHandle, ToolRegistry};
     let f = Fixture::new().await;
     let (db, report) = native_install_fixture_with_body(&f, r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>App reader</title></head><body><main>Sample</main></body></html>"#).await;
@@ -4868,11 +4972,16 @@ async fn native_app_query_record_rechecks_consent_roster_source_and_visibility()
         Caller::authenticated(account)
             .with_host_asserted_app(AppAttribution::new("agent.docs", "0.8.2", generation).unwrap())
     };
-    let queries = [
+    let mut queries = [
         json!({"steps":[{"step":"filter","ids":["note",hidden]}],"limit":500}),
         json!({"steps":[{"step":"filter","ids":["note",hidden],"facets":[{"key":"runtime","in":["native.mdx.v1","native.mdx.v2"]}]}],"order":"name_asc","limit":500}),
         json!({"steps":[{"step":"filter","ids":["missing"]}],"order":"name_asc","limit":500}),
     ];
+    if metadata_only {
+        for query in &mut queries {
+            query["projection"] = json!("metadata");
+        }
+    }
     for facet in [
         json!({"key":"runtime","in":["native.mdx.v1","native.mdx.v2"]}),
         json!({"key":"runtime","eq":"native.mdx.v2"}),
@@ -4911,6 +5020,15 @@ async fn native_app_query_record_rechecks_consent_roster_source_and_visibility()
             .await
             .unwrap();
         assert_eq!(app["records"], direct["records"]);
+        if metadata_only {
+            assert!(app["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("body").is_none()
+                    && row.get("body_digest").is_none()
+                    && row.get("fields").is_none()));
+        }
         assert!(!app["records"]
             .as_array()
             .unwrap()
@@ -5628,6 +5746,9 @@ async fn operator_apps_format_three_activates_and_replays_verified_shell_auto() 
 #[path = "app_state/declarative_apps.rs"]
 mod declarative_apps;
 
+#[path = "app_state/app_scope.rs"]
+mod app_scope;
+
 #[cfg(feature = "v2-kernel-probe")]
 mod app_messaging {
     use super::*;
@@ -5735,6 +5856,133 @@ mod app_messaging {
         assert!(value["snapshot"].is_string());
         value.as_object_mut().unwrap().remove("snapshot");
         value
+    }
+    #[tokio::test]
+    async fn slack_app_roster_admission_is_read_only_and_install_bound() {
+        let (_f, db, _report) = fixture().await;
+        let claim = AppAttribution::new("agent.slack-workspace-v2", "0.5.18", "install").unwrap();
+        crate::mcp::app_attribution::admit_kernel_v2(
+            &db,
+            "account-a",
+            "manage_memberships",
+            &json!({"action":"list","include_person":true}),
+            &claim,
+        )
+        .await
+        .unwrap();
+        let denied = crate::mcp::app_attribution::admit_kernel_v2(
+            &db,
+            "account-a",
+            "manage_memberships",
+            &json!({"action":"set_role","member_id":"account-b","role":"owner"}),
+            &claim,
+        )
+        .await
+        .unwrap_err();
+        assert!(denied
+            .to_string()
+            .contains("app_operation_unsupported_on_v2"));
+        let stale = AppAttribution::new("agent.slack-workspace-v2", "0.5.18", "missing").unwrap();
+        assert!(crate::mcp::app_attribution::admit_kernel_v2(
+            &db,
+            "account-a",
+            "manage_memberships",
+            &json!({"action":"list"}),
+            &stale,
+        )
+        .await
+        .is_err());
+        db.close().await;
+    }
+    #[tokio::test]
+    async fn slack_roster_rechecks_app_scope_after_dispatch_without_blocking_members() {
+        use crate::mcp::registry::EngineKind;
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::oneshot;
+
+        let (_f, db, _report) = fixture().await;
+        let gate = Arc::new(Mutex::new(
+            None::<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+        ));
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_membership_tool_with(&mut registry, |_, _, _| async {
+            Err::<Value, _>(crate::Error::engine("unexpected SQLite roster delegate"))
+        })
+        .unwrap();
+        registry
+            .register_engine_handler_for_selector_values(
+                "manage_memberships",
+                EngineKind::KernelV2,
+                "action",
+                &["list"],
+                {
+                    let gate = gate.clone();
+                    move |engine, caller, _| {
+                        let pause = gate.lock().unwrap().take();
+                        async move {
+                            if let Some((started, release)) = pause {
+                                let _ = started.send(());
+                                let _ = release.await;
+                            }
+                            let EngineHandle::KernelV2(db) = engine else {
+                                unreachable!()
+                            };
+                            crate::mcp::kernel_v2::identity_read::require_unscoped_app_directory_as(
+                                &db, &caller,
+                            )
+                            .await?;
+                            Ok(json!({"members":[]}))
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        let registry = Arc::new(registry);
+        for caller in [app("account-a"), Caller::authenticated("account-a")] {
+            assert_eq!(
+                registry
+                    .call_engine(
+                        EngineHandle::KernelV2(db.clone()),
+                        caller,
+                        "manage_memberships",
+                        json!({"action":"list"}),
+                    )
+                    .await
+                    .unwrap()["members"],
+                json!([])
+            );
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *gate.lock().unwrap() = Some((started_tx, release_rx));
+        let pending = {
+            let registry = registry.clone();
+            let db = db.clone();
+            tokio::spawn(async move {
+                registry
+                    .call_engine(
+                        EngineHandle::KernelV2(db),
+                        app("account-a"),
+                        "manage_memberships",
+                        json!({"action":"list"}),
+                    )
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        tool(
+            &db,
+            Caller::authenticated("account-a"),
+            "manage_alpha_tabs",
+            json!({"action":"set_scope","package":"agent.slack-workspace-v2",
+                "scope":{"kind":"folders","folder_ids":["folder"]}}),
+        )
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        let denied = pending.await.unwrap().unwrap_err();
+        assert!(denied.to_string().contains("outside_app_scope"));
+        db.close().await;
     }
     #[tokio::test]
     async fn slack_app_inbox_matches_member_view_and_excludes_private_state() {
@@ -6030,13 +6278,25 @@ mod app_messaging {
             own["messages"][0]["human"]["stage"], "opened",
             "app reports never mutate another member's awareness"
         );
+        for (action, emoji) in [("add_reaction", "👍"), ("remove_reaction", "👍")] {
+            let request = json!({"action":action,"message_id":id,"emoji":emoji,
+                "idempotency_key":format!("slack-{action}"),"reason":"Synthetic Slack reaction"});
+            let out = call(&db, app("account-a"), request.clone()).await.unwrap();
+            assert!(out["app_attribution"].is_object());
+            assert_eq!(call(&db, app("account-a"), request).await.unwrap(), out);
+        }
+        let removable = call(&db, app("account-a"), send("slack-delete-target"))
+            .await
+            .unwrap();
+        let delete = json!({"action":"delete","message_id":removable["id"],
+            "idempotency_key":"slack-delete","reason":"Synthetic Slack deletion"});
+        let deleted = call(&db, app("account-a"), delete.clone()).await.unwrap();
+        assert!(deleted["app_attribution"].is_object());
+        assert_eq!(call(&db, app("account-a"), delete).await.unwrap(), deleted);
         let bad_before = k::dump_all_kernel_tables(&db).await.unwrap();
         for action in [
-            "add_reaction",
-            "remove_reaction",
             "list_context",
             "edit",
-            "delete",
             "set_routing",
             "set_agent_disposition",
             "get_attention",
@@ -6068,11 +6328,16 @@ mod app_messaging {
             );
         }
         assert_eq!(bad_before, k::dump_all_kernel_tables(&db).await.unwrap());
+        let rollback_target = call(&db, app("account-a"), send("slack-rollback-target"))
+            .await
+            .unwrap();
         sqlx::query("CREATE TRIGGER fail_app_completion BEFORE INSERT ON kernel_app_actions BEGIN SELECT RAISE(ABORT,'synthetic app completion failure'); END").execute(db.write_pool()).await.unwrap();
         let before_failure = k::dump_all_kernel_tables(&db).await.unwrap();
         for request in [
             send("late-attribution-failure"),
             json!({"action":"mark_no_longer_relevant","message_id":id,"idempotency_key":"late-mark-failure","reason":"Rollback a relevance effect too"}),
+            json!({"action":"add_reaction","message_id":id,"emoji":"👍","idempotency_key":"late-reaction-failure","reason":"Rollback a reaction too"}),
+            json!({"action":"delete","message_id":rollback_target["id"],"idempotency_key":"late-delete-failure","reason":"Rollback a deletion too"}),
         ] {
             assert!(call(&db, app("account-a"), request).await.is_err());
             assert_eq!(
@@ -6408,3 +6673,462 @@ async fn native_app_sql_separates_only_admitted_staging_from_the_caller_vm_bound
 #[cfg(feature = "package-cel-dev")]
 #[path = "app_state/package_delivery.rs"]
 mod package_delivery;
+
+/// Current native admission fixture only: inherited synthetic V1 import,
+/// asserted frozen activation/catalog/cookie trust, actual stage/preview/adopt.
+/// This does not qualify shipping host authentication, Spaces/needs or cuts.
+pub(super) async fn native_peer_adopted_app_fixture(
+) -> std::sync::Arc<super::super::NativePeerAdoptedAppFixture> {
+    let f = Fixture::new().await;
+    let body = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Review fixture</title></head><body><main>Sample only</main></body></html>"#;
+    let (db, report) = native_install_fixture_with_body(&f, body).await;
+    let administrator = report.principals["account-a"].clone();
+    let host = k::resolve_principal_by_binding(&db, k::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    app_roster(&db, "account-a", &["account-a", "account-b"]).await;
+    k::app_installs::activate_as(&db, &host, app_activation_proof(&db).await)
+        .await
+        .unwrap();
+    k::rehome_record_as(&db, &administrator, "secret", KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    app_roster(&db, "account-c", &["account-a", "account-b", "account-c"]).await;
+    let principal = k::resolve_principal_by_binding(&db, "account-c")
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let pins = k::app_installs::frozen_sources_as(&db, &principal)
+        .await
+        .unwrap();
+    assert_eq!(pins.len(), 1);
+    let mut pin = k::app_installs::InstallRequest {
+        package: pins[0]["package"].as_str().unwrap().into(),
+        version: pins[0]["version"].as_str().unwrap().into(),
+        digest: pins[0]["digest"].as_str().unwrap().into(),
+        artifact_id: "secret".into(),
+        source_revision: "source".into(),
+        declaration: serde_json::from_str(pins[0]["consented_declaration"].as_str().unwrap())
+            .unwrap(),
+        reason: "Review the frozen app independently".into(),
+        request: None,
+        idempotency_key: Some("member-install".into()),
+        expected_install_event_id: None,
+    };
+    let staged = k::app_installs::install_as(&db, &principal, pin.clone())
+        .await
+        .unwrap();
+    let entry = k::app_installs::inspect_as(&db, &principal, &pin.package)
+        .await
+        .unwrap();
+    assert_eq!(entry["install"]["adoption"], "caller_asserted");
+    assert_eq!(entry["install"]["resolves"], false);
+    pin.expected_install_event_id = Some(staged.generation.clone());
+    pin.idempotency_key = None;
+    let preview = k::app_installs::preview_as(
+        &db,
+        &principal,
+        &native_app_hosted_caller("account-c", &pin, false),
+        pin.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview.body, body);
+    let mut adopt = k::app_installs::AdoptRequest {
+        pin: pin.clone(),
+        receipt_id: preview.receipt.receipt_id,
+        nonce: preview.receipt.nonce,
+        preview_session: preview.receipt.preview_session,
+        scope: None,
+    };
+    adopt.pin.idempotency_key = Some("member-adopt".into());
+    let adopting_caller = native_app_hosted_caller("account-c", &pin, true);
+    let adopted = k::app_installs::adopt_as(&db, &principal, &adopting_caller, adopt)
+        .await
+        .unwrap();
+    assert!(adopted.outcome.changed);
+    assert_ne!(adopted.outcome.generation, staged.generation);
+    assert_eq!(adopted.install["adoption"], "shell_adopt.v1");
+    let staged_caller = adopting_caller.clone().with_host_asserted_app(
+        crate::mcp::app_attribution::AppAttribution::new(
+            &pin.package,
+            &pin.version,
+            &staged.generation,
+        )
+        .unwrap(),
+    );
+    let adopted_caller = adopting_caller.with_host_asserted_app(
+        crate::mcp::app_attribution::AppAttribution::new(
+            &pin.package,
+            &pin.version,
+            &adopted.outcome.generation,
+        )
+        .unwrap(),
+    );
+    std::sync::Arc::new(super::super::NativePeerAdoptedAppFixture {
+        db,
+        principal,
+        administrator,
+        source_id: "secret".into(),
+        pin,
+        staged_generation: staged.generation,
+        adopted_generation: adopted.outcome.generation,
+        staged_caller,
+        adopted_caller,
+        _directory: f._dir,
+    })
+}
+
+/// Same inherited synthetic import/frozen activation/catalog/cookie trust as
+/// the one-account fixture. Native stage/inspect/preview/adopt are real; this
+/// is not a shipping Spaces/host consent proof. Staged Callers are stale.
+pub(super) async fn native_peer_two_adopted_apps_fixture(
+) -> std::sync::Arc<super::super::NativePeerTwoAdoptedAppsFixture> {
+    let owner = native_peer_adopted_app_fixture().await;
+    let db = &owner.db;
+    let principal = k::resolve_principal_by_binding(db, "account-b")
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let mut pin = owner.pin.clone();
+    // The inherited import already contains account-b's install. Replace it
+    // through actual native removal, then use that returned predecessor.
+    let inherited = k::app_installs::inspect_as(db, &principal, &pin.package)
+        .await
+        .unwrap();
+    assert_eq!(inherited["install"]["status"], "installed");
+    let inherited_generation = inherited["install"]["event_id"].as_str().unwrap();
+    let removed = k::app_installs::remove_as(db, &principal, &pin.package, inherited_generation)
+        .await
+        .unwrap();
+    assert_ne!(removed, inherited_generation);
+    let removed_entry = k::app_installs::inspect_as(db, &principal, &pin.package)
+        .await
+        .unwrap();
+    assert_eq!(removed_entry["install"]["status"], "removed");
+    assert_eq!(removed_entry["install"]["event_id"], removed);
+    let first_account = k::app_installs::inspect_as(db, &owner.principal, &pin.package)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_account["install"]["event_id"],
+        owner.adopted_generation
+    );
+    assert_eq!(first_account["install"]["status"], "installed");
+    assert_eq!(first_account["install"]["adoption"], "shell_adopt.v1");
+    let admitted_first = k::app_installs::admit_account_app_as(
+        db,
+        owner.adopted_caller.credential(),
+        owner.adopted_caller.host_asserted_app().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(admitted_first.principal, owner.principal);
+    assert_eq!(admitted_first.generation, owner.adopted_generation);
+    pin.expected_install_event_id = Some(removed);
+    pin.idempotency_key = Some("second-member-install".into());
+    let staged = k::app_installs::install_as(db, &principal, pin.clone())
+        .await
+        .unwrap();
+    let inspected = k::app_installs::inspect_as(db, &principal, &pin.package)
+        .await
+        .unwrap();
+    assert_eq!(inspected["install"]["adoption"], "caller_asserted");
+    assert_eq!(inspected["install"]["resolves"], false);
+    pin.expected_install_event_id = Some(staged.generation.clone());
+    pin.idempotency_key = None;
+    let preview = k::app_installs::preview_as(
+        db,
+        &principal,
+        &native_app_hosted_caller("account-b", &pin, false),
+        pin.clone(),
+    )
+    .await
+    .unwrap();
+    let adopting_caller = native_app_hosted_caller("account-b", &pin, true);
+    let mut adopt_pin = pin.clone();
+    adopt_pin.idempotency_key = Some("second-member-adopt".into());
+    let adopted = k::app_installs::adopt_as(
+        db,
+        &principal,
+        &adopting_caller,
+        k::app_installs::AdoptRequest {
+            pin: adopt_pin,
+            receipt_id: preview.receipt.receipt_id,
+            nonce: preview.receipt.nonce,
+            preview_session: preview.receipt.preview_session,
+            scope: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(adopted.outcome.changed);
+    assert_eq!(adopted.install["adoption"], "shell_adopt.v1");
+    assert_ne!(adopted.outcome.generation, staged.generation);
+    assert_ne!(adopted.outcome.generation, owner.adopted_generation);
+    let claim = |generation: &str| {
+        crate::mcp::app_attribution::AppAttribution::new(&pin.package, &pin.version, generation)
+            .unwrap()
+    };
+    let _second_staged_caller = adopting_caller
+        .clone()
+        .with_host_asserted_app(claim(&staged.generation));
+    let second_adopted_caller =
+        adopting_caller.with_host_asserted_app(claim(&adopted.outcome.generation));
+    let mut conn = db.pool().acquire().await.unwrap();
+    k::app_installs::admit_app_on(
+        &mut conn,
+        &owner.principal,
+        owner.adopted_caller.host_asserted_app().unwrap(),
+    )
+    .await
+    .unwrap();
+    k::app_installs::admit_app_on(
+        &mut conn,
+        &principal,
+        second_adopted_caller.host_asserted_app().unwrap(),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    std::sync::Arc::new(super::super::NativePeerTwoAdoptedAppsFixture {
+        owner,
+        second_principal: principal,
+        second_pin: pin,
+        _second_staged_generation: staged.generation,
+        second_adopted_generation: adopted.outcome.generation,
+        _second_staged_caller,
+        second_adopted_caller,
+    })
+}
+
+#[tokio::test]
+async fn read_app_bundle_rechecks_consent_source_and_principal_without_writes() {
+    use crate::mcp::{Caller, EngineHandle, ToolRegistry};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sha2::{Digest, Sha256};
+    let (f, db, report) = native_data_fixture().await;
+    app_roster(&db, "account-a", &["account-a", "account-b", "account-c"]).await;
+    let mut registry = ToolRegistry::new();
+    crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+    crate::mcp::kernel_v2::register_kernel_v2_tools(&mut registry).unwrap();
+    let arguments = json!({"package":"agent.docs","expected_install_event_id":"install",
+        "parent_origin":"native-ui://app","length":524288});
+    let read = |caller, args| {
+        registry.call_engine(
+            EngineHandle::KernelV2(db.clone()),
+            caller,
+            "read_app_bundle",
+            args,
+        )
+    };
+    let before = k::dump_all_kernel_tables(&db).await.unwrap();
+    let result = read(Caller::authenticated("account-a"), arguments.clone())
+        .await
+        .unwrap();
+    let bytes = STANDARD
+        .decode(result["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        result["document_sha256"],
+        hex::encode(Sha256::digest(&bytes))
+    );
+    let mut snapshot = db.pool().begin().await.unwrap();
+    let source = k::app_installs::admit_install_on(
+        &mut snapshot,
+        &report.principals["account-a"],
+        "agent.docs",
+        "install",
+    )
+    .await
+    .unwrap();
+    snapshot.rollback().await.unwrap();
+    assert_eq!(
+        result["source_sha256"],
+        crate::mcp::tools::alpha_tabs::alpha_tab_bundle_digest(&source.body)
+    );
+    assert_eq!(result["artifact_id"], "secret");
+    assert_eq!(result["version"], "0.8.2");
+    assert!(result.get("url").is_none());
+    assert!(result["headers"]["content-security-policy"]
+        .as_str()
+        .unwrap()
+        .contains("frame-ancestors native-ui://app"));
+    for (account, package, event, code) in [
+        ("account-a", "unknown.package", "install", "missing_install"),
+        ("account-c", "agent.docs", "install", "missing_install"),
+        ("account-b", "agent.docs", "install", "cas_mismatch"),
+        ("account-a", "agent.docs", "stale-install", "cas_mismatch"),
+        ("account-a", "agent.docs", "install-b", "cas_mismatch"),
+    ] {
+        let mut args = arguments.clone();
+        args["package"] = json!(package);
+        args["expected_install_event_id"] = json!(event);
+        let error = read(Caller::authenticated(account), args)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(code), "{error}");
+    }
+    let mut page = arguments.clone();
+    page["length"] = json!(17);
+    let first = read(Caller::authenticated("account-a"), page.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["next_offset"], 17);
+    page["offset"] = json!(17);
+    let next = read(Caller::authenticated("account-a"), page.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["document_sha256"], next["document_sha256"]);
+    assert_eq!(
+        STANDARD.decode(first["content"].as_str().unwrap()).unwrap(),
+        bytes[..17]
+    );
+    assert_eq!(
+        STANDARD.decode(next["content"].as_str().unwrap()).unwrap(),
+        bytes[17..34]
+    );
+    assert_eq!(before, k::dump_all_kernel_tables(&db).await.unwrap());
+    // The shipping v2 standby opener uses physically read-only
+    // pools; reads must not fall back to the writable source connection.
+    let standby = crate::db::open_kernel_v2_standby_read_only(f.target.to_str().unwrap())
+        .await
+        .unwrap();
+    let mut standby_registry = ToolRegistry::new();
+    crate::mcp::tools::register_surface_tools(&mut standby_registry).unwrap();
+    crate::mcp::kernel_v2::register_kernel_v2_tools(&mut standby_registry).unwrap();
+    standby_registry.set_standby_read_only(true);
+    let standby_before = k::dump_all_kernel_tables(&standby).await.unwrap();
+    let offline = standby_registry
+        .call_engine(
+            EngineHandle::KernelV2(standby.clone()),
+            Caller::authenticated("account-a"),
+            "read_app_bundle",
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(offline, result);
+    // Exercise StdioServer's protocol dispatcher with a standby-configured
+    // registry and physical read-only v2 handle. This does not exercise the
+    // owner standby's StandbyStdioSession activation and dispatch path.
+    async fn read_logs(db: &crate::Db) -> Vec<Option<i64>> {
+        let mut counts = Vec::new();
+        for table in ["read_log_calls", "read_log_touches"] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?)",
+            )
+            .bind(table)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            counts.push(if exists {
+                Some(
+                    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            });
+        }
+        counts
+    }
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let logs_before = read_logs(&standby).await;
+    let server = crate::mcp::stdio::StdioServer::new(
+        std::sync::Arc::new(standby_registry),
+        EngineHandle::KernelV2(standby.clone()),
+        Caller::authenticated("account-a"),
+    );
+    let (client, transport) = tokio::io::duplex(65536);
+    let (receive, mut send) = tokio::io::split(client);
+    let (reader, writer) = tokio::io::split(transport);
+    let task = tokio::spawn(async move { server.serve(BufReader::new(reader), writer).await });
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_app_bundle","arguments":arguments}});
+    send.write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    let line = BufReader::new(receive)
+        .lines()
+        .next_line()
+        .await
+        .unwrap()
+        .unwrap();
+    let transported: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(transported["result"]["isError"], false, "{transported}");
+    assert_eq!(
+        transported["result"]["structuredContent"]["document_sha256"],
+        result["document_sha256"]
+    );
+    send.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(logs_before, read_logs(&standby).await);
+    assert!(sqlx::query("CREATE TABLE forbidden_bundle_write(x)")
+        .execute(standby.pool())
+        .await
+        .is_err());
+    assert_eq!(
+        standby_before,
+        k::dump_all_kernel_tables(&standby).await.unwrap()
+    );
+    standby.close().await;
+    // Projection corruption is deliberate here: exercise each independent
+    // defence while the source and generation remain valid.
+    sqlx::query("UPDATE kernel_app_installs SET row_json=json_set(row_json,'$.adoption','caller_asserted') WHERE principal=?")
+        .bind(&report.principals["account-a"]).execute(db.write_pool()).await.unwrap();
+    // Page 2 must recheck adoption, even though the pinned document matches.
+    page["expected_document_sha256"] = first["document_sha256"].clone();
+    let error = read(Caller::authenticated("account-a"), page.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("app_consent_not_executable"),
+        "{error}"
+    );
+    sqlx::query("UPDATE kernel_app_installs SET row_json=json_set(row_json,'$.adoption','shell_adopt.v1') WHERE principal=?")
+        .bind(&report.principals["account-a"]).execute(db.write_pool()).await.unwrap();
+    // Roster exclusion alone does not revoke consent. Real offboarding
+    // revokes the install persistently, including after readmission.
+    app_roster(&db, "account-b", &["account-b"]).await;
+    // SAFETY: complete synthetic catalogue; B is the retained recipient.
+    let offboard = unsafe {
+        k::hosted_identity::offboarding::VerifiedOffboarding::from_catalog_unchecked(
+            uuid::Uuid::new_v4().to_string(),
+            "account-b".into(),
+            "account-a".into(),
+            "account-b".into(),
+            "Bundle consent revocation proof".into(),
+        )
+    };
+    k::hosted_identity::offboarding::apply(&db, offboard)
+        .await
+        .unwrap();
+    app_roster(&db, "account-a", &["account-a", "account-b"]).await;
+    let revoked_before = k::dump_all_kernel_tables(&db).await.unwrap();
+    let error = read(Caller::authenticated("account-a"), page)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cas_mismatch"), "{error}");
+    assert_eq!(
+        revoked_before,
+        k::dump_all_kernel_tables(&db).await.unwrap()
+    );
+    db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "app_state/admission_cache.rs"]
+mod admission_cache;
+
+#[path = "app_state/owner_updates.rs"]
+mod owner_updates;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "app_state/docs_diagnostics.rs"]
+mod docs_diagnostics;

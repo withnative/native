@@ -80,6 +80,36 @@ async fn named_view_events_fold_without_probe() {
         .execute(&mut conn)
         .await
         .unwrap();
+    let global_manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../src/named_views/fixtures/facet-manifest-global-v1.json"
+    ))
+    .unwrap();
+    let global_selector = String::from_utf8(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+        &json!({"context":global_manifest["context"],"selection":global_manifest["selection"]}),
+    ))
+    .unwrap();
+    let global_name = format!(
+        "view_gen_{:x}",
+        Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &json!([
+                global_manifest["workspace_id"],
+                generator,
+                global_manifest["context"]["logical_home_id"],
+                global_selector
+            ])
+        ))
+    );
+    let mut global = definition_fixture();
+    global["origin"] = json!({"kind":"generated","generator":generator,"version":"facet-global-1","source_identity":global_manifest["context"]["logical_home_id"],"selector":global_selector});
+    global["generated"] = global_manifest;
+    let global_digest = format!(
+        "{:x}",
+        Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &json!(["native.named-view-revision.v1", 2, view, global])
+        ))
+    );
+    let global_revision = uuid::Uuid::new_v4().to_string();
+    let generated_binding = uuid::Uuid::new_v4().to_string();
     let payloads = [
         (
             "kernel.named_view_revision_recorded.v1",
@@ -98,8 +128,18 @@ async fn named_view_events_fold_without_probe() {
         ),
         (
             "kernel.named_view_binding_changed.v1",
-            uuid::Uuid::new_v4().to_string(),
+            generated_binding.clone(),
             json!({"v":1,"view_id":view,"expected":binding,"action":"activate","name":generated_name,"pin":{"view_id":view,"revision_id":generated_revision,"definition_sha256":generated_digest,"schema_sha256":schema_digest()}}),
+        ),
+        (
+            "kernel.named_view_revision_recorded.v1",
+            global_revision.clone(),
+            json!({"v":2,"view_id":view,"definition_sha256":global_digest,"definition":global}),
+        ),
+        (
+            "kernel.named_view_binding_changed.v1",
+            uuid::Uuid::new_v4().to_string(),
+            json!({"v":1,"view_id":view,"expected":generated_binding,"action":"activate","name":global_name,"pin":{"view_id":view,"revision_id":global_revision,"definition_sha256":global_digest,"schema_sha256":schema_digest()}}),
         ),
         (
             "kernel.named_view_admitted.v1",
@@ -134,7 +174,7 @@ async fn named_view_events_fold_without_probe() {
             .await
             .unwrap();
         projector::project(&mut conn, &e).await.unwrap();
-        if matches!(e.local_seq, 3 | 4) {
+        if matches!(e.local_seq, 3..=6) {
             let projected: i64 = sqlx::query_scalar(
                 "SELECT event_seq FROM kernel_record_metadata WHERE record_id='bearer'",
             )
@@ -149,4 +189,217 @@ async fn named_view_events_fold_without_probe() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+fn global_revision_payload(vocab_ref: serde_json::Value, source_row: &str) -> serde_json::Value {
+    let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../src/named_views/fixtures/facet-manifest-global-v1.json"
+    ))
+    .unwrap();
+    manifest["slots"][0]["fragments"][0]["decl"]["vocab_ref"] = vocab_ref;
+    manifest["slots"][0]["fragments"][0]["decl"]["vocab"] = serde_json::Value::Null;
+    manifest["sources"][1]["row_id"] = json!(source_row);
+    manifest["sources"][1]["source_id"] = json!(format!("[\"{source_row}\"]"));
+    let selector = String::from_utf8(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+        &json!({"context":manifest["context"],"selection":manifest["selection"]}),
+    ))
+    .unwrap();
+    let mut def = definition_fixture();
+    def["origin"] = json!({"kind":"generated","generator":"native.declared-relational-defaults","version":"facet-global-1","source_identity":manifest["context"]["logical_home_id"],"selector":selector});
+    def["generated"] = manifest;
+    let view = "native.named-view:bearer";
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &json!(["native.named-view-revision.v1", 2, view, def])
+        ))
+    );
+    json!({"v":2,"view_id":view,"definition_sha256":digest,"definition":def})
+}
+
+fn facet1_revision_payload(vocab_ref: serde_json::Value, source_row: &str) -> serde_json::Value {
+    let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../src/named_views/fixtures/facet-manifest-v1.json"
+    ))
+    .unwrap();
+    manifest["slots"][0]["fragments"][0]["decl"]["vocab_ref"] = vocab_ref;
+    manifest["slots"][0]["fragments"][0]["decl"]["vocab"] = serde_json::Value::Null;
+    manifest["sources"][2]["row_id"] = json!(source_row);
+    manifest["sources"][2]["source_id"] = json!(format!("[\"{source_row}\"]"));
+    let selector = String::from_utf8(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+        &json!({"context":manifest["context"],"selection":manifest["selection"]}),
+    ))
+    .unwrap();
+    let mut def = definition_fixture();
+    def["origin"] = json!({"kind":"generated","generator":"native.declared-relational-defaults","version":"facet-1","source_identity":"fixture-task","selector":selector});
+    def["generated"] = manifest;
+    let view = "native.named-view:bearer";
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &json!(["native.named-view-revision.v1", 2, view, def])
+        ))
+    );
+    json!({"v":2,"view_id":view,"definition_sha256":digest,"definition":def})
+}
+
+#[tokio::test]
+async fn named_view_global_name_carriers_fold_without_probe() {
+    async fn fresh_conn() -> sqlx::SqliteConnection {
+        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        sqlx::query("CREATE TABLE content_events(seq INTEGER PRIMARY KEY,id TEXT UNIQUE,record_id TEXT,type TEXT,payload TEXT,actor TEXT,created_at TEXT)").execute(&mut conn).await.unwrap();
+        sqlx::query("CREATE TABLE kernel_record_metadata(record_id TEXT,last_activity_at TEXT,event_seq INTEGER)").execute(&mut conn).await.unwrap();
+        sqlx::query("CREATE TABLE kernel_facets(record_id TEXT,key TEXT,value TEXT,as_of TEXT,event_seq INTEGER)").execute(&mut conn).await.unwrap();
+        sqlx::query("INSERT INTO kernel_record_metadata VALUES('bearer', '', 0)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn
+    }
+    fn revision_event(seq: i64, payload: serde_json::Value) -> EventRow {
+        EventRow {
+            local_seq: seq,
+            id: uuid::Uuid::new_v4().to_string(),
+            record_id: "bearer".into(),
+            event_type: "kernel.named_view_revision_recorded.v1".into(),
+            payload: Some(payload.to_string()),
+            actor: None,
+            run_key: None,
+            parent_key: None,
+            intent: None,
+            created_at: "2026-10-26T00:00:00Z".into(),
+            causal_envelope: CausalEnvelopeV1::legacy_unknown(),
+            act: None,
+        }
+    }
+    fn activation_event(seq: i64, rev_id: &str, rev_payload: &serde_json::Value) -> EventRow {
+        let view = "native.named-view:bearer";
+        let gen = &rev_payload["definition"]["generated"];
+        let selector = String::from_utf8(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &json!({"context": gen["context"], "selection": gen["selection"]}),
+        ))
+        .unwrap();
+        let name = format!(
+            "view_gen_{:x}",
+            Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+                &json!([
+                    gen["workspace_id"],
+                    "native.declared-relational-defaults",
+                    gen["context"]["logical_home_id"],
+                    selector
+                ])
+            ))
+        );
+        let payload = json!({"v":1,"view_id":view,"expected":null,"action":"activate","name":name,
+            "pin":{"view_id":view,"revision_id":rev_id,
+            "definition_sha256":rev_payload["definition_sha256"],"schema_sha256":schema_digest()}});
+        EventRow {
+            local_seq: seq,
+            id: uuid::Uuid::new_v4().to_string(),
+            record_id: "bearer".into(),
+            event_type: "kernel.named_view_binding_changed.v1".into(),
+            payload: Some(payload.to_string()),
+            actor: None,
+            run_key: None,
+            parent_key: None,
+            intent: None,
+            created_at: "2026-10-26T00:00:00Z".into(),
+            causal_envelope: CausalEnvelopeV1::legacy_unknown(),
+            act: None,
+        }
+    }
+    async fn insert_project(conn: &mut sqlx::SqliteConnection, e: &EventRow) {
+        sqlx::query("INSERT INTO content_events VALUES(?,?,?,?,?,?,?)")
+            .bind(e.local_seq)
+            .bind(&e.id)
+            .bind(&e.record_id)
+            .bind(&e.event_type)
+            .bind(&e.payload)
+            .bind(&e.actor)
+            .bind(&e.created_at)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        projector::project(conn, e).await.unwrap();
+    }
+    // Mixed facet-1/global history: facet-1 ID revision interleaved with the
+    // global ID control, both canonical-name spellings, then activation.
+    let revs = [
+        facet1_revision_payload(json!("rec:priority"), "priority"),
+        global_revision_payload(json!("rec:priority"), "priority"),
+        global_revision_payload(json!("priority"), "voc:priority"),
+        global_revision_payload(json!("team:area"), "voc:team:area"),
+    ];
+    // Strict canonical FULL: ID control plus both canonical-name spellings.
+    let mut full = fresh_conn().await;
+    let mut full_rev4_id = String::new();
+    for (i, payload) in revs.iter().enumerate() {
+        let e = revision_event(i as i64 + 1, payload.clone());
+        if i == 3 {
+            full_rev4_id = e.id.clone();
+        }
+        insert_project(&mut full, &e).await;
+    }
+    let full_act = activation_event(5, &full_rev4_id, &revs[3]);
+    insert_project(&mut full, &full_act).await;
+    let full_meta: i64 =
+        sqlx::query_scalar("SELECT event_seq FROM kernel_record_metadata WHERE record_id='bearer'")
+            .fetch_one(&mut full)
+            .await
+            .unwrap();
+    assert_eq!(full_meta, 5);
+    // Projector-level prefix/tail: split replay reaches the same prefix.
+    let mut split = fresh_conn().await;
+    let mut split_rev4_id = String::new();
+    for (i, payload) in revs.iter().enumerate() {
+        let seq = i as i64 + 1;
+        let e = revision_event(seq, payload.clone());
+        if i == 3 {
+            split_rev4_id = e.id.clone();
+        }
+        insert_project(&mut split, &e).await;
+        let meta: i64 = sqlx::query_scalar(
+            "SELECT event_seq FROM kernel_record_metadata WHERE record_id='bearer'",
+        )
+        .fetch_one(&mut split)
+        .await
+        .unwrap();
+        assert_eq!(meta, seq);
+    }
+    let split_act = activation_event(5, &split_rev4_id, &revs[3]);
+    insert_project(&mut split, &split_act).await;
+    let split_meta: i64 =
+        sqlx::query_scalar("SELECT event_seq FROM kernel_record_metadata WHERE record_id='bearer'")
+            .fetch_one(&mut split)
+            .await
+            .unwrap();
+    assert_eq!(split_meta, full_meta);
+    // rec:<name> carriers refuse with the exact reader diagnostic.
+    for payload in [
+        global_revision_payload(json!("rec:priority"), "voc:priority"),
+        global_revision_payload(json!("rec:team:area"), "voc:team:area"),
+        facet1_revision_payload(json!("priority"), "voc:priority"),
+        facet1_revision_payload(json!("team:area"), "voc:team:area"),
+    ] {
+        let mut conn = fresh_conn().await;
+        let e = revision_event(1, payload);
+        sqlx::query("INSERT INTO content_events VALUES(?,?,?,?,?,?,?)")
+            .bind(e.local_seq)
+            .bind(&e.id)
+            .bind(&e.record_id)
+            .bind(&e.event_type)
+            .bind(&e.payload)
+            .bind(&e.actor)
+            .bind(&e.created_at)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let error = projector::project(&mut conn, &e).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("v2 vocabulary declaration mismatch"),
+            "{error}"
+        );
+    }
 }

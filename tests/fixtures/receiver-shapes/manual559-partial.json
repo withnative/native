@@ -1,0 +1,37 @@
+{
+  "result": "PARTIAL: authentic sealed pre-A v7 ingress passed; hosted95 runtime and A retry remain UNPROVED",
+  "harness_source": "559754f33e8c0fb69edf537427e91725f39e645d",
+  "a_source": "559754f33e8c0fb69edf537427e91725f39e645d",
+  "a_artifact_sha256": "a155c1435c08a8ea7ef983518aa65e7e81f85f8d1f1e4d9615e166815f1a8c21",
+  "old_source": "03b1bbb3f4204591b69e0e80a2d14788bf0535ef",
+  "old_artifact_sha256": "96ace0b09190066037ea52efa47b82229740b966bb5434c5a49076c6bcc7c21f",
+  "producer95_source": "79570567dc19b5fd1b91191d302a7a573265073f",
+  "producer95_artifact_sha256": "18b5a32492b1cf64ee5cf451a55c98333868823c64d549b5885f1d73f45de6ad",
+  "compile_duration": "10m40s",
+  "execution_duration": "17.12s",
+  "proved": [
+    "actual old process served verified94 and entered sealed offline working_applied admission",
+    "one genuine installed v7 entry has exact original arguments",
+    "recorded public94 local contract digest is unchanged and original is null",
+    "canonical fixture body remained base while the write was held offline",
+    "old process stopped and old Hosting drained before reference95 was invoked",
+    "reference95 private-volume guard refused before maintenance, readiness or runtime"
+  ],
+  "journal": {
+    "version": 7,
+    "sha256": "cc9c4669a7774ea5f7bce0d57706903a5e21a51317369c3e8ddca187975d6cab",
+    "idempotency_key": "installed-lost",
+    "public_local_digest": "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a",
+    "original": null,
+    "working_original_present": true
+  },
+  "failure": "fixture catalog serves /fixtures/catalog-data/hosted-v2.db outside its /fixtures/hosting-data Hosting data root; reference helper correctly refuses",
+  "limitation": "The fixture explicitly publishes its external import target in the catalog. Resolving the catalog confirms the out-of-volume path; it cannot authorize relaxing the helper guard.",
+  "next": "In explicit manual mode only, create the initial import target under the original catalog tenant's verified databases parent before catalog publication or old ingress. Bind account, route, origin and shutdown path; keep the reference95 guard unchanged.",
+  "evidence": [
+    "target/agent-evidence/receiver-installed-v7/5597-03b1-795",
+    "target/agent-evidence/installed-node-v2-.tmpv8sydZ"
+  ],
+  "temporary_sources_restored": true,
+  "installed_service_or_production_changed": false
+}

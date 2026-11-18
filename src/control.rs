@@ -36,7 +36,7 @@ pub(crate) use alpha_tab_provenance::complete_update_in as complete_alpha_tab_up
 
 pub const CONTROL_EVENT_SCHEMA_VERSION: i64 = 1;
 
-pub const CONTROL_EVENT_TYPES: [&str; 41] = [
+pub const CONTROL_EVENT_TYPES: [&str; 43] = [
     "agent_run.started.v1",
     "agent_run.started.v2",
     "agent_run.closed.v1",
@@ -72,6 +72,8 @@ pub const CONTROL_EVENT_TYPES: [&str; 41] = [
     "alpha_tab.removed",
     "alpha_tab.order_set",
     "alpha_tab.adopted.v2",
+    "held_command.cancelled.v1",
+    "provenance.keyed_command_receipt.v1",
     "notification_preference.set",
     "hcp.entry.versioned.v1",
     "hcp.entry.status_set.v1",
@@ -796,6 +798,8 @@ pub fn hcp_entry_fits(entry_json: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlEventPayload {
+    HeldCommandCancelled(crate::provenance::cancellation::CancellationEvidence),
+    KeyedCommandReceipt(crate::provenance::KeyedCommandReceiptAnchor),
     AgentRunStarted(AgentRunStartedPayload),
     AgentRunClosed(AgentRunClosedPayload),
     AgentRunIdentityEnriched(AgentRunIdentityEnrichedPayload),
@@ -890,6 +894,8 @@ impl ControlEventPayload {
             Self::AlphaTabAdopted(_) => "alpha_tab.adopted",
             Self::AlphaTabAdoptedV2(_) => "alpha_tab.adopted.v2",
             Self::AlphaTabOrderSet(_) => "alpha_tab.order_set",
+            Self::HeldCommandCancelled(_) => "held_command.cancelled.v1",
+            Self::KeyedCommandReceipt(_) => "provenance.keyed_command_receipt.v1",
             Self::NotificationPreferenceSet(_) => "notification_preference.set",
             Self::HcpEntryVersioned(_) => "hcp.entry.versioned.v1",
             Self::HcpEntryStatusSet(_) => "hcp.entry.status_set.v1",
@@ -935,6 +941,8 @@ impl ControlEventPayload {
             | Self::AlphaTabAdopted(_)
             | Self::AlphaTabAdoptedV2(_)
             | Self::AlphaTabOrderSet(_) => "alpha_tab",
+            Self::HeldCommandCancelled(_) => "held_command",
+            Self::KeyedCommandReceipt(_) => "keyed_command_receipt",
             Self::NotificationPreferenceSet(_) => "notification_preference",
             Self::HcpEntryVersioned(_)
             | Self::HcpEntryStatusSet(_)
@@ -991,6 +999,8 @@ impl ControlEventPayload {
             Self::AlphaTabAdopted(value) => serde_json::to_string(value)?,
             Self::AlphaTabAdoptedV2(value) => serde_json::to_string(value)?,
             Self::AlphaTabOrderSet(value) => serde_json::to_string(value)?,
+            Self::HeldCommandCancelled(value) => serde_json::to_string(value)?,
+            Self::KeyedCommandReceipt(value) => serde_json::to_string(value)?,
             Self::NotificationPreferenceSet(value) => serde_json::to_string(value)?,
             Self::HcpEntryVersioned(value) => serde_json::to_string(value)?,
             Self::HcpEntryStatusSet(value) => serde_json::to_string(value)?,
@@ -1372,6 +1382,8 @@ fn expected_aggregate_kind(event_type: &str) -> Option<&'static str> {
         value if value.starts_with("onboarding_programme.") => Some("onboarding_programme"),
         value if value.starts_with("member_obligation.") => Some("member_obligation"),
         "seeded_instruction_source.applied" => Some("seeded_instruction_source"),
+        "held_command.cancelled.v1" => Some("held_command"),
+        "provenance.keyed_command_receipt.v1" => Some("keyed_command_receipt"),
         "notification_preference.set" => Some("notification_preference"),
         "hcp.entry.versioned.v1"
         | "hcp.entry.status_set.v1"
@@ -2275,6 +2287,22 @@ pub(crate) fn validate_stored_control_event(event: &ControlEventRow) -> Result<(
         "alpha_tab.order_set" => {
             let value: AlphaTabOrderPayload = decode(event)?;
             validate_alpha_tab_order(event, &value)?;
+        }
+        "provenance.keyed_command_receipt.v1" => {
+            let value: crate::provenance::KeyedCommandReceiptAnchor = decode(event)?;
+            value.validate()?;
+            if event.aggregate_id != value.attestation_id {
+                return Err(Error::engine(
+                    "keyed receipt aggregate does not match attestation",
+                ));
+            }
+        }
+        "held_command.cancelled.v1" => {
+            let value: crate::provenance::cancellation::CancellationEvidence = decode(event)?;
+            value.validate()?;
+            if event.actor != value.principal || event.aggregate_id != value.identity_digest() {
+                return Err(Error::engine("held command cancellation evidence mismatch"));
+            }
         }
         "notification_preference.set" => {
             let value: NotificationPreferencePayload = decode(event)?;
@@ -3360,6 +3388,14 @@ pub(crate) async fn project_control(
         }
         // The newest event of the account's aggregate is the setting; readers
         // consult `control_events` directly, so there is nothing to project.
+        "provenance.keyed_command_receipt.v1" => {
+            let _: crate::provenance::KeyedCommandReceiptAnchor = decode(event)?;
+            // This portable fact selects a companion; it grants no local authority.
+        }
+        "held_command.cancelled.v1" => {
+            let _: crate::provenance::cancellation::CancellationEvidence = decode(event)?;
+            // A foreign control event is evidence, never local cancellation authority.
+        }
         "notification_preference.set" => {
             let _: NotificationPreferencePayload = decode(event)?;
         }

@@ -66,6 +66,11 @@ impl AppBundleDelivery {
     }
 
     /// Ordinary artifacts have separate signed authority from installs/previews.
+    ///
+    /// The cap is bound to whatever the serve path can re-admit on every GET:
+    /// the cookie session when ingress attached one (unchanged), otherwise a
+    /// bearer JWT that ingress verified for this request. A JWT-bound cap
+    /// expires no later than the token. Neither binding comes from arguments.
     #[cfg(feature = "v2-kernel-probe")]
     pub(crate) fn artifact_launch(
         &self,
@@ -78,26 +83,37 @@ impl AppBundleDelivery {
         if !self.enabled || caller.is_trusted_local() {
             return None;
         }
+        let session = caller.hosting_session_id();
+        let jwt = if session.is_none() {
+            Some(caller.hosting_jwt_binding()?)
+        } else {
+            None
+        };
         let fields = bundle_url::IssueFields {
             principal: caller.hosting_principal()?.into(),
             database: caller.hosting_database()?.into(),
-            session: caller.hosting_session_id()?.into(),
+            session: session.unwrap_or_default().into(),
             package: "native.artifact-render".into(),
             install_event: artifact.into(),
             parent_origin: self.runtime.resolve_parent_origin(parent).ok()?,
             adapter_revision: crate::artifact_html::ADAPTER_REVISION,
         };
-        let cap = bundle_url::issue_artifact(
-            self.keyring.as_ref()?,
-            &self.runtime.artifact_origin,
-            digest,
-            &fields,
-            now,
-        )
-        .ok()?;
+        let keyring = self.keyring.as_ref()?;
+        let origin = &self.runtime.artifact_origin;
+        let (cap, lifetime) = match jwt {
+            None => (
+                bundle_url::issue_artifact(keyring, origin, digest, &fields, now).ok()?,
+                bundle_url::ARTIFACT_LIFETIME_SECONDS,
+            ),
+            Some(jwt) => (
+                bundle_url::issue_artifact_for_jwt(keyring, origin, digest, &fields, jwt, now)
+                    .ok()?,
+                bundle_url::ARTIFACT_LIFETIME_SECONDS.min(jwt.token_exp.checked_sub(now)?),
+            ),
+        };
         Some(
             json!({"url":format!("{}{}{digest}/{cap}",self.runtime.artifact_origin,bundle_url::ROUTE_PATH),
-            "expires_in_ms":bundle_url::ARTIFACT_LIFETIME_SECONDS*1000,"bridge_version":crate::artifact_html::BRIDGE_VERSION}),
+            "expires_in_ms":lifetime*1000,"bridge_version":crate::artifact_html::BRIDGE_VERSION}),
         )
     }
 
@@ -206,12 +222,130 @@ mod tests {
         );
         assert_eq!(fields.principal, "principal");
         assert_eq!(fields.database, "database");
-        assert_eq!(fields.session, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(
+            fields.binding,
+            bundle_url::CapBinding::Session("11111111-1111-4111-8111-111111111111".into())
+        );
         assert_eq!(fields.package, "example.app");
         assert_eq!(fields.install_event, "install");
         assert_eq!(fields.parent_origin, "https://parent.test");
         assert_eq!(fields.iat, 1000);
         assert_eq!(fields.exp, 4540);
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    fn jwt() -> bundle_url::JwtBinding {
+        bundle_url::JwtBinding {
+            subject: "user_subject".into(),
+            jti: Some("token-1".into()),
+            token_iat: 900,
+            token_exp: 1120,
+        }
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    fn artifact_cap(config: &AppBundleDelivery, response: &Value) -> bundle_url::VerifiedFields {
+        let url = response["url"].as_str().unwrap();
+        let (hex, cap) = url
+            .strip_prefix(&format!(
+                "{}{}",
+                config.runtime.artifact_origin,
+                bundle_url::ROUTE_PATH
+            ))
+            .unwrap()
+            .split_once('/')
+            .unwrap();
+        bundle_url::verify(
+            config.keyring.as_ref().unwrap(),
+            &config.runtime.artifact_origin,
+            hex,
+            cap,
+            1000,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    #[test]
+    fn artifact_launch_binds_a_verified_jwt_when_no_session_exists() {
+        let config = config();
+        let hex = "a".repeat(64);
+        // SAFETY: fixture stands in for verified hosted JWT ingress.
+        let jwt_caller = unsafe {
+            Caller::authenticated("account")
+                .with_hosting_context("principal", "database")
+                .with_verified_hosting_jwt_binding(jwt())
+        };
+        let response = config
+            .artifact_launch(&jwt_caller, "artifact-1", &hex, None, 1000)
+            .unwrap();
+        // The link never outlives the token: 120 s left, not 300 s.
+        assert_eq!(response["expires_in_ms"], 120_000);
+        let fields = artifact_cap(&config, &response);
+        assert!(fields.artifact_render);
+        assert_eq!(fields.binding, bundle_url::CapBinding::Jwt(jwt()));
+        assert_eq!(fields.principal, "principal");
+        assert_eq!(fields.database, "database");
+        assert_eq!(fields.install_event, "artifact-1");
+        assert_eq!(fields.exp, 1120);
+        // An expired token, or no hosted footing, mints nothing.
+        let expired = unsafe {
+            Caller::authenticated("account")
+                .with_hosting_context("principal", "database")
+                .with_verified_hosting_jwt_binding(bundle_url::JwtBinding {
+                    token_exp: 1000,
+                    ..jwt()
+                })
+        };
+        assert!(config
+            .artifact_launch(&expired, "artifact-1", &hex, None, 1000)
+            .is_none());
+        let unrouted =
+            unsafe { Caller::authenticated("account").with_verified_hosting_jwt_binding(jwt()) };
+        assert!(config
+            .artifact_launch(&unrouted, "artifact-1", &hex, None, 1000)
+            .is_none());
+        // Changing the hosting identity drops the binding with the session.
+        let switched = jwt_caller.with_hosting_context("other", "other-database");
+        assert!(switched.hosting_jwt_binding().is_none());
+        assert!(config
+            .artifact_launch(&switched, "artifact-1", &hex, None, 1000)
+            .is_none());
+        // Neither binding: unchanged refusal.
+        let neither =
+            Caller::authenticated("account").with_hosting_context("principal", "database");
+        assert!(config
+            .artifact_launch(&neither, "artifact-1", &hex, None, 1000)
+            .is_none());
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    #[test]
+    fn artifact_launch_for_a_cookie_session_is_unchanged() {
+        let config = config();
+        let hex = "a".repeat(64);
+        let response = config
+            .artifact_launch(&caller(), "artifact-1", &hex, None, 1000)
+            .unwrap();
+        assert_eq!(response["expires_in_ms"], 300_000);
+        let fields = artifact_cap(&config, &response);
+        assert_eq!(
+            fields.binding,
+            bundle_url::CapBinding::Session("11111111-1111-4111-8111-111111111111".into())
+        );
+        assert_eq!(fields.exp, 1300);
+        // A session, when present, is always the binding.
+        let both = unsafe { caller().with_verified_hosting_jwt_binding(jwt()) };
+        let fields = artifact_cap(
+            &config,
+            &config
+                .artifact_launch(&both, "artifact-1", &hex, None, 1000)
+                .unwrap(),
+        );
+        assert_eq!(
+            fields.binding,
+            bundle_url::CapBinding::Session("11111111-1111-4111-8111-111111111111".into())
+        );
     }
 
     #[test]

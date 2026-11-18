@@ -14,6 +14,7 @@
 
 pub mod account_config;
 pub mod alpha_tabs;
+pub(crate) mod app_bundle;
 pub mod app_undo;
 pub mod apps;
 pub mod artifact_input_cache;
@@ -52,6 +53,7 @@ pub(crate) mod keyed_replay;
 pub mod lifecycle;
 pub mod links;
 pub mod live_scheduler;
+pub mod merge_body;
 pub mod messaging;
 pub mod meta;
 pub mod mint;
@@ -61,16 +63,21 @@ pub mod orientation;
 pub mod participants;
 pub mod policy;
 mod private_create;
+mod publication;
 pub mod querying;
 pub mod quickstart;
+pub(crate) mod record_hook;
 pub mod record_shape;
 pub mod relationships;
 pub mod resolution;
+pub mod saved_tabs;
 pub mod similar;
 pub mod sql_write;
 pub mod suggestions;
 pub mod surface_bindings;
 pub mod tab_effect_catalogue;
+#[doc(hidden)]
+pub mod webhooks;
 pub mod work;
 pub mod workspace_snapshot;
 
@@ -89,6 +96,35 @@ use crate::error::{Error, Result};
 use super::registry::{Caller, ToolRegistry};
 use super::SnapshotSourceRef;
 use super::{ExperimentalExecutors, EXPERIMENTAL_SQL_WRITE_EXECUTOR};
+
+/// Only caller-directed ordinary filing is redirected. Derived placements,
+/// private policy homes, import and event replay never enter this policy.
+pub(crate) fn redirects_root_filing(record_type: Option<&str>, home: Option<&str>) -> bool {
+    home == Some(crate::schema::ROOT_RECORD_ID)
+        && !matches!(record_type, Some("Collection" | "Message" | "Annotation"))
+}
+
+pub(crate) fn disclose_root_filing(receipt: &mut Value) {
+    receipt["redirected_home"] = serde_json::json!({
+        "requested": crate::schema::ROOT_RECORD_ID,
+        "applied": crate::schema::UNFILED_RECORD_ID,
+    });
+    // create_many retains per-item warnings even in its compact receipt.
+    let warning = serde_json::json!({
+        "code": "home_redirected",
+        "requested": crate::schema::ROOT_RECORD_ID,
+        "applied": crate::schema::UNFILED_RECORD_ID,
+        "message": "Explicit filing at native:root was redirected to native:unfiled.",
+    });
+    receipt
+        .as_object_mut()
+        .expect("write receipt object")
+        .entry("warnings")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("receipt warnings array")
+        .push(warning);
+}
 
 /// Register every shipped surface tool, in surface order (registration order
 /// is the `tools/list` order). Stages extend this as they land; today: stage 3
@@ -111,6 +147,7 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     identity::register_identity_tools(registry)?;
     policy::register_policy_tools(registry)?;
     account_config::register_account_config_tool(registry)?;
+    saved_tabs::register(registry)?;
     instructions::register_instruction_tools(registry)?;
     apps::register_history_app_tool(registry)?;
     links::register_link_tools(registry)?;
@@ -120,6 +157,7 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     interventions::register_intervention_tools(registry)?;
     named_views::register(registry)?;
     artifacts::register_artifact_tools(registry)?;
+    app_bundle::register(registry)?;
     surface_bindings::register_surface_binding_tools(registry)?;
     alpha_tabs::register_alpha_tab_tools(registry)?;
     artifact_interactions::register_artifact_interaction_tool(registry)?;
@@ -142,6 +180,14 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     record_shape::register_record_shape_tool(registry)?;
     canvas::register_canvas_tools(registry)?;
     Ok(())
+}
+
+/// Explicit opt-in for publication management. Register before installing v2
+/// handlers and pinning the executor catalogue. This does not enable a host,
+/// route, public read service, or the independent producer gate.
+#[doc(hidden)]
+pub fn register_publication_management_tool(registry: &mut ToolRegistry) -> Result<()> {
+    publication::register(registry)
 }
 
 /// Install only on a host with an owned outbox or retained status service.
@@ -865,3 +911,5 @@ mod bulk_visibility_tests {
         db.close().await;
     }
 }
+
+pub mod catalog_assets;

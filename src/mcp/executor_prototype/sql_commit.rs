@@ -588,15 +588,17 @@ impl ExecutorPrototypeStdioServer {
                         .await
                         .map_err(|e| ("plan_execution_indeterminate", e.to_string(), true))?;
                 }
-                Ok(self.replay_write_plan(
-                    c.id.clone(),
-                    c.plan,
-                    result,
-                    1,
-                    c.telemetry_request,
-                    c.started,
-                    c.modern,
-                ))
+                Ok(self
+                    .replay_write_plan(
+                        c.id.clone(),
+                        c.plan,
+                        result,
+                        1,
+                        c.telemetry_request,
+                        c.started,
+                        c.modern,
+                    )
+                    .await)
             }
             StoredState::Expired => Err((
                 "plan_expired",

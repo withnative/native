@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Field toggle</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem;color:#243047;max-width:55rem}input,textarea,button{font:inherit;padding:.5rem}textarea{width:95%;min-height:3rem}li{margin:.6rem 0}.kit-error{color:#9c2630}small{color:#5b6677}</style>
+</head><body><main id="app"><h1>Field toggle</h1><p>Opening Native…</p></main>
+<script type="module">
+// Field toggle over the supplied core kit (1.7.0): one task's lifecycle flips
+// between open and completed through `update_record`.
+//
+// Supported shape: `{ id, reason, lifecycle }` for the intended task
+// open/completed toggle, plus an optional plain-text `summary` draft. The
+// readers ask for WorkItems only, and the toggle stays off for anything but a
+// task sitting on open/completed; other shapes remain subject to normal
+// admission, and a refusal keeps the editable request on screen beside
+// Retry/Discard. The draft input is component state and is never cleared by a
+// submit or a refusal. Writes are memory-only: an account or workspace change
+// drops every entry, and a reload loses them. Switching records does not
+// remount the toggle, so entries and the draft survive it (each entry names
+// the record it targets); unmounting or reloading the page disposes the write
+// helper and loses them, unless explicit persistence (export/restore through
+// app state) is wired.
+//
+// What this example does NOT do: paint an update shared with other apps. It
+// declares the update and shows safe write feedback (Sending…/Sent/Not sent)
+// from the helper. With core kit 1.7.9 or later, `useRecord` also lays this
+// app's own update_record over the record at once (its `edit`), until the host
+// confirms it; the host's own delivery then replaces it. Pre-settlement shared
+// delivery is proven only for steps queries under R5b — these SQL readers
+// display host-delivered rows — so this file claims no shared optimism. The browser
+// fixture proves API/control behavior (request shape, entries, retry, fencing).
+// Create-list prediction is deferred: ordinary V2 `create_record` refuses an
+// explicit `id` except for messaging sends, and the backend guard is retained
+// until a new contract lands — nothing here implies create is imminent.
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact?.useRecordList) root.textContent = 'Open in Native with core kit 1.7.0.';
+else {
+  const { html, render, useState, useEffect, useRecord, useRecordList, useWrite, Loading, Empty, ErrorState, FeedNotice, WriteStatus } = kit.preact;
+  const REASON = 'Toggled in field-toggle example.';
+  function Toggle({ id }) {
+    // Task reads only: other types are never a toggleable record here.
+    const r = useRecord(id, { types: ['WorkItem'] });
+    // Second subscriber to the same task: the list keeps one row for this id.
+    const list = useRecordList({ ids: [id] }, { limit: 1, types: ['WorkItem'] });
+    const write = useWrite({ operation: 'update_record' });
+    // One draft per record: switching records never carries a summary into
+    // another record's toggle.
+    const [drafts, setDrafts] = useState({});
+    // Latched fence: either reader hearing scope_changed clears every draft
+    // and locks submission until the page reloads. The helper already drops
+    // its entries on the same signal; the latch covers the case where only
+    // one reader hears it while the record still looks ready.
+    const fenceSignal = (r.error && r.error.code === 'scope_changed')
+      || (list.error && list.error.code === 'scope_changed');
+    const [fenced, setFenced] = useState(false);
+    useEffect(() => { if (fenceSignal) { setDrafts({}); setFenced(true); } }, [fenceSignal]);
+    const summary = drafts[id] ?? '';
+    const setSummary = (value) => setDrafts((prev) => ({ ...prev, [id]: value }));
+    const current = r.record?.lifecycle;
+    // Explicit support: task open/completed only. Anything else shows an
+    // unsupported state instead of silently overwriting another token; normal
+    // backend admission still applies to the writes that do go out.
+    const supported = r.record?.kind === 'task' && (current === 'open' || current === 'completed');
+    const next = current === 'completed' ? 'open' : 'completed';
+    const busy = write.pending || r.status === 'loading';
+    const toggle = () => { write.submit({ id, reason: REASON, lifecycle: next, ...(summary ? { summary } : {}) }); };
+    const listed = (list.rows || []).find(row => row.id === id);
+    return html`<article>
+      ${r.status === 'loading' && html`<${Loading} what="record" />`}
+      ${r.status === 'missing' && html`<${Empty}>This record is unavailable.<//>`}
+      ${r.status === 'error' && html`<${ErrorState} error=${r.error} onRetry=${r.retry} />`}
+      <${FeedNotice} feed=${r} />
+      ${r.record && html`<h2>${r.record.name || r.record.id}</h2>
+        <p>Lifecycle: <strong>${current ?? 'unknown'}</strong>${listed && listed.lifecycle !== current ? html` <small>(list still shows ${listed.lifecycle ?? 'unknown'})</small>` : ''}${r.refreshing ? html` <small>· checking for updates</small>` : ''}</p>`}
+      ${r.record && !supported && html`<p role="note"><small>This toggle supports task open/completed only; this record is ${r.record.kind}/${current ?? 'unknown'}.</small></p>`}
+      <label>Summary draft (kept on refusal) <input id="summary" value=${summary} onInput=${e => setSummary(e.currentTarget.value)} /></label>
+      <p><button type="button" id="toggle" disabled=${!supported || busy || fenced} onClick=${toggle}>Mark ${next}</button></p>
+      ${fenced && html`<p role="alert"><small>Account or workspace changed. Reload the page to continue; drafts and pending writes were dropped.</small></p>`}
+      <p><small>Retry resends the captured request. To send an edited draft, toggle again for a new write.</small></p>
+      <ul>${write.entries.map(e => html`<li key=${e.id}><small>for ${String(e.request.id)} · </small><${WriteStatus} entry=${e} onRetry=${() => write.retry(e.id)} onDiscard=${() => write.discard(e.id)} />${e.status === 'failed' && e.error && e.error.message ? html`<br /><small>Reason: ${e.error.message}</small>` : ''}</li>`)}</ul>
+    </article>`;
+  }
+  function App() {
+    const [draft, setDraft] = useState('');
+    const [id, setId] = useState('');
+    return html`<section><h1>Field toggle</h1>
+      <p>Open a task you can see, then flip its task lifecycle between <code>open</code> and <code>completed</code>. The request is <code>update_record</code> with <code>id</code>, <code>reason</code> and <code>lifecycle</code>; other shapes stay subject to normal admission and the toggle stays off for them.</p>
+      <label>Task id <input id="record" value=${draft} onInput=${e => setDraft(e.currentTarget.value)} /></label>
+      <button type="button" id="open" disabled=${!draft.trim()} onClick=${() => setId(draft.trim())}>Open</button>
+      ${id && html`<${Toggle} id=${id} />`}
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>

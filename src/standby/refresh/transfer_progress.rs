@@ -209,7 +209,7 @@ impl Drop for AttemptActivity<'_> {
     fn drop(&mut self) {
         let result = (|| -> Result<()> {
             let lock = open_private_lock(&self.controller.refresh_dir.join("trigger.lock"))?;
-            lock.lock_exclusive()?;
+            lock_exclusive_bounded(&lock, LOCK_WAIT_TIMEOUT)?;
             let mut state = self.controller.state()?;
             if state.refresh_active
                 && state.last_attempt_id.as_deref() == Some(&self.attempt_id.to_string())
@@ -239,8 +239,7 @@ impl StandbyRefreshController {
         {
             let lock =
                 open_private_lock(&self.refresh_dir.join("trigger.lock")).map_err(local_io)?;
-            lock.lock_exclusive()
-                .map_err(|error| local_io(error.into()))?;
+            lock_exclusive_bounded(&lock, LOCK_WAIT_TIMEOUT).map_err(local_io)?;
             let state = self.state().map_err(local_io)?;
             // Acquisition-only callers have no active refresh diagnostics.
             if !state.refresh_active {

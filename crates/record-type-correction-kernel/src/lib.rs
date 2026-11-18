@@ -4,7 +4,7 @@
 //! kernel is deliberately pure: identical snapshot facts produce identical
 //! eligibility, reasons and target identity on every backend.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 mod classifier;
 pub mod preparation;
@@ -37,7 +37,7 @@ impl Eligibility {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     #[serde(rename = "type")]
     pub record_type: String,

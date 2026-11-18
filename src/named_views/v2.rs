@@ -5,16 +5,16 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Definition {
+pub(crate) struct Definition<M = Manifest> {
     pub query: contract::SavedSqlV12,
     pub origin: contract::Origin,
     pub description: String,
     pub scope: contract::Scope,
     pub columns: std::collections::BTreeMap<String, contract::FieldMeaning>,
     pub source_pins: Vec<contract::SourcePin>,
-    pub generated: Manifest,
+    pub generated: M,
 }
-impl Definition {
+impl<M> Definition<M> {
     pub(crate) fn common(&self) -> contract::Definition {
         contract::Definition {
             query: self.query.clone(),
@@ -25,6 +25,8 @@ impl Definition {
             source_pins: self.source_pins.clone(),
         }
     }
+}
+impl Definition {
     pub(crate) fn validate(&self) -> Result<()> {
         self.common().validate_retained()?;
         self.generated.validate()?;
@@ -189,6 +191,9 @@ impl Manifest {
             .ok_or_else(|| invalid("v2 source cross-reference mismatch"))
     }
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_profile(false)
+    }
+    fn validate_profile(&self, global: bool) -> Result<()> {
         if self.format != "native.generated-facets.v1"
             || self.sources.len() > 288
             || self.slots.len() != 8
@@ -217,7 +222,7 @@ impl Manifest {
             text(&source.origin, 128)?;
             text(&source.row_id, 128)?;
             optional(&source.anchor, 128)?;
-            if source.section != Section::SchemaConfig && source.anchor.is_some() {
+            if (global || source.section != Section::SchemaConfig) && source.anchor.is_some() {
                 return Err(invalid("v2 vocabulary source has no record ACL anchor"));
             }
         }
@@ -260,6 +265,7 @@ impl Manifest {
                 || slot.layer != if i % 2 == 0 { Layer::Pack } else { Layer::User }
                 || &slot.shape_key != expected_shape
                 || (self.context.kind.is_none() && i % 4 >= 2 && !slot.fragments.is_empty())
+                || (global && i >= 4 && !slot.fragments.is_empty())
                 || slot.fragments.len() > 128 * selected.len()
             {
                 return Err(invalid("v2 cascade slot mismatch"));
@@ -299,7 +305,10 @@ impl Manifest {
         if declarations.len() != selected.len() {
             return Err(invalid("v2 selected declaration absent"));
         }
-        if self.governance_basis.is_empty() || self.governance_basis.len() > 64 {
+        if (global && !self.governance_basis.is_empty())
+            || (!global && self.governance_basis.is_empty())
+            || self.governance_basis.len() > 64
+        {
             return Err(invalid("v2 governance bound"));
         }
         let mut governance = BTreeSet::new();
@@ -323,11 +332,14 @@ impl Manifest {
                 .get(&vocab.field)
                 .ok_or_else(|| invalid("v2 vocabulary field absent"))?;
             let reference = decl.vocab_ref.as_ref().or(decl.vocab.as_ref());
+            let retained = reference.is_some_and(|r| {
+                crate::meta::vocabulary::resolve_vocab_ref(r) == source.row_id.as_str()
+                    || (global && !r.starts_with("rec:") && source.row_id == format!("voc:{r}"))
+            });
             if !fields.insert(&vocab.field)
                 || vocab.values.len() > 64
                 || decl.r#type.is_some()
-                || reference.map(|s| crate::meta::vocabulary::resolve_vocab_ref(s))
-                    != Some(source.row_id.as_str())
+                || !retained
             {
                 return Err(invalid("v2 vocabulary declaration mismatch"));
             }
@@ -389,5 +401,118 @@ impl Manifest {
             return Err(invalid("v2 vocabulary/source coverage mismatch"));
         }
         Ok(())
+    }
+}
+
+/// Separate closed carrier: adding a defaulted context field would silently
+/// reinterpret old facet-1 bytes. This type is parsed unconditionally, never
+/// accepted by the public preparation or serving adapters.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GlobalManifest {
+    pub format: String,
+    pub workspace_id: String,
+    pub context: GlobalContext,
+    pub selection: Selection,
+    pub sources: Vec<Source>,
+    pub slots: Vec<Slot>,
+    pub governance_basis: Vec<Governance>,
+    pub vocabularies: Vec<Vocabulary>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GlobalContext {
+    pub declaration_scope: GlobalScope,
+    pub r#type: String,
+    pub kind: Option<String>,
+    pub logical_home_id: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GlobalScope {
+    Global,
+}
+impl GlobalManifest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.format != "native.generated-facets.v2" {
+            return Err(invalid("global manifest format mismatch"));
+        }
+        self.inputs().validate_profile(true)
+    }
+    /// Common semantic inputs for bounded comparison/compiler bookkeeping only.
+    /// This is not a facet-1 carrier, validation, or serving conversion.
+    pub(crate) fn inputs(&self) -> Manifest {
+        let m = self;
+        Manifest {
+            format: "native.generated-facets.v1".into(),
+            workspace_id: m.workspace_id.clone(),
+            context: Context {
+                r#type: m.context.r#type.clone(),
+                kind: m.context.kind.clone(),
+                logical_home_id: m.context.logical_home_id.clone(),
+            },
+            selection: m.selection.clone(),
+            sources: m.sources.clone(),
+            slots: m.slots.clone(),
+            governance_basis: m.governance_basis.clone(),
+            vocabularies: m.vocabularies.clone(),
+        }
+    }
+}
+impl Definition<GlobalManifest> {
+    pub(crate) fn validate_global(&self) -> Result<()> {
+        self.common().validate_retained()?;
+        if self.generated.format != "native.generated-facets.v2" {
+            return Err(invalid("global manifest format mismatch"));
+        }
+        let contract::Origin::Generated {
+            generator,
+            version,
+            selector,
+            source_identity,
+        } = &self.origin
+        else {
+            return Err(invalid("global manifest requires generated origin"));
+        };
+        let canonical = native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &serde_json::json!({"context":self.generated.context,"selection":self.generated.selection}),
+        );
+        if generator != "native.declared-relational-defaults"
+            || version != "facet-global-1"
+            || source_identity != &self.generated.context.logical_home_id
+            || selector.as_bytes() != canonical
+            || !self.source_pins.is_empty()
+        {
+            return Err(invalid("global origin/selector/source pins mismatch"));
+        }
+        // Share the bounded structural rules, not the old carrier's semantics.
+        // Only this typed branch permits absent governance and forbids ALL
+        // anchored sources/home fragments. No SQL or current-state work here.
+        self.generated.validate()
+    }
+}
+
+pub(crate) fn validate_definition(value: &serde_json::Value) -> Result<contract::Definition> {
+    match value
+        .pointer("/generated/format")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("native.generated-facets.v1") => {
+            let def: Definition = serde_json::from_value(value.clone())?;
+            if serde_json::to_value(&def)? != *value {
+                return Err(invalid("non-canonical revision definition"));
+            }
+            def.validate()?;
+            Ok(def.common())
+        }
+        Some("native.generated-facets.v2") => {
+            let def: Definition<GlobalManifest> = serde_json::from_value(value.clone())?;
+            if serde_json::to_value(&def)? != *value {
+                return Err(invalid("non-canonical revision definition"));
+            }
+            def.validate_global()?;
+            Ok(def.common())
+        }
+        _ => Err(invalid("unsupported generated manifest format")),
     }
 }

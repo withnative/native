@@ -84,6 +84,7 @@ async fn stage3_tools_register_in_surface_order() {
         "create_record",
         "get_record",
         "update_record",
+        "merge_body",
         "claim_unowned_record",
         "correct_record_type",
         "delete_record",
@@ -91,7 +92,7 @@ async fn stage3_tools_register_in_surface_order() {
         "render_record",
     ];
     assert_eq!(
-        &names[..14],
+        &names[..15],
         &expected,
         "orientation, QuickStart, recovery, and record lifecycle tools lead the surface"
     );
@@ -326,7 +327,7 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
     assert_eq!(fixed["scope"], "engine");
     assert_eq!(fixed["kind"], "fixed");
     assert_eq!(fixed["source"]["type"], "engine");
-    assert_eq!(fixed["source"]["template_version"], 11);
+    assert_eq!(fixed["source"]["template_version"], 14);
     assert!(fixed["source"].get("record_id").is_none());
     assert!(fixed["content"]
         .as_str()

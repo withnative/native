@@ -321,3 +321,28 @@ async fn record_and_home_ids_stay_disjoint_on_every_route() {
     tx.rollback().await.unwrap();
     w.replay_equal().await;
 }
+
+/// S1b precondition: live home bindings cannot introduce a recordless
+/// secondary logical-root alias. Historical folds deliberately remain able
+/// to replay one; the demand reader has a separate census fallback for it.
+#[tokio::test]
+async fn demand_scoped_root_secondary_alias_live_invariant_and_historical_fold() {
+    let w = World::fresh().await;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id='native:root')")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert!(!exists);
+    let spec = || AppendSpec {
+        record_id: v1_import_home_id("native:root"),
+        event_type: KERNEL_HOME_CREATED_EVENT.into(),
+        payload: json!({"parent_id":KERNEL_ROOT_ID,"owner_id":w.admin,"source_record_id":"native:root"}),
+        actor: Some(w.admin.clone()),
+    };
+    refused_everywhere(&w, spec, "invalid record home binding").await;
+    fold_direct(&w, as_event(max_seq(&w).await, spec()))
+        .await
+        .expect("historical root aliases must remain replayable");
+    w.db.close().await;
+}

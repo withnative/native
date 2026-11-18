@@ -118,8 +118,8 @@ pub fn validate_direct_method_params(
     protocol::validate_method_params(method, params)
 }
 
-/// Thin wrapper over the shared standby app-caller check: `native/app`
-/// metadata is only valid on the read-only owner standby.
+/// Shared app-carrier check: owner standby or a sealed, still-live Desktop
+/// proof result attached by reviewed hosted ingress. Generic bearer refuses.
 pub fn check_direct_standby_caller(
     registry: &ToolRegistry,
     caller: Caller,

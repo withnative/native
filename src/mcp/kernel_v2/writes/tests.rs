@@ -4,6 +4,31 @@ use crate::{
     mcp::{kernel_v2::tests::registry, registry::Caller},
 };
 
+mod batches;
+mod main_contracts;
+mod source_declarations;
+
+#[tokio::test]
+async fn registry_kernel_v2_record_selector_aliases() {
+    let w = world().await;
+    let created = admin(&w, "create_record", json!({"type":"Document","kind":"note","name":"Aliases","home_id":w.home,"reason":"alias fixture"})).await;
+    let id = created["id"].as_str().unwrap();
+    let updated = admin(
+        &w,
+        "update_record",
+        json!({"record_id":id,"body_append":"text","reason":"alias update"}),
+    )
+    .await;
+    assert_eq!(updated["effect"], "updated");
+    for selector in [json!({"id":id}), json!({"ids":[id]})] {
+        let mut args = selector;
+        args["text"] = json!("attachment content");
+        let attached = admin(&w, "attach_text", args).await;
+        assert_eq!(attached["record_id"], id);
+        assert_eq!(attached["blob"]["size_bytes"], 18);
+    }
+}
+
 struct World {
     _dir: tempfile::TempDir,
     db: Db,
@@ -176,9 +201,13 @@ async fn registry_create_update_body_facets_archive_and_links() {
     assert!(crate::mcp::render::render("manage_links", &listed)
         .unwrap()
         .contains("visible links"));
-    assert!(crate::mcp::render::render("create_record", &task)
-        .unwrap()
-        .contains("Created"));
+    for (tool, receipt) in [("create_record", &task), ("update_record", &updated)] {
+        let text = crate::mcp::render::render(tool, receipt).unwrap();
+        for field in ["version", "body_digest"] {
+            let expected = serde_json::to_string(&receipt[field]).unwrap();
+            assert!(text.contains(&expected), "{tool} omitted {field}:\n{text}");
+        }
+    }
     assert_eq!(listed["links"][0]["relationship"], "relates_to");
     assert_eq!(listed["links"][0]["target_id"], note_id);
     let remove = json!({"action":"remove","source_id":id,"target_id":note_id,"relationship":"relates_to","idempotency_key":"unlink"});
@@ -211,18 +240,28 @@ async fn registry_create_update_body_facets_archive_and_links() {
     let before = count(&w).await;
     assert_eq!(admin(&w, "manage_links", add).await, added);
     assert_eq!(before, count(&w).await);
-    assert_eq!(
-        admin(
-            &w,
-            "manage_links",
-            json!({"action":"list","record_id":note_id})
-        )
-        .await["links"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    // Provider relates_to rows are directional with retained source
+    // identity: the relink (id -> note_id) lists under the target's
+    // incoming links and is never mirrored to its outbound-only alias.
+    let relisted = admin(
+        &w,
+        "manage_links",
+        json!({"action":"list","record_id":note_id}),
+    )
+    .await;
+    assert_eq!(relisted["links"], json!([]));
+    let incoming = relisted["links_in"].as_array().unwrap();
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0]["relationship"], "relates_to");
+    assert_eq!(incoming[0]["source_id"], json!(id));
+    assert_eq!(incoming[0]["target_id"], json!(note_id));
+    assert!(incoming[0]["id"].is_string());
+    assert!(incoming[0]["note"].is_null());
+    assert!(incoming[0]["created_at"].is_string());
+    // The forward direction still lists from the source.
+    let forward = admin(&w, "manage_links", json!({"action":"list","record_id":id})).await;
+    assert_eq!(forward["links"].as_array().unwrap().len(), 1);
+    assert_eq!(forward["links"][0]["target_id"], json!(note_id));
     let seq: i64 = sqlx::query_scalar("SELECT MAX(event_seq) FROM kernel_provider_receipts WHERE json_extract(request_json,'$.anchor.record_id')=?").bind(id).fetch_one(w.db.pool()).await.unwrap();
     let timestamp: String = sqlx::query_scalar("SELECT created_at FROM content_events WHERE seq=?")
         .bind(seq)
@@ -378,7 +417,44 @@ async fn registry_concurrent_retries_commit_once_and_receipt_survives_reopen() {
     );
     let a = a.unwrap();
     assert_eq!(a, b.unwrap());
-    assert_eq!(count(&w).await, before + 2);
+    assert_eq!(
+        count(&w).await,
+        before + 3,
+        "two creation events and one canonical recovery fact"
+    );
+    let (fact_act, raw): (i64, String) = sqlx::query_as(
+        "SELECT act,payload FROM content_events WHERE record_id='kernel:mcp-write-receipts' \
+         AND type='kernel.mcp_write_receipt_recorded.v1' AND actor=? \
+         AND json_extract(payload,'$.operation')='create_record' \
+         AND json_extract(payload,'$.operation_key')='concurrent'",
+    )
+    .bind(&w.admin)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    let fact: Value = serde_json::from_str(&raw).unwrap();
+    let ledger: String = sqlx::query_scalar("SELECT receipt_json FROM kernel_mcp_write_receipts WHERE principal_id=? AND operation='create_record' AND operation_key='concurrent'")
+        .bind(&w.admin).fetch_one(w.db.pool()).await.unwrap();
+    assert_eq!(fact["receipt_json"].as_str().unwrap(), ledger);
+    let mut outward: Value = serde_json::from_str(&ledger).unwrap();
+    crate::mcp::counter_fence::withhold_receipt_acts("create_record", &mut outward);
+    let mut operation_receipt = a.clone();
+    operation_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("run_context");
+    assert_eq!(outward, operation_receipt);
+    let output_acts: Vec<i64> =
+        sqlx::query_scalar("SELECT act FROM content_events WHERE record_id=? ORDER BY seq")
+            .bind(a["id"].as_str().unwrap())
+            .fetch_all(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        output_acts,
+        vec![fact_act, fact_act],
+        "creation and recovery share one act"
+    );
     kernel::replay_all_projections(&w.db).await.unwrap();
     assert_eq!(admin(&w, "create_record", args.clone()).await, a);
     let path = w._dir.path().join("writes.db");
@@ -420,9 +496,17 @@ async fn registry_receipt_failure_rolls_back_and_replay_rechecks_access() {
     // Receipt failure must roll back the events as well as the projection.
     sqlx::query("CREATE TRIGGER fail_mcp_receipt BEFORE INSERT ON kernel_mcp_write_receipts BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END").execute(w.db.write_pool()).await.unwrap();
     let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    let before_log: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM content_events),(SELECT next_act FROM act_state WHERE singleton=1)")
+        .fetch_one(w.db.pool()).await.unwrap();
     let fail = json!({"id":first["id"],"body_append":"lost","idempotency_key":"fail-receipt","reason":"fixture"});
     assert!(call(&w, "acct:admin", "update_record", fail).await.is_err());
     assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    let after_log: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM content_events),(SELECT next_act FROM act_state WHERE singleton=1)")
+        .fetch_one(w.db.pool()).await.unwrap();
+    assert_eq!(
+        before_log, after_log,
+        "the body, private outcome fact and shared act must roll back together"
+    );
     sqlx::query("DROP TRIGGER fail_mcp_receipt")
         .execute(w.db.write_pool())
         .await
@@ -512,6 +596,7 @@ async fn registry_archive_round_trip_is_independent_of_lifecycle() {
     assert_eq!(record(&w, id).await.fields["lifecycle"], "completed");
     let noop_args = json!({"id":id,"archived":false,"reason":"already restored","idempotency_key":"restore-noop"});
     let before = count(&w).await;
+    let subject_revision = record(&w, id).await.revision;
     let noop = admin(&w, "archive_record", noop_args.clone()).await;
     let mut operation_receipt = noop.clone();
     operation_receipt
@@ -522,7 +607,35 @@ async fn registry_archive_round_trip_is_independent_of_lifecycle() {
         operation_receipt,
         json!({"id":id,"archived":false,"changed":false})
     );
-    assert_eq!(before, count(&w).await);
+    assert_eq!(
+        count(&w).await,
+        before + 1,
+        "only the private canonical receipt fact is appended"
+    );
+    assert_eq!(
+        record(&w, id).await.revision,
+        subject_revision,
+        "archive no-op does not mutate the subject"
+    );
+    let (act, raw): (i64, String) = sqlx::query_as(
+        "SELECT act,payload FROM content_events WHERE record_id='kernel:mcp-write-receipts' \
+         AND type='kernel.mcp_write_receipt_recorded.v1' AND actor=? \
+         AND json_extract(payload,'$.operation')='archive_record' \
+         AND json_extract(payload,'$.operation_key')='restore-noop'",
+    )
+    .bind(&w.admin)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert!(act > 0);
+    let fact: Value = serde_json::from_str(&raw).unwrap();
+    let ledger: String = sqlx::query_scalar("SELECT receipt_json FROM kernel_mcp_write_receipts WHERE principal_id=? AND operation='archive_record' AND operation_key='restore-noop'")
+        .bind(&w.admin).fetch_one(w.db.pool()).await.unwrap();
+    assert_eq!(fact["receipt_json"].as_str().unwrap(), ledger);
+    assert_eq!(
+        serde_json::from_str::<Value>(&ledger).unwrap(),
+        operation_receipt
+    );
     admin(
         &w,
         "archive_record",
@@ -714,7 +827,37 @@ async fn registry_noops_preserve_revision_timestamp_and_do_not_claim_a_write() {
         assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
     }
     let noop_args = json!({"id":id,"facets":{},"reason":"keyed no-op","idempotency_key":"noop"});
+    let before_noop = count(&w).await;
     let noop = admin(&w, "update_record", noop_args.clone()).await;
+    assert_eq!(
+        count(&w).await,
+        before_noop + 1,
+        "keyed no-op appends only its private recovery fact"
+    );
+    assert_eq!(noop["record_version"], task["record_version"]);
+    assert!(noop.get("write_receipt").is_none());
+    let raw: String = sqlx::query_scalar(
+        "SELECT payload FROM content_events WHERE record_id='kernel:mcp-write-receipts' \
+         AND type='kernel.mcp_write_receipt_recorded.v1' AND actor=? \
+         AND json_extract(payload,'$.operation')='update_record' \
+         AND json_extract(payload,'$.operation_key')='noop'",
+    )
+    .bind(&w.admin)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    let fact: Value = serde_json::from_str(&raw).unwrap();
+    let ledger: String = sqlx::query_scalar("SELECT receipt_json FROM kernel_mcp_write_receipts WHERE principal_id=? AND operation='update_record' AND operation_key='noop'")
+        .bind(&w.admin).fetch_one(w.db.pool()).await.unwrap();
+    assert_eq!(fact["receipt_json"].as_str().unwrap(), ledger);
+    let mut outward: Value = serde_json::from_str(&ledger).unwrap();
+    crate::mcp::counter_fence::withhold_receipt_acts("update_record", &mut outward);
+    let mut operation_receipt = noop.clone();
+    operation_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("run_context");
+    assert_eq!(outward, operation_receipt);
     let before = count(&w).await;
     let body = admin(&w,"update_record",json!({"id":id,"body_set":"next","if_unmodified_since":task["updated_at"],"reason":"timestamp still valid"})).await;
     assert_eq!(
@@ -922,12 +1065,34 @@ async fn registry_generic_create_links_paging_and_atomic_failure() {
         cursor = page["next_cursor"].clone();
         assert!(cursor.is_string());
     }
-    // relates_to is symmetric: one outgoing and one incoming candidate.
-    assert_eq!(collected.len(), 4);
+    // Provider relates_to rows are directional with retained source
+    // identity: part_of-in, derived_from-in, and the single retained
+    // task -> target assertion. No mirrored reverse row exists.
+    assert_eq!(collected.len(), 3);
     let mut unique: Vec<_> = collected.iter().map(Value::to_string).collect();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), 4);
+    assert_eq!(unique.len(), 3);
+    let relates: Vec<_> = collected
+        .iter()
+        .filter(|row| row["relationship"] == "relates_to")
+        .collect();
+    assert_eq!(relates.len(), 1);
+    assert_eq!(relates[0]["source_id"], task["id"]);
+    assert_eq!(relates[0]["target_id"], target);
+    assert!(relates[0]["note"].is_null());
+    assert!(relates[0]["id"].is_string());
+    assert!(relates[0]["created_at"].is_string());
+    for (relationship, note) in [("part_of", "parent"), ("derived_from", "basis")] {
+        let rows: Vec<_> = collected
+            .iter()
+            .filter(|row| row["relationship"] == relationship)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source_id"], task["id"]);
+        assert_eq!(rows[0]["target_id"], target);
+        assert_eq!(rows[0]["note"], note);
+    }
     let before = count(&w).await;
     assert!(call(
         &w,
@@ -2815,4 +2980,494 @@ async fn vault_native_folders_and_attachment_visibility_follow_moves() {
     .await
     .unwrap();
     assert!(!moved.records.contains_key(folder["id"].as_str().unwrap()));
+}
+
+fn minted_args(principal: &str, nonce: u8) -> Value {
+    let (id, nonce) = crate::record_id::mint(
+        &crate::record_id::qualified_principal(principal),
+        "first-party",
+        [nonce; 32],
+    );
+    json!({"type":"Document","kind":"note","name":"Minted","id":id,"id_nonce":nonce,"reason":"mint fixture"})
+}
+
+#[tokio::test]
+async fn minted_ids_create_replay_conflict_and_uniform_occupancy() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        kernel::replace_home_policy(&w.db,&w.admin,&w.home,&[(&w.admin,"manage"),(&w.viewer,"edit")]).await.unwrap();
+        let mut args = minted_args(&w.viewer, 1);
+        args["home_id"] = json!(w.home);
+        args["idempotency_key"] = json!("minted");
+        let first = call(&w,"acct:viewer","create_record",args.clone()).await.unwrap();
+        assert_eq!(first["id"], args["id"]);
+        assert_eq!(first, call(&w,"acct:viewer","create_record",args.clone()).await.unwrap());
+        let mut changed = args.clone(); changed["name"] = json!("Different");
+        assert!(call(&w,"acct:viewer","create_record",changed).await.unwrap_err().to_string().contains("different request"));
+        let mut bad = args.clone();
+        bad["id_nonce"] = minted_args(&w.viewer, 99)["id_nonce"].clone();
+        assert!(call(&w,"acct:viewer","create_record",bad).await.unwrap_err().to_string().contains("invalid record id proof"), "proof must be checked before conflicting keyed intent");
+        let mut spoof = args.clone();
+        spoof["attachment_id"] = args["id"].clone();
+        spoof["id"] = json!(w.private);
+        assert!(call(&w,"acct:viewer","create_record",spoof).await.unwrap_err().to_string().contains("invalid record id proof"), "unsupported attachment_id must not redirect proof verification away from id");
+        // Without the exact key, equality is never a successful retry. All
+        // occupant states must yield the same full error representation.
+        args.as_object_mut().unwrap().remove("idempotency_key");
+        let visible = call(&w,"acct:viewer","create_record",args.clone()).await.unwrap_err();
+        let id = args["id"].as_str().unwrap();
+        sqlx::query("UPDATE kernel_records SET home_id=?,owner_id=? WHERE id=?").bind(&w.private).bind(&w.admin).bind(id).execute(w.db.write_pool()).await.unwrap();
+        assert!(kernel::read_record_as(&w.db, &w.viewer, id).await.unwrap().is_none());
+        let hidden = call(&w,"acct:viewer","create_record",args.clone()).await.unwrap_err();
+        admin(&w,"delete_record",json!({"id":id,"reason":"deleted collision occupant"})).await;
+        let tombstoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_import_tombstones WHERE record_id=?)").bind(id).fetch_one(w.db.pool()).await.unwrap();
+        assert!(tombstoned);
+        let deleted = call(&w,"acct:viewer","create_record",args.clone()).await.unwrap_err();
+        assert_eq!(format!("{visible:?}"), format!("{hidden:?}"));
+        assert_eq!(format!("{visible:?}"), format!("{deleted:?}"));
+        assert!(visible.to_string().contains("id unavailable"));
+        let evidence: String = sqlx::query_scalar("SELECT json_extract(payload,'$.origin.record_id_mint.nonce') FROM content_events WHERE record_id=? AND type='kernel.record_created.v1'").bind(id).fetch_one(w.db.pool()).await.unwrap();
+        assert_eq!(evidence, args["id_nonce"].as_str().unwrap());
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_comments_attachments_and_revoked_creator() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        let note = admin(&w,"create_record",json!({"type":"Document","kind":"note","home_id":w.home,"reason":"bearer"})).await;
+        let mut comment = minted_args(&w.viewer, 2);
+        comment["type"] = json!("Annotation"); comment["kind"] = json!("comment");
+        comment["body"] = json!("a comment");
+        comment["links"] = json!([{"target_id":note["id"],"relationship":"part_of"}]);
+        comment["idempotency_key"] = json!("comment-mint");
+        let first = call(&w,"acct:viewer","create_record",comment.clone()).await.unwrap();
+        assert_eq!(first["id"],comment["id"]);
+        assert_eq!(first, call(&w,"acct:viewer","create_record",comment.clone()).await.unwrap());
+        let mint = minted_args(&w.admin, 3);
+        let attachment = json!({"record_id":note["id"],"text":"minted attachment","attachment_id":mint["id"],"id_nonce":mint["id_nonce"],"idempotency_key":"attachment-mint"});
+        let first = call(&w,"acct:admin","attach_text",attachment.clone()).await.unwrap();
+        assert_eq!(first["attachment_id"],mint["id"]);
+        assert_eq!(first,call(&w,"acct:admin","attach_text",attachment).await.unwrap());
+        kernel::replace_home_policy(&w.db,&w.admin,&w.home,&[(&w.admin,"manage")]).await.unwrap();
+        assert_hidden(call(&w,"acct:viewer","create_record",comment).await.unwrap_err());
+        w.db.close().await;
+    }).await;
+}
+
+fn assert_hidden(error: Error) {
+    assert!(
+        matches!(&error, Error::Engine(message) if message == kernel::HIDDEN_OR_MISSING),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn minted_ids_off_preserves_main_contracts_and_refusals() {
+    MINTED_IDS_TEST.scope(false, async {
+        let w = world().await;
+        let mut baseline = registry();
+        // Restore the raw main create schema, then run the frozen main
+        // contract registration. This reference cannot acquire pilot fields.
+        let raw = baseline.get("create_record").unwrap().input_schema.clone();
+        baseline.set_kernel_v2_schema("create_record",raw).unwrap();
+        main_contracts::register(&mut baseline).unwrap();
+        let current = registry();
+        for tool in ["create_record","attach_text","attach_from_url"] {
+            assert_eq!(serde_json::to_vec(current.get(tool).unwrap().input_schema_for_engine(EngineKind::KernelV2)).unwrap(),
+                serde_json::to_vec(baseline.get(tool).unwrap().input_schema_for_engine(EngineKind::KernelV2)).unwrap(), "{tool} schema differs from main");
+        }
+        use crate::mcp::executor_prototype::ExecutorPrototypeStdioServer;
+        let pin = |r: &ToolRegistry| ExecutorPrototypeStdioServer::pin_hosted_catalogue_for_engine(r,&crate::mcp::ExperimentalExecutors::empty(),crate::mcp::McpSurfaceMode::Executor,EngineKind::KernelV2).unwrap();
+        let current=pin(&current);let baseline=pin(&baseline);
+        for (executor,operation) in [("records_write","create_record"),("records_write","attach_text"),("external_import","attach_from_url")] {
+            let a=current.contract_digest_for_test(executor,operation);
+            let b=baseline.contract_digest_for_test(executor,operation);
+            assert!(a.is_some(),"missing {operation} digest");
+            assert_eq!(a,b,"{operation} disabled digest differs from main");
+        }
+        let mut args = minted_args(&w.admin,4);
+        args.as_object_mut().unwrap().remove("id_nonce");
+        let error = call(&w,"acct:admin","create_record",args.clone()).await.unwrap_err();
+        assert!(matches!(error,Error::Engine(ref m) if m == "kernel-v2 write: id is only supported for messaging sends"),"{error:?}");
+        // Intent/webhook routes must keep main's refusal too, rather than
+        // taking the enabled pilot's origin-bearing admission fence.
+        let mut tx=begin_write(w.db.write_pool()).await.unwrap();
+        for origin in [json!({"artifact_id":"intent-artifact","source_digest":"source","invocation_digest":"invocation"}),json!({"webhook_id":"webhook"})] {
+            let error=create_with_origin(&w.db,&mut tx,&mut ActAllocation::new(),&w.admin,&args,origin).await.unwrap_err();
+            assert_eq!(format!("{error:?}"),format!("{:?}",invalid("id is only supported for messaging sends")));
+        }
+        let mut with_nonce=args.clone();with_nonce["id_nonce"]=minted_args(&w.admin,4)["id_nonce"].clone();
+        let error=create_with_origin(&w.db,&mut tx,&mut ActAllocation::new(),&w.admin,&with_nonce,json!({"artifact_id":"intent-artifact"})).await.unwrap_err();
+        assert_eq!(format!("{error:?}"),format!("{:?}",invalid("unsupported argument id_nonce")));
+        tx.rollback().await.unwrap();
+        args["id_nonce"] = minted_args(&w.admin,4)["id_nonce"].clone();
+        let error = call(&w,"acct:admin","create_record",args).await.unwrap_err();
+        assert_eq!(format!("{error:?}"),format!("{:?}",invalid("unsupported argument id_nonce")));
+        let bearer=call(&w,"acct:admin","create_record",json!({"type":"Document","kind":"note","home_id":w.home,"reason":"off fixture"})).await.unwrap()["id"].clone();
+        for key in ["attachment_id","id_nonce"] {
+            let mut args = json!({"record_id":bearer,"text":"bytes"});args[key]=json!("extra");
+            let error = call(&w,"acct:admin","attach_text",args).await.unwrap_err();
+            assert_eq!(format!("{error:?}"),format!("{:?}",invalid(format!("unsupported argument {key}"))));
+            let mut args = json!({"record_id":bearer,"url":"https://example.com"});args[key]=json!("extra");
+            let error = call(&w,"acct:admin","attach_from_url",args.clone()).await.unwrap_err();
+            let old = crate::mcp::kernel_v2::parse::<url_attachment::LegacyArgs>("attach_from_url",args).err().unwrap();
+            assert_eq!(format!("{error:?}"),format!("{old:?}"));
+        }
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_roots_and_principals_are_unavailable() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        for (nonce, table) in [(5, "principal"), (6, "root")] {
+            let args = minted_args(&w.admin,nonce);
+            let id = args["id"].as_str().unwrap();
+            if table == "principal" {
+                sqlx::query("INSERT INTO kernel_principals VALUES (?,'agent','Occupant','mint-occupant')").bind(id).execute(w.db.write_pool()).await.unwrap();
+            } else {
+                sqlx::query("INSERT INTO kernel_roots(root_id,parent_id,owner_id,created_seq,created_at) VALUES (?,NULL,?,1,'2026-11-13T00:00:00Z')").bind(id).bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+            }
+            let error = call(&w,"acct:admin","create_record",args).await.unwrap_err();
+            assert_eq!(format!("{error:?}"),format!("{:?}",Error::conflict("id unavailable")));
+        }
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_delegation_is_authenticated_and_replay_bound() {
+    MINTED_IDS_TEST
+        .scope(true, async {
+            let w = world().await;
+            let issuer = crate::awareness::HumanInteractionTokenIssuer::random("mint-test");
+            let ids = vec!["message:mint-test".to_owned()];
+            let token = issuer
+                .issue("acct:admin", "agent-executor:executor:delegation", &ids, 60)
+                .unwrap();
+            let caller = Caller::authenticated("acct:admin")
+                .with_agent_executor_token(&issuer, &token, "executor", "delegation", &ids)
+                .unwrap();
+            let mut args = minted_args(&w.admin, 7);
+            args["home_id"] = json!(w.home);
+            // A first-party proof cannot be admitted from a verified delegation.
+            let error = registry()
+                .call_engine(
+                    EngineHandle::KernelV2(w.db.clone()),
+                    caller.clone(),
+                    "create_record",
+                    args.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid record id proof"));
+            let context = crate::record_id::context(None, Some("delegation"));
+            let (id, nonce) = crate::record_id::mint(
+                &crate::record_id::qualified_principal(&w.admin),
+                &context,
+                [7; 32],
+            );
+            args["id"] = json!(id);
+            args["id_nonce"] = json!(nonce);
+            args["idempotency_key"] = json!("delegated-mint");
+            let first = registry()
+                .call_engine(
+                    EngineHandle::KernelV2(w.db.clone()),
+                    caller.clone(),
+                    "create_record",
+                    args.clone(),
+                )
+                .await
+                .unwrap();
+            let replay = registry()
+                .call_engine(
+                    EngineHandle::KernelV2(w.db.clone()),
+                    caller,
+                    "create_record",
+                    args.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first, replay);
+            assert!(call(&w, "acct:admin", "create_record", args)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid record id proof"));
+            w.db.close().await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn minted_ids_url_attachment_commit_and_preflight() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        let note = admin(&w,"create_record",json!({"type":"Document","kind":"note","home_id":w.home,"reason":"bearer"})).await;
+        let mint = minted_args(&w.admin,8);
+        let args = json!({"record_id":note["id"],"url":"https://example.com/file","attachment_id":mint["id"],"id_nonce":mint["id_nonce"],"idempotency_key":"url-mint"});
+        let dispatch = crate::provenance::ProvenanceDispatch::from_caller(&Caller::authenticated("acct:admin"),"attach_from_url",&args,None);
+        dispatch.scope(async {
+        let fingerprint = dispatched_fingerprint("attach_from_url",args.clone()).unwrap();
+        let first = url_attachment::commit(&w.db,&w.admin,&args,&fingerprint,url_attachment::FetchedUrl {
+            bytes:b"fetched".to_vec(),mime:"text/plain".into(),filename:None,name:"fetched".into(),final_url:"https://example.com/file".into(),redirects:0,
+        }).await.unwrap();
+        assert_eq!(first["attachment_id"],mint["id"]);
+        // Registered preflight must replay without performing network I/O.
+        let replay = url_attachment::execute(&w.db,&w.admin,args.clone(),&FetchConfig::default()).await.unwrap();
+        assert_eq!(first,replay);
+        let mut collision = args.clone(); collision.as_object_mut().unwrap().remove("idempotency_key");
+        assert!(call(&w,"acct:admin","attach_from_url",collision).await.unwrap_err().to_string().contains("id unavailable"));
+        let mut bad = args; bad["id_nonce"] = minted_args(&w.admin,9)["id_nonce"].clone();
+        assert!(call(&w,"acct:admin","attach_from_url",bad).await.unwrap_err().to_string().contains("invalid record id proof"));
+        }).await;
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_origin_and_missing_dispatch_fences() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        let args = minted_args(&w.admin,20);
+        let error = mint_evidence(&w.admin,&args,"id").unwrap_err();
+        assert!(matches!(error,Error::Engine(ref m) if m == "record ID minting requires trusted provenance dispatch"));
+        let origin = json!({"artifact_id":"artifact","source_digest":"source","invocation_digest":"invocation"});
+        let mut tx = begin_write(w.db.write_pool()).await.unwrap();
+        for key in ["id","id_nonce"] {
+            let mut request = json!({"type":"Document","kind":"note","home_id":w.home});
+            request[key] = args[key].clone();
+            let error = create_with_origin(&w.db,&mut tx,&mut ActAllocation::new(),&w.admin,&request,origin.clone()).await.unwrap_err();
+            assert!(matches!(error,Error::Engine(ref m) if m == "kernel-v2 write: caller record IDs are not supported for origin-bearing creates"));
+        }
+        // A derived create with no caller ID preserves every origin field.
+        let request = json!({"type":"Document","kind":"note","home_id":w.home});
+        let result = create_with_origin(&w.db,&mut tx,&mut ActAllocation::new(),&w.admin,&request,origin.clone()).await.unwrap();
+        let stored: String = sqlx::query_scalar("SELECT json_extract(payload,'$.origin') FROM content_events WHERE record_id=? AND type='kernel.record_created.v1'").bind(result["id"].as_str().unwrap()).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(),origin);
+        tx.rollback().await.unwrap();
+        // Even bypassing the write driver cannot expose the kernel collision.
+        let mut args = minted_args(&w.admin,21);args["home_id"]=json!(w.home);
+        call(&w,"acct:admin","create_record",args.clone()).await.unwrap();
+        let dispatch = crate::provenance::ProvenanceDispatch::from_caller(&Caller::authenticated("acct:admin"),"create_record",&args,None);
+        let mut tx = begin_write(w.db.write_pool()).await.unwrap();
+        let error = dispatch.scope(create(&w.db,&mut tx,&mut ActAllocation::new(),&w.admin,&args)).await.unwrap_err();
+        assert!(matches!(error,Error::Conflict(ref m) if m == "id unavailable"));
+        tx.rollback().await.unwrap();
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_revoked_plain_creator_and_attachment_replays() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        kernel::replace_home_policy(&w.db,&w.admin,&w.home,&[(&w.admin,"manage"),(&w.viewer,"edit")]).await.unwrap();
+        let mut plain = minted_args(&w.viewer,22);plain["home_id"]=json!(w.home);plain["idempotency_key"]=json!("revoked-plain");
+        call(&w,"acct:viewer","create_record",plain.clone()).await.unwrap();
+        let mint = minted_args(&w.viewer,23);
+        let attachment = json!({"record_id":plain["id"],"text":"bytes","attachment_id":mint["id"],"id_nonce":mint["id_nonce"],"idempotency_key":"revoked-attachment"});
+        call(&w,"acct:viewer","attach_text",attachment.clone()).await.unwrap();
+        sqlx::query("UPDATE kernel_records SET owner_id=? WHERE id=?").bind(&w.admin).bind(plain["id"].as_str().unwrap()).execute(w.db.write_pool()).await.unwrap();
+        kernel::replace_home_policy(&w.db,&w.admin,&w.home,&[(&w.admin,"manage")]).await.unwrap();
+        assert_hidden(call(&w,"acct:viewer","create_record",plain).await.unwrap_err());
+        assert_hidden(call(&w,"acct:viewer","attach_text",attachment).await.unwrap_err());
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_comment_and_attachment_collisions_are_uniform() {
+    MINTED_IDS_TEST.scope(true, async {
+        let w = world().await;
+        let note = admin(&w,"create_record",json!({"type":"Document","kind":"note","home_id":w.home,"reason":"bearer"})).await;
+        let mut comment = minted_args(&w.admin,24);comment["type"]=json!("Annotation");comment["kind"]=json!("comment");comment["body"]=json!("comment");comment["links"]=json!([{"target_id":note["id"],"relationship":"part_of"}]);
+        call(&w,"acct:admin","create_record",comment.clone()).await.unwrap();
+        let error = call(&w,"acct:admin","create_record",comment).await.unwrap_err();
+        assert!(matches!(error,Error::Conflict(ref m) if m == "id unavailable"));
+        let mint = minted_args(&w.admin,25);
+        let attachment = json!({"record_id":note["id"],"text":"bytes","attachment_id":mint["id"],"id_nonce":mint["id_nonce"]});
+        call(&w,"acct:admin","attach_text",attachment.clone()).await.unwrap();
+        let error = call(&w,"acct:admin","attach_text",attachment).await.unwrap_err();
+        assert!(matches!(error,Error::Conflict(ref m) if m == "id unavailable"));
+        w.db.close().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_app_install_context_is_bound_before_occupancy() {
+    MINTED_IDS_TEST.scope(true, async {
+        let principal = "kernel-principal";
+        let app = Caller::authenticated("account").with_host_asserted_app(crate::mcp::app_attribution::AppAttribution::new("test.mint","1","installation-1").unwrap());
+        let issuer = crate::awareness::HumanInteractionTokenIssuer::random("mint-test");
+        let ids = vec!["message:mint-test".into()];
+        let token = issuer.issue("account","agent-executor:executor:delegation",&ids,60).unwrap();
+        let delegated = Caller::authenticated("account").with_agent_executor_token(&issuer,&token,"executor","delegation",&ids).unwrap();
+        let first = Caller::authenticated("account");
+        let callers = [first,delegated.clone(),app.clone(),app.with_agent_executor_token(&issuer,&token,"executor","delegation",&ids).unwrap()];
+        let contexts = [crate::record_id::context(None,None),crate::record_id::context(None,Some("delegation")),crate::record_id::context(Some("installation-1"),None),crate::record_id::context(Some("installation-1"),Some("delegation"))];
+        // Uses the actual ingress provenance constructor. Verification is pure
+        // and intentionally happens before app consent or occupancy DB reads.
+        for (i,caller) in callers.iter().enumerate() {
+            for (j,context) in contexts.iter().enumerate() {
+                let (id,nonce)=crate::record_id::mint(&crate::record_id::qualified_principal(principal),context,[26;32]);
+                let args=json!({"id":id,"id_nonce":nonce});
+                let dispatch=crate::provenance::ProvenanceDispatch::from_caller(caller,"create_record",&args,None);
+                let result=dispatch.scope(async { mint_evidence(principal,&args,"id") }).await;
+                if i==j { assert!(result.unwrap().is_some()); }
+                else { assert!(matches!(result.unwrap_err(),Error::Engine(ref m) if m == "kernel-v2 write: invalid record id proof")); }
+            }
+        }
+        let different=Caller::authenticated("account").with_host_asserted_app(crate::mcp::app_attribution::AppAttribution::new("test.mint","1","installation-2").unwrap());
+        let (id,nonce)=crate::record_id::mint(&crate::record_id::qualified_principal(principal),&contexts[2],[26;32]);
+        let args=json!({"id":id,"id_nonce":nonce});
+        let dispatch=crate::provenance::ProvenanceDispatch::from_caller(&different,"create_record",&args,None);
+        assert!(dispatch.scope(async { mint_evidence(principal,&args,"id") }).await.is_err());
+    }).await;
+}
+
+#[tokio::test]
+async fn minted_ids_disabling_conflicts_with_existing_pilot_receipt() {
+    let w = world().await;
+    let mut args = minted_args(&w.admin, 27);
+    args["home_id"] = json!(w.home);
+    args["idempotency_key"] = json!("pilot-receipt");
+    MINTED_IDS_TEST
+        .scope(true, call(&w, "acct:admin", "create_record", args.clone()))
+        .await
+        .unwrap();
+    let error = MINTED_IDS_TEST
+        .scope(false, call(&w, "acct:admin", "create_record", args))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error,Error::Conflict(ref m) if m=="idempotency_key reused for different request")
+    );
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn minted_ids_enabled_contracts_advertise_proofs() {
+    MINTED_IDS_TEST
+        .scope(true, async {
+            let registry = registry();
+            for tool in ["create_record", "attach_text", "attach_from_url"] {
+                let properties = &registry
+                    .get(tool)
+                    .unwrap()
+                    .input_schema_for_engine(EngineKind::KernelV2)["properties"];
+                assert_eq!(properties["id_nonce"]["type"], "string");
+                let id_key = if tool == "create_record" {
+                    "id"
+                } else {
+                    "attachment_id"
+                };
+                assert_eq!(properties[id_key]["type"], "string");
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn registry_working_undo_real_write_round_trip() {
+    use crate::kernel::working_undo::{test_keys, test_snapshot, with_handle, Collector};
+    let mut w = world().await;
+    // The ordinary fixture pool has multiple writers. Qualification must
+    // retain one physical writer, matching the future working-copy manager.
+    w.db.constrain_pending_writer().await.unwrap();
+    let target=admin(&w,"create_record",json!({"type":"Document","kind":"note","name":"Accepted target","body":"accepted","home_id":w.home,"reason":"undo base"})).await;
+    let mut c = w.db.write_pool().acquire().await.unwrap();
+    with_handle(&mut c, |raw| {
+        let missing = crate::kernel::working_undo::test_fk_index_report(raw)
+            .map_err(|e| Error::engine(e.to_string()))?;
+        eprintln!("Kernel FK child indexes missing: {missing:#?}");
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (collector, base) = with_handle(&mut c, |raw| {
+        let collector = Collector::install(raw, &test_keys(raw), 100_000, 64 * 1024 * 1024)
+            .map_err(|e| Error::engine(e.to_string()))?;
+        let base = test_snapshot(raw).map_err(|e| Error::engine(e.to_string()))?;
+        raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+        collector
+            .proposal(raw, "pending")
+            .map_err(|e| Error::engine(e.to_string()))?;
+        raw.execute_batch("COMMIT").unwrap();
+        Ok((collector, base))
+    })
+    .await
+    .unwrap();
+    drop(c);
+    let created=admin(&w,"create_record",json!({"type":"Document","kind":"note","name":"Pending note","body":"pending body","home_id":w.home,"idempotency_key":"undo-create","reason":"undo gate"})).await;
+    let id = created["id"].as_str().unwrap();
+    admin(&w,"update_record",json!({"id":id,"body_append":" appended","idempotency_key":"undo-append","reason":"undo gate"})).await;
+    assert!(call(&w,"acct:admin","update_record",json!({"id":id,"name":"must roll back","links":[{"relationship":"relates_to","target_id":"missing"}],"reason":"refusal gate"})).await.is_err());
+    // A second committed proposal boundary still shares the dedicated
+    // one-connection writer. Existing title fields take the ordinary
+    // kernel_record_fields ON CONFLICT DO UPDATE path.
+    let mut next = w.db.write_pool().acquire().await.unwrap();
+    with_handle(&mut next, |raw| {
+        raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+        collector
+            .proposal(raw, "pending-links")
+            .map_err(|e| Error::engine(e.to_string()))?;
+        raw.execute_batch("COMMIT").unwrap();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drop(next);
+    for name in ["Pending accepted title", "Pending accepted title again"] {
+        admin(
+            &w,
+            "update_record",
+            json!({"id":target["id"],"name":name,"reason":"undo UPSERT qualification"}),
+        )
+        .await;
+    }
+    admin(&w,"manage_links",json!({"action":"add","source_id":id,"target_id":target["id"],"relationship":"relates_to","idempotency_key":"undo-link"})).await;
+    admin(
+        &w,
+        "attach_text",
+        json!({"id":id,"text":"blob bytes for pending attachment","idempotency_key":"undo-blob"}),
+    )
+    .await;
+    let mut c = w.db.write_pool().acquire().await.unwrap();
+    with_handle(&mut c, |raw| {
+        raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(
+            raw.query_row(
+                "SELECT count(*) FROM working_undo WHERE t='kernel_record_fields' AND op='UPDATE'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+                > 0
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM working_undo_boundaries", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        collector
+            .undo(raw, "pending")
+            .map_err(|e| Error::engine(e.to_string()))?;
+        assert_eq!(
+            test_snapshot(raw).unwrap(),
+            base,
+            "full ordinary rows, logical FTS rows, event logs, blobs and sqlite_sequence"
+        );
+        raw.execute_batch(
+            "INSERT INTO kernel_search_fts(kernel_search_fts) VALUES('integrity-check'); COMMIT",
+        )
+        .unwrap();
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

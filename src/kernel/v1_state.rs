@@ -332,23 +332,29 @@ pub(crate) async fn schema_rows_on(
                 continue;
             }
         }
-        let text = |key: &str| -> Result<String> {
-            row[key]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| Error::engine("invalid imported schema row"))
-        };
-        schema.push(crate::query::cascade::SchemaConfigRow {
-            id: text("id")?,
-            layer: text("layer")?,
-            name: row["name"].as_str().map(str::to_owned),
-            data: serde_json::from_str(&text("data")?)?,
-            applies_to_collection_id: anchor,
-            version_lineage: row["version_lineage"].as_str().map(str::to_owned),
-            created_at: text("created_at")?,
-        });
+        schema.push(schema_row(&row)?);
     }
     Ok(schema)
+}
+
+/// Decode the shared imported/native catalogue row without applying visibility.
+/// Callers decide admission before reading or publishing any decoded rows.
+pub(crate) fn schema_row(row: &Value) -> Result<crate::query::cascade::SchemaConfigRow> {
+    let text = |key: &str| -> Result<String> {
+        row[key]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| Error::engine("invalid imported schema row"))
+    };
+    Ok(crate::query::cascade::SchemaConfigRow {
+        id: text("id")?,
+        layer: text("layer")?,
+        name: row["name"].as_str().map(str::to_owned),
+        data: serde_json::from_str(&text("data")?)?,
+        applies_to_collection_id: row["applies_to_collection_id"].as_str().map(str::to_owned),
+        version_lineage: row["version_lineage"].as_str().map(str::to_owned),
+        created_at: text("created_at")?,
+    })
 }
 
 pub(crate) async fn interpreter_on(
@@ -428,55 +434,6 @@ pub(crate) async fn lifecycle_on(
 /// Member state is read-only. Completed/declined generations never enter the
 /// pending list; no bootstrap action changes obligations or replays delivery.
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) async fn onboarding_as(db: &Db, actor: &str, is_member: bool) -> Result<Value> {
-    if !is_member {
-        return Ok(
-            serde_json::json!({"status":"read_only","delivery_enabled":false,"pending":[],"programmes":[]}),
-        );
-    }
-    let mut tx = db.write_pool().begin().await?;
-    let rows:Vec<String>=sqlx::query_scalar("SELECT payload FROM kernel_v1_state WHERE section='member_obligations' AND account_principal=? ORDER BY source_id").bind(actor).fetch_all(&mut *tx).await?;
-    let obligations: Vec<Value> = rows
-        .into_iter()
-        .map(|v| serde_json::from_str(&v))
-        .collect::<std::result::Result<_, _>>()?;
-    let pending: Vec<_> = obligations
-        .iter()
-        .filter(|v| v["state"] == "pending")
-        .cloned()
-        .collect();
-    // Programme/source status is visible only when all its retained sources
-    // are visible. No hidden source ids, titles or evidence leak to members.
-    let mut programmes = vec![];
-    let sources = rows_on(&mut tx, "onboarding_programme_sources").await?;
-    for programme in rows_on(&mut tx, "onboarding_programmes").await? {
-        let mut visible = true;
-        for source in sources
-            .iter()
-            .filter(|s| s["programme_id"] == programme["id"])
-        {
-            let id = source["source_record_id"].as_str().unwrap_or_default();
-            if !kernel_effective_capability_on(&mut tx, actor, id)
-                .await?
-                .allows(Capability::View)
-            {
-                visible = false;
-                break;
-            }
-        }
-        if visible {
-            programmes.push(serde_json::json!({"id":programme["id"],"generation":programme["generation"],"enabled":programme["enabled"]}));
-        }
-    }
-    let progress:Vec<String>=sqlx::query_scalar("SELECT payload FROM kernel_v1_state WHERE section='member_obligation_progress' AND account_principal=? ORDER BY source_id").bind(actor).fetch_all(&mut *tx).await?;
-    let progress: Vec<Value> = progress
-        .into_iter()
-        .map(|v| serde_json::from_str(&v))
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(
-        serde_json::json!({"status":"read_only","delivery_enabled":false,"pending":pending,"states":obligations,"progress":progress,"programmes":programmes}),
-    )
-}
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn disclosed_accounts_on(
     conn: &mut SqliteConnection,
@@ -510,8 +467,13 @@ pub(crate) async fn claims_on(
     #[cfg(feature = "v2-kernel-probe")]
     app_installs::admit_dispatched_on(tx, actor).await?;
     kernel_require(tx, actor, id, Capability::View).await?;
-    let allowed = disclosed_accounts_on(tx, actor).await?;
     let rows:Vec<(String,String,Option<String>)>=sqlx::query_as("SELECT payload,observed_at,account_principal FROM kernel_v1_state WHERE section='claims' AND record_id=? ORDER BY source_id").bind(id).fetch_all(&mut *tx).await?;
+    // Most records have no retained claims. Their unchanged admission above
+    // suffices; no account-directory disclosure work can affect an empty list.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let allowed = disclosed_accounts_on(tx, actor).await?;
     rows.into_iter()
         .filter(|(_, _, account)| account.as_ref().is_some_and(|a| allowed.contains(a)))
         .map(|(p, cutover, _)| {

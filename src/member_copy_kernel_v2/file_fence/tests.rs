@@ -151,9 +151,18 @@ async fn native_file_fence_matches_authenticated_footing_but_never_admits_a_prof
     assert_eq!(tables, ["kernel_member_identity"]);
     assert!(!fixture.file().with_extension("db-wal").exists());
     assert!(!fixture.file().with_extension("db-journal").exists());
-    assert!(
-        crate::member_copy_admission::validate_manifest(&fixture.manifest.canonical_bytes())
-            .is_err()
+    // Declaration validation is shared by both member profiles; it grants no
+    // file or serving authority. This identity-only fixture is not a profile.
+    crate::member_copy_admission::validate_manifest(&fixture.manifest.canonical_bytes()).unwrap();
+    assert_eq!(
+        super::super::profile::AdmittedMemberFile::open(
+            &fixture.file(),
+            fixture.dir.path(),
+            &fixture.context,
+            &fixture.manifest,
+        )
+        .err(),
+        Some(super::super::profile::Refusal::Schema)
     );
     assert!(crate::db::open_database(fixture.file().to_str().unwrap())
         .await

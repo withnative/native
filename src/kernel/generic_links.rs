@@ -4,6 +4,10 @@
 //! support their future projections without changing recorded history.
 use super::*;
 
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[path = "generic_links_diagnostics.rs"]
+pub(crate) mod diagnostics;
+
 pub(crate) const DDL: &str = "CREATE TABLE kernel_generic_links (
  link_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES kernel_records(id),
  target_id TEXT NOT NULL REFERENCES kernel_records(id), relationship TEXT NOT NULL,
@@ -438,7 +442,7 @@ pub async fn add_generic_link_as(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn add_generic_link_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     principal: &str,
     source: &str,
@@ -469,7 +473,7 @@ pub(crate) async fn add_generic_link_in(
         relationship: relationship.into(),
         note,
     };
-    let event = append_in(
+    let event = crate::store::append_on(
         db,
         tx,
         AppendSpec {
@@ -543,7 +547,7 @@ pub async fn remove_generic_link_triple_as(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remove_generic_link_triple_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     principal: &str,
     source: &str,
@@ -558,7 +562,7 @@ pub(crate) async fn remove_generic_link_triple_in(
     let link = active_triple(tx, source, target, relationship)
         .await?
         .ok_or_else(|| Error::conflict("link is absent"))?;
-    append_in(
+    crate::store::append_on(
         db,
         tx,
         AppendSpec {
@@ -578,14 +582,14 @@ pub(crate) async fn remove_generic_link_triple_in(
 #[allow(clippy::too_many_arguments)]
 async fn append_note(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     principal: &str,
     link: &GenericLink,
     note: Option<String>,
     imported: bool,
 ) -> Result<()> {
-    append_in(
+    crate::store::append_on(
         db,
         tx,
         AppendSpec {
@@ -836,6 +840,16 @@ fn visible_generic_links_sql() -> String {
     format!("{} SELECT l.link_id,l.source_id,l.target_id,l.relationship,l.note,l.created_at,l.actor FROM ({ANCHORED_GENERIC_LINKS}) l JOIN visible s ON s.id=l.source_id JOIN visible t ON t.id=l.target_id", visible_cte())
 }
 
+#[cfg(test)]
+fn visible_generic_links_candidate_sql() -> String {
+    // Fence compound-query flattening so the two endpoint predicates are not
+    // duplicated into both anchor branches. Keep visibility inline: separate
+    // endpoint/visible materializations added VM work at high degree.
+    // Candidate-first joins retain record primary-key seeks rather than a
+    // whole-workspace visibility scan. Inner bearer/audience reads stay full.
+    format!("{}, candidates AS MATERIALIZED ({ANCHORED_GENERIC_LINKS}) SELECT l.link_id,l.source_id,l.target_id,l.relationship,l.note,l.created_at,l.actor FROM candidates l CROSS JOIN visible s ON s.id=l.source_id CROSS JOIN visible t ON t.id=l.target_id", visible_cte().trim_end())
+}
+
 pub(crate) const LEGACY_TARGET_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_kernel_links_target ON kernel_links(target_id,source_id,relationship)";
 pub(crate) const PROVIDER_AGGREGATE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_kernel_provider_subjects_aggregate ON kernel_provider_subjects(aggregate_id,subject_id)";
 
@@ -845,8 +859,24 @@ pub async fn ensure_link_read_indexes(db: &Db) -> Result<()> {
     for ddl in [LEGACY_TARGET_INDEX, PROVIDER_AGGREGATE_INDEX] {
         sqlx::query(ddl).execute(&mut *tx).await?;
     }
+    prepare_link_endpoint_indexes_on(&mut tx).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Add optional endpoint accelerators during explicit preparation. Older
+/// files remain servable with the original query plan.
+pub(super) async fn prepare_link_endpoint_indexes_on(conn: &mut SqliteConnection) -> Result<()> {
+    for ddl in [
+        links_v2::LINK4_SOURCE_INDEX,
+        links_v2::LINK4_TARGET_INDEX,
+        provider_link_reads::LINK_ROWS_SOURCE_INDEX,
+        provider_link_reads::LINK_ROWS_TARGET_INDEX,
+    ] {
+        sqlx::query(ddl).execute(&mut *conn).await?;
+    }
+    links_v2::require_endpoint_indexes_on(conn).await?;
+    provider_link_reads::require_endpoint_indexes_on(conn).await
 }
 
 /// Ordinary MCP link projection. Record endpoints share one visibility snapshot;
@@ -869,9 +899,30 @@ pub(crate) async fn visible_link_rows_for_on(
     principal: &str,
     anchors: &[String],
 ) -> Result<Vec<serde_json::Value>> {
+    #[cfg(test)]
+    if diagnostics::enabled() {
+        return diagnostics::measure(tx, principal, anchors).await;
+    }
+    visible_link_rows_for_on_inner(tx, principal, anchors).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+async fn visible_link_rows_for_on_inner(
+    tx: &mut SqliteConnection,
+    principal: &str,
+    anchors: &[String],
+) -> Result<Vec<serde_json::Value>> {
+    #[cfg(test)]
+    diagnostics::phase("admission");
     app_installs::admit_dispatched_on(tx, principal).await?;
+    #[cfg(test)]
+    diagnostics::phase("readiness");
     super::provider_link_reads::require_ready_on(tx).await?;
+    #[cfg(test)]
+    diagnostics::phase("home_scope");
     let scope = visible_home_anchors_as(tx, principal).await?;
+    #[cfg(test)]
+    diagnostics::returned_rows(scope.homes.len());
     let homes: Vec<_> = scope
         .homes
         .into_iter()
@@ -880,8 +931,18 @@ pub(crate) async fn visible_link_rows_for_on(
         .collect();
     let homes = serde_json::to_string(&homes)?;
     let anchors = serde_json::to_string(anchors)?;
+    #[cfg(test)]
+    diagnostics::phase("shaping");
     let cte = visible_cte();
-    let sql = visible_generic_links_sql()
+    #[cfg(test)]
+    let generic_sql = if diagnostics::generic_visibility_candidate() {
+        visible_generic_links_candidate_sql()
+    } else {
+        visible_generic_links_sql()
+    };
+    #[cfg(not(test))]
+    let generic_sql = visible_generic_links_sql();
+    let sql = generic_sql
         .replace(
             "source_id<>?3",
             "source_id NOT IN (SELECT value FROM json_each(?3))",
@@ -894,41 +955,47 @@ pub(crate) async fn visible_link_rows_for_on(
             "target_id=?3",
             "target_id IN (SELECT value FROM json_each(?3))",
         );
+    #[cfg(test)]
+    diagnostics::explain_bound(tx, "generic_query", &sql, &homes, principal, &anchors).await?;
+    #[cfg(test)]
+    diagnostics::before_query(tx, "generic", &sql).await?;
     let links: Vec<GenericLink> = sqlx::query_as(&sql)
         .bind(&homes)
         .bind(principal)
         .bind(&anchors)
         .fetch_all(&mut *tx)
         .await?;
+    #[cfg(test)]
+    diagnostics::returned_rows(links.len());
+    #[cfg(test)]
+    diagnostics::after_query(tx, "generic", &sql).await?;
+    #[cfg(test)]
+    diagnostics::phase("shaping");
     let mut rows: Vec<_> = links.into_iter().map(|l| serde_json::json!({"id":l.link_id,"source_id":l.source_id,"target_id":l.target_id,"relationship":l.relationship,"note":l.note,"created_at":l.created_at})).collect();
     // Principal targets are not policy-bearing. Record targets still need View.
     let sql = format!("{cte} SELECT l.source_id,l.target_id,l.relationship,e.created_at FROM (SELECT * FROM kernel_links WHERE source_id IN (SELECT value FROM json_each(?3)) UNION ALL SELECT * FROM kernel_links WHERE target_id IN (SELECT value FROM json_each(?3)) AND source_id NOT IN (SELECT value FROM json_each(?3))) l JOIN visible s ON s.id=l.source_id LEFT JOIN visible t ON t.id=l.target_id LEFT JOIN kernel_principals p ON p.principal_id=l.target_id JOIN main.content_events e INDEXED BY idx_kernel_event_birth ON e.seq=l.created_seq WHERE t.id IS NOT NULL OR p.principal_id IS NOT NULL");
+    #[cfg(test)]
+    diagnostics::explain_bound(tx, "legacy_query", &sql, &homes, principal, &anchors).await?;
+    #[cfg(test)]
+    diagnostics::before_query(tx, "legacy", &sql).await?;
     let legacy: Vec<(String, String, String, String)> = sqlx::query_as(&sql)
         .bind(&homes)
         .bind(principal)
         .bind(&anchors)
         .fetch_all(&mut *tx)
         .await?;
+    #[cfg(test)]
+    diagnostics::returned_rows(legacy.len());
+    #[cfg(test)]
+    diagnostics::after_query(tx, "legacy", &sql).await?;
+    #[cfg(test)]
+    diagnostics::phase("shaping");
     for (source, target, rel, created) in legacy {
         rows.push(serde_json::json!({"id":null,"source_id":source,"target_id":target,"relationship":rel,"note":null,"created_at":created}));
     }
-    // Start from the subject index, not every provider state. The reverse
-    // subject index bounds the all-endpoints visibility check per aggregate.
-
-    let sql = format!("{cte} SELECT p.left_id,p.right_id FROM kernel_provider_link_heads p WHERE p.active=1 AND p.aggregate_id IN (SELECT aggregate_id FROM kernel_provider_subjects WHERE subject_id IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM kernel_provider_subjects s WHERE s.aggregate_id=p.aggregate_id AND NOT EXISTS(SELECT 1 FROM visible v WHERE v.id=s.subject_id))");
-    let pairs: Vec<(String, String)> = sqlx::query_as(&sql)
-        .bind(&homes)
-        .bind(principal)
-        .bind(&anchors)
-        .fetch_all(&mut *tx)
-        .await?;
-    for (left, right) in pairs {
-        for (source, target) in [(&left, &right), (&right, &left)] {
-            rows.push(serde_json::json!({"id":null,"source_id":source,"target_id":target,"relationship":"relates_to","note":null,"created_at":null}));
-        }
-    }
-    // Prefer the generic identity/note/provenance when an older declared lane
-    // carries the same triple. This does not migrate or mutate the older row.
+    // Prefer generic provenance over the older declared lane for the same
+    // triple. Provider sources below have their own identities: two retained
+    // assertions of the same triple must both survive.
     let mut seen = std::collections::BTreeSet::new();
     rows.retain(|l| {
         seen.insert((
@@ -937,6 +1004,50 @@ pub(crate) async fn visible_link_rows_for_on(
             l["relationship"].as_str().unwrap().to_owned(),
         ))
     });
+    // Start from the subject index and admit every provider subject in this
+    // snapshot. Read the interpreted rows, rather than synthesizing a symmetric
+    // pair from its head: retained sources carry direction and provenance.
+    let sql = format!("{cte} SELECT r.id,r.source_id,r.target_id,r.note,r.created_at,r.raw_json,r.if_absent FROM kernel_provider_link_rows r JOIN visible s ON s.id=r.source_id JOIN visible t ON t.id=r.target_id WHERE r.aggregate_id IN (SELECT aggregate_id FROM kernel_provider_subjects WHERE subject_id IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM kernel_provider_subjects p WHERE p.aggregate_id=r.aggregate_id AND NOT EXISTS(SELECT 1 FROM visible v WHERE v.id=p.subject_id)) ORDER BY r.aggregate_id,r.ordinal");
+    #[cfg(test)]
+    diagnostics::explain_bound(tx, "provider_query", &sql, &homes, principal, &anchors).await?;
+    #[cfg(test)]
+    diagnostics::before_query(tx, "provider", &sql).await?;
+    #[allow(clippy::type_complexity)]
+    let provider_rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        bool,
+    )> = sqlx::query_as(&sql)
+        .bind(&homes)
+        .bind(principal)
+        .bind(&anchors)
+        .fetch_all(&mut *tx)
+        .await?;
+    #[cfg(test)]
+    diagnostics::returned_rows(provider_rows.len());
+    #[cfg(test)]
+    diagnostics::after_query(tx, "provider", &sql).await?;
+    #[cfg(test)]
+    diagnostics::phase("shaping");
+    // Match SQL's first-row interpretation: native pair rows only fill an
+    // absent identity; repeated retained identities must agree, including time.
+    let mut providers = std::collections::BTreeMap::new();
+    for (id, source, target, note, created, raw, if_absent) in provider_rows {
+        if let Some(previous) = providers.get(&id) {
+            if !if_absent && previous != &raw {
+                return Err(Error::engine(
+                    "provider source identity has conflicting link metadata",
+                ));
+            }
+        } else {
+            providers.insert(id.clone(), raw);
+            rows.push(serde_json::json!({"id":id,"source_id":source,"target_id":target,"relationship":"relates_to","note":note,"created_at":created}));
+        }
+    }
     rows.sort_by_key(|l| {
         (
             l["relationship"].as_str().unwrap_or("").to_owned(),

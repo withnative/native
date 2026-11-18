@@ -70,7 +70,7 @@ pub(crate) struct RenderOutcome {
 /// resolution, the advertised schema and the dispatch cannot disagree — a
 /// renderer that exists but is never reached is exactly the drift this file is
 /// most likely to grow.
-const RENDERED_TOOLS: [&str; 78] = [
+pub(crate) const RENDERED_TOOLS: [&str; 79] = [
     "bootstrap",
     "quickstart",
     "get_structure",
@@ -83,6 +83,7 @@ const RENDERED_TOOLS: [&str; 78] = [
     "get_record",
     "resolve_many",
     "update_record",
+    "merge_body",
     "claim_unowned_record",
     "correct_record_type",
     "delete_record",
@@ -169,7 +170,7 @@ pub(crate) fn format_schema(tool: &str) -> Value {
         "type": "string",
         "enum": values,
         "default": default,
-        "description": "Response representation. text is the compact model-facing rendering; json is exact serialized JSON plus structuredContent."
+        "description": "text: compact model rendering; json: exact serialized JSON plus structuredContent."
     })
 }
 
@@ -317,6 +318,7 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
         "get_record" => Some(render_get_record(value, true)),
         "resolve_many" => Some(render_resolve_many(value)),
         "update_record" => Some(render_update_record(value)),
+        "merge_body" => Some(render_merge_body(value)),
         "claim_unowned_record" => Some(render_ownership_claim(value)),
         "correct_record_type" => Some(render_record_type_correction(value)),
         "delete_record" => Some(render_delete_record(value)),
@@ -407,25 +409,44 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
     })
 }
 
+/// The source and age of a local-copy answer, in one clause.
+///
+/// This is a boundary disclosure (honest staleness, a10e004): it always says
+/// the answer came from the read-only local copy and how long ago it last
+/// matched hosted. It names a freshness state only when that state is not
+/// `fresh`, so it never asserts freshness a later fence could contradict: a
+/// node that knows hosted is ahead says so in its own routing line, and puts
+/// `behind_hosted_head` in the JSON payload, without editing this text.
 fn render_standby_context(value: &Value) -> String {
     let mode = claimed_string(value.get("mode"), "mode");
     let freshness = claimed_string(value.pointer("/freshness/state"), "freshness");
-    let mut out = format!(
-        "Standby context: `{mode}` · read-only local replica · hosted Native is canonical · freshness `{freshness}`"
-    );
-    if let (Some(age), Some(rpo)) = (
-        value
-            .pointer("/freshness/age_seconds")
-            .and_then(Value::as_u64),
-        value
+    let mut out = String::from("Source: local copy (read-only; hosted Native is canonical)");
+    match value
+        .pointer("/freshness/age_seconds")
+        .and_then(Value::as_u64)
+    {
+        Some(age) => {
+            let _ = write!(out, " · last matching hosted check or capture {age}s ago");
+        }
+        None => out.push_str(" · last matching hosted check or capture unknown"),
+    }
+    if mode != "standby" {
+        let _ = write!(out, " · mode `{mode}`");
+    }
+    if freshness != "fresh" {
+        let _ = write!(out, " · freshness `{freshness}`");
+        if let Some(rpo) = value
             .pointer("/freshness/target_rpo_seconds")
-            .and_then(Value::as_u64),
-    ) {
-        let _ = write!(out, " ({age}s old; {rpo}s RPO)");
+            .and_then(Value::as_u64)
+        {
+            let _ = write!(out, " ({rpo}s refresh target)");
+        }
+        out.push_str("; age alone does not show which changes are missing");
     }
     if let Some(action) = string(value, "next_safe_action") {
-        let _ = write!(out, ". Next safe action: {action}.");
+        let _ = write!(out, ". Next safe action: {}", display_inline(&action));
     }
+    out.push('.');
     out
 }
 
@@ -440,7 +461,7 @@ fn render_standby_status(value: &Value) -> String {
         out,
         "\nMode: `{mode}` · read-only · writes unsupported · canonical authority: hosted"
     );
-    let _ = write!(out, "Freshness: `{freshness}`");
+    let _ = write!(out, "Check-age status: `{freshness}`");
     if let (Some(age), Some(rpo)) = (
         value
             .pointer("/freshness/age_seconds")
@@ -449,9 +470,27 @@ fn render_standby_status(value: &Value) -> String {
             .pointer("/freshness/target_rpo_seconds")
             .and_then(Value::as_u64),
     ) {
-        let _ = write!(out, " · snapshot age {age}s · target RPO {rpo}s");
+        let _ = write!(out, " · last matching hosted check/capture {age}s ago · target RPO {rpo}s · elapsed age alone does not establish missing changes");
     }
     out.push('\n');
+    for (label, field) in [
+        (
+            "Last matching hosted check/capture",
+            "last_matching_hosted_check_at",
+        ),
+        (
+            "Last local materialization",
+            "last_local_materialization_at",
+        ),
+        ("Last source data change", "last_data_change_at"),
+    ] {
+        let at = match value.get("sync_observation").and_then(|v| v.get(field)) {
+            // The typed producer explicitly uses null for an unknown time.
+            Some(Value::Null) => "unknown".to_owned(),
+            field => claimed_string(field, label),
+        };
+        let _ = writeln!(out, "{label}: {at}");
+    }
     if let Some(id) = value
         .pointer("/serving_generation/generation_id")
         .and_then(Value::as_str)
@@ -3166,6 +3205,8 @@ fn render_create_many(value: &Value) -> String {
     // carries the same coordinate on each `results[].record.act` instead, so
     // this array is absent there and the item lines render without it.
     let acts = array(value, "acts");
+    let body_digests = array(value, "body_digests");
+    let results = array(value, "results");
     let act_at = |index: usize| -> Option<i64> {
         acts.iter()
             .find(|entry| integer(entry, "index") == Some(index as i64))
@@ -3176,10 +3217,28 @@ fn render_create_many(value: &Value) -> String {
     for (index, id) in ids.iter().enumerate() {
         match id.as_str() {
             Some(id) => {
-                let _ = match act_at(index) {
-                    Some(act) => writeln!(out, "- [{index}] {id} (act: {act})"),
-                    None => writeln!(out, "- [{index}] {id}"),
-                };
+                let _ = write!(out, "- [{index}] {id}");
+                if let Some(act) = act_at(index) {
+                    let _ = write!(out, " (act: {act})");
+                }
+                let record = results
+                    .iter()
+                    .find(|entry| integer(entry, "index") == Some(index as i64))
+                    .and_then(|entry| entry.get("record"));
+                if let Some(version) = record.and_then(|record| {
+                    string(record, "version").or_else(|| string(record, "record_version"))
+                }) {
+                    let _ = write!(out, " · version {}", display_inline(&version));
+                }
+                if let Some(digest) = body_digests
+                    .iter()
+                    .find(|entry| integer(entry, "index") == Some(index as i64))
+                    .and_then(|entry| string(entry, "sha256"))
+                    .or_else(|| record.and_then(|record| string(record, "body_digest")))
+                {
+                    let _ = write!(out, " · body_digest {}", display_inline(&digest));
+                }
+                out.push('\n');
             }
             None => {
                 let _ = writeln!(out, "- [{index}] not created");
@@ -3200,15 +3259,7 @@ fn render_create_many(value: &Value) -> String {
     if !warnings.is_empty() {
         let _ = writeln!(out, "Warnings: {} (see structured receipt)", warnings.len());
     }
-    let body_digests = array(value, "body_digests");
-    if !body_digests.is_empty() {
-        let _ = writeln!(
-            out,
-            "Body digests: {} (see structured receipt)",
-            body_digests.len()
-        );
-    }
-    if !array(value, "results").is_empty() {
+    if !results.is_empty() {
         let _ = writeln!(
             out,
             "Verbose created-record results are present in the structured receipt."
@@ -4044,20 +4095,16 @@ fn render_run_context_with_follow(context: &Value, include_follow_url: bool) -> 
             .and_then(Value::as_str)
             .unwrap_or("(none)"),
     );
-    let raw_intent = context
-        .get("intent")
-        .and_then(Value::as_str)
-        .unwrap_or("(none)");
-    let (intent, intent_shortened) = one_line_preview(raw_intent, 500);
-    let intent = display_inline(&intent);
-    let mut out = format!("\nRun context: {run_key} · intent: {intent}");
+    // The key is echoed on every response: it is what stops an agent losing
+    // or inventing it. The intent is not. The caller wrote it, set_intent
+    // acknowledges it in its own body, and a copy that cannot know it (the
+    // node's local copy) would otherwise print a misleading "(none)". JSON
+    // keeps `run_context.intent` exactly as the payload reports it.
+    let mut out = format!("\nRun context: {run_key}");
     if let Some(parent) = context.get("parent_key").and_then(Value::as_str) {
         let _ = write!(out, " · parent: {}", display_inline(parent));
     }
     out.push('\n');
-    if intent_shortened {
-        out.push_str("Run context intent shortened in text.\n");
-    }
     if include_follow_url {
         if let Some(follow_url) = context.get("follow_url").and_then(Value::as_str) {
             let _ = writeln!(out, "Follow this run: {}", display_inline(follow_url));
@@ -4094,13 +4141,31 @@ fn string(value: &Value, key: &str) -> Option<String> {
 pub(crate) fn display_inline(text: &str) -> String {
     let mut displayed = String::with_capacity(text.len());
     for character in text.chars() {
-        if character.is_control() {
+        if character.is_control() || breaks_or_reorders_line(character) {
             displayed.extend(character.escape_default());
         } else {
             displayed.push(character);
         }
     }
     displayed
+}
+
+/// Characters outside Rust's control class that a Unicode-aware reader may
+/// still treat as a line break (U+2028, U+2029) or that reorder the visible
+/// text around them (bidi embeddings, overrides, isolates and marks). Left
+/// literal, authored text could appear to start a line of its own or move a
+/// quote marker, so text renderings escape them like control characters.
+fn breaks_or_reorders_line(character: char) -> bool {
+    matches!(
+        character,
+        '\u{2028}'
+            | '\u{2029}'
+            | '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Natural-language projection of the structured lifecycle envelope. This is
@@ -4177,7 +4242,26 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
 /// cells and schema shapes). Unlike a prose summary it cannot silently discard
 /// a field the renderer does not know yet.
 fn inline_json(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable JSON>".into())
+    let encoded = serde_json::to_string(value).unwrap_or_else(|_| "<unserializable JSON>".into());
+    // serde_json leaves NEL, the Unicode line/paragraph separators and bidi
+    // controls literal. They can only occur inside JSON strings, where a
+    // `\uXXXX` escape is the same value, so escaping keeps the JSON exact
+    // while keeping it on one visible line.
+    if !encoded
+        .chars()
+        .any(|character| character == '\u{0085}' || breaks_or_reorders_line(character))
+    {
+        return encoded;
+    }
+    let mut escaped = String::with_capacity(encoded.len() + 12);
+    for character in encoded.chars() {
+        if character == '\u{0085}' || breaks_or_reorders_line(character) {
+            let _ = write!(escaped, "\\u{:04x}", character as u32);
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 fn temporal_header(value: &Value) -> String {
@@ -4571,7 +4655,7 @@ fn render_bootstrap_world_items(
         }
         // A superseded recent item stays listed — Bootstrap annotates, never
         // excludes — with its successor reference inline.
-        if let Some(summary) = format_superseded_by(item) {
+        if let Some(summary) = format_record_context(item) {
             let _ = write!(out, " · {summary}");
         }
         out.push('\n');
@@ -5023,6 +5107,9 @@ fn render_structure(value: &Value) -> String {
         // line stays a stable column layout, and the blob is where this
         // surface already puts per-node truth. Inserted only when present so
         // unsuperseded nodes render byte-identical text to before.
+        if let Some(disclosures) = node.get("read_disclosures") {
+            details["read_disclosures"] = disclosures.clone();
+        }
         if let Some(superseded) = node.get("superseded_by") {
             details["superseded_by"] = superseded.clone();
         }
@@ -5055,7 +5142,9 @@ fn escaped_record_name(record: &Value) -> String {
             '\r' => escaped.push_str("\\r"),
             '[' => escaped.push_str("\\["),
             ']' => escaped.push_str("\\]"),
-            character if character.is_control() => escaped.extend(character.escape_default()),
+            character if character.is_control() || breaks_or_reorders_line(character) => {
+                escaped.extend(character.escape_default())
+            }
             character => escaped.push(character),
         }
     }
@@ -5131,10 +5220,37 @@ fn record_line(record: &Value, id_width: usize, type_width: usize) -> String {
     // describing this one, so it rides outside the state bracket — and only
     // when there is a successor to name, keeping unsuperseded rows
     // byte-identical to before.
-    if let Some(summary) = format_superseded_by(record) {
+    if let Some(summary) = format_record_context(record) {
         let _ = write!(line, "  [{summary}]");
     }
     line
+}
+
+fn format_read_disclosures(record: &Value) -> Option<String> {
+    let summaries: Vec<_> = record
+        .get("read_disclosures")?
+        .as_array()?
+        .iter()
+        .filter_map(|rule| rule.get("summary").and_then(Value::as_str))
+        .filter(|summary| !summary.is_empty())
+        .map(display_inline)
+        .collect();
+    (!summaries.is_empty()).then(|| summaries.join("; "))
+}
+
+/// Definition-driven context takes precedence over the older succession
+/// annotation, keeping each disclosed relationship visible exactly once.
+fn format_record_context(record: &Value) -> Option<String> {
+    match (
+        format_read_disclosures(record),
+        format_superseded_by(record),
+    ) {
+        (Some(context), Some(currency)) if !context.contains(&currency) => {
+            Some(format!("{context}; {currency}"))
+        }
+        (Some(context), _) => Some(context),
+        (None, currency) => currency,
+    }
 }
 
 /// One-line disclosure of the incoming-`supersedes` projection, shared by
@@ -6252,6 +6368,59 @@ fn unknown_object_keys(value: &Value, known: impl Fn(&str) -> bool) -> Vec<Strin
         .collect()
 }
 
+/// The total that accompanies a windowed record section.
+fn section_count_key(section: &str) -> Option<&'static str> {
+    Some(match section {
+        "citations" => "citation_count",
+        "comments" => "comment_count",
+        "children" => "child_count",
+        "suggestions" => "suggestion_count",
+        "links_out" => "links_out_count",
+        "links_in" => "links_in_count",
+        "mentions_out" => "mentions_out_count",
+        "mentions_in" => "mentions_in_count",
+        _ => return None,
+    })
+}
+
+/// The member-copy marker shape (`{"unavailable_offline":{"surface","retry"}}`)
+/// that replaces a section the copy cannot compute.
+fn offline_marker(field: &Value) -> Option<(String, String)> {
+    // Already escaped for display; absence renders as absence.
+    let marker = field.get("unavailable_offline").filter(|m| m.is_object())?;
+    Some((
+        claimed_string(marker.get("surface"), "surface"),
+        claimed_string(marker.get("retry"), "retry"),
+    ))
+}
+
+/// Whether a field the lean text would otherwise leave to JSON tells the
+/// reader that something was withheld or is not visible to them. Those stay
+/// in text: account/access withholding is a boundary, and a reader who cannot
+/// see that a part was withheld will take what it got for the whole.
+fn is_disclosure_field(key: &str, field: &Value) -> bool {
+    let set = match field {
+        Value::Null | Value::Bool(false) => false,
+        Value::Number(number) => number.as_f64() != Some(0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(true) => true,
+    };
+    let withholding = [
+        "withheld",
+        "redact",
+        "restricted",
+        "hidden",
+        "omitted",
+        "not_visible",
+    ]
+    .iter()
+    .any(|word| key.contains(word));
+    (withholding && set)
+        || (key.contains("visible") && !key.contains("not_visible") && *field == Value::Bool(false))
+}
+
 // Keep get_record's presentation classification separate from write receipts.
 fn is_get_record_text_field(key: &str) -> bool {
     is_record_render_field(key)
@@ -6261,31 +6430,50 @@ fn is_get_record_text_field(key: &str) -> bool {
         )
 }
 
-fn render_legacy_provenance(out: &mut String, value: &Value) {
+/// Imported-v1 authorship: one line on a single read, and in a batch only the
+/// withholding notice, which is a boundary and always renders.
+fn render_legacy_provenance(out: &mut String, value: &Value, batched: bool) {
     let Some(legacy) = value.get("legacy_provenance").filter(|v| !v.is_null()) else {
         return;
     };
     if legacy.get("kind").and_then(Value::as_str) != Some("v1.snapshot_provenance") {
         return;
     }
-    out.push_str("Imported v1 provenance (snapshot):\n");
+    let withheld = legacy.get("actors_withheld").and_then(Value::as_bool) == Some(true);
+    if batched {
+        if withheld {
+            out.push_str("  Actor attribution withheld.\n");
+        }
+        return;
+    }
+    let mut parts = Vec::new();
     for (label, key) in [
-        ("created at", "created_at"),
-        ("creator", "creator"),
-        ("last edited at", "updated_at"),
-        ("last editor", "last_editor"),
+        ("created", "created_at"),
+        ("by", "creator"),
+        ("last edited", "updated_at"),
+        ("by", "last_editor"),
     ] {
         if let Some(found) = string(legacy, key) {
-            let _ = writeln!(out, "  {label}: {}", display_inline(&found));
+            parts.push(format!("{label} {}", display_inline(&found)));
         }
     }
-    if legacy.get("actors_withheld").and_then(Value::as_bool) == Some(true) {
-        out.push_str("  Actor attribution withheld.\n");
+    let _ = write!(out, "  Imported from v1: {}", parts.join(" "));
+    if withheld {
+        out.push_str(" · actor attribution withheld");
     }
+    out.push('\n');
 }
 
 /// Bounded provenance/governance cues, never the full envelopes.
-fn render_record_read_summaries(out: &mut String, item: &Value) {
+fn render_record_read_summaries(out: &mut String, item: &Value, offline: &[&str]) {
+    let item = &Value::Object(
+        item.as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| !offline.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
     if let Some(kind) = item.get("kind_governance").filter(|v| !v.is_null()) {
         let canonical = claimed_string(kind.get("canonical_kind"), "canonical kind");
         let classification = claimed_string(kind.get("classification"), "classification");
@@ -6298,6 +6486,18 @@ fn render_record_read_summaries(out: &mut String, item: &Value) {
                 path.rsplit('/').next().unwrap_or(path),
             )
         };
+        if contribution
+            .pointer("/executor/kind")
+            .and_then(Value::as_str)
+            == Some("delegated_service")
+        {
+            let _ = writeln!(
+                out,
+                "  Contribution: delegated service · channel {}",
+                field("/channel/kind")
+            );
+            return;
+        }
         let _ = write!(
             out,
             "  Contribution: {} · channel {} · run {}",
@@ -6332,6 +6532,77 @@ fn render_preview_note(out: &mut String, value: &Value) {
     }
 }
 
+/// Total characters of record-authored body a batched `get_record` renders
+/// in full. Matches the 24k detail budgets the other renderers use; JSON stays
+/// uncapped and a single-record read is never shortened.
+const BATCHED_BODY_BUDGET: usize = 24_000;
+
+/// Floor for a shortened body, so a record past the budget still shows its
+/// opening rather than an empty quote.
+const SHORTENED_BODY_MIN: usize = 500;
+
+/// Which batched bodies must be shortened, and to how many characters.
+///
+/// Records absent from the map render in full. Small bodies are admitted
+/// first so that one long record cannot crowd every short one out of the
+/// batch; whatever remains is shared among the records that did not fit.
+fn batched_body_allowances(records: &[Value]) -> BTreeMap<usize, usize> {
+    let mut sizes = records
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| string(item, "status").as_deref() != Some("not_found"))
+        .filter_map(|(index, item)| string(item, "body").map(|body| (index, body.chars().count())))
+        .collect::<Vec<_>>();
+    sizes.sort_by_key(|&(index, size)| (size, index));
+    let mut remaining = BATCHED_BODY_BUDGET;
+    let mut over = Vec::new();
+    for (index, size) in sizes {
+        if over.is_empty() && size <= remaining {
+            remaining -= size;
+        } else {
+            over.push((index, size));
+        }
+    }
+    let mut allowances = BTreeMap::new();
+    let mut left = over.len();
+    for (index, size) in over {
+        let share = (remaining / left.max(1)).max(SHORTENED_BODY_MIN);
+        let shown = share.min(size.saturating_sub(1));
+        remaining = remaining.saturating_sub(shown);
+        left -= 1;
+        allowances.insert(index, shown);
+    }
+    allowances
+}
+
+/// The first `max` characters of a body, cut back to a line end when one
+/// falls in the second half (by characters) so the quote ends on a whole line.
+fn shortened_body_prefix(body: &str, max: usize) -> &str {
+    let end = body
+        .char_indices()
+        .nth(max)
+        .map_or(body.len(), |(at, _)| at);
+    let prefix = &body[..end];
+    match prefix.rfind('\n') {
+        Some(newline) if prefix[..newline].chars().count() >= max / 2 => &prefix[..newline],
+        _ => prefix,
+    }
+}
+
+/// Line-quote record-authored text so no line of it can pass for one of
+/// Native's own. Control characters are escaped by `display_inline`.
+fn push_quoted_body(out: &mut String, body: &str) {
+    if body.is_empty() {
+        out.push_str("    > \n");
+        return;
+    }
+    for line in body.split_inclusive('\n') {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let _ = writeln!(out, "    > {}", display_inline(line));
+    }
+}
+
 fn render_get_record(value: &Value, include_response_disclosures: bool) -> String {
     let mut out = temporal_header(value);
     render_preview_note(&mut out, value);
@@ -6347,15 +6618,50 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
     let citations_offset = integer(value, "citations_offset").unwrap_or_default();
     let comments_limit = integer(value, "comments_limit").unwrap_or_default();
     let comments_offset = integer(value, "comments_offset").unwrap_or_default();
+    // Text is a lean projection: what an agent acts on next, plus the
+    // boundary items (quoted bodies, source and age, guard tokens, the run
+    // key, withholding). Everything else is one `format:"json"` read away, and
+    // the response says so once rather than listing fields per record.
+    let mut more_in_json = false;
+    let mut disclosure_fields = BTreeSet::new();
+    let mut requested_fields = BTreeSet::new();
     if include_response_disclosures {
-        let unknown = unknown_object_keys(value, is_get_record_response_field);
-        if !unknown.is_empty() {
-            let _ = writeln!(
-                out,
-                "Additional response fields omitted from text: {}; re-call this read with the same arguments and format:\"json\" for exact values.",
-                inline_json(&json!(unknown))
-            );
-        }
+        let unknown = unknown_object_keys(value, |key| {
+            is_get_record_response_field(key) || key == "standby_context"
+        });
+        more_in_json |= !unknown.is_empty();
+        disclosure_fields.extend(
+            unknown
+                .into_iter()
+                .filter(|key| is_disclosure_field(key, &value[key.as_str()])),
+        );
+    }
+    let body_allowances = if multiple {
+        batched_body_allowances(records)
+    } else {
+        BTreeMap::new()
+    };
+    if !body_allowances.is_empty() {
+        let shortened = body_allowances
+            .keys()
+            .filter_map(|index| records.get(*index))
+            .map(|item| {
+                Value::String(
+                    string(item, "display_reference")
+                        .or_else(|| string(item, "id"))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            out,
+            "Batched bodies are shown in full while they fit a {BATCHED_BODY_BUDGET}-character \
+             budget; the rest show only their opening. \
+             Shortened: {} of {} records {}; each is marked below with how to read it in full.",
+            shortened.len(),
+            records.len(),
+            inline_json(&Value::Array(shortened))
+        );
     }
     for (index, item) in records.iter().enumerate() {
         if index > 0 {
@@ -6407,8 +6713,13 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
 
         // Succession heads the record: a reader who never inspects links
         // still learns the successor's title and reference here.
+        if let Some(summary) = format_read_disclosures(item) {
+            let _ = writeln!(out, "  Context: {summary}");
+        }
         if let Some(summary) = format_superseded_by(item) {
-            let _ = writeln!(out, "  Currency: {summary}");
+            if !format_read_disclosures(item).is_some_and(|context| context.contains(&summary)) {
+                let _ = writeln!(out, "  Currency: {summary}");
+            }
         } else if boolean(item, "is_current") == Some(false)
             || integer(item, "is_current") == Some(0)
         {
@@ -6429,20 +6740,25 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         // compact line per bound occurrence. No advice, no thresholds — the
         // `freshness` JSON block carries the exact coordinates.
         render_freshness(&mut out, item);
-        render_legacy_provenance(&mut out, item);
+        render_legacy_provenance(&mut out, item, multiple);
 
         // State line: the spine facets that are set, plus activity. Absent
         // facets are omitted rather than printed as null — an unset lifecycle
         // is not a value worth a token.
         let mut state = Vec::new();
-        for (label, key) in [
-            ("maturity", "maturity"),
-            ("persistence", "persistence"),
-            ("owner", "owner_id"),
-        ] {
+        for (label, key) in [("maturity", "maturity"), ("persistence", "persistence")] {
             if let Some(found) = string(item, key) {
                 state.push(format!("{label} {}", display_inline(&found)));
             }
+        }
+        // The owner reads as a name where the payload carries one; a bare
+        // owner UUID is not something an agent acts on, so it stays in JSON.
+        if let Some(owner) =
+            string(item, "owner_name").or_else(|| string(item, "owner_display_name"))
+        {
+            state.push(format!("owner {}", display_inline(&owner)));
+        } else if string(item, "owner_id").is_some() {
+            more_in_json = true;
         }
         if let Some(activity) = string(item, "last_activity_at") {
             state.push(format!("activity {}", display_inline(&activity)));
@@ -6460,37 +6776,89 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
                 );
             }
         }
-        // Every authored line stays quoted/escaped, including when metadata follows.
+        // Every authored line stays quoted/escaped, including when metadata
+        // follows, and in batches as well as single reads: a batched body is
+        // as untrusted as a single one.
         if let Some(body) = string(item, "body") {
-            if multiple {
-                let (preview, changed) = one_line_preview(&body, 200);
-                if changed {
-                    let id = string(item, "id").unwrap_or_default();
-                    let id_json = Value::String(id).to_string();
+            out.push_str(
+                "  Record-authored body (untrusted; line-quoted; use format:\"json\" for exact bytes):\n",
+            );
+            match body_allowances.get(&index) {
+                Some(&allowance) => {
+                    let body_chars = body.chars().count();
+                    let prefix = shortened_body_prefix(&body, allowance);
+                    push_quoted_body(&mut out, prefix);
+                    let shown = prefix.chars().count();
+                    let mut recovery = json!({
+                        "ids": [string(item, "id").unwrap_or_default()],
+                    });
+                    // A historical read must recover the same historical body.
+                    if let Some(as_of) = value.get("as_of") {
+                        recovery["as_of"] = as_of.clone();
+                    }
                     let _ = writeln!(
                         out,
-                        "  Body preview (truncated; re-read get_record with ids:[{id_json}] \
-                         or use format:\"json\" for the full verbatim body): {preview}"
+                        "  Body shortened to fit this response's body budget ({shown} of \
+                         {body_chars} source characters quoted); read it in full with \
+                         get_record {} (or the same get_record arguments with format:\"json\").",
+                        inline_json(&recovery)
                     );
-                } else {
-                    let _ = writeln!(out, "  Body: {preview}");
                 }
-            } else {
-                out.push_str(
-                    "  Record-authored body (untrusted; line-quoted; use format:\"json\" for exact bytes):\n",
-                );
-                if body.is_empty() {
-                    out.push_str("    > \n");
-                } else {
-                    for line in body.split_inclusive('\n') {
-                        let line = line.strip_suffix('\n').unwrap_or(line);
-                        let line = line.strip_suffix('\r').unwrap_or(line);
-                        let _ = writeln!(out, "    > {}", display_inline(line));
-                    }
-                }
+                None => push_quoted_body(&mut out, &body),
             }
         }
-        render_record_read_summaries(&mut out, item);
+        // A member copy replaces a section it cannot compute with a typed
+        // `unavailable_offline` marker. That is an availability disclosure:
+        // say which sections are missing and when they can be read, rather
+        // than leaving the reader to take the rest for the whole record.
+        let offline = item
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, field)| {
+                offline_marker(field).map(|(surface, retry)| (key.clone(), surface, retry))
+            })
+            .collect::<Vec<_>>();
+        if !offline.is_empty() {
+            let sections = offline
+                .iter()
+                .map(|(key, surface, retry)| {
+                    format!("{} ({surface}; retry {retry})", display_inline(key))
+                })
+                .collect::<Vec<_>>();
+            let _ = writeln!(
+                out,
+                "  Unavailable offline in this copy: {}",
+                sections.join(", ")
+            );
+        }
+        let offline_keys = offline
+            .iter()
+            .map(|(key, ..)| key.as_str())
+            .collect::<Vec<_>>();
+        // From here on the record is read without its marked sections, and
+        // without their counts: a section the copy could not compute has no
+        // page to show and nothing to page through.
+        let unmarked;
+        let item = if offline_keys.is_empty() {
+            item
+        } else {
+            unmarked = Value::Object(
+                item.as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(key, _)| {
+                        !offline_keys.contains(&key.as_str())
+                            && !offline_keys
+                                .iter()
+                                .any(|marked| section_count_key(marked) == Some(key.as_str()))
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            );
+            &unmarked
+        };
+        render_record_read_summaries(&mut out, item, &offline_keys);
         // The header supplies the short reference and linked title; details
         // retain the full id while dropping derivable paths and the used URL.
         let mut rendered_keys = vec![
@@ -6516,6 +6884,7 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
             "mentions_out",
             "mentions_in",
             "superseded_by",
+            "read_disclosures",
             "freshness",
             "children",
             "suggestions",
@@ -6537,23 +6906,52 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         } else if string(item, "record_url").is_some() {
             rendered_keys.push("record_url");
         }
-        if let Some(details) =
-            exact_known_object_remainder(item, &rendered_keys, is_get_record_text_field)
-        {
+        // Details keep the full id (once per record) and the write-guard
+        // tokens, plus any field that discloses withholding or visibility.
+        // The rest is in JSON, flagged once for the whole response.
+        let mut guard = Vec::new();
+        if let Some(id) = string(item, "id") {
+            guard.push(format!("id {}", display_inline(&id)));
+        }
+        if let Some(version) = string(item, "version").or_else(|| string(item, "record_version")) {
+            guard.push(format!("version {}", display_inline(&version)));
+        }
+        if let Some(digest) = string(item, "body_digest") {
+            guard.push(format!("body_digest {}", display_inline(&digest)));
+        }
+        let details = exact_known_object_remainder(item, &rendered_keys, is_get_record_text_field);
+        let unknown = unknown_object_keys(item, is_get_record_text_field);
+        for (key, field) in details.iter().filter_map(Value::as_object).flatten().chain(
+            unknown
+                .iter()
+                .filter_map(|key| item.get(key.as_str()).map(|field| (key, field))),
+        ) {
+            if offline_marker(field).is_some() {
+                continue;
+            }
+            // Message expectation state says whether a reply or action is
+            // still owed: something an agent acts on, so it stays.
+            if is_disclosure_field(key, field) || key == "message_expectation_state" {
+                guard.push(format!("{} {}", display_inline(key), inline_json(field)));
+            } else if !matches!(
+                key.as_str(),
+                "id" | "version" | "record_version" | "body_digest"
+            ) {
+                more_in_json = true;
+                // A projection the caller asked for by name is named back, so
+                // asking for it never looks like it was ignored.
+                if key == "history_summary" {
+                    requested_fields.insert(key.clone());
+                }
+            }
+        }
+        if !guard.is_empty() {
             let label = if value.get("as_of").is_some() {
                 "Record details (historical projection with live-at-read-time enrichments)"
             } else {
                 "Record details"
             };
-            let _ = writeln!(out, "  {label}: {}", inline_json(&details));
-        }
-        let omitted = unknown_object_keys(item, is_get_record_text_field);
-        if !omitted.is_empty() {
-            let _ = writeln!(
-                out,
-                "  Additional record fields omitted from text: {}; re-call this read with the same arguments and format:\"json\" for exact values.",
-                inline_json(&json!(omitted))
-            );
+            let _ = writeln!(out, "  {label}: {}", guard.join(" · "));
         }
         let facets = array(item, "facets");
         if !facets.is_empty() {
@@ -6634,7 +7032,15 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
                 "children_limit",
             );
             for child in children {
-                let _ = writeln!(out, "    {}", inline_json(child));
+                match render_child_line(child) {
+                    Some(line) => {
+                        let _ = writeln!(out, "    {line}");
+                        more_in_json = true;
+                    }
+                    None => {
+                        let _ = writeln!(out, "    {}", inline_json(child));
+                    }
+                }
             }
         }
         let suggestion_count = integer(item, "suggestion_count").unwrap_or(0);
@@ -6741,6 +7147,16 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
             if total == 0 {
                 continue;
             }
+            // A batch is for reading several bodies; each record's link rows
+            // are a single read (or JSON) away, and the count says they exist.
+            if multiple {
+                let _ = writeln!(
+                    out,
+                    "  {heading}: {} (rows on a single-record read or in format:\"json\")",
+                    claimed_integer(item.get(count_key), count_key)
+                );
+                continue;
+            }
             render_window_heading(
                 &mut out,
                 heading,
@@ -6760,7 +7176,9 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
                 // A row that carries its far-end summary reads like a mention:
                 // title and short reference first. A row without one (an
                 // adapter that attaches none) keeps its exact JSON.
-                match render_link_line(link, arrow) {
+                match render_link_line(link, arrow)
+                    .or_else(|| render_bare_link_line(link, arrow, list_key))
+                {
                     Some(line) => {
                         let _ = writeln!(out, "    {line}");
                     }
@@ -6801,6 +7219,32 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
     }
     if records.is_empty() {
         out.push_str("No records returned.\n");
+    }
+    if more_in_json {
+        // Other tools reuse this renderer for records inside their receipts
+        // (create_exploration, start_work); their arguments are not a read.
+        out.push_str(if include_response_disclosures {
+            "\nMore fields: get_record with the same arguments and format:\"json\""
+        } else {
+            "\nMore record fields: get_record for these ids with format:\"json\""
+        });
+        if !requested_fields.is_empty() {
+            let names = requested_fields.into_iter().map(Value::String).collect();
+            let _ = write!(
+                out,
+                " (including the requested {})",
+                inline_json(&Value::Array(names))
+            );
+        }
+        if !disclosure_fields.is_empty() {
+            let names = disclosure_fields.into_iter().map(Value::String).collect();
+            let _ = write!(
+                out,
+                " (including the withholding fields {})",
+                inline_json(&Value::Array(names))
+            );
+        }
+        out.push_str(".\n");
     }
     out
 }
@@ -6920,6 +7364,55 @@ fn render_mention_lines(entries: &[Value], list_key: &str) -> Vec<String> {
 /// Absence stays absence: a record with no lifecycle says nothing about one,
 /// and a row without the `superseded` flag is not claimed live — the flag is
 /// only ever emitted when true.
+/// One child row: title and reference, type, lifecycle. A row without an id
+/// keeps its exact JSON, since nothing else could address it.
+fn render_child_line(child: &Value) -> Option<String> {
+    let id = string(child, "id").filter(|id| !id.is_empty())?;
+    let reference = match string(child, "display_reference").filter(|r| !r.is_empty()) {
+        Some(short) => short,
+        None => id,
+    };
+    let mut line = format!(
+        "{} ({})  {}",
+        escaped_record_name(child),
+        display_inline(&reference),
+        type_label(child)
+    );
+    if let Some(lifecycle) = lifecycle_display(child).or_else(|| string(child, "lifecycle")) {
+        let _ = write!(line, " · {}", display_inline(&lifecycle));
+    }
+    if child.get("archived").and_then(Value::as_bool) == Some(true) {
+        line.push_str("  [archived]");
+    }
+    for (key, field) in child.as_object().into_iter().flatten() {
+        if is_disclosure_field(key, field) {
+            let _ = write!(line, " · {} {}", display_inline(key), inline_json(field));
+        }
+    }
+    Some(line)
+}
+
+/// A link row with no far-end summary: relationship, the far end's id, and
+/// the note. The row's own id and timestamps stay in JSON.
+fn render_bare_link_line(link: &Value, arrow: &str, list_key: &str) -> Option<String> {
+    let relationship = display_inline(&string(link, "relationship")?);
+    let far_key = if list_key == "links_out" {
+        "target_id"
+    } else {
+        "source_id"
+    };
+    let far = display_inline(&string(link, far_key).filter(|id| !id.is_empty())?);
+    let mut line = format!("{arrow} {relationship} {far}");
+    if let Some(note) = string(link, "note").filter(|note| !note.is_empty()) {
+        let (note, shortened) = one_line_preview(&note, 160);
+        let _ = write!(line, " — {}", display_inline(&note));
+        if shortened {
+            line.push_str(" (note shortened)");
+        }
+    }
+    Some(line)
+}
+
 fn render_link_line(link: &Value, arrow: &str) -> Option<String> {
     let other = link.get("other").filter(|other| other.is_object())?;
     let relationship = display_inline(&string(link, "relationship")?);
@@ -6927,9 +7420,11 @@ fn render_link_line(link: &Value, arrow: &str) -> Option<String> {
     // Short reference for reading, full id for copying: the raw row this
     // replaces carried the full id and nothing else in the text does.
     let id = display_inline(&string(other, "id").filter(|id| !id.is_empty())?);
+    // The short reference where the server minted one (it resolves in any
+    // call); the full id only where it did not.
     let reference =
         match string(other, "display_reference").filter(|reference| !reference.is_empty()) {
-            Some(reference) => format!("{} · {id}", display_inline(&reference)),
+            Some(reference) => display_inline(&reference),
             None => id,
         };
     let mut facts = Vec::new();
@@ -7036,7 +7531,7 @@ fn compact_query_record_omitted_fields(record: &Value) -> Vec<String> {
                 "id" | "type" | "kind" | "name" | "maturity" | "last_activity_at" | "work_state"
                     // Rendered inline by `record_line` as `[superseded by …]`,
                     // so the footnote must not also claim it was omitted.
-                    | "superseded_by"
+                    | "superseded_by" | "read_disclosures"
             )
         })
         .map(|(key, _)| key.clone())
@@ -7723,14 +8218,23 @@ fn render_search(value: &Value) -> String {
     }
     out.push('\n');
 
-    let id_width = column_width(hits, |hit| string(hit, "id").unwrap_or_default());
+    // A hit is addressed by its server-minted short reference where it has
+    // one (it resolves in any call), else by its full id.
+    let reference = |hit: &Value| match string(hit, "display_reference")
+        .filter(|reference| !reference.is_empty())
+    {
+        Some(reference) => display_inline(&reference),
+        None => claimed_string(hit.get("id"), "id"),
+    };
+    let id_width = column_width(hits, reference);
     let type_width = column_width(hits, type_label);
+    let mut snippets_shortened = false;
     for hit in hits {
         render_pending_label(&mut out, hit);
         let _ = write!(
             out,
             "  {}  {}  {}  [score {}]",
-            pad(&string(hit, "id").unwrap_or_default(), id_width),
+            pad(&reference(hit), id_width),
             pad(&type_label(hit), type_width),
             linked_record_name(hit),
             hit.get("score")
@@ -7741,7 +8245,7 @@ fn render_search(value: &Value) -> String {
         out.push('\n');
         // The successor is why-adjacent: a hit worth opening is worth knowing
         // the replacement of, without a second read.
-        if let Some(summary) = format_superseded_by(hit) {
+        if let Some(summary) = format_record_context(hit) {
             let _ = writeln!(out, "      {summary}");
         }
         // The snippet is why this hit matched — the one thing the id and name
@@ -7749,16 +8253,14 @@ fn render_search(value: &Value) -> String {
         if let Some(snippet) = string(hit, "snippet") {
             let (flat, changed) = one_line_preview(&snippet, 200);
             if !flat.is_empty() {
-                let _ = write!(out, "      {flat}");
-                if changed {
-                    let _ = write!(
-                        out,
-                        " (snippet shortened; use format:\"json\" for the full value)"
-                    );
-                }
-                out.push('\n');
+                let _ = writeln!(out, "      {}", display_inline(&flat));
+                snippets_shortened |= changed;
             }
         }
+    }
+
+    if snippets_shortened {
+        out.push_str("  (Snippets are shortened to one line; format:\"json\" has them in full.)\n");
     }
 
     // Near-misses and guidance are the thin-results machinery (3bc7fd0): the
@@ -7781,14 +8283,26 @@ fn render_search(value: &Value) -> String {
             let _ = writeln!(
                 out,
                 "  {}  {}  {}",
-                string(candidate, "id").unwrap_or_default(),
+                reference(candidate),
                 type_label(candidate),
                 linked_record_name(candidate),
             );
         }
     }
-    if let Some(guidance) = string(value, "guidance") {
-        let _ = writeln!(out, "\n{guidance}");
+    if value.get("near_misses").is_some() {
+        // Thin results: keep the prompt to reformulate (3bc7fd0), in one line.
+        // The near-miss headings above explain themselves.
+        let _ = writeln!(
+            out,
+            "\n{} — absence is weak evidence. Try synonyms, fewer or different terms, or query_record for structured filters.",
+            if hits.is_empty() {
+                "No full-text matches".to_string()
+            } else {
+                format!("Only {} full-text match(es); likely not exhaustive", hits.len())
+            }
+        );
+    } else if let Some(guidance) = string(value, "guidance") {
+        let _ = writeln!(out, "\n{}", display_inline(&guidance));
     }
     out
 }
@@ -7898,7 +8412,7 @@ fn render_batch_write(value: &Value) -> String {
     );
     for result in results {
         let _ = match claimed_string(result.get("op"), "op").as_str() {
-            "add_link" => writeln!(
+            "add_link" => write!(
                 out,
                 "  [{}] add_link {} -> {}  {}",
                 claimed_integer(result.get("index"), "index"),
@@ -7906,7 +8420,7 @@ fn render_batch_write(value: &Value) -> String {
                 claimed_string(result.get("target_id"), "target_id"),
                 claimed_string(result.get("status"), "status"),
             ),
-            op => writeln!(
+            op => write!(
                 out,
                 "  [{}] {} {}  {}",
                 claimed_integer(result.get("index"), "index"),
@@ -7915,6 +8429,12 @@ fn render_batch_write(value: &Value) -> String {
                 claimed_string(result.get("status"), "status"),
             ),
         };
+        for key in ["version", "body_digest"] {
+            if let Some(token) = string(result, key) {
+                let _ = write!(out, " · {key} {}", display_inline(&token));
+            }
+        }
+        out.push('\n');
     }
     let warnings = array(value, "warnings");
     if !warnings.is_empty() {
@@ -7962,7 +8482,12 @@ fn render_write_receipt(out: &mut String, value: &Value) {
     };
     let receipt = object
         .iter()
-        .filter(|(key, _)| key.as_str() == "body_digest" || !is_record_render_field(key))
+        .filter(|(key, field)| match key.as_str() {
+            "body_digest" => true,
+            // Kernel v2 already renders the same guard as record_version.
+            "version" => object.get("record_version") != Some(*field),
+            _ => !is_record_render_field(key),
+        })
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
@@ -8066,6 +8591,7 @@ fn is_enriched_record_field(key: &str) -> bool {
             | "mentions_in"
             | "mentions_in_count"
             | "superseded_by"
+            | "read_disclosures"
             | "children"
             | "child_count"
             | "suggestions"
@@ -8162,6 +8688,47 @@ fn render_act(out: &mut String, value: &Value) {
             "act: {act} (the per-workspace act number this write allocated)",
         );
     }
+}
+
+fn render_merge_body(value: &Value) -> String {
+    let record = string(value, "record_id").unwrap_or_default();
+    let outcome = string(value, "outcome").unwrap_or_default();
+    if outcome == "refused" {
+        let mut out = format!("Merge refused  {record}\n");
+        if let Some(reason) = string(value, "reason") {
+            let _ = writeln!(out, "reason: {reason}");
+        }
+        if let Some(retryable) = boolean(value, "retryable") {
+            let _ = writeln!(out, "retryable: {retryable}");
+        }
+        if let Some(message) = string(value, "message") {
+            let _ = writeln!(out, "{message}");
+        }
+        return out;
+    }
+    let mut out = format!(
+        "{}  {}\n",
+        if outcome == "merged_with_clashes" {
+            "Merged with unmerged passages"
+        } else {
+            "Merged"
+        },
+        record
+    );
+    if let Some(version) = value.pointer("/result/version").and_then(Value::as_str) {
+        let _ = writeln!(out, "version: {version}");
+    }
+    if let Some(digest) = value.pointer("/result/body_digest").and_then(Value::as_str) {
+        let _ = writeln!(out, "body_digest: {digest}");
+    }
+    if let Some(hunks) = value.get("applied_hunks").and_then(Value::as_u64) {
+        let _ = writeln!(out, "applied hunks: {hunks}");
+    }
+    if let Some(clashes) = value.get("unmerged").and_then(Value::as_array) {
+        let _ = writeln!(out, "unmerged passages: {}", clashes.len());
+    }
+    render_act(&mut out, value);
+    out
 }
 
 fn render_delete_record(value: &Value) -> String {
@@ -8334,7 +8901,7 @@ fn render_history(value: &Value) -> String {
         out.push_str(" — stream exhausted");
     }
     out.push('\n');
-    render_legacy_provenance(&mut out, value);
+    render_legacy_provenance(&mut out, value, false);
     if detail == "metadata" {
         let note = "Metadata detail: authoritative events[].payload values were omitted. Request detail \"full\" for complete caller-visible payloads. Payload sizes below are compact UTF-8 JSON bytes after authorization and redaction.\n";
         #[cfg(feature = "v2-kernel-probe")]
@@ -8502,12 +9069,13 @@ fn render_exploration(value: &Value) -> String {
     };
     let name = string(exploration, "name").unwrap_or_else(|| "Exploration".into());
     let mut out = format!(
-        "{name} — {} candidate{} in one exploration (unordered)\n",
+        "{} — {} candidate{} in one exploration (unordered)\n",
+        display_inline(&name),
         candidates.len(),
         if candidates.len() == 1 { "" } else { "s" }
     );
     if let Some(id) = string(exploration, "id") {
-        let _ = writeln!(out, "Exploration: {id}");
+        let _ = writeln!(out, "Exploration: {}", display_inline(&id));
     }
     match boolean(value, "exploration_created") {
         Some(created) => {
@@ -10357,7 +10925,16 @@ fn scan_unavailable_marker(value: &Value) -> Option<(String, String)> {
     ))
 }
 
+fn scan_budget_unavailable(value: &Value) -> bool {
+    string(value, "status").as_deref() == Some("unavailable")
+        && string(value, "reason").as_deref() == Some("attribution_budget_exhausted")
+}
+
 fn render_count_shape(out: &mut String, label: &str, value: &Value) {
+    if scan_budget_unavailable(value) {
+        let _ = writeln!(out, "{label}: unavailable (attribution_budget_exhausted)");
+        return;
+    }
     if let Some((surface, retry)) = scan_unavailable_marker(value) {
         let _ = writeln!(
             out,
@@ -10494,12 +11071,19 @@ fn render_scan(value: &Value) -> String {
         out.push_str("\nCensus\n");
         for (name, counts) in census {
             render_count_shape(&mut out, name, counts);
+            if let Some(note) = string(counts, "interpretation_note") {
+                let _ = writeln!(out, "  {note}");
+            }
         }
     }
 
     if let Some(axes) = value.get("axes").and_then(Value::as_object) {
         out.push_str("\nAxes\n");
         for (name, axis) in axes {
+            if scan_budget_unavailable(axis) {
+                let _ = writeln!(out, "{name}: unavailable (attribution_budget_exhausted); authored_by contributions to convergence are unavailable");
+                continue;
+            }
             if let Some((surface, retry)) = scan_unavailable_marker(axis) {
                 let _ = writeln!(
                     out,
@@ -10520,6 +11104,11 @@ fn render_scan(value: &Value) -> String {
             }
             if (samples.len() as i64) < count {
                 out.push_str(" (sample is a window, not the pool)");
+            }
+            if boolean(axis, "sample_selection_bounded") == Some(true) {
+                out.push_str(
+                    " · sample selection reached the search candidate bound; pool count is exact",
+                );
             }
             out.push('\n');
             for sample in samples {
@@ -11653,5 +12242,72 @@ mod body_receipt_render_tests {
             rendered.contains("[demo-advisor@1.0] notice: plain advice"),
             "{rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_disclosure_render_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_context_preserves_legacy_currency_and_explicit_current_state() {
+        let mut row = json!({"id":"old","name":"Sketch","status":"found",
+            "read_disclosures":[{"summary":"part of Programme (parent)"}],
+            "superseded_by":{"total_count":1,"items":[{"id":"new","name":"Plan"}]}});
+        for output in [
+            record_line(&row, 3, 8),
+            render_get_record(&json!({"records":[row.clone()]}), true),
+        ] {
+            assert!(output.contains("part of Programme (parent)"), "{output}");
+            assert!(output.contains("superseded by Plan (new)"), "{output}");
+        }
+        row.as_object_mut().unwrap().remove("superseded_by");
+        row["is_current"] = json!(true);
+        let output = render_get_record(&json!({"records":[row]}), true);
+        assert!(output.contains("Currency: current"), "{output}");
+    }
+
+    #[test]
+    fn read_disclosures_render_in_get_search_and_list_without_duplication() {
+        let row = json!({"id":"old", "name":"Sketch", "type":"Document",
+            "status":"found", "read_disclosures":[
+                {"summary":"superseded by Plan (new)"},
+                {"summary":"newer work builds on this: Programme (prog)"}],
+            "superseded_by":{"total_count":1,"items":[{"id":"new","name":"Plan"}]}});
+        let get = render_get_record(&json!({"records":[row.clone()],"links_limit":0}), true);
+        let search = render_search(&json!({"query":"Sketch","hits":[row.clone()]}));
+        let list = record_line(&row, 3, 8);
+        for output in [get, search, list] {
+            assert_eq!(
+                output.matches("superseded by Plan (new)").count(),
+                1,
+                "{output}"
+            );
+            assert!(
+                output.contains("newer work builds on this: Programme (prog)"),
+                "{output}"
+            );
+            assert!(
+                !output.contains("Omitted record fields: read_disclosures"),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_disclosures_preserve_existing_text_and_escape_multiline_summaries() {
+        let plain = json!({"id":"old","name":"Sketch","type":"Document","status":"found"});
+        let mut empty = plain.clone();
+        empty["read_disclosures"] = json!([]);
+        assert_eq!(record_line(&plain, 3, 8), record_line(&empty, 3, 8));
+        assert_eq!(
+            render_get_record(&json!({"records":[plain]}), true),
+            render_get_record(&json!({"records":[empty]}), true)
+        );
+        let context = format_read_disclosures(
+            &json!({"read_disclosures":[{"summary":"part of Parent\nforged line"}]}),
+        )
+        .unwrap();
+        assert!(!context.contains('\n'));
     }
 }

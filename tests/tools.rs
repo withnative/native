@@ -81,6 +81,8 @@ mod mcp;
 mod mcp_apps;
 #[path = "tools/native_cli.rs"]
 mod native_cli;
+#[path = "tools/node_oauth_resource.rs"]
+mod node_oauth_resource;
 #[path = "tools/overlap_measurement.rs"]
 mod overlap_measurement;
 #[path = "tools/position_inputs.rs"]
@@ -99,6 +101,8 @@ mod record_shape_preflight;
 mod records_read_format;
 #[path = "tools/relationships.rs"]
 mod relationships;
+#[path = "tools/replay_conformance.rs"]
+mod replay_conformance;
 #[path = "tools/resolve_many.rs"]
 mod resolve_many;
 #[path = "tools/saved_sessions_s4.rs"]

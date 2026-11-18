@@ -658,11 +658,24 @@ enum SortDirectionSchema {
     Desc,
 }
 
+#[derive(Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordProjection {
+    Metadata,
+    /// View-backed hook read. The wire value is the dotted projection name.
+    #[serde(rename = "record_hook.v1")]
+    #[schemars(rename = "record_hook.v1")]
+    RecordHookV1,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct QueryRecordArgs {
     #[schemars(with = "Vec<QueryStepSchema>", length(min = 1))]
     steps: Vec<Value>,
+    /// List metadata only; omits body and body_digest. Default is the existing full read.
+    projection: Option<RecordProjection>,
     /// Event activity over `steps`; exclusive with other terminals and paging.
     activity: Option<activity::ActivityArgs>,
     #[serde(default)]
@@ -747,6 +760,7 @@ enum QueryPlan {
         args: activity::ActivityArgs,
         request: Value,
     },
+    RecordHook,
 }
 
 impl QueryPlan {
@@ -755,6 +769,7 @@ impl QueryPlan {
             Self::Aggregate { steps, .. }
             | Self::Pipeline { steps, .. }
             | Self::Activity { steps, .. } => steps,
+            Self::RecordHook => &[],
         }
     }
 
@@ -763,6 +778,7 @@ impl QueryPlan {
             Self::Aggregate { steps, .. }
             | Self::Pipeline { steps, .. }
             | Self::Activity { steps, .. } => steps,
+            Self::RecordHook => &mut [],
         }
     }
 }
@@ -772,6 +788,13 @@ impl QueryPlan {
 /// record cannot acquire `has_query` under a weaker interpretation than a
 /// direct call.
 fn parse_query_plan(tool: &str, arguments: Value) -> Result<QueryPlan> {
+    // The hook accepts `body_chars`, which is not part of the saved-query
+    // grammar. Validate that projection from the raw object before
+    // `QueryRecordArgs` rejects the field as unknown.
+    if super::record_hook::requested(&arguments) {
+        super::record_hook::validate(tool, &arguments)?;
+        return Ok(QueryPlan::RecordHook);
+    }
     let request = arguments.clone();
     let args: QueryRecordArgs = parse_args(tool, arguments)?;
     if args.steps.is_empty() {
@@ -789,6 +812,13 @@ fn parse_query_plan(tool: &str, arguments: Value) -> Result<QueryPlan> {
     if matches!(steps.first(), Some(pipeline::Step::Traverse(_))) {
         return Err(Error::engine(format!(
             "{tool}: pipeline cannot start with a traverse step — seed with a filter first"
+        )));
+    }
+    if args.projection.is_some()
+        && (args.activity.is_some() || args.aggregate.is_some() || args.count_by.is_some())
+    {
+        return Err(Error::engine(format!(
+            "{tool}: projection requires a record-producing query"
         )));
     }
     if let Some(activity_args) = args.activity {
@@ -935,6 +965,7 @@ fn parse_query_plan(tool: &str, arguments: Value) -> Result<QueryPlan> {
         steps,
         count_by,
         opts: pipeline::PipelineOptions {
+            metadata_only: args.projection.is_some(),
             facet_order,
             order,
             limit: args.limit.unwrap_or(defaults.limit),
@@ -943,21 +974,38 @@ fn parse_query_plan(tool: &str, arguments: Value) -> Result<QueryPlan> {
     })
 }
 
+fn reject_saved_projection(tool: &str, arguments: &Value) -> Result<()> {
+    if arguments.get("projection").is_some() {
+        return Err(Error::engine(format!(
+            "{tool}: projection is direct-call-only"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_saved_query_args(tool: &str, arguments: Value) -> Result<()> {
+    reject_saved_projection(tool, &arguments)?;
     match parse_query_plan(tool, arguments)? {
         QueryPlan::Activity { .. } => Err(Error::engine(format!(
             "{tool}: activity is direct-call-only and is not supported in saved query v{SAVED_QUERY_VERSION}"
+        ))),
+        QueryPlan::RecordHook => Err(Error::engine(format!(
+            "{tool}: projection is direct-call-only"
         ))),
         QueryPlan::Pipeline { .. } | QueryPlan::Aggregate { .. } => Ok(()),
     }
 }
 
 fn validate_saved_record_query_args(tool: &str, arguments: Value) -> Result<()> {
+    reject_saved_projection(tool, &arguments)?;
     match parse_query_plan(tool, arguments)? {
         QueryPlan::Pipeline {
             count_by: None, ..
         } => Ok(()),
-        QueryPlan::Pipeline { .. } | QueryPlan::Aggregate { .. } | QueryPlan::Activity { .. } => {
+        QueryPlan::Pipeline { .. }
+        | QueryPlan::Aggregate { .. }
+        | QueryPlan::Activity { .. }
+        | QueryPlan::RecordHook => {
             Err(Error::engine(format!(
                 "{tool}: Collection kind:query v{SAVED_QUERY_VERSION} must return records; non-record terminals are not supported"
             )))
@@ -971,6 +1019,9 @@ pub(crate) async fn execute_query_record_args_as(
     tool: &str,
     arguments: Value,
 ) -> Result<Value> {
+    if super::record_hook::requested(&arguments) {
+        return super::record_hook::execute_owned(db, caller, arguments).await;
+    }
     execute_query_record_args_with_lens_as(&ReadLens::live(db), caller, tool, arguments).await
 }
 
@@ -1021,6 +1072,10 @@ pub(crate) async fn execute_portable_live_query_record<
                 "query_record activity terminal",
             ))
         }
+        QueryPlan::RecordHook => Err(crate::domain_transaction::unsupported_backend_operation(
+            "portable-domain",
+            "query_record record_hook.v1 projection",
+        )),
         QueryPlan::Aggregate { steps, spec } => {
             crate::domain_transaction::logical_query::run_aggregate(
                 executor, caller, TOOL, &steps, &spec,
@@ -1176,24 +1231,33 @@ async fn member_require_record(pool: &sqlx::SqlitePool, tool: &str, record_id: &
 /// A hidden parent is nulled at produce time, so the walk stops short and
 /// the path reads not-visible — matching online.
 async fn member_containment_path_visible(pool: &sqlx::SqlitePool, record_id: &str) -> Result<bool> {
-    if record_id == crate::schema::ROOT_RECORD_ID {
+    let mut connection = pool.acquire().await?;
+    member_containment_path_visible_on(&mut connection, record_id, crate::schema::ROOT_RECORD_ID)
+        .await
+}
+async fn member_containment_path_visible_on(
+    connection: &mut sqlx::SqliteConnection,
+    record_id: &str,
+    root: &str,
+) -> Result<bool> {
+    if record_id == root {
         return Ok(true);
     }
     let mut current: Option<String> =
         sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
             .bind(record_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *connection)
             .await?
             .flatten();
     for _ in 0..64 {
         match current {
             None => return Ok(false),
-            Some(id) if id == crate::schema::ROOT_RECORD_ID => return Ok(true),
+            Some(id) if id == root => return Ok(true),
             Some(id) => {
                 let row: Option<Option<String>> =
                     sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
                         .bind(&id)
-                        .fetch_optional(pool)
+                        .fetch_optional(&mut *connection)
                         .await?;
                 match row {
                     None => return Ok(false),
@@ -1206,6 +1270,8 @@ async fn member_containment_path_visible(pool: &sqlx::SqlitePool, record_id: &st
 }
 
 enum QueryExecutionSource<'a, 'db> {
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember(&'a mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession),
     Lens(&'a ReadLens<'db>),
     Live(&'a mut sqlx::Transaction<'db, sqlx::Sqlite>),
 }
@@ -1215,6 +1281,10 @@ impl QueryExecutionSource<'_, '_> {
         // Member copies omit `version` (§2.6) and exclude `content_events`,
         // so there is nothing to annotate; the scrub removes any key anyway.
         if matches!(self, Self::Lens(lens) if lens.is_member()) {
+            return Ok(());
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if matches!(self, Self::NativeMember(_)) {
             return Ok(());
         }
         let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
@@ -1229,6 +1299,8 @@ impl QueryExecutionSource<'_, '_> {
         }
 
         let rows: Vec<(String, i64)> = match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => return Ok(()),
             Self::Lens(lens) => {
                 let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT record_id, MAX(seq) FROM content_events WHERE record_id IN (",
@@ -1293,6 +1365,13 @@ impl QueryExecutionSource<'_, '_> {
             return Ok(());
         }
         let mut states = match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => {
+                return Err(Error::unavailable_offline(
+                    "query_record",
+                    "include_coordination",
+                ))
+            }
             Self::Lens(lens) => {
                 let mut conn = lens.projection().snapshot_pool().acquire().await?;
                 super::work::project_work_states_in_cross_pool(
@@ -1321,6 +1400,22 @@ impl QueryExecutionSource<'_, '_> {
 
     async fn require_record(&mut self, caller: &Caller, tool: &str, record_id: &str) -> Result<()> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                let present: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND deleted_at IS NULL)",
+                )
+                .bind(record_id)
+                .fetch_one(&mut **session.transaction())
+                .await?;
+                if present {
+                    Ok(())
+                } else {
+                    Err(Error::engine(format!(
+                        "{tool}: record {record_id} does not exist"
+                    )))
+                }
+            }
             Self::Lens(lens) => {
                 // Slice presence replaces the policy fold; hidden and absent
                 // are indistinguishable not_found, matching online.
@@ -1356,6 +1451,10 @@ impl QueryExecutionSource<'_, '_> {
 
     async fn hydrate_has_query_filters(&mut self, steps: &mut [pipeline::Step]) -> Result<()> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                hydrate_has_query_filters_in(session.transaction(), steps).await
+            }
             Self::Lens(lens) => hydrate_has_query_filters(lens.projection(), steps).await,
             Self::Live(tx) => hydrate_has_query_filters_in(tx, steps).await,
         }
@@ -1370,6 +1469,8 @@ impl QueryExecutionSource<'_, '_> {
         request: Value,
     ) -> Result<Value> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => Err(Error::unavailable_offline(tool, "activity")),
             Self::Lens(lens) => {
                 execute_activity_with_lens(lens, Some(caller), tool, steps, args, request).await
             }
@@ -1384,6 +1485,10 @@ impl QueryExecutionSource<'_, '_> {
         spec: &pipeline::AggregateSpec,
     ) -> Result<(pipeline::AggregateOutput, Vec<(String, i64)>)> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                pipeline::run_member_aggregate_with_diagnostics(session, steps, spec).await
+            }
             Self::Lens(lens) => {
                 pipeline::run_aggregate_with_lens_diagnostics_as(lens, principal, steps, spec).await
             }
@@ -1401,6 +1506,10 @@ impl QueryExecutionSource<'_, '_> {
         opts: &pipeline::PipelineOptions,
     ) -> Result<(pipeline::PipelineOutput, Vec<(String, i64)>)> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                pipeline::run_member_with_diagnostics(session, steps, count_by, opts).await
+            }
             Self::Lens(lens) => {
                 pipeline::run_with_lens_diagnostics_as(lens, principal, steps, count_by, opts).await
             }
@@ -1412,6 +1521,8 @@ impl QueryExecutionSource<'_, '_> {
 
     async fn visible_ids(&mut self, caller: &Caller, ids: Vec<String>) -> Result<HashSet<String>> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => Ok(pipeline::member_visible_ids(session, ids).await),
             Self::Lens(lens) => {
                 super::visible_ids_in_pool(lens.meta().snapshot_pool(), caller, ids).await
             }
@@ -1425,6 +1536,13 @@ impl QueryExecutionSource<'_, '_> {
         authored_home: Option<&str>,
     ) -> Result<bool> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => Ok(sqlx::query_scalar(
+                "SELECT custody_boundary FROM main.member_record_metadata WHERE record_id=?",
+            )
+            .bind(record_id)
+            .fetch_one(&mut **session.transaction())
+            .await?),
             Self::Lens(lens) => {
                 // Member copies ship no anchors; the MCP layer turns the
                 // field into a marker, mirroring get_record.
@@ -1449,6 +1567,15 @@ impl QueryExecutionSource<'_, '_> {
             return Ok(true);
         }
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                member_containment_path_visible_on(
+                    session.transaction(),
+                    record_id,
+                    crate::events::KERNEL_ROOT_ID,
+                )
+                .await
+            }
             Self::Lens(lens) => {
                 if lens.is_member() {
                     return member_containment_path_visible(
@@ -1485,6 +1612,23 @@ pub(crate) async fn execute_query_record_args_with_lens_as(
 ) -> Result<Value> {
     execute_query_record_args_from(
         &mut QueryExecutionSource::Lens(lens),
+        caller,
+        tool,
+        arguments,
+        false,
+    )
+    .await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn execute_query_record_args_with_native_member_as(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value> {
+    execute_query_record_args_from(
+        &mut QueryExecutionSource::NativeMember(session),
         caller,
         tool,
         arguments,
@@ -1548,11 +1692,22 @@ async fn execute_query_record_args_from(
     arguments: Value,
     include_page_basis: bool,
 ) -> Result<Value> {
+    let metadata_only = arguments["projection"] == "metadata";
     let mut plan = parse_query_plan(tool, arguments)?;
+    if matches!(plan, QueryPlan::RecordHook) {
+        return Err(Error::engine(format!(
+            "{tool}: record_hook.v1 is served by the caller SQL read session"
+        )));
+    }
     authorize_query_reference_selectors(source, caller, tool, plan.steps()).await?;
     source.hydrate_has_query_filters(plan.steps_mut()).await?;
     let principal = super::principal(caller);
     let mut payload = match plan {
+        QueryPlan::RecordHook => {
+            return Err(Error::engine(format!(
+                "{tool}: record_hook.v1 is served by the caller SQL read session"
+            )));
+        }
         QueryPlan::Activity {
             steps,
             args,
@@ -1601,7 +1756,35 @@ async fn execute_query_record_args_from(
         }
     };
     redact_query_record_references(source, caller, &mut payload).await?;
+    if metadata_only {
+        project_record_metadata(&mut payload);
+    }
     Ok(payload)
+}
+
+/// The shared structured-list projection. Keep lifecycle interpretation intact:
+/// consumers derive the raw lifecycle without inventing a second interpretation.
+pub(crate) fn project_record_metadata(payload: &mut Value) {
+    if let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) {
+        for record in records {
+            if let Some(record) = record.as_object_mut() {
+                record.retain(|key, _| {
+                    matches!(
+                        key.as_str(),
+                        "id" | "type"
+                            | "kind"
+                            | "name"
+                            | "summary"
+                            | "home_id"
+                            | "lifecycle_interpretation"
+                            | "maturity"
+                            | "updated_at"
+                            | "last_activity_at"
+                    )
+                });
+            }
+        }
+    }
 }
 
 async fn activity_event_for_caller(
@@ -1843,7 +2026,43 @@ async fn redact_query_record_references_inner(
         })
         .collect();
     let visible = source.visible_ids(caller, ids).await?;
-    for record in records {
+    // The live source already pins content, policy and custody to one
+    // transaction. Keep ancestor permission reuse inside that same boundary.
+    let live_disclosures = if let QueryExecutionSource::Live(tx) = source {
+        if super::is_legacy_local(caller) {
+            None
+        } else {
+            let mut indices = Vec::new();
+            let mut subjects = Vec::new();
+            for (index, record) in records.iter().enumerate() {
+                if let Some(id) = record.get("id").and_then(Value::as_str) {
+                    indices.push(index);
+                    subjects.push((
+                        id.to_owned(),
+                        record
+                            .get("home_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    ));
+                }
+            }
+            let disclosures = crate::query::tree::query_path_disclosures_in(
+                tx,
+                super::principal(caller),
+                &subjects,
+            )
+            .await?;
+            Some(
+                indices
+                    .into_iter()
+                    .zip(disclosures)
+                    .collect::<HashMap<_, _>>(),
+            )
+        }
+    } else {
+        None
+    };
+    for (index, record) in records.iter_mut().enumerate() {
         let Some(object) = record.as_object_mut() else {
             continue;
         };
@@ -1853,11 +2072,19 @@ async fn redact_query_record_references_inner(
             .and_then(Value::as_str)
             .map(str::to_owned);
         if let Some(record_id) = record_id.as_deref() {
-            let custody_boundary = source
-                .custody_boundary(record_id, authored_home.as_deref())
-                .await?;
-            let containment_path_visible =
-                source.containment_path_visible(caller, record_id).await?;
+            let (custody_boundary, containment_path_visible) = match live_disclosures
+                .as_ref()
+                .and_then(|disclosures| disclosures.get(&index))
+                .copied()
+            {
+                Some(disclosure) => disclosure,
+                None => (
+                    source
+                        .custody_boundary(record_id, authored_home.as_deref())
+                        .await?,
+                    source.containment_path_visible(caller, record_id).await?,
+                ),
+            };
             object.insert("custody_boundary".into(), json!(custody_boundary));
             object.insert(
                 "containment_path_visible".into(),
@@ -1933,11 +2160,12 @@ fn validate_interpretation_query(tool: &str, arguments: Value) -> Result<()> {
             "{tool}: include_interpretation requires limit <= {}",
             super::attribution::MAX_GENERIC_INTERPRETATION_BEARERS
         ))),
-        QueryPlan::Pipeline { .. } | QueryPlan::Aggregate { .. } | QueryPlan::Activity { .. } => {
-            Err(Error::engine(format!(
-                "{tool}: include_interpretation is supported only for record-producing queries"
-            )))
-        }
+        QueryPlan::Pipeline { .. }
+        | QueryPlan::Aggregate { .. }
+        | QueryPlan::Activity { .. }
+        | QueryPlan::RecordHook => Err(Error::engine(format!(
+            "{tool}: include_interpretation is supported only for record-producing queries"
+        ))),
     }
 }
 
@@ -1951,11 +2179,12 @@ fn validate_coordination_query(tool: &str, arguments: Value) -> Result<()> {
         QueryPlan::Pipeline { count_by: None, .. } => Err(Error::engine(format!(
             "{tool}: include_coordination requires limit <= 50"
         ))),
-        QueryPlan::Pipeline { .. } | QueryPlan::Aggregate { .. } | QueryPlan::Activity { .. } => {
-            Err(Error::engine(format!(
-                "{tool}: include_coordination is supported only for record-producing queries"
-            )))
-        }
+        QueryPlan::Pipeline { .. }
+        | QueryPlan::Aggregate { .. }
+        | QueryPlan::Activity { .. }
+        | QueryPlan::RecordHook => Err(Error::engine(format!(
+            "{tool}: include_coordination is supported only for record-producing queries"
+        ))),
     }
 }
 
@@ -1967,6 +2196,21 @@ fn validate_query_record_envelope(
     let include_interpretation = take_include_interpretation(tool, arguments)?;
     let include_coordination = take_include_coordination(tool, arguments)?;
     let page_basis_digest = take_page_basis_digest(tool, arguments)?;
+    if arguments["projection"] == "metadata" && (include_interpretation || include_coordination) {
+        return Err(Error::engine(format!(
+            "{tool}: metadata projection cannot include interpretation or coordination"
+        )));
+    }
+    if arguments["projection"] == "record_hook.v1"
+        && (include_interpretation
+            || include_coordination
+            || as_of.is_some()
+            || page_basis_digest.is_some())
+    {
+        return Err(Error::engine(format!(
+            "{tool}: record_hook.v1 cannot include interpretation, coordination, as_of, or a page basis"
+        )));
+    }
     if include_interpretation {
         if as_of.is_some() {
             return Err(Error::engine(format!(
@@ -2010,7 +2254,7 @@ fn verify_page_basis(tool: &str, output: &Value, expected: Option<&str>) -> Resu
 fn record_producing_query(tool: &str, arguments: Value) -> Result<bool> {
     Ok(matches!(
         parse_query_plan(tool, arguments)?,
-        QueryPlan::Pipeline { count_by: None, .. }
+        QueryPlan::Pipeline { count_by: None, .. } | QueryPlan::RecordHook
     ))
 }
 
@@ -2215,7 +2459,7 @@ async fn execute_live_record_query(
 /// Validation-only seam for the test-only progressive-contract fixture.
 /// Production execution calls [`validate_query_record_envelope`] too, so
 /// describe/repair parity cannot silently drift from runtime acceptance.
-#[cfg(feature = "mcp-executor-prototype")]
+#[cfg(any(test, feature = "mcp-executor-prototype"))]
 pub(crate) fn validate_query_record_operation(mut arguments: Value) -> Result<()> {
     validate_query_record_envelope("query_record", &mut arguments)?;
     // Use the same parser called at the existing production execution point;
@@ -2281,7 +2525,20 @@ async fn member_query_record(
         execute_query_record_args_with_lens_as_with_page_basis(&lens, caller, TOOL, arguments)
             .await?;
     member_annotate_query_record_paths(db, caller, &mut output).await?;
-    inject_member_query_record_markers(&mut output);
+    Ok(finish_member_query_record(
+        output,
+        continuation,
+        include_interpretation,
+        false,
+    ))
+}
+fn finish_member_query_record(
+    mut output: Value,
+    continuation: Value,
+    include_interpretation: bool,
+    custody_held: bool,
+) -> Value {
+    inject_member_query_record_markers(&mut output, custody_held);
     // The generic interpretation projection reads excluded companions, so
     // member rows carry the marker where online attaches a projection. The
     // rows and counts still serve; the key is never silently absent.
@@ -2322,13 +2579,90 @@ async fn member_query_record(
         };
         object.insert("next_request".into(), next_request);
     }
-    Ok(output)
+    output
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_query_record(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    mut arguments: Value,
+) -> Result<Value> {
+    const TOOL: &str = "query_record";
+    let (as_of, interpretation, coordination, basis) =
+        validate_query_record_envelope(TOOL, &mut arguments)?;
+    if as_of.is_some() {
+        return Err(Error::unavailable_offline(TOOL, "as_of"));
+    }
+    if super::record_hook::requested(&arguments) {
+        return Err(Error::engine(
+            "query_record: record_hook.v1 requires the member query_sql records view",
+        ));
+    }
+    if arguments.get("activity").is_some() {
+        return Err(Error::unavailable_offline(TOOL, "activity"));
+    }
+    if coordination {
+        return Err(Error::unavailable_offline(TOOL, "include_coordination"));
+    }
+    if basis.is_some() && !record_producing_query(TOOL, arguments.clone())? {
+        return Err(Error::engine("query_record: if_page_basis_digest is supported only for record-producing continuations"));
+    }
+    let mut continuation = arguments.clone();
+    if interpretation {
+        continuation["include_interpretation"] = Value::Bool(true);
+    }
+    let mut output = execute_query_record_args_from(
+        &mut QueryExecutionSource::NativeMember(session),
+        caller,
+        TOOL,
+        arguments,
+        true,
+    )
+    .await?;
+    if let Some(records) = output.get_mut("records").and_then(Value::as_array_mut) {
+        for record in records.iter_mut() {
+            let Some(id) = record["id"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            let reference: Option<String> = sqlx::query_scalar(
+                "SELECT display_reference FROM main.member_record_metadata WHERE record_id=?",
+            )
+            .bind(&id)
+            .fetch_one(&mut **session.transaction())
+            .await?;
+            super::lifecycle::apply_record_path_with_reference(record, &id, reference)?;
+        }
+        super::lifecycle::annotate_superseded_by_in_tx(session.transaction(), caller, records)
+            .await?;
+    }
+    Ok(finish_member_query_record(
+        output,
+        continuation,
+        interpretation,
+        true,
+    ))
 }
 
 async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
     const TOOL: &str = "query_record";
     let (as_of, include_interpretation, include_coordination, page_basis_digest) =
         validate_query_record_envelope(TOOL, &mut arguments)?;
+    if super::record_hook::requested(&arguments) {
+        let continuation = arguments.clone();
+        let mut output = super::record_hook::execute_owned(&db, &caller, arguments).await?;
+        if caller.is_member_copy() {
+            member_annotate_query_record_paths(&db, &caller, &mut output).await?;
+            return Ok(finish_member_query_record(
+                output,
+                continuation,
+                false,
+                false,
+            ));
+        }
+        annotate_query_record_paths(&db, &caller, db.write_pool(), &mut output).await?;
+        return Ok(output);
+    }
     if caller.is_member_copy() {
         return member_query_record(
             &db,
@@ -2556,7 +2890,7 @@ async fn member_annotate_query_record_paths(
 /// provenance read excluded tables, so member rows carry the contract's
 /// `unavailable_offline` marker instead of a silent absence; custody has no
 /// member answer either (the copy ships no anchors).
-fn inject_member_query_record_markers(payload: &mut Value) {
+fn inject_member_query_record_markers(payload: &mut Value, custody_held: bool) {
     let Some(records) = payload.get_mut("records").and_then(Value::as_array_mut) else {
         return;
     };
@@ -2564,10 +2898,12 @@ fn inject_member_query_record_markers(payload: &mut Value) {
         let Some(object) = record.as_object_mut() else {
             continue;
         };
-        object.insert(
+        if !custody_held {
+            object.insert(
             "custody_boundary".into(),
             serde_json::json!({ "unavailable_offline": { "surface": "custody_boundary", "retry": "when_online" } }),
         );
+        }
         if object.get("type").and_then(Value::as_str) == Some("Message") {
             object.insert(
                 "communication_origin".into(),
@@ -2609,6 +2945,10 @@ fn saved_query_grammar_schema() -> Value {
         .as_object_mut()
         .expect("query grammar properties are an object")
         .remove("activity");
+    schema["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projection");
     schema
 }
 
@@ -2627,7 +2967,62 @@ fn query_record_input_schema() -> Value {
         "type": "string",
         "description": "Prior page basis; rejects when current visibility changed."
     });
+    // The field schema stays the normal order enum. `name_nocase` is valid
+    // only for `record_hook.v1`, so the direct schema states that with if/else
+    // and removes the property enum that would reject it for every projection.
+    let normal_order = schema["properties"]["order"].clone();
+    schema["properties"]["order"] = json!({
+        "description": "Sort key. Allowed values depend on the projection and are stated by the conditional schema."
+    });
+    schema["properties"]["body_chars"] = json!({
+        "description": "Optional code-point prefix length. Allowed only for one record_hook.v1 id, as stated by the conditional schema."
+    });
+    // Omitted order defaults. Explicit null is not a sort key: the hook
+    // parser accepts only the two strings below.
+    let hook_order = json!({
+        "type": "string",
+        "enum": ["updated_desc", "name_nocase"]
+    });
+    let hook_body_chars = json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 262142
+    });
+    let branch = json!({
+        "if": {
+            "properties": { "projection": { "const": "record_hook.v1" } },
+            "required": ["projection"]
+        },
+        "then": { "properties": { "order": hook_order, "body_chars": hook_body_chars } },
+        "else": { "properties": { "order": normal_order, "body_chars": false } }
+    });
+    match schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        Some(items) => items.push(branch),
+        None => schema["allOf"] = json!([branch]),
+    }
+    // Serde's wire name is `record_hook.v1`. Drop a snake_case alias if the
+    // schema generator also emits the variant's rename_all form.
+    retain_record_hook_wire_name(&mut schema);
     schema
+}
+
+fn retain_record_hook_wire_name(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            if items.iter().any(|item| item == "record_hook.v1") {
+                items.retain(|item| item != "record_hook_v1");
+            }
+            for item in items {
+                retain_record_hook_wire_name(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                retain_record_hook_wire_name(item);
+            }
+        }
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
 }
 
 #[cfg(feature = "mcp-executor-prototype")]
@@ -3865,6 +4260,7 @@ async fn tree_siblings(
     scope: Option<&HashSet<String>>,
     include_archived: bool,
     exclude_predicate: Option<&str>,
+    native_member: bool,
 ) -> Result<Vec<Value>> {
     let home_ids: Vec<String> = {
         let mut seen = HashSet::new();
@@ -3878,12 +4274,23 @@ async fn tree_siblings(
     }
     let archived_filter = if include_archived {
         ""
+    } else if native_member {
+        "AND r.archived=0"
     } else {
         "AND NOT EXISTS (SELECT 1 FROM facet_values av
                           WHERE av.record_id = r.id AND av.key = 'archived')"
     };
     let placeholders = vec!["?"; home_ids.len()].join(", ");
-    let not_hidden = if member {
+    let not_hidden = if native_member {
+        #[cfg(feature = "v2-kernel-probe")]
+        {
+            crate::mcp::kernel_v2::native_query_hidden_predicate("r", &[])
+        }
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        {
+            unreachable!("native source requires its feature")
+        }
+    } else if member {
         crate::query::member_not_hidden_predicate("r")
     } else {
         crate::query::not_hidden_predicate("r")
@@ -3934,7 +4341,12 @@ async fn tree_siblings(
     }
     query = query.bind(NEAR_MISS_CAP);
     let rows = query.fetch_all(&mut *conn).await?;
-    let visible_parents: HashSet<String> = if member {
+    let visible_parents: HashSet<String> = if native_member {
+        // Native home_id is already source-authorised and redacted by the
+        // producer. It can name the visible virtual root, which is not an
+        // ordinary held record. Do not discard that actual selected placement.
+        home_ids.iter().cloned().collect()
+    } else if member {
         let encoded = serde_json::to_string(&home_ids)?;
         sqlx::query_scalar::<_, String>(
             "SELECT id FROM records WHERE id IN (SELECT value FROM json_each(?))",
@@ -4024,11 +4436,174 @@ pub(crate) async fn search_in(
     search_in_excluding(tx, caller, query, scope, limit, include_archived, None).await
 }
 
+// Only the sealed admitted-session entry selects NativeMember. Existing
+// canonical/v1 calls keep their caller, transaction and policy-binding path.
+enum SearchReadSource<'a, 'db> {
+    Canonical(&'a mut sqlx::Transaction<'db, sqlx::Sqlite>),
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember(&'a mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession),
+}
+impl SearchReadSource<'_, '_> {
+    fn native_member(&self) -> bool {
+        match self {
+            Self::Canonical(_) => false,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => true,
+        }
+    }
+    fn connection(&mut self) -> &mut sqlx::SqliteConnection {
+        match self {
+            Self::Canonical(tx) => tx,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => session.transaction(),
+        }
+    }
+    async fn require_scope(&mut self, caller: &Caller, root: &str) -> Result<()> {
+        match self {
+            Self::Canonical(tx) => {
+                super::require_record_in(
+                    tx,
+                    caller,
+                    "search",
+                    root,
+                    crate::authorization::Capability::View,
+                )
+                .await
+            }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => Err(Error::copy_unavailable()),
+        }
+    }
+    async fn member_scope_present(&mut self, root: &str) -> Result<bool> {
+        match self {
+            Self::Canonical(tx) => Ok(sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
+            )
+            .bind(root.to_owned())
+            .fetch_one(&mut ***tx)
+            .await?),
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                crate::query::read::ordinary_record_read_eligible_native_member_in(
+                    session.transaction(),
+                    root,
+                )
+                .await
+            }
+        }
+    }
+    async fn matches(
+        &mut self,
+        caller: &Caller,
+        query: &str,
+        opts: &FtsOptions,
+        mechanism: fts::SearchMechanism,
+    ) -> Result<Vec<SearchHit>> {
+        match self {
+            Self::Canonical(tx) => match mechanism {
+                fts::SearchMechanism::Strict => {
+                    fts::search_with_policy_bypass_in(
+                        tx,
+                        caller.credential(),
+                        super::is_legacy_local(caller),
+                        caller.is_host_member(),
+                        query,
+                        opts,
+                    )
+                    .await
+                }
+                fts::SearchMechanism::Prefix => {
+                    fts::name_prefix_with_policy_bypass_in(
+                        tx,
+                        caller.credential(),
+                        super::is_legacy_local(caller),
+                        caller.is_host_member(),
+                        query,
+                        opts,
+                    )
+                    .await
+                }
+                fts::SearchMechanism::Infix => {
+                    fts::name_infix_with_policy_bypass_in(
+                        tx,
+                        caller.credential(),
+                        super::is_legacy_local(caller),
+                        caller.is_host_member(),
+                        query,
+                        opts,
+                    )
+                    .await
+                }
+            },
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                fts::native_member_matches(session, query, opts, mechanism).await
+            }
+        }
+    }
+    async fn annotate(&mut self, caller: &Caller, payload: &mut Value) -> Result<()> {
+        match self {
+            Self::Canonical(tx) => annotate_search_record_paths_in(tx, caller, payload).await,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                annotate_search_record_paths_in(session.transaction(), caller, payload).await
+            }
+        }
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_search(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    let mut args: SearchArgs = parse_args("search", arguments)?;
+    if let Some(scope) = args.scope.as_mut() {
+        *scope =
+            super::lifecycle::native_member_resolve_reference(session, scope, "search").await?;
+    }
+    search_from_source(
+        SearchReadSource::NativeMember(session),
+        caller,
+        &args.query,
+        args.scope.as_deref(),
+        args.limit,
+        args.include_archived.unwrap_or(false),
+        None,
+    )
+    .await
+}
+
 /// [`search_in`] with a trusted static predicate (see
 /// `FtsOptions::exclude_predicate`) that keeps matching records out of the
 /// hits before any cap applies.
 pub(crate) async fn search_in_excluding(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    query: &str,
+    scope: Option<&str>,
+    limit: Option<i64>,
+    include_archived: bool,
+    exclude_predicate: Option<String>,
+) -> Result<Value> {
+    search_from_source(
+        SearchReadSource::Canonical(tx),
+        caller,
+        query,
+        scope,
+        limit,
+        include_archived,
+        exclude_predicate,
+    )
+    .await
+}
+
+async fn search_from_source(
+    mut source: SearchReadSource<'_, '_>,
     caller: &Caller,
     query: &str,
     scope: Option<&str>,
@@ -4051,52 +4626,57 @@ pub(crate) async fn search_in_excluding(
         exclude_predicate,
     };
     let trusted_local_bypass = super::is_legacy_local(caller);
+    let native_member = source.native_member();
     let scope_set: Option<HashSet<String>> = match &opts.scope {
         Some(root) => {
             if member {
                 // A member copy has no policy plane: the scope root must
                 // simply be present in the slice.
-                let exists: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM records WHERE id = ? AND deleted_at IS NULL)",
-                )
-                .bind(root)
-                .fetch_one(&mut **tx)
-                .await?;
+                let exists = source.member_scope_present(root).await?;
                 if !exists {
                     return Err(Error::engine(format!(
                         "{TOOL}: scope record {root} does not exist"
                     )));
                 }
             } else {
-                super::require_record_in(
-                    tx,
-                    caller,
-                    TOOL,
-                    root,
-                    crate::authorization::Capability::View,
-                )
-                .await?;
+                source.require_scope(caller, root).await?;
             }
             // `subtree_ids` contract: the scope hedge always excludes
             // archived records, even for archived-including searches.
-            Some(
-                crate::query::tree::subtree_ids_with_hidden_in(tx, root, false, false, false)
+            Some(if native_member {
+                #[cfg(feature = "v2-kernel-probe")]
+                {
+                    crate::query::tree::native_member_subtree_ids_in(
+                        source.connection(),
+                        root,
+                        false,
+                    )
                     .await?
                     .into_iter()
-                    .collect(),
-            )
+                    .collect()
+                }
+                #[cfg(not(feature = "v2-kernel-probe"))]
+                {
+                    unreachable!("native source requires its feature")
+                }
+            } else {
+                crate::query::tree::subtree_ids_with_hidden_in(
+                    source.connection(),
+                    root,
+                    false,
+                    false,
+                    false,
+                )
+                .await?
+                .into_iter()
+                .collect()
+            })
         }
         None => None,
     };
-    let hits = fts::search_with_policy_bypass_in(
-        tx,
-        caller.credential(),
-        trusted_local_bypass,
-        caller.is_host_member(),
-        query,
-        &opts,
-    )
-    .await?;
+    let hits = source
+        .matches(caller, query, &opts, fts::SearchMechanism::Strict)
+        .await?;
     // One evaluation, two readers: the payload field and the guidance branch
     // below must not be able to drift apart.
     let limit_reached = hits.len() as i64 == limit;
@@ -4141,29 +4721,17 @@ pub(crate) async fn search_in_excluding(
                 .collect()
         };
         let prefix = dedup(
-            fts::name_prefix_with_policy_bypass_in(
-                tx,
-                caller.credential(),
-                trusted_local_bypass,
-                caller.is_host_member(),
-                query,
-                &near_opts,
-            )
-            .await?,
+            source
+                .matches(caller, query, &near_opts, fts::SearchMechanism::Prefix)
+                .await?,
         );
         let infix = dedup(
-            fts::name_infix_with_policy_bypass_in(
-                tx,
-                caller.credential(),
-                trusted_local_bypass,
-                caller.is_host_member(),
-                query,
-                &near_opts,
-            )
-            .await?,
+            source
+                .matches(caller, query, &near_opts, fts::SearchMechanism::Infix)
+                .await?,
         );
         let siblings = tree_siblings(
-            tx,
+            source.connection(),
             caller.credential(),
             trusted_local_bypass,
             caller.is_host_member(),
@@ -4173,6 +4741,7 @@ pub(crate) async fn search_in_excluding(
             scope_set.as_ref(),
             opts.include_archived,
             opts.exclude_predicate.as_deref(),
+            native_member,
         )
         .await?;
         let any_near_miss = !(prefix.is_empty() && infix.is_empty() && siblings.is_empty());
@@ -4217,7 +4786,7 @@ pub(crate) async fn search_in_excluding(
         // cannot both describe one response.
         object.insert("guidance".into(), json!(CAPPED_RESULTS_GUIDANCE));
     }
-    annotate_search_record_paths_in(tx, caller, &mut payload).await?;
+    source.annotate(caller, &mut payload).await?;
     Ok(payload)
 }
 
@@ -4728,6 +5297,12 @@ pub(crate) async fn execute_portable_nonlexical_scan<
     .await
 }
 
+#[path = "querying/scan_source.rs"]
+mod scan_source;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use scan_source::native_member_scan;
+use scan_source::ScanReadSource;
+
 /// One axis facet: the FULL pool size plus a bounded sample — the cap never
 /// hides depth, because `count` is the uncapped pool.
 struct AxisFacet {
@@ -4802,16 +5377,22 @@ async fn axis(
     binds: &[String],
     metric: Option<AxisMetricColumn>,
 ) -> Result<AxisFacet> {
-    let mut query = sqlx::query(sql);
-    for bind in binds {
-        query = query.bind(bind);
-    }
-    let rows = query.fetch_all(db.write_pool()).await?;
+    axis_from_source(&mut ScanReadSource::Pool(db), caller, sql, binds, metric).await
+}
+
+async fn axis_from_source(
+    source: &mut ScanReadSource<'_>,
+    caller: &Caller,
+    sql: &str,
+    binds: &[String],
+    metric: Option<AxisMetricColumn>,
+) -> Result<AxisFacet> {
+    let rows = source.rows(sql, binds).await?;
     let ids = rows
         .iter()
         .map(|row| row.try_get::<String, _>("id"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let visible = super::visible_ids(db, caller, ids).await?;
+    let visible = source.visible(caller, ids).await?;
     let mut visible_rows = Vec::new();
     for row in &rows {
         let id: String = row.try_get("id")?;
@@ -4867,18 +5448,35 @@ async fn derived_relationship_axis(
     minimum: i64,
     member: bool,
 ) -> Result<AxisFacet> {
+    derived_relationship_axis_from_source(
+        &mut ScanReadSource::Pool(db),
+        caller,
+        corpus_where,
+        binds,
+        metric,
+        minimum,
+        member,
+    )
+    .await
+}
+
+async fn derived_relationship_axis_from_source(
+    source: &mut ScanReadSource<'_>,
+    caller: &Caller,
+    corpus_where: &str,
+    binds: &[String],
+    metric: DerivedAxisMetric,
+    minimum: i64,
+    member: bool,
+) -> Result<AxisFacet> {
     let sql =
         format!("SELECT r.id, r.type, r.name FROM records r WHERE {corpus_where} ORDER BY r.id");
-    let mut query = sqlx::query(&sql);
-    for bind in binds {
-        query = query.bind(bind);
-    }
-    let rows = query.fetch_all(db.write_pool()).await?;
+    let rows = source.rows(&sql, binds).await?;
     let corpus_ids = rows
         .iter()
         .map(|row| row.try_get::<String, _>("id"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let visible_corpus = super::visible_ids(db, caller, corpus_ids.clone()).await?;
+    let visible_corpus = source.visible(caller, corpus_ids.clone()).await?;
     let visible_rows: Vec<(String, _)> = rows
         .into_iter()
         .zip(corpus_ids)
@@ -4908,16 +5506,17 @@ async fn derived_relationship_axis(
     let mut related_per_corpus: Vec<Vec<String>> = vec![Vec::new(); corpus_ids.len()];
     match metric {
         DerivedAxisMetric::Degree => {
-            let link_rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT source_id, target_id FROM links
+            let link_rows = source
+                .rows(
+                    "SELECT source_id, target_id FROM links
                   WHERE source_id IN (SELECT value FROM json_each(?))
                      OR target_id IN (SELECT value FROM json_each(?))",
-            )
-            .bind(&corpus_json)
-            .bind(&corpus_json)
-            .fetch_all(db.write_pool())
-            .await?;
-            for (source_id, target_id) in link_rows {
+                    &[corpus_json.clone(), corpus_json.clone()],
+                )
+                .await?;
+            for row in link_rows {
+                let source_id: String = row.try_get("source_id")?;
+                let target_id: String = row.try_get("target_id")?;
                 if source_id == target_id {
                     if let Some(position) = index.get(source_id.as_str()) {
                         related_per_corpus[*position].push(target_id);
@@ -4933,21 +5532,18 @@ async fn derived_relationship_axis(
             }
         }
         DerivedAxisMetric::ChildCount => {
-            let child_not_hidden = if member {
-                crate::query::member_not_hidden_predicate("c")
-            } else {
-                crate::query::not_hidden_predicate("c")
-            };
+            let child_not_hidden = source.hidden("c", member);
             let sql = format!(
                 "SELECT c.id, c.home_id FROM records c
                   WHERE c.home_id IN (SELECT value FROM json_each(?))
                     AND c.deleted_at IS NULL AND {child_not_hidden}"
             );
-            let child_rows: Vec<(String, String)> = sqlx::query_as(&sql)
-                .bind(&corpus_json)
-                .fetch_all(db.write_pool())
+            let child_rows = source
+                .rows(&sql, std::slice::from_ref(&corpus_json))
                 .await?;
-            for (child_id, home_id) in child_rows {
+            for row in child_rows {
+                let child_id: String = row.try_get("id")?;
+                let home_id: String = row.try_get("home_id")?;
                 if let Some(position) = index.get(home_id.as_str()) {
                     related_per_corpus[*position].push(child_id);
                 }
@@ -4961,7 +5557,7 @@ async fn derived_relationship_axis(
         .filter(|id| seen.insert(*id))
         .map(|id| id.to_string())
         .collect::<Vec<_>>();
-    let visible_related = super::visible_ids(db, caller, unique_related).await?;
+    let visible_related = source.visible(caller, unique_related).await?;
     let mut matches = Vec::new();
     for ((id, row), related) in visible_rows.iter().zip(related_per_corpus.iter()) {
         let visible_metric = related
@@ -5006,6 +5602,14 @@ async fn annotate_scan_axes_record_paths(
     caller: &Caller,
     axes: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
+    annotate_scan_axes_record_paths_from_source(&mut ScanReadSource::Pool(db), caller, axes).await
+}
+
+async fn annotate_scan_axes_record_paths_from_source(
+    source: &mut ScanReadSource<'_>,
+    caller: &Caller,
+    axes: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
     let mut ids = Vec::new();
     for facet in axes.values() {
         let Some(samples) = facet.get("samples").and_then(Value::as_array) else {
@@ -5019,12 +5623,7 @@ async fn annotate_scan_axes_record_paths(
     }
     // Q6c: a member copy ships its display references; never recompute a
     // slice-local prefix, which a hidden record could make too short.
-    let references = if caller.is_member_copy() {
-        member_scan_display_references(db.write_pool(), &ids).await?
-    } else {
-        let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
-        crate::mcp::record_ref::display_references(db, &borrowed).await?
-    };
+    let references = source.references(caller, &ids).await?;
     for facet in axes.values_mut() {
         let Some(samples) = facet.get_mut("samples").and_then(Value::as_array_mut) else {
             continue;
@@ -5051,17 +5650,19 @@ async fn annotate_scan_axes_superseded(
     caller: &Caller,
     axes: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
+    annotate_scan_axes_superseded_from_source(&mut ScanReadSource::Pool(db), caller, axes).await
+}
+
+async fn annotate_scan_axes_superseded_from_source(
+    source: &mut ScanReadSource<'_>,
+    caller: &Caller,
+    axes: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
     for facet in axes.values_mut() {
         let Some(samples) = facet.get_mut("samples").and_then(Value::as_array_mut) else {
             continue;
         };
-        super::lifecycle::annotate_superseded_by_in_pools(
-            db.write_pool(),
-            db.write_pool(),
-            caller,
-            samples,
-        )
-        .await?;
+        source.superseded(caller, samples).await?;
     }
     Ok(())
 }
@@ -5071,15 +5672,15 @@ async fn annotate_scan_axes_lifecycle(
     caller: &Caller,
     axes: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
-    let interpreter = if caller.is_member_copy() {
-        // A member copy ships its schema rows (no policy scoping); interpret
-        // from the shipped set, exactly as the record readers do.
-        let rows = crate::query::cascade::schema_config_rows_in_pool(db.write_pool(), None).await?;
-        crate::query::lifecycle::LifecycleInterpreter::load_from_pool(db.write_pool(), rows).await?
-    } else {
-        let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
-        crate::query::lifecycle::LifecycleInterpreter::load(db, principal).await?
-    };
+    annotate_scan_axes_lifecycle_from_source(&mut ScanReadSource::Pool(db), caller, axes).await
+}
+
+async fn annotate_scan_axes_lifecycle_from_source(
+    source: &mut ScanReadSource<'_>,
+    caller: &Caller,
+    axes: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let interpreter = source.interpreter(caller).await?;
     let mut interpretations = std::collections::HashMap::new();
     for facet in axes.values_mut() {
         let Some(samples) = facet.get_mut("samples").and_then(Value::as_array_mut) else {
@@ -5090,12 +5691,18 @@ async fn annotate_scan_axes_lifecycle(
                 continue;
             };
             if !interpretations.contains_key(&id) {
-                let row =
-                    sqlx::query("SELECT type, kind, home_id, lifecycle FROM records WHERE id = ?")
-                        .bind(&id)
-                        .fetch_optional(db.write_pool())
-                        .await?;
-                let Some(row) = row else { continue };
+                let rows = source
+                    .rows(
+                        "SELECT type, kind, home_id, lifecycle FROM records WHERE id = ?",
+                        std::slice::from_ref(&id),
+                    )
+                    .await?;
+                let Some(row) = rows.first() else {
+                    if source.native() {
+                        return Err(Error::copy_unavailable());
+                    }
+                    continue;
+                };
                 let record_type: String = row.try_get("type")?;
                 let kind: Option<String> = row.try_get("kind")?;
                 let home_id: Option<String> = row.try_get("home_id")?;
@@ -5118,7 +5725,7 @@ async fn annotate_scan_axes_lifecycle(
     Ok(())
 }
 
-fn build_scan_convergence(axes: &serde_json::Map<String, Value>) -> Vec<Value> {
+pub(crate) fn build_scan_convergence(axes: &serde_json::Map<String, Value>) -> Vec<Value> {
     struct ConvergenceRecord {
         id: String,
         record_type: String,
@@ -5244,7 +5851,7 @@ async fn member_scan_display_references(
 /// The scan axes actually served: facets carrying a `samples` array. Marker
 /// axes (a bare `unavailable_offline` object) are excluded, so convergence
 /// over the served set can never include an excluded axis.
-fn served_scan_axes(axes: &serde_json::Map<String, Value>) -> Vec<String> {
+pub(crate) fn served_scan_axes(axes: &serde_json::Map<String, Value>) -> Vec<String> {
     axes.iter()
         .filter(|(_, value)| value.get("samples").and_then(Value::as_array).is_some())
         .map(|(name, _)| name.clone())
@@ -5261,10 +5868,15 @@ async fn member_scan_census(
     args: &ScanArgs,
     include_archived: bool,
 ) -> Result<serde_json::Map<String, Value>> {
-    let mut clauses = vec![
-        "r.deleted_at IS NULL".to_string(),
-        crate::query::member_not_hidden_predicate("r"),
-    ];
+    member_scan_census_from_source(&mut ScanReadSource::Pool(db), args, include_archived).await
+}
+
+async fn member_scan_predicate(
+    source: &mut ScanReadSource<'_>,
+    args: &ScanArgs,
+    include_archived: bool,
+) -> Result<(String, Vec<String>)> {
+    let mut clauses = vec!["r.deleted_at IS NULL".to_string(), source.hidden("r", true)];
     let mut binds: Vec<String> = Vec::new();
     if let Some(types) = &args.types {
         if !types.is_empty() {
@@ -5273,18 +5885,28 @@ async fn member_scan_census(
         }
     }
     if !include_archived {
-        clauses.push(
+        clauses.push(if source.native() {
+            "r.archived=0".into()
+        } else {
             "NOT EXISTS (SELECT 1 FROM facet_values av
                WHERE av.record_id = r.id AND av.key = 'archived')"
-                .into(),
-        );
+                .into()
+        });
     }
     if let Some(root) = &args.scope {
-        let ids = crate::query::tree::member_subtree_ids(db, root, include_archived).await?;
+        let ids = source.subtree(root, include_archived).await?;
         clauses.push("r.id IN (SELECT value FROM json_each(?))".into());
         binds.push(serde_json::to_string(&ids)?);
     }
-    let where_sql = clauses.join(" AND ");
+    Ok((clauses.join(" AND "), binds))
+}
+
+async fn member_scan_census_from_source(
+    source: &mut ScanReadSource<'_>,
+    args: &ScanArgs,
+    include_archived: bool,
+) -> Result<serde_json::Map<String, Value>> {
+    let (where_sql, binds) = member_scan_predicate(source, args, include_archived).await?;
     let mut census = serde_json::Map::new();
     for (label, column) in [
         ("by_type", "type"),
@@ -5295,11 +5917,7 @@ async fn member_scan_census(
             "SELECT r.{column} AS key, COUNT(*) AS n FROM records r
               WHERE {where_sql} GROUP BY r.{column}"
         );
-        let mut query = sqlx::query(&sql);
-        for bind in &binds {
-            query = query.bind(bind);
-        }
-        let rows = query.fetch_all(db.write_pool()).await?;
+        let rows = source.rows(&sql, &binds).await?;
         let mut buckets: Vec<(Option<String>, i64)> = rows
             .iter()
             .map(|row| {
@@ -5326,16 +5944,8 @@ async fn member_scan_census(
     Ok(census)
 }
 
-async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+fn scan_bounds(args: &ScanArgs) -> Result<(i64, i64, bool)> {
     const TOOL: &str = "scan";
-    // A member copy holds only E(m), so the slice is the authorization
-    // universe: visibility is slice presence. Servable axes run at parity over
-    // the slice; the provenance census and the authored_by axis need excluded
-    // history and become explicit `unavailable_offline` markers with the shared
-    // shape (contract c323277 rev 8 §2.3(a)). Never an empty bucket or a zero
-    // standing in for a refusal.
-    let member = caller.is_member_copy();
-    let args: ScanArgs = parse_args(TOOL, arguments)?;
     let recent_window_days = args
         .recent_window_days
         .unwrap_or(DEFAULT_RECENT_WINDOW_DAYS);
@@ -5351,6 +5961,33 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
         )));
     }
     let include_archived = args.include_archived.unwrap_or(false);
+
+    Ok((recent_window_days, high_degree_min, include_archived))
+}
+fn scan_authored_selector<'a>(caller: &'a Caller, args: &'a ScanArgs) -> Result<&'a str> {
+    let authored_selector = args.authored_by.as_deref().unwrap_or(caller.credential());
+    if !caller.is_host_owner()
+        && args.authored_by.is_some()
+        && authored_selector != caller.credential()
+    {
+        return Err(Error::engine(
+            "scan: authored_by may name only the current caller",
+        ));
+    }
+    Ok(authored_selector)
+}
+
+async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    const TOOL: &str = "scan";
+    // A member copy holds only E(m), so the slice is the authorization
+    // universe: visibility is slice presence. Servable axes run at parity over
+    // the slice; the provenance census and the authored_by axis need excluded
+    // history and become explicit `unavailable_offline` markers with the shared
+    // shape (contract c323277 rev 8 §2.3(a)). Never an empty bucket or a zero
+    // standing in for a refusal.
+    let member = caller.is_member_copy();
+    let args: ScanArgs = parse_args(TOOL, arguments)?;
+    let (recent_window_days, high_degree_min, include_archived) = scan_bounds(&args)?;
 
     // The corpus predicate every axis shares: live, unarchived (unless asked),
     // in scope, of the named types. Built once, appended per axis.
@@ -5562,15 +6199,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     // without rewriting history. An explicit selector must be a known account;
     // the implicit caller falls back to exact matching for legacy `local`
     // fixtures and other pre-binding callers.
-    let authored_selector = args.authored_by.as_deref().unwrap_or(caller.credential());
-    if !caller.is_host_owner()
-        && args.authored_by.is_some()
-        && authored_selector != caller.credential()
-    {
-        return Err(Error::engine(format!(
-            "{TOOL}: authored_by may name only the current caller"
-        )));
-    }
+    let authored_selector = scan_authored_selector(&caller, &args)?;
     if member {
         // Rev 8 §2.3(a): authored_by joins each record's latest `content_events`
         // row, which the member profile excludes. Explicit marker, never an
@@ -5750,6 +6379,27 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     // computed over the served axes only; a member copy additionally declares
     // which axes participated (rev 8 §2.3(a)). Marker axes carry no samples, so
     // they contribute nothing by construction.
+    Ok(finish_scan(
+        corpus_size,
+        &args,
+        census,
+        axes,
+        cutoff,
+        (recent_window_days, high_degree_min),
+        member,
+    ))
+}
+
+fn finish_scan(
+    corpus_size: i64,
+    args: &ScanArgs,
+    census: serde_json::Map<String, Value>,
+    axes: serde_json::Map<String, Value>,
+    cutoff: String,
+    bounds: (i64, i64),
+    member: bool,
+) -> Value {
+    let (recent_window_days, high_degree_min) = bounds;
     let convergence = build_scan_convergence(&axes);
 
     let mut output = json!({
@@ -5780,7 +6430,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
                 }),
             );
     }
-    Ok(output)
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -8080,6 +8730,30 @@ mod grammar_tests {
         assert!(has_query.contains("does not execute saved queries"));
     }
 
+    fn assert_enum_or_null(name: &str, property: &Value) -> Vec<String> {
+        let branches = property["anyOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} must use enum-or-null: {property}"));
+        assert!(
+            branches
+                .iter()
+                .any(|branch| branch["type"] == Value::String("null".into())),
+            "{name} has no null branch: {property}"
+        );
+        branches
+            .iter()
+            .find_map(|branch| branch.get("enum").and_then(Value::as_array))
+            .unwrap_or_else(|| panic!("{name} has no enum branch: {property}"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name} enum value is not a string: {value}"))
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn optional_enums_advertise_the_explicit_null_that_serde_accepts() {
         let schema = query_record_input_schema();
@@ -8087,23 +8761,58 @@ mod grammar_tests {
             &schema["properties"]["steps"]["items"]["oneOf"][1]["properties"]["direction"];
         for (name, property) in [
             ("count_by", &schema["properties"]["count_by"]),
-            ("order", &schema["properties"]["order"]),
             ("direction", direction),
         ] {
-            let branches = property["anyOf"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{name} must use enum-or-null: {property}"));
-            assert!(
-                branches
-                    .iter()
-                    .any(|branch| branch["type"] == Value::String("null".into())),
-                "{name} has no null branch: {property}"
-            );
-            assert!(
-                branches.iter().any(|branch| branch.get("enum").is_some()),
-                "{name} has no enum branch: {property}"
-            );
+            assert_enum_or_null(name, property);
         }
+        let root_order = &schema["properties"]["order"];
+        assert!(
+            root_order.get("anyOf").is_none() && root_order.get("enum").is_none(),
+            "root order stays description-only: {root_order}"
+        );
+        let branch = schema["allOf"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item["if"]["properties"]["projection"]["const"] == "record_hook.v1"
+                })
+            })
+            .expect("record_hook order branch");
+        let mut ordinary =
+            assert_enum_or_null("ordinary order", &branch["else"]["properties"]["order"]);
+        ordinary.sort_unstable();
+        assert_eq!(
+            ordinary,
+            vec![
+                "created_desc",
+                "last_activity_desc",
+                "name_asc",
+                "updated_desc",
+            ]
+        );
+        let hook_order = &branch["then"]["properties"]["order"];
+        assert!(
+            hook_order.get("anyOf").is_none(),
+            "hook order is a strict string enum: {hook_order}"
+        );
+        assert_eq!(hook_order["type"], json!("string"));
+        assert_eq!(hook_order["enum"], json!(["updated_desc", "name_nocase"]));
+        assert!(validate_query_record_operation(json!({
+            "steps": [{"step": "filter", "types": ["Document"]}],
+            "order": null
+        }))
+        .is_ok());
+        assert!(validate_query_record_operation(json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+        }))
+        .is_ok());
+        assert!(validate_query_record_operation(json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}],
+            "order": null
+        }))
+        .is_err());
         assert_eq!(schema["required"], json!(["steps"]));
         assert_eq!(
             schema["properties"]["steps"]["items"]["oneOf"][1]["required"],
@@ -9119,5 +9828,177 @@ mod scan_scalability_tests {
             large.statements <= small.statements + 4 * extra_blocks,
             "statement count tracked the corpus: {small:?} -> {large:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_projection_tests {
+    use super::*;
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[test]
+    fn query_record_metadata_contract_is_optional_and_record_only() {
+        let schema = query_record_input_schema();
+        assert!(schema["properties"]["projection"]
+            .to_string()
+            .contains("metadata"));
+        assert!(schema["properties"]["projection"]
+            .to_string()
+            .contains("record_hook.v1"));
+        let hook = json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+        });
+        assert!(validate_query_record_operation(hook).is_ok());
+        assert!(validate_query_record_operation(
+            json!({"projection": "record_hook.v2", "steps": [{"step": "filter"}]})
+        )
+        .is_err());
+        let base = json!({"steps":[{"step":"filter"}],"projection":"metadata"});
+        assert!(validate_query_record_operation(base.clone()).is_ok());
+        assert!(validate_saved_query_args("query_record", base.clone()).is_err());
+        assert!(validate_saved_record_query_args("query_record", base.clone()).is_err());
+        for (key, value) in [
+            ("projection", json!("full")),
+            ("count_by", json!("type")),
+            ("aggregate", json!({"op":"count"})),
+            ("activity", json!({})),
+            ("include_interpretation", json!(true)),
+            ("include_coordination", json!(true)),
+        ] {
+            let mut args = base.clone();
+            args[key] = value;
+            assert!(validate_query_record_operation(args).is_err(), "{key}");
+        }
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[test]
+    fn record_hook_projection_schema_and_validation() {
+        let schema = query_record_input_schema().to_string();
+        assert!(schema.contains("metadata"));
+        assert!(schema.contains("record_hook.v1"));
+        assert!(!schema.contains("record_hook_v1"));
+        assert!(validate_query_record_operation(json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+        }))
+        .is_ok());
+        assert!(validate_query_record_operation(json!({
+            "projection": "record_hook.v2",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+        }))
+        .is_err());
+        assert!(validate_saved_query_args(
+            "query_record",
+            json!({
+                "projection": "record_hook.v1",
+                "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+            })
+        )
+        .is_err());
+        let direct = query_record_input_schema();
+        let base_order = direct["properties"]["order"].to_string();
+        assert!(!base_order.contains("name_nocase"));
+        let branch = direct["allOf"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item["if"]["properties"]["projection"]["const"] == "record_hook.v1"
+                })
+            })
+            .expect("record_hook order branch");
+        assert_eq!(
+            branch["if"]["properties"]["projection"]["const"],
+            "record_hook.v1"
+        );
+        let hook_order = branch["then"]["properties"]["order"].to_string();
+        let normal_order = branch["else"]["properties"]["order"].to_string();
+        assert!(hook_order.contains("name_nocase"));
+        assert!(hook_order.contains("updated_desc"));
+        assert!(!hook_order.contains("name_asc"));
+        assert!(normal_order.contains("name_asc"));
+        assert!(normal_order.contains("created_desc"));
+        assert!(!normal_order.contains("name_nocase"));
+        let hook_body = branch["then"]["properties"]["body_chars"].to_string();
+        assert!(hook_body.contains("262142"));
+        assert_eq!(branch["else"]["properties"]["body_chars"], false);
+        assert!(!query_record_grammar_schema()
+            .to_string()
+            .contains("body_chars"));
+        assert!(validate_query_record_operation(json!({
+            "projection": "record_hook.v1",
+            "body_chars": 2,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+        }))
+        .is_ok());
+        assert!(validate_query_record_operation(json!({
+            "projection": "record_hook.v1",
+            "body_chars": 2,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1", "rec-2"]}]
+        }))
+        .is_err());
+        assert!(validate_query_record_operation(json!({
+            "projection": "metadata",
+            "body_chars": 2,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": ["rec-1"]}]
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn query_record_metadata_v1_500_large_bodies_preserves_order_and_pages() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let body = "Large document text. ".repeat(3400);
+        let mut tx = db.write_pool().begin().await.unwrap();
+        for i in 0..500 {
+            sqlx::query("INSERT INTO records(id,type,kind,name,body,summary,created_at,updated_at,last_activity_at) VALUES(?,'Document',?,?,?,'Summary','2026-11-01T00:00:00.000Z','2026-11-02T00:00:00.000Z','2026-11-03T00:00:00.000Z')")
+                .bind(format!("metadata-{i:03}")).bind(if i % 5 == 0 { "artifact" } else { "note" }).bind(format!("Document {i:03}")).bind(&body).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        for (order, limit, offset) in [
+            ("updated_desc", 500, 0),
+            ("created_desc", 17, 3),
+            ("last_activity_desc", 17, 3),
+            ("name_asc", 17, 3),
+        ] {
+            let mut args = json!({"steps":[{"step":"filter","types":["Document"]}],"order":order,"limit":limit,"offset":offset});
+            let mut full =
+                execute_query_record_args_as(&db, &Caller::local(), "query_record", args.clone())
+                    .await
+                    .unwrap();
+            args["projection"] = json!("metadata");
+            let metadata =
+                execute_query_record_args_as(&db, &Caller::local(), "query_record", args)
+                    .await
+                    .unwrap();
+            if limit == 500 {
+                let full_bytes = serde_json::to_vec(&full).unwrap().len();
+                let metadata_bytes = serde_json::to_vec(&metadata).unwrap().len();
+                eprintln!("500 v1 rows: full={full_bytes} metadata={metadata_bytes} bytes");
+                assert!(full_bytes > 32_000_000);
+                assert!(metadata_bytes * 50 < full_bytes);
+            }
+            project_record_metadata(&mut full);
+            assert_eq!(metadata, full);
+        }
+        // The pipeline itself never hydrated the bodies, before JSON projection.
+        let pipeline::PipelineOutput::Records { records, .. } = pipeline::run(
+            &db,
+            &[pipeline::Step::Filter(Default::default())],
+            None,
+            &pipeline::PipelineOptions {
+                metadata_only: true,
+                limit: 500,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("record page expected")
+        };
+        assert_eq!(records.len(), 500);
+        assert!(records.iter().all(|r| r.body.is_none()));
+        db.close().await;
     }
 }

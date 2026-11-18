@@ -2520,6 +2520,9 @@ async fn promote(
             caller_owner.as_deref(),
             &reason,
             &super::mint::MintRequest {
+                origin: None,
+                persistence: None,
+                maturity: None,
                 record_type: &item.record_type,
                 kind: &item.kind,
                 name: item.name.as_deref(),

@@ -1646,10 +1646,28 @@ pub fn classify_send(verdict: &GateVerdict) -> SendClass {
     let Some(reply) = verdict.reply.as_deref() else {
         return SendClass::Uncertain;
     };
+    let parsed: Option<Value> = serde_json::from_str(reply).ok();
+    // A later refusal describes only its own attempt. The gate's journal note
+    // may still say that an earlier attempt of the same write applied.
+    if parsed.as_ref().is_some_and(|value| {
+        [
+            "/result/structuredContent",
+            "/result/structuredContent/node_journal",
+            "/result/_meta/node_journal",
+            "/error/data",
+            "/error/data/node_journal",
+            "/error/data/upstream_body",
+            "/error/data/upstream_body/error",
+        ]
+        .into_iter()
+        .filter_map(|pointer| value.pointer(pointer))
+        .any(super::has_uncertain_outcome)
+    }) {
+        return SendClass::Uncertain;
+    }
     if is_key_refusal_text(reply) {
         return SendClass::KeyRefused;
     }
-    let parsed: Option<Value> = serde_json::from_str(reply).ok();
     let error_code = parsed
         .as_ref()
         .and_then(|v| {
@@ -3538,6 +3556,10 @@ pub(super) struct GateSink {
     upstream: Arc<super::Upstream>,
     gate: Arc<super::gate::WriteGate>,
     frames: std::sync::Mutex<FrameIds>,
+    /// The router that owns the own-write floor. Saver writes are node
+    /// writes like any other: they must leave hosted reads preferred until
+    /// the floor resolves.
+    floor: Option<Arc<dyn super::gate::Outage>>,
 }
 
 #[cfg(feature = "mcp-executor-prototype")]
@@ -3547,7 +3569,34 @@ impl GateSink {
             upstream,
             gate,
             frames: std::sync::Mutex::new(FrameIds::default()),
+            floor: None,
         }
+    }
+
+    pub(super) fn with_floor(mut self, floor: Option<Arc<dyn super::gate::Outage>>) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// A hosted write: recorded in the own-write floor before it goes out and
+    /// settled from the reply after. Reads use `round_trip` directly.
+    async fn write_round_trip(&self, message: Value) -> super::SendReport {
+        if let Some(floor) = &self.floor {
+            if !floor.before_send().await {
+                return super::SendReport {
+                    reply: None,
+                    failure: None,
+                    attempt: super::Attempt::NotSent,
+                    status: None,
+                    reply_kind: Default::default(),
+                };
+            }
+        }
+        let report = self.round_trip(message).await;
+        if let Some(floor) = &self.floor {
+            floor.after_write(report.reply.as_deref()).await;
+        }
+        report
     }
 
     async fn read_round_trip(&self, message: Value) -> Result<super::SendReport> {
@@ -3881,7 +3930,7 @@ impl HostedSink for GateSink {
             return Err(Error::engine("quote link requires its stable key"));
         }
         let report = self
-            .round_trip(self.write_frame("manage_links.add", arguments))
+            .write_round_trip(self.write_frame("manage_links.add", arguments))
             .await;
         Ok(Self::classify(&report))
     }
@@ -3895,13 +3944,13 @@ impl HostedSink for GateSink {
             return Err(Error::engine("state write requires its frozen key"));
         }
         let report = self
-            .round_trip(self.write_frame("update_record", arguments))
+            .write_round_trip(self.write_frame("update_record", arguments))
             .await;
         Ok(Self::classify(&report))
     }
     async fn create_step(&self, request: &FrozenStepRequest) -> Result<SendClass> {
         let message = self.write_frame("create_record", step_create_arguments(request));
-        let report = self.round_trip(message).await;
+        let report = self.write_round_trip(message).await;
         Ok(Self::classify(&report))
     }
 
@@ -4031,7 +4080,7 @@ impl HostedSink for GateSink {
             }
         }
         let message = self.write_frame("create_record", arguments);
-        let report = self.round_trip(message).await;
+        let report = self.write_round_trip(message).await;
         match Self::classify(&report) {
             SendClass::Committed => Ok(CreateResult::Created {
                 record_id: Self::receipt_record_id(&report.reply),
@@ -4158,6 +4207,15 @@ mod tests {
             )),
             NotSent
         );
+        // A maintenance refusal cannot settle an earlier possibly applied
+        // attempt, whether it arrives as a tool result or an HTTP error.
+        for reply in [
+            r#"{"result":{"isError":true,"structuredContent":{"error_code":"DEPLOYMENT_READ_ONLY","applied":false,"node_journal":{"outcome":"uncertain"}}}}"#,
+            r#"{"error":{"data":{"error_code":"DEPLOYMENT_READ_ONLY","applied":false,"outcome":"refused","node_journal":{"outcome":"uncertain"}}}}"#,
+            r#"{"error":{"data":{"error_code":"DEPLOYMENT_READ_ONLY","applied":"partial","outcome":"unknown"}}}"#,
+        ] {
+            assert_eq!(classify_send(&answered(reply)), Uncertain, "{reply}");
+        }
         // Positive refusals stop the session.
         assert_eq!(
             classify_send(&answered(
@@ -5115,6 +5173,7 @@ mod tests {
                 std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
                     .unwrap();
                 let config = crate::node::NodeConfig {
+                    working_note_appends: false,
                     markdown_folder: None,
                     hosted_base_url: format!("http://{address}"),
                     home_id: "test-home".into(),
@@ -5122,10 +5181,18 @@ mod tests {
                     credential_file: token,
                     socket_directory: socket_dir.clone(),
                     oauth_auth_file: None,
+                    node_install_key_file: None,
+                    node_install_id: None,
                     standby_config: None,
                     account_id: None,
                     refresh_config: None,
                     disk_floor_bytes: None,
+                    online_local_reads: None,
+                    local_reads_by_default: false,
+                    desktop_app_proof_transport: false,
+                    desktop_app_proof_resource_origin: None,
+                    pending_fork_reads: false,
+                    hosted_kernel_v2: false,
                 };
                 let gate = StdArc::new(
                     crate::node::gate::WriteGate::open(&socket_dir, Default::default()).unwrap(),
@@ -5680,6 +5747,62 @@ mod tests {
                     .unwrap(),
                 StateAction::NotDue
             );
+        }
+
+        #[derive(Default)]
+        struct FloorProbe {
+            before: std::sync::atomic::AtomicUsize,
+            after: std::sync::atomic::AtomicUsize,
+            refuse: std::sync::atomic::AtomicBool,
+        }
+        impl crate::node::gate::Outage for FloorProbe {
+            fn confirm_down(&self) -> crate::node::gate::Ready<'_, bool> {
+                Box::pin(async { false })
+            }
+            fn before_send(&self) -> crate::node::gate::Ready<'_, bool> {
+                self.before
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let ok = !self.refuse.load(std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move { ok })
+            }
+            fn after_write<'a>(
+                &'a self,
+                _reply: Option<&'a str>,
+            ) -> crate::node::gate::Ready<'a, ()> {
+                self.after.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {})
+            }
+        }
+
+        #[tokio::test]
+        async fn saver_writes_take_part_in_own_write_floor_accounting() {
+            let mut rig = Rig::new().await;
+            let probe = StdArc::new(FloorProbe::default());
+            rig.sink.floor = Some(probe.clone());
+            rig.ensure("t", "boot-1", "2026-10-17T00:00:00Z").await;
+            let counts = || {
+                (
+                    probe.before.load(std::sync::atomic::Ordering::SeqCst),
+                    probe.after.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            };
+            let (before, after) = counts();
+            assert!(before > 0, "ensure_session creates through the floor");
+            assert_eq!(before, after, "every write is settled");
+            // A floor that cannot be saved stops the write: nothing is sent.
+            probe
+                .refuse
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let sent_before = rig.hosted.received.lock().unwrap().len();
+            let class = rig
+                .sink
+                .update_state(json!({"ids":["x"],"idempotency_key":"k","reason":"r"}))
+                .await
+                .unwrap();
+            assert_eq!(class, SendClass::NotSent);
+            assert_eq!(rig.hosted.received.lock().unwrap().len(), sent_before);
+            let (b2, a2) = counts();
+            assert_eq!((b2, a2), (before + 1, after));
         }
 
         #[tokio::test]

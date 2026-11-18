@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subscription budget reader</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px/1.45 system-ui,sans-serif;margin:2rem;color:#243047;max-width:68rem}button,select,input{font:inherit;padding:.4rem .65rem;margin-right:.35rem}.layout{display:grid;grid-template-columns:18rem 1fr;gap:1.5rem;margin-top:1rem}ul,ol{padding-left:1.2rem}li{margin:.35rem 0}.kit-error{color:#9c2630}.note{color:#526075;font-size:.9rem}.embed{border-left:3px solid #cbd5e1;padding-left:.75rem;margin:.6rem 0}</style>
+</head><body><main><h1>Subscription budget reader</h1><div id="app">Opening Native…</div></main>
+<script type="module">
+// Worked example for core kit 1.7.0 subscription budgeting:
+// - The frame bridge caps open live subscriptions at 32 per frame BEFORE the
+//   host's readHub deduplicates identical SQL/steps queries.
+// - Mounted hidden components and duplicate hooks in the same item each spend
+//   a slot. Unmounting off-window readers (or passing null to useRecord /
+//   useRecordList) frees slots immediately.
+// - Retained off-window snapshots keep last-good record/body data in memory
+//   without holding live subscriptions, while preserving the kit's definite
+//   error, missing, and scope_changed clearing rules (never rewriting an
+//   error as ready). Off-window snapshots are not live-watched until the item
+//   re-enters the active window.
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact?.useRecordList) root.textContent = 'Open in Native with core kit 1.7.0.';
+else {
+  const { html, render, useState, useEffect, useRecord, useRecordList, Loading, Empty, ErrorState, FeedNotice, RecordLink, Markdown } = kit.preact;
+  const params = new URLSearchParams(location.search);
+  const FAST_RETRY = params.get('fastRetry') === '1' ? { retryDelaysMs: [40, 80], noticeDelayMs: 60 } : {};
+  const DECKS = [
+    { id: 'deck-main', name: 'Main presentation (19 slides)' },
+    { id: 'deck-alt', name: 'Short deck (2 slides)' },
+    { id: 'deck-embeds', name: 'Embed-heavy deck' }
+  ];
+  const WINDOW_RADIUS = 2;
+  const LEAKING_EAGER_FOLDERS = ['eager-recent-1', 'eager-recent-2', 'eager-recent-3', 'eager-recent-4', 'eager-recent-5'];
+  const withinWindow = (idx, center) => !(Math.abs(idx - center) > WINDOW_RADIUS);
+  const parseEmbedIds = (body) => {
+    if (typeof body !== 'string' || !body) return [];
+    const seen = new Set();
+    for (const match of body.matchAll(/\[\[embed:([A-Za-z0-9._:-]{1,128})\]\]/g)) seen.add(match[1]);
+    return [...seen];
+  };
+
+  function EmbedReader({ id }) {
+    const r = useRecord(id, { body: 4000, ...FAST_RETRY });
+    return html`<div class="embed" data-testid=${'embed-' + id} data-embed-status=${r.status}>
+      ${r.status === 'loading' && html`<${Loading} what=${'figure ' + id} />`}
+      ${r.status === 'missing' && html`<${Empty}>Figure ${id} unavailable.<//>`}
+      ${r.status === 'error' && html`<${ErrorState} error=${r.error} onRetry=${r.retry} />`}
+      ${r.record && html`<p><strong>Figure: ${r.record.name || r.record.id}</strong> — ${r.body || ''}</p>`}
+    </div>`;
+  }
+
+  function WindowItemReader({ id, isCurrent, onSnapshot, onScopeChanged }) {
+    const r = useRecord(id, FAST_RETRY);
+    useEffect(() => {
+      if (r.error?.code === 'scope_changed') { onScopeChanged(); return; }
+      onSnapshot(id, r);
+    }, [id, r.status, r.record, r.body, r.error && r.error.code, r.notice]);
+    // The kit owns current read/recovery state. Retained outline snapshots
+    // never stand in for a fresh body's error or authority decision.
+    const shownRecord = r.record;
+    const shownBody = r.body ?? '';
+    const embeds = parseEmbedIds(shownBody);
+    if (!isCurrent) {
+      return html`<div hidden data-testid=${'warm-window-' + id}>
+        ${embeds.map((embedId) => html`<${EmbedReader} key=${embedId} id=${embedId} />`)}
+      </div>`;
+    }
+    return html`<article data-testid="active-slide" data-slide-id=${id} data-slide-status=${r.status}>
+      ${r.status === 'loading' && !shownRecord && html`<${Loading} what="slide" />`}
+      ${r.status === 'missing' && html`<${Empty}>This slide is unavailable.<//>`}
+      ${r.status === 'error' && html`<${ErrorState} error=${r.error} onRetry=${r.retry} />`}
+      <${FeedNotice} feed=${r} />
+      ${shownRecord && html`<h2 data-testid="slide-title">${shownRecord.name || shownRecord.id}</h2>
+        <p><${RecordLink} id=${shownRecord.id}>Open record<//>${r.cached || (!r.record && shownRecord) ? ' · Cached copy' : ''}</p>
+        <div data-testid="slide-body"><${Markdown} source=${shownBody} /></div>
+        ${embeds.map((embedId) => html`<${EmbedReader} key=${embedId} id=${embedId} />`)}`}
+    </article>`;
+  }
+
+  function BackgroundMetaProbe({ id, onMetadata, onScopeChanged }) {
+    const r = useRecord(id, { body: false, ...FAST_RETRY });
+    useEffect(() => {
+      if (!id) return;
+      if (r.error?.code === 'scope_changed') { onScopeChanged(); return; }
+      if (r.status === 'ready' || r.status === 'missing' || r.status === 'unsupported' || r.status === 'error' && !r.error?.retrying) onMetadata(id, r);
+    }, [id, r.status, r.record, r.error && r.error.code]);
+    return null;
+  }
+
+  function LazyPicker({ folder, onSelect, onClose }) {
+    const list = useRecordList({ folder }, { limit: 20, order: 'updated', ...FAST_RETRY });
+    return html`<section data-testid="lazy-picker" aria-label="Deck picker">
+      <h2>Switch item from live picker</h2>
+      <${FeedNotice} feed=${list} />
+      ${list.status === 'loading' && !list.rows.length && html`<${Loading} what="picker" />`}
+      ${list.status === 'error' && html`<${ErrorState} error=${list.error} onRetry=${list.retry} />`}
+      <ul>${list.rows.map((row, idx) => html`<li key=${row.id}><button type="button" data-testid=${'pick-' + row.id} onClick=${() => { onSelect(idx); onClose(); }}>${row.name || row.id}</button></li>`)}</ul>
+      <button type="button" id="close-picker" onClick=${onClose}>Close picker</button>
+    </section>`;
+  }
+
+  // Deliberately leaking anti-pattern: keeps every visited slide mounted in a
+  // hidden tree AND mounts a duplicate hook for the same slide id, spending 2
+  // per-frame slots per visited slide before host query deduplication.
+  function LeakingSlideReader({ id, isCurrent }) {
+    const full = useRecord(id, FAST_RETRY);
+    const duplicateHook = useRecord(id, FAST_RETRY);
+    const embeds = parseEmbedIds(full.body);
+    return html`<article hidden=${!isCurrent} data-testid=${isCurrent ? 'active-slide' : 'leaked-slide-' + id} data-slide-id=${id} data-slide-status=${full.status}>
+      ${full.status === 'loading' && !full.record && html`<${Loading} what="slide" />`}
+      ${full.status === 'missing' && html`<${Empty}>This slide is unavailable.<//>`}
+      ${full.status === 'error' && html`<${ErrorState} error=${full.error} onRetry=${full.retry} />`}
+      <${FeedNotice} feed=${full} />
+      ${full.record && html`<h2 data-testid=${isCurrent ? 'slide-title' : undefined}>${duplicateHook.record?.name || full.record.name || full.record.id}</h2>
+        <div data-testid=${isCurrent ? 'slide-body' : undefined}><${Markdown} source=${full.body || ''} /></div>`}
+      ${embeds.map((embedId) => html`<${EmbedReader} key=${embedId} id=${embedId} />`)}
+    </article>`;
+  }
+
+  function EagerLeakingLists() {
+    for (const folder of LEAKING_EAGER_FOLDERS) useRecordList({ folder }, { limit: 10 });
+    return null;
+  }
+
+  function App() {
+    const initialMode = params.get('mode') === 'leaking' ? 'leaking' : 'bounded';
+    const [mode, setMode] = useState(initialMode);
+    const [deckId, setDeckId] = useState(DECKS[0].id);
+    const [index, setIndex] = useState(0);
+    const [pickerOpen, setPickerOpen] = useState(false);
+    const [visited, setVisited] = useState([]);
+    const [retained, setRetained] = useState({});
+    const [metadata, setMetadata] = useState({});
+
+    const deck = useRecordList({ folder: deckId }, { limit: 50, order: 'name', ...FAST_RETRY });
+
+    // useRecordList already retains rows through transient failures and
+    // clears them on a definite stop or a changed source.
+    const rows = deck.rows;
+    const safeIndex = rows.length ? Math.min(Math.max(0, index), rows.length - 1) : 0;
+    const currentRow = rows[safeIndex] || null;
+
+    useEffect(() => {
+      if (deck.error?.code === 'scope_changed') {
+        setRetained({});
+        setMetadata({});
+        setVisited([]);
+      }
+    }, [deck.error && deck.error.code]);
+
+    useEffect(() => {
+      if (currentRow?.id) {
+        setVisited((prev) => (prev.includes(currentRow.id) ? prev : [...prev, currentRow.id]));
+      }
+    }, [currentRow && currentRow.id]);
+
+    const onScopeChanged = () => {
+      setRetained({});
+      setMetadata({});
+      setVisited([]);
+    };
+
+    const onSnapshot = (id, r) => {
+      setRetained((prev) => {
+        if (r.status === 'loading' || r.status === 'idle') return prev;
+        // Preserve the exact kit fields, including error/no-record states.
+        // A metadata-only success must never upgrade a failed body snapshot.
+        const { retry, ...snapshot } = r;
+        return JSON.stringify(prev[id]) === JSON.stringify(snapshot) ? prev : { ...prev, [id]: snapshot };
+      });
+    };
+    const onMetadata = (id, r) => {
+      const { retry, ...snapshot } = r;
+      setMetadata(prev => JSON.stringify(prev[id]) === JSON.stringify(snapshot) ? prev : { ...prev, [id]: snapshot });
+    };
+
+    const switchDeck = (nextDeck) => {
+      setDeckId(nextDeck);
+      setIndex(0);
+      setPickerOpen(false);
+      setRetained({});
+      setMetadata({});
+      setVisited([]);
+    };
+
+    const switchMode = (nextMode) => {
+      setMode(nextMode);
+      setVisited(currentRow?.id ? [currentRow.id] : []);
+    };
+
+    const windowIds = rows
+      .filter((_, idx) => withinWindow(idx, safeIndex))
+      .map((row) => row.id);
+    const currentReady = !!(currentRow && retained[currentRow.id]?.status === 'ready');
+    const nextMetaId = mode === 'bounded' && currentReady
+      ? rows.find((row, idx) => !withinWindow(idx, safeIndex) && !retained[row.id] && !metadata[row.id])?.id ?? null
+      : null;
+
+    return html`<section data-testid="budget-app" data-mode=${mode} data-deck=${deckId}>
+      <p class="note">Active window: current ±${WINDOW_RADIUS}. Off-window rows display retained snapshots without holding live subscription slots.</p>
+      <div>
+        <label>Deck <select id="deck-select" data-testid="deck-select" value=${deckId} onChange=${(e) => switchDeck(e.currentTarget.value)}>
+          ${DECKS.map((d) => html`<option key=${d.id} value=${d.id}>${d.name}</option>`)}
+        </select></label>
+        <button type="button" id="toggle-mode" data-testid="toggle-mode" onClick=${() => switchMode(mode === 'bounded' ? 'leaking' : 'bounded')}>
+          Mode: ${mode === 'bounded' ? 'Bounded window' : 'Leaking (anti-pattern)'}
+        </button>
+        <button type="button" id="toggle-picker" data-testid="toggle-picker" onClick=${() => setPickerOpen((open) => !open)}>
+          ${pickerOpen ? 'Close picker' : 'Open picker'}
+        </button>
+      </div>
+      <p>
+        <button type="button" id="first" disabled=${!safeIndex} onClick=${() => setIndex(0)}>First</button>
+        <button type="button" id="prev" disabled=${!safeIndex} onClick=${() => setIndex((i) => Math.max(0, i - 1))}>Previous</button>
+        <span data-testid="slide-position">${rows.length ? `${safeIndex + 1} / ${rows.length}` : '0 / 0'}</span>
+        <button type="button" id="next" disabled=${!rows.length || safeIndex >= rows.length - 1} onClick=${() => setIndex((i) => Math.min(rows.length - 1, i + 1))}>Next</button>
+        <button type="button" id="last" disabled=${!rows.length || safeIndex >= rows.length - 1} onClick=${() => setIndex(Math.max(0, rows.length - 1))}>Last</button>
+      </p>
+      ${deck.status === 'unsupported' && html`<p role="alert">${deck.message}</p>`}
+      ${deck.status === 'loading' && !rows.length && html`<${Loading} what="deck" />`}
+      ${deck.status === 'error' && html`<${ErrorState} error=${deck.error} onRetry=${deck.retry} />`}
+      <${FeedNotice} feed=${deck} />
+      ${mode === 'leaking' && html`<${EagerLeakingLists} />`}
+      ${pickerOpen && html`<${LazyPicker} folder=${deckId} onSelect=${(idx) => setIndex(idx)} onClose=${() => setPickerOpen(false)} />`}
+      <div class="layout">
+        <nav aria-label="Outline">
+          <h2>Outline</h2>
+          <ol>${rows.map((row, idx) => {
+            const inWindow = withinWindow(idx, safeIndex);
+            const snap = retained[row.id];
+            const label = snap?.record?.name || metadata[row.id]?.record?.name || row.name || row.id;
+            return html`<li key=${row.id} data-testid=${'outline-item-' + (idx + 1)} data-in-window=${String(inWindow)} data-retained=${String(!!snap?.record)}>
+              <button type="button" data-testid=${'jump-' + (idx + 1)} onClick=${() => setIndex(idx)}>${idx + 1}. ${label}</button>
+            </li>`;
+          })}</ol>
+        </nav>
+        <div>
+          ${mode === 'bounded'
+            ? html`
+                ${windowIds.map((id) => html`<${WindowItemReader} key=${deckId + ':' + id} id=${id} isCurrent=${currentRow?.id === id} onSnapshot=${onSnapshot} onScopeChanged=${onScopeChanged} />`)}
+                ${nextMetaId && html`<${BackgroundMetaProbe} key=${deckId + ':meta:' + nextMetaId} id=${nextMetaId} onMetadata=${onMetadata} onScopeChanged=${onScopeChanged} />`}
+              `
+            : html`
+                ${visited.map((id) => html`<${LeakingSlideReader} key=${deckId + ':leak:' + id} id=${id} isCurrent=${currentRow?.id === id} />`)}
+              `}
+        </div>
+      </div>
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>

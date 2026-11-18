@@ -54,7 +54,12 @@ pub struct MemberCopyDeviceConfig {
     pub hosted_route_database_id: String,
     /// Optional trusted canonical origin pin. `None` is ungrounded: the first
     /// authenticated success supplies it. A set value is only a constraint and
-    /// must equal the authenticated origin.
+    /// must equal the authenticated origin. On an unpinned native restart a
+    /// current matching credential can recover that origin from the verified
+    /// receipt. With an attached retained vault, missing/rotated credentials
+    /// refuse construction; they cannot take custody through an old receipt.
+    /// Without a vault, online refresh can establish a fresh authenticated
+    /// context. A new no-receipt setup does not read credentials at construction.
     pub origin_database_id: Option<String>,
     pub credential_file: PathBuf,
     pub copy_root: PathBuf,
@@ -228,7 +233,7 @@ impl MemberCopyDriver {
     /// Attach the N2 publisher to this serialized member-copy owner. The
     /// collector must hand over the writer lock before attachment. A pending
     /// durable revocation is completed before returning, including on restart.
-    /// Native serving stays Locked; this adds deletion ownership only.
+    /// The same owner publishes admitted native generations and owns deletion.
     #[cfg(feature = "v2-kernel-probe")]
     pub fn attach_markdown_vault(&mut self, path: &Path) -> Result<()> {
         validate_absolute_unambiguous(path, "markdown vault")?;
@@ -237,6 +242,19 @@ impl MemberCopyDriver {
             || self.config.copy_root.starts_with(path)
         {
             return Err(Error::engine("member vault ownership refused"));
+        }
+        // A retained native vault cannot establish copy identity. Recover only
+        // from the current guarded credential and verified admission receipt,
+        // before taking its writer lock. A fresh no-receipt setup reads no
+        // credential here and can still obtain one for its first HTTP refresh.
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.serving.needs_native_receipt_metadata() {
+            let current = self.read_current_selection()?;
+            if !self.serving.restore_native_receipt_metadata(&current) {
+                return Err(Error::engine(
+                    "member copy authenticated receipt recovery refused",
+                ));
+            }
         }
         let mut vault = crate::markdown_vault::Publisher::open(path)?;
         if !vault.matches_member_copy(
@@ -285,6 +303,9 @@ impl MemberCopyDriver {
     /// copy. A revocation/account tombstone has no recovery target.
     #[cfg(feature = "v2-kernel-probe")]
     async fn publish_rebound_vault(&mut self) -> Result<()> {
+        if self.vault.is_none() {
+            return Ok(());
+        }
         let Some(scope) = self.serving.bound_scope_ref().map(str::to_owned) else {
             return Ok(());
         };
@@ -299,6 +320,19 @@ impl MemberCopyDriver {
             })
             .transpose()?
             .unwrap_or(false);
+        if let Some(source) = self.serving.native_vault_snapshot()? {
+            if let Some(vault) = self.vault.as_mut() {
+                let publisher = vault
+                    .get_mut()
+                    .map_err(|_| Error::engine("member vault owner unavailable"))?;
+                if pending {
+                    publisher.publish_member_scope(&scope, &source)?;
+                } else {
+                    publisher.cycle_with_freshness(&source, || Ok(source.freshness.clone()))?;
+                }
+            }
+            return Ok(());
+        }
         if !pending {
             return Ok(());
         }
@@ -398,6 +432,25 @@ impl MemberCopyDriver {
             .await
     }
 
+    /// Shutdown uses the same cleanup/reconciliation as deadline expiry, so a
+    /// large preparation budget does not become a long shutdown delay.
+    pub(crate) async fn refresh_bounded_or_stopped<F>(
+        &mut self,
+        budget: Duration,
+        stopped: F,
+    ) -> Result<RefreshDisposition>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        self.refresh_until_deadline(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(budget) => {},
+                _ = stopped => {},
+            }
+        })
+        .await
+    }
+
     /// Shared bounded-refresh core: races one serialized refresh against an
     /// injected `deadline`. Production passes `tokio::time::sleep(budget)`;
     /// tests pass a oneshot deadline fired only after the transport confirms a
@@ -473,12 +526,20 @@ impl MemberCopyDriver {
                 return Err(error);
             }
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.serving.needs_native_receipt_metadata() {
+            self.serving.restore_native_receipt_metadata(&selection);
+        }
         if self.serving.held_receipt_eligibility(&selection) != ReceiptEligibility::HeldValidated {
             self.serving.quiesce().await;
             return Ok(ReceiptEligibility::NotServable);
         }
         if !self.serving.is_serving() {
             let _ = self.serving.recover_after_failed_candidate().await;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.serving.is_serving() {
+            self.publish_rebound_vault().await?;
         }
         Ok(if self.serving.is_serving() {
             ReceiptEligibility::HeldValidated
@@ -1044,6 +1105,7 @@ mod tests {
 
     fn device_consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: crate::standby_snapshot::STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,

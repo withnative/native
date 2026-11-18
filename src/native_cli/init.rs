@@ -409,7 +409,7 @@ async fn run_into(mut opts: Options, io: &mut Interaction<'_>, report: &mut Valu
     .await?;
     if !opts.no_connect && !opts.review_supersession {
         let deps = connect::Deps {
-            current_exe: std::env::current_exe()?,
+            launch_exe: super::launch::saved_launch_exe()?,
             run: &connect::run_command,
             find_on_path: &connect::find_on_path,
         };

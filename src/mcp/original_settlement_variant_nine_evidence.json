@@ -1,0 +1,28 @@
+{
+  "scope": "qualification-fixture evidence only; runtime 10, qualified c9 binary, real test JWT; NOT a live queue or a universal historical inventory",
+  "source": "installed-node v2 qualification fixture: accepted-cut-restart-D retained working entries (runtime 10, qualified c9 node binary)",
+  "supporting_inventory": "installed-node v2 qualification fixture: owned contract-digest inventory (25 retained snapshots, 7 combinations)",
+  "rows": [
+    {
+      "index": 0,
+      "version": 9,
+      "executor": "records_write",
+      "operation": "update_record",
+      "contract_digest": "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a"
+    },
+    {
+      "index": 2,
+      "version": 9,
+      "executor": "records_write",
+      "operation": "update_record",
+      "contract_digest": "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a"
+    },
+    {
+      "index": 6,
+      "version": 9,
+      "executor": "records_write",
+      "operation": "create_record",
+      "contract_digest": "79c37864d58d7fa2b3e55e2f13cb075658cae8ecd01b2f84b3e8d80b944dfff2"
+    }
+  ]
+}

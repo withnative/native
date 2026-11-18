@@ -437,10 +437,30 @@ where
 /// stored text (handlers return structured data; a JSON-in-a-string field
 /// would push parsing onto every caller).
 pub(crate) fn event_to_value(event: &EventRow, actor_names: &HashMap<String, String>) -> Value {
-    let payload = event
+    let mut payload = event
         .payload
         .as_deref()
         .map(|raw| serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string())));
+    if event.event_type == "kernel.app_action_recorded.v1" {
+        if let Some(object) = payload.as_mut().and_then(Value::as_object_mut) {
+            object.remove("caller_write_ordinal");
+        }
+    } else if event.event_type == crate::standby::shapes::WRITE_RECEIPT_EVENT {
+        if let Some(object) = payload.as_mut().and_then(Value::as_object_mut) {
+            if let Some(mut receipt) = object
+                .get("receipt_json")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            {
+                if crate::standby::shapes::scrub_receipt_metadata(&mut receipt) {
+                    object.insert(
+                        "receipt_json".into(),
+                        json!(serde_json::to_string(&receipt).expect("JSON receipt")),
+                    );
+                }
+            }
+        }
+    }
     json!({
         "local_seq": event.local_seq,
         "id": event.id,
@@ -496,8 +516,31 @@ pub(crate) fn shape_history_event(mut event: Value, detail: HistoryDetail) -> Va
     let event_type = object
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let changed_fields = metadata_changed_fields(event_type, &payload);
+        .unwrap_or_default()
+        .to_owned();
+    // Advisory scalar metadata, already through the viewer's event redaction.
+    // Bound the projection: never copy arbitrary nested client data into a list.
+    if event_type == "record.updated" {
+        object.insert(
+            "merged_offline".into(),
+            json!(payload.get("merged_offline") == Some(&Value::Bool(true))),
+        );
+        if let Some(interval) = payload.get("offline_interval") {
+            if let (Some(start), Some(end), Some(true)) = (
+                interval.get("started_at_ms").and_then(Value::as_u64),
+                interval.get("reconnected_at_ms").and_then(Value::as_u64),
+                interval.get("client_reported").and_then(Value::as_bool),
+            ) {
+                object.insert(
+                    "offline_interval".into(),
+                    json!({
+                        "started_at_ms": start, "reconnected_at_ms": end, "client_reported": true,
+                    }),
+                );
+            }
+        }
+    }
+    let changed_fields = metadata_changed_fields(&event_type, &payload);
     object.insert("payload_omitted".into(), json!(payload_omitted));
     object.insert(
         "payload_json_utf8_bytes".into(),
@@ -2814,6 +2857,8 @@ async fn tab_record_changes_walk(
                 "run_key": shaped["run_key"],
                 "changed_fields": changed_fields,
                 "fields_truncated": fields_truncated,
+                "merged_offline": shaped["merged_offline"] == Value::Bool(true),
+                "offline_interval": shaped["offline_interval"],
                 "reason": reason,
                 "reason_truncated": reason_truncated,
                 "payload_bytes": shaped["payload_json_utf8_bytes"],
@@ -4596,5 +4641,22 @@ mod message_revision_tests {
             metadata_changed_fields("message.revision.recorded.v1", &payload),
             vec!["body".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod offline_merge_tests {
+    use super::*;
+
+    #[test]
+    fn offline_merge_is_available_without_body_payloads() {
+        let event = json!({"type":"record.updated", "payload":{
+            "body":"private body", "merged_offline":true,
+            "offline_interval":{"started_at_ms":1000,"reconnected_at_ms":2000,"client_reported":true}
+        }});
+        let shaped = shape_history_event(event, HistoryDetail::Metadata);
+        assert_eq!(shaped["merged_offline"], json!(true));
+        assert_eq!(shaped["offline_interval"]["started_at_ms"], json!(1000));
+        assert!(shaped.get("payload").is_none());
     }
 }

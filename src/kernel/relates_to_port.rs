@@ -587,7 +587,7 @@ pub async fn commit_provider_as(
 
 pub(crate) async fn commit_provider_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     principal: &str,
     r: &ProviderRequest,

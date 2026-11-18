@@ -12,6 +12,138 @@
       "major": 1,
       "manifest": "1.1.0/manifest.json",
       "manifest_sha256": "59ea2f4a6c0fd7d6afc72a5b5f7b7a6c380813e2ac9c87dc457bd156d0d2f090"
+    },
+    {
+      "version": "1.1.1",
+      "major": 1,
+      "manifest": "1.1.1/manifest.json",
+      "manifest_sha256": "ce5b716112405d7e24a7f0a48a8cb216e9d368f989271fc4c8bd008e443a4e39"
+    },
+    {
+      "version": "1.1.2",
+      "major": 1,
+      "manifest": "1.1.2/manifest.json",
+      "manifest_sha256": "31c05aada415a1dc414c0cc86eb232b48355658271bf2dc77a9f7b6ad039162c"
+    },
+    {
+      "version": "1.2.0",
+      "major": 1,
+      "manifest": "1.2.0/manifest.json",
+      "manifest_sha256": "1b5873f66f180b0b9baf411551ac1904da0c01f135abbb556c60b09d0e7c8df6"
+    },
+    {
+      "version": "1.3.0",
+      "major": 1,
+      "manifest": "1.3.0/manifest.json",
+      "manifest_sha256": "795cb575147d3978675b1aaca5d49b1f06179f7c9b38c7f6dfb69fd903e7e410"
+    },
+    {
+      "version": "1.4.0",
+      "major": 1,
+      "manifest": "1.4.0/manifest.json",
+      "manifest_sha256": "fa832dde870d00b11bf0334cfeee4ff4ba1c85ed640d2f6f068a76c09162c3ea"
+    },
+    {
+      "version": "1.5.0",
+      "major": 1,
+      "manifest": "1.5.0/manifest.json",
+      "manifest_sha256": "cd3ac2c52b7643d0eb60ff60ea3f46d0feecee1962c5f906fcb1deb5a43a6be9"
+    },
+    {
+      "version": "1.6.0",
+      "major": 1,
+      "manifest": "1.6.0/manifest.json",
+      "manifest_sha256": "95e7ab1b0c7a003b75e1301067741c3c6765d4edf145c26ac38437ec979e879a"
+    },
+    {
+      "version": "1.7.0",
+      "major": 1,
+      "manifest": "1.7.0/manifest.json",
+      "manifest_sha256": "b5ca487cabdf822e56b93bed95253c7716e9cfd4ec20fe3a4ad6da6ff87175ea"
+    },
+    {
+      "version": "1.7.1",
+      "major": 1,
+      "manifest": "1.7.1/manifest.json",
+      "manifest_sha256": "89ad4992ec79864c36affaff4c31a5c8ab0a2c9c13a2649945b8dfbebc6c71e2"
+    },
+    {
+      "version": "1.7.2",
+      "major": 1,
+      "manifest": "1.7.2/manifest.json",
+      "manifest_sha256": "0d2091acdb322ba630b1d50608d847d22c5d39fd9bbc3ac3aee6c3d7445d1c4a"
+    },
+    {
+      "version": "1.7.3",
+      "major": 1,
+      "manifest": "1.7.3/manifest.json",
+      "manifest_sha256": "2b82badccb61cea92fea5bde2e6b01e914788aee08ceb99d28d524ec3080289a"
+    },
+    {
+      "version": "1.7.4",
+      "major": 1,
+      "manifest": "1.7.4/manifest.json",
+      "manifest_sha256": "ba5a08dd8769ba32e7ecba075ecad618444b395ab44e9bf947ddf3ee5bf3e5b9"
+    },
+    {
+      "version": "1.7.5",
+      "major": 1,
+      "manifest": "1.7.5/manifest.json",
+      "manifest_sha256": "e6d6dc74d24e60cb21bf32455ba8c5f95f27e6a2668b9ceace0cdcb689dddb5a"
+    },
+    {
+      "version": "1.7.6",
+      "major": 1,
+      "manifest": "1.7.6/manifest.json",
+      "manifest_sha256": "eb1d9caeb0503d201f1aa0d621d5f73e9dad566cfdd5d05fb02324506c1c80e3"
+    },
+    {
+      "version": "1.7.7",
+      "major": 1,
+      "manifest": "1.7.7/manifest.json",
+      "manifest_sha256": "7a9ef9e0aad8c99ecbf19519eb964f4cf506d509053f6ace9a1841cb0934047f"
+    },
+    {
+      "version": "1.7.8",
+      "major": 1,
+      "manifest": "1.7.8/manifest.json",
+      "manifest_sha256": "6562352cf96e1cb3c4099731deee13276d92256448353b4836b8b85d8cafd1b7"
+    },
+    {
+      "version": "1.7.9",
+      "major": 1,
+      "manifest": "1.7.9/manifest.json",
+      "manifest_sha256": "dea7e18b15d2d2cff3cd054e8be5237832cc1e0a7c054c0a39a10845d93f3f40"
+    },
+    {
+      "version": "1.7.10",
+      "major": 1,
+      "manifest": "1.7.10/manifest.json",
+      "manifest_sha256": "7cb27765b4e999bc293128e78657dc4b71789e2ccb8470d008921d495aa209a0"
+    },
+    {
+      "version": "1.7.11",
+      "major": 1,
+      "manifest": "1.7.11/manifest.json",
+      "manifest_sha256": "0a7328cbc1c967ec88b639b7e5945834ebd399f3b3454b41f897a1666a79ae63"
+    },
+    {
+      "version": "1.7.12",
+      "major": 1,
+      "manifest": "1.7.12/manifest.json",
+      "manifest_sha256": "22cc7ae2a3e4447d64b058162b04035deb7c9cd2fafb8a6731056e39b784c51e"
+    },
+    {
+      "version": "1.7.13",
+      "major": 1,
+      "manifest": "1.7.13/manifest.json",
+      "manifest_sha256": "4fb5fde1a4d89018eafbdb6a9f6762639cefb3f7f828d391586983553585484c"
+    },
+    {
+      "version": "1.7.14",
+      "major": 1,
+      "manifest": "1.7.14/manifest.json",
+      "manifest_sha256": "f2b7713ce2332ea014ce29499013740884dbc1d9e5aa012d738dfe4ce81e2189"
     }
   ]
 }

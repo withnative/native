@@ -135,7 +135,7 @@ artifact in question, not from this document.
 ## Proof
 
 Four journeys run against a real server in the `security-render` shard of the
-real-server Playwright harness (`web/workbench/e2e/real-server.spec.ts`),
+real-server Playwright harness (`web/dev/e2e/real-server.spec.ts`),
 with zero retries. Each opens the artifact in a fresh tab, stamps a marker on
 the host page's `window`, performs the write **out of band** through the tool
 route, and asserts the visible change and that the marker survived — the

@@ -45,6 +45,38 @@ bodies, excerpts, notes or facet values. Early fatal errors produce a redacted
 refusal report; the target may be partial. Preserve private targets/reports outside
 the repository.
 
+## New hosted accounts born on v2
+
+`NATIVE_CE_NEW_ACCOUNT_ENGINE=v2` (default `v1`; a `v2-kernel-probe` build is
+required, and startup refuses it otherwise) makes hosted provisioning — sign-up
+and guest upgrade alike — create the personal database through this importer
+instead of serving the v1 genesis file (task 2ca0689, option A). While holding
+the row's provisioning claim, `held/hosting/src/hosting/v2_provision.rs`:
+
+1. seeds the ordinary `account_bootstrap` v1 genesis and the owner's first
+   hosted identity reconciliation in a private file under
+   `<data_dir>/.provisioning-scratch/`;
+2. runs this importer (`all`, `history`, roster = that one account), requiring
+   no refusals or review, `admin_source = sole_account_binding`, and a complete
+   zero-mismatch capture; a fresh account must carry no app state;
+3. vacuums the target to a standalone file and verifies its NKV2 marker,
+   readiness and captures;
+4. in one catalog write transaction fenced on the claim token, fsyncs the
+   file, renames it to `databases/<id>.db`, fsyncs `databases/`, and sets
+   `status='ready'`, `engine='v2'`, `origin_db_id=NULL`. This runs on a
+   spawned task so a dropped request cannot cancel it mid-way; a refusal or
+   failed commit removes the renamed file.
+
+No freeze, drain or build-pinned receipt applies: the source was never routed
+and has a single writer. Hosted identity (H3) activates on the owner's first
+request, as for every cut-over workspace. A failed attempt leaves the row
+`failed` with engine `v1`, nothing in `users/` or `databases/`, and is retried
+by the next sign-in. Any later claim on a never-ready row — whichever engine
+is configured by then — removes a never-served file at the v2 slot and that
+row's `<id>-*` scratch. Catalog open sweeps scratch older than an hour, and
+account purge removes the account's scratch. The setting never converts an
+existing database.
+
 ## Identity, placement and authority
 
 Records retain v1 IDs. UUID records use S1's existing creation event; named IDs
@@ -74,8 +106,29 @@ Canonical v1 `account` bindings map to principals whose `auth_binding` is exactl
 maps directly. Unknown/ambiguous owners default to the workspace administrator only if v1 authorization already gives that account visibility. Otherwise they require review and are not imported with that owner. Source owner IDs and binding evidence are retained and assumptions reported.
 An exclusive account-only private policy instead supplies the owning account;
 even when the verified v1 owner names another account (Richard’s private-policy-wins decision). Such changes are reported in `owner_overrides` and stamped as imported legacy provenance, retaining the original owner and verified account evidence. Private records never default to a
-different administrator. The importer requires exactly one explicit root account
-with Manage to identify the workspace administrator.
+different administrator. The importer identifies the workspace administrator
+(the v2 root owner) from exactly one explicit root account with Manage
+(`admin_source: root_manage`, the HQ shape). Two or more refuse. A modern
+hosted `account_bootstrap` personal database has no root Manage entry: its root
+policy is the genesis `members: edit`, and its owner administers the root
+through the hosting catalog's Owner role. For that shape only, the importer
+falls back to the sole canonical account binding (`admin_source:
+sole_account_binding`) when every witness agrees: exactly one canonical
+`account` binding, on a live person; a `--members-file` roster of exactly that
+account; exactly one `member_contexts` row, for that account and person; and
+owner evidence — the account's only onboarding obligation is the owner
+first-run programme, which v1 provisioning writes only for a hosted Owner
+arrival (or a standalone file operator). Anything else, including a sole Member
+or Guest arrival, refuses before target creation and before the
+`.import.lock` sidecar is created, with a fixed `native:workspace-owner`
+reason (sanitized category `ownership_review`). The owner keeps their v1
+record capabilities; the root owner floor carries the catalog Owner's root
+administration, and records v1 left without a verified owner become
+administrator-owned assumptions exactly as on HQ: less than Manage becomes
+Manage on those, listed in `assumed_owners` (on a fresh personal database the
+owner's own person record and `native:unfiled` go Edit→Manage, and
+`native:onboarding-guest-guidance`, under its own `members: view` policy, goes
+View→Manage).
 
 Public external bindings have a separate v2 list/add projection. Existing
 imports do not populate it: a missing public binding is returned as an empty

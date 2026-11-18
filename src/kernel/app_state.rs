@@ -301,10 +301,12 @@ pub(crate) async fn import_as(
             tx.rollback().await?;
             return Ok(ImportResult::Unchanged);
         }
-    } else if state.is_empty() {
+    } else if state.is_empty() && !canvas_v2::is_canvas_shell(&mut tx, id).await? {
         tx.rollback().await?;
         return Ok(ImportResult::Unchanged);
     }
+    // Even a never-edited canvas needs an explicit frozen custody frontier:
+    // activation must distinguish a verified empty scene from missing custody.
     let imported = Imported {
         origin: origin.into(),
         bearer: id.into(),

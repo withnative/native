@@ -191,7 +191,7 @@ pub(crate) mod tests {
                 )
                 .await
                 .is_err());
-            let body=server.handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":executor,"operation":operation,"arguments":operation_args}}})).await.unwrap();
+            let body=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":executor,"operation":operation,"arguments":operation_args}}})).await.unwrap();
             assert!(
                 serde_json::to_string(&body).unwrap().contains("disabled"),
                 "{operation}: {body}"
@@ -214,10 +214,15 @@ pub(crate) mod tests {
     pub(crate) async fn named_view_executor_plan_prepares_without_writing_and_commits_exactly_once()
     {
         for race in [None, Some("drift"), Some("cas")] {
-            publication_plan_fixture(race).await;
+            publication_plan_fixture(race, false).await;
         }
     }
-    async fn publication_plan_fixture(race: Option<&'static str>) {
+    #[tokio::test]
+    async fn v2_direct_named_view_activation_executes_and_replays_in_one_call() {
+        publication_plan_fixture(None, true).await;
+    }
+
+    async fn publication_plan_fixture(race: Option<&'static str>, direct: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (db, admin) = crate::kernel::create_v2_database(
             dir.path().join("plan.db").to_str().unwrap(),
@@ -293,7 +298,34 @@ pub(crate) mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-            let prepared=server.handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":{"id":id,"pin":draft["pin"],"name":"view_planned","expected_binding_event_id":null,"idempotency_key":"activate-plan"}}}})).await.unwrap();
+            if direct {
+                let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":{"id":id,"pin":draft["pin"],"name":"view_planned","expected_binding_event_id":null,"idempotency_key":"activate-plan"}}}});
+                let done = server.handle_message(request.clone()).await.unwrap();
+                assert_eq!(done["result"]["isError"], false, "{done}");
+                let after: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    after,
+                    before + 2,
+                    "one binding and one private receipt fact"
+                );
+                let replay = server.handle_message(request).await.unwrap();
+                assert_eq!(
+                    replay["result"]["structuredContent"],
+                    done["result"]["structuredContent"]
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                    after
+                );
+                return;
+            }
+            let prepared=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":{"id":id,"pin":draft["pin"],"name":"view_planned","expected_binding_event_id":null,"idempotency_key":"activate-plan"}}}})).await.unwrap();
             assert_eq!(prepared["result"]["isError"], false, "{prepared}");
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
@@ -322,7 +354,10 @@ pub(crate) mod tests {
                     tokio::spawn(crate::named_views::gate::testing(
                         true,
                         crate::mcp::kernel_v2::writes::named_views::trace_commit(async move {
-                            server.handle_message(request).await.unwrap()
+                            server
+                                .handle_guarded_plan_fixture_message(request)
+                                .await
+                                .unwrap()
                         }),
                     ))
                 };
@@ -423,7 +458,7 @@ pub(crate) mod tests {
                 return;
             }
             let (executed, trace) = crate::mcp::kernel_v2::writes::named_views::trace_commit(
-                server.handle_message(request.clone()),
+                server.handle_guarded_plan_fixture_message(request.clone()),
             )
             .await;
             let executed = executed.unwrap();
@@ -438,11 +473,59 @@ pub(crate) mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-            assert_eq!(after, before + 1);
+            assert_eq!(
+                after,
+                before + 2,
+                "one binding event and one canonical private receipt fact"
+            );
+            let facts: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT act,payload FROM content_events WHERE record_id='kernel:mcp-write-receipts' \
+                 AND type='kernel.mcp_write_receipt_recorded.v1' AND actor=? \
+                 AND json_extract(payload,'$.operation')='manage_named_views.activate_view' \
+                 AND json_extract(payload,'$.operation_key')='activate-plan'"
+            ).bind(&admin).fetch_all(db.pool()).await.unwrap();
+            assert_eq!(
+                facts.len(),
+                1,
+                "publication commits one recovery fact under the plan key"
+            );
+            let (fact_act, raw) = &facts[0];
+            assert!(*fact_act > 0);
+            let fact: Value = serde_json::from_str(raw).unwrap();
+            let ledger: String = sqlx::query_scalar("SELECT receipt_json FROM kernel_mcp_write_receipts WHERE principal_id=? AND operation='manage_named_views.activate_view' AND operation_key='activate-plan'")
+                .bind(&admin).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                fact["receipt_json"].as_str().unwrap(),
+                ledger,
+                "the canonical fact preserves the complete stored response bytes"
+            );
+            let receipt: Value = serde_json::from_str(&ledger).unwrap();
+            let (output_record, output_type, output_act): (String, String, i64) =
+                sqlx::query_as("SELECT record_id,type,act FROM content_events WHERE id=?")
+                    .bind(receipt["event_id"].as_str().unwrap())
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(output_record, id);
+            assert_eq!(output_type, crate::named_views::TRANSITION);
+            assert_eq!(
+                output_act, *fact_act,
+                "publication and recovery fact commit in one act"
+            );
             let source = crate::kernel::read_record_as(&db, &admin, &source_id)
                 .await
                 .unwrap()
                 .unwrap();
+            let pinned_source_seq: i64 =
+                sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
+                    .bind(&event_id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                source.revision, pinned_source_seq,
+                "publication must not mutate its pinned source"
+            );
             crate::kernel::set_archived_as(&db, &admin, &source_id, true, source.revision)
                 .await
                 .unwrap();
@@ -450,7 +533,10 @@ pub(crate) mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-            let retry = server.handle_message(request).await.unwrap();
+            let retry = server
+                .handle_guarded_plan_fixture_message(request)
+                .await
+                .unwrap();
             assert_eq!(retry["result"]["isError"], false, "{retry}");
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
@@ -464,6 +550,257 @@ pub(crate) mod tests {
     }
     // Test-only bridge: the source-proof fixtures supply real imported facet
     // proposals; this module owns the real executor/catalog-guard harness.
+    async fn proposal_rpc(server: &Arc<ExecutorPrototypeStdioServer>, message: Value) -> Value {
+        crate::named_views::gate::testing(
+            false,
+            server.handle_guarded_plan_fixture_message(message),
+        )
+        .await
+        .unwrap()
+    }
+    async fn proposal_receipts(db: &crate::Db) -> i64 {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kernel_mcp_write_receipts')")
+            .fetch_one(db.pool()).await.unwrap();
+        if exists {
+            sqlx::query_scalar("SELECT count(*) FROM kernel_mcp_write_receipts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        } else {
+            0
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // Shared production-dispatch fixture inputs, not an API.
+    async fn proposal_executor_fixture(
+        db: &crate::Db,
+        bearer: &str,
+        home: &str,
+        member: &str,
+        member_caller: &Caller,
+        registry: &Arc<ToolRegistry>,
+        store: &plan_store::PlanStore,
+        authority: &Arc<ViewAuthority>,
+        definition: &Value,
+        name: &str,
+    ) -> (Value, Arc<ExecutorPrototypeStdioServer>, String) {
+        // An ordinary member asks for a selector, never a hand-built manifest.
+        // The exact bytes returned here flow into the existing guarded write fixture.
+        let member_server = ExecutorPrototypeStdioServer::new_with_plan_store(
+            registry.clone(),
+            EngineHandle::KernelV2(db.clone()),
+            member_caller.clone(),
+            None,
+            ExecutorConstruction {
+                plan_store: Some(store.clone()),
+                hosted_authority: Some(authority.clone()),
+                pinned_catalogue: None,
+                experimental: ExperimentalExecutors::empty(),
+                lean: true,
+                telemetry: TelemetryConstruction::Disabled,
+                transport: telemetry::TelemetryTransport::Http,
+                deployment_mutation_barrier: None,
+            },
+        )
+        .await
+        .unwrap();
+        let member_server = Arc::new(member_server);
+
+        let contract = member_server
+            .contracts
+            .get(&("records_read".into(), "propose_view".into()))
+            .unwrap();
+        assert_eq!(contract.access, OperationAccess::Read);
+        assert!(contract.selector_specific_schema);
+        assert!(!write_operations::requires_plan(
+            "records_read",
+            "propose_view"
+        ));
+        assert!(contract.input_schema["properties"].get("action").is_none());
+        let selector = json!({"id":bearer,"record_type":"WorkItem","kind":"task","home":home,
+            "selection":{"kind":"keys","keys":["priority","area"]}});
+        // Bootstrap uses this same ledger mint; establish it before measuring the read.
+        let existing_run = crate::kernel::mint_run_as(db, member, None).await.unwrap();
+        let proposal_request = json!({"jsonrpc":"2.0","id":100,"method":"tools/call","params":{
+            "name":"call_executor","arguments":{"executor":"records_read","operation":"propose_view",
+                "run_key":existing_run,"arguments":selector}}});
+        let before_plans: i64 = sqlx::query_scalar("SELECT count(*) FROM write_plans")
+            .fetch_one(store.local_pool())
+            .await
+            .unwrap();
+        let before_receipts = proposal_receipts(db).await;
+        let before_runs: i64 = sqlx::query_scalar("SELECT count(*) FROM kernel_runs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let before_schema: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let before_proposal: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        let proposal = proposal_rpc(&member_server, proposal_request.clone()).await;
+
+        assert_eq!(proposal["result"]["isError"], false, "{proposal}");
+        let proposed = &proposal["result"]["structuredContent"];
+        assert_eq!(&proposed["definition"], definition);
+        assert_eq!(proposed["name"], name);
+        for key in [
+            "proof",
+            "source_proof",
+            "deadline",
+            "pin",
+            "event_id",
+            "write_receipt",
+        ] {
+            assert!(
+                proposed.get(key).is_none(),
+                "proposal must not return {key}"
+            );
+        }
+        let repeated = proposal_rpc(&member_server, proposal_request.clone()).await;
+        assert_eq!(
+            repeated["result"]["structuredContent"]["definition"],
+            proposed["definition"]
+        );
+        for unknown in [Some("scout-chair-a748b2"), None] {
+            let mut request = proposal_request.clone();
+            if let Some(key) = unknown {
+                request["params"]["arguments"]["run_key"] = json!(key);
+            } else {
+                request["params"]["arguments"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("run_key");
+            }
+            let response = proposal_rpc(&member_server, request).await;
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            assert_eq!(
+                response["result"]["structuredContent"]["definition"],
+                proposed["definition"]
+            );
+        }
+        for run in ["new", "new:scout-chair"] {
+            // Both valid and invalid operation envelopes refuse before run decoration.
+            for invalid in [false, true] {
+                let mut request = proposal_request.clone();
+                request["params"]["arguments"]["run_key"] = json!(run);
+                if invalid {
+                    request["params"]["arguments"]["format"] = json!(12);
+                }
+                let denied = proposal_rpc(&member_server, request).await;
+                assert_eq!(denied["result"]["isError"], true, "{denied}");
+                assert!(denied.to_string().contains("cannot allocate"), "{denied}");
+            }
+            let mut direct = proposal_request.clone();
+            direct["params"]["name"] = json!("records_read");
+            direct["params"]["arguments"]
+                .as_object_mut()
+                .unwrap()
+                .remove("executor");
+            direct["params"]["arguments"]["run_key"] = json!(run);
+            let refused = proposal_rpc(&member_server, direct).await;
+            assert!(refused.to_string().contains("cannot allocate"), "{refused}");
+            for modern in [false, true] {
+                // Invalid representation must not mint while rendering a source refusal.
+                let mut message = json!({"jsonrpc":"2.0","id":101,"method":"tools/call","params":{
+                    "name":"manage_named_views","arguments":{"action":"propose_view","run_key":run,"format":12}}});
+                if modern {
+                    message["params"]["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":protocol::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities":{},
+                        "io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"}});
+                }
+                let (registry, db, caller) = (registry.clone(), db.clone(), member_caller.clone());
+                let outcome = tokio::spawn(async move {
+                    if modern {
+                        Box::pin(protocol::handle_modern_engine_message(
+                            registry,
+                            EngineHandle::KernelV2(db),
+                            caller,
+                            message,
+                        ))
+                        .await
+                    } else {
+                        Box::pin(protocol::handle_legacy_engine_message(
+                            registry,
+                            EngineHandle::KernelV2(db),
+                            caller,
+                            message,
+                        ))
+                        .await
+                    }
+                })
+                .await
+                .unwrap();
+                let body = outcome_body(outcome).unwrap();
+                assert!(body.to_string().contains("cannot allocate"), "{body}");
+            }
+            let source = json!({"action":"propose_view","run_key":run});
+            let denied = registry
+                .call_engine(
+                    EngineHandle::KernelV2(db.clone()),
+                    member_caller.clone(),
+                    "manage_named_views",
+                    source,
+                )
+                .await
+                .unwrap_err();
+            assert!(denied.to_string().contains("cannot allocate"), "{denied}");
+            // The explicit profile field never changes allocation authority.
+            let profiled = json!({"action":"propose_view","run_key":run,
+                "profile":"facet-global-1"});
+            let denied = registry
+                .call_engine(
+                    EngineHandle::KernelV2(db.clone()),
+                    member_caller.clone(),
+                    "manage_named_views",
+                    profiled,
+                )
+                .await
+                .unwrap_err();
+            assert!(denied.to_string().contains("cannot allocate"), "{denied}");
+        }
+        assert_eq!(
+            before_proposal,
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            authority
+                .acquisitions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            before_plans,
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM write_plans")
+                .fetch_one(store.local_pool())
+                .await
+                .unwrap()
+        );
+        assert_eq!(before_receipts, proposal_receipts(db).await);
+        assert_eq!(
+            before_runs,
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM kernel_runs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            before_schema,
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        );
+        (proposed.clone(), member_server, existing_run)
+    }
+
     pub(crate) async fn generated_publication_guard_fixture(
         db: &crate::Db,
         dir: &std::path::Path,
@@ -533,17 +870,34 @@ pub(crate) mod tests {
             .await
             .unwrap(),
         );
+        let (proposed, member_server, existing_run) = proposal_executor_fixture(
+            db,
+            bearer,
+            home,
+            &member,
+            &member_caller,
+            &registry,
+            &store,
+            &authority,
+            &definition,
+            name,
+        )
+        .await;
+        let definition = proposed["definition"].clone();
         let work = async {
             let draft_args = json!({"action":"record_view_revision","id":bearer,"definition":definition,"idempotency_key":"member-generated-draft"});
-            let draft = registry
-                .call_engine(
-                    EngineHandle::KernelV2(db.clone()),
-                    member_caller.clone(),
-                    "manage_named_views",
-                    draft_args.clone(),
-                )
-                .await
-                .unwrap();
+            let mut executor_draft = draft_args.clone();
+            executor_draft.as_object_mut().unwrap().remove("action");
+            let drafted = member_server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":103,"method":"tools/call","params":{
+                "name":"call_executor","arguments":{"executor":"records_write","operation":"record_view_revision",
+                    "format":"json","run_key":existing_run,"arguments":executor_draft}
+            }})).await.unwrap();
+            assert_eq!(drafted["result"]["isError"], false, "{drafted}");
+            let draft = drafted["result"]["structuredContent"].clone();
+            assert_eq!(
+                draft["pin"]["definition_sha256"],
+                proposed["definition_sha256"]
+            );
             let mut dedup_args = draft_args.clone();
             dedup_args["idempotency_key"] = json!("member-generated-dedup");
             let dedup = registry
@@ -626,7 +980,7 @@ pub(crate) mod tests {
                     .unwrap()
             );
             source.as_object_mut().unwrap().remove("action");
-            let prepared=server.handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":source}}})).await.unwrap();
+            let prepared=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":source}}})).await.unwrap();
             assert_eq!(prepared["result"]["isError"], false, "{prepared}");
             let plan = &prepared["result"]["structuredContent"];
             let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","plan_id":plan["plan_id"],"target":plan["target"],"effect_summary":plan["effect_summary"]}}});
@@ -640,7 +994,10 @@ pub(crate) mod tests {
                 tokio::spawn(crate::named_views::gate::testing(
                     true,
                     crate::mcp::kernel_v2::writes::named_views::trace_commit(async move {
-                        server.handle_message(request).await.unwrap()
+                        server
+                            .handle_guarded_plan_fixture_message(request)
+                            .await
+                            .unwrap()
                     }),
                 ))
             };
@@ -687,7 +1044,22 @@ pub(crate) mod tests {
             let (published, trace) = running.await.unwrap();
             assert_eq!(trace, ["prepare", "guard"]);
             assert_eq!(published["result"]["isError"], false, "{published}");
-            let stale=server.handle_message(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":{"id":bearer,"name":name,"pin":draft["pin"],"expected_binding_event_id":null,"idempotency_key":"stale-generated-CAS"}}}})).await.unwrap();
+            // The proposal's bytes have passed the ordinary member draft and
+            // owner plan/guard. Retained reads work with producers disabled.
+            for sql in [
+                format!("SELECT relation_name, column_name FROM catalog_columns WHERE relation_name='{name}' ORDER BY column_name"),
+                format!("SELECT id,name,area,priority FROM {name} ORDER BY id"),
+            ] {
+                let read = proposal_rpc(&server, json!({"jsonrpc":"2.0","id":102,"method":"tools/call","params":{
+                    "name":"call_executor","arguments":{"executor":"sql_read","operation":"query_sql","format":"json","arguments":{"sql":sql}}
+                }})).await;
+                assert_eq!(read["result"]["isError"], false, "{read}");
+                let rows = read["result"]["structuredContent"]["rows"].as_array()
+                    .unwrap_or_else(|| panic!("expected query rows: {read}"));
+                assert!(!rows.is_empty(), "{read}");
+            }
+
+            let stale=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"activate_view","arguments":{"id":bearer,"name":name,"pin":draft["pin"],"expected_binding_event_id":null,"idempotency_key":"stale-generated-CAS"}}}})).await.unwrap();
             assert_eq!(stale["result"]["isError"], true, "{stale}");
             assert!(
                 stale.to_string().contains("view_binding_conflict"),
@@ -709,13 +1081,16 @@ pub(crate) mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-            let replay = server.handle_message(request).await.unwrap();
+            let replay = server
+                .handle_guarded_plan_fixture_message(request)
+                .await
+                .unwrap();
             assert_eq!(replay["result"]["isError"], false, "{replay}");
             let binding:String=sqlx::query_scalar("SELECT id FROM content_events WHERE record_id=? AND type=? ORDER BY seq DESC LIMIT 1").bind(bearer).bind(crate::named_views::TRANSITION).fetch_one(db.pool()).await.unwrap();
-            let remove=server.handle_message(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"unpublish_view","arguments":{"id":bearer,"expected_binding_event_id":binding,"idempotency_key":"demoted-generated-remove"}}}})).await.unwrap();
+            let remove=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"unpublish_view","arguments":{"id":bearer,"expected_binding_event_id":binding,"idempotency_key":"demoted-generated-remove"}}}})).await.unwrap();
             assert_eq!(remove["result"]["isError"], false, "{remove}");
             let plan = &remove["result"]["structuredContent"];
-            let denied=server.handle_message(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"unpublish_view","plan_id":plan["plan_id"],"target":plan["target"],"effect_summary":plan["effect_summary"]}}})).await.unwrap();
+            let denied=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"unpublish_view","plan_id":plan["plan_id"],"target":plan["target"],"effect_summary":plan["effect_summary"]}}})).await.unwrap();
             assert_eq!(denied["result"]["isError"], true, "{denied}");
             assert!(!denied.to_string().contains("indeterminate"), "{denied}");
             assert_eq!(
@@ -840,7 +1215,10 @@ pub(crate) mod tests {
             let prepare_request = |operation: &str, args: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":operation,"arguments":args}}});
             let activation = json!({"id":id,"pin":draft["pin"],"name":"view_role","expected_binding_event_id":null,"idempotency_key":"owner-publish"});
             let denied = member_server
-                .handle_message(prepare_request("activate_view", activation.clone()))
+                .handle_guarded_plan_fixture_message(prepare_request(
+                    "activate_view",
+                    activation.clone(),
+                ))
                 .await
                 .unwrap();
             assert!(
@@ -850,7 +1228,7 @@ pub(crate) mod tests {
                 "{denied}"
             );
             let prepared = server
-                .handle_message(prepare_request("activate_view", activation))
+                .handle_guarded_plan_fixture_message(prepare_request("activate_view", activation))
                 .await
                 .unwrap();
             assert_eq!(prepared["result"]["isError"], false, "{prepared}");
@@ -867,7 +1245,10 @@ pub(crate) mod tests {
                 let server = server.clone();
                 let request = request.clone();
                 tokio::spawn(crate::named_views::gate::testing(true, async move {
-                    server.handle_message(request).await.unwrap()
+                    server
+                        .handle_guarded_plan_fixture_message(request)
+                        .await
+                        .unwrap()
                 }))
             };
             entered.acquire().await.unwrap().forget();
@@ -903,7 +1284,7 @@ pub(crate) mod tests {
                 .acquisitions
                 .load(std::sync::atomic::Ordering::SeqCst);
             let replay = demoted_server
-                .handle_message(request.clone())
+                .handle_guarded_plan_fixture_message(request.clone())
                 .await
                 .unwrap();
             assert_eq!(replay["result"]["isError"], false, "{replay}");
@@ -927,7 +1308,7 @@ pub(crate) mod tests {
                     json!({"id":id,"expected_binding_event_id":null,"idempotency_key":"demoted-unpublish"})
                 };
                 let denied = demoted_server
-                    .handle_message(prepare_request(operation, args))
+                    .handle_guarded_plan_fixture_message(prepare_request(operation, args))
                     .await
                     .unwrap();
                 assert!(
@@ -956,11 +1337,11 @@ pub(crate) mod tests {
                 before
             );
             let binding: String = sqlx::query_scalar("SELECT id FROM content_events WHERE type='kernel.named_view_binding_changed.v1' ORDER BY seq DESC LIMIT 1").fetch_one(db.pool()).await.unwrap();
-            let removal = second_server.handle_message(prepare_request("unpublish_view", json!({"id":id,"expected_binding_event_id":binding,"idempotency_key":"owner-unpublish"}))).await.unwrap();
+            let removal = second_server.handle_guarded_plan_fixture_message(prepare_request("unpublish_view", json!({"id":id,"expected_binding_event_id":binding,"idempotency_key":"owner-unpublish"}))).await.unwrap();
             assert_eq!(removal["result"]["isError"], false, "{removal}");
             let remove_request = execute_request("unpublish_view", &removal);
             let removed = second_server
-                .handle_message(remove_request.clone())
+                .handle_guarded_plan_fixture_message(remove_request.clone())
                 .await
                 .unwrap();
             assert_eq!(removed["result"]["isError"], false, "{removed}");
@@ -973,7 +1354,7 @@ pub(crate) mod tests {
                 .acquisitions
                 .load(std::sync::atomic::Ordering::SeqCst);
             let removed_replay = second_demoted
-                .handle_message(remove_request.clone())
+                .handle_guarded_plan_fixture_message(remove_request.clone())
                 .await
                 .unwrap();
             assert_eq!(
@@ -998,7 +1379,10 @@ pub(crate) mod tests {
                 (&demoted_server, request),
                 (&second_demoted, remove_request),
             ] {
-                let refused = server.handle_message(request).await.unwrap();
+                let refused = server
+                    .handle_guarded_plan_fixture_message(request)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     refused["result"]["isError"], true,
                     "revoked access must refuse receipt replay: {refused}"
@@ -1071,7 +1455,7 @@ async fn named_view_untrusted_v2_draft_refuses_source_app_and_indirect_executor(
         assert_eq!(error,crate::named_views::MISSING);
         let app=caller.clone().with_host_asserted_app(crate::mcp::app_attribution::AppAttribution::new("test.app","1.0.0","installation").unwrap());
         assert!(registry.call_engine(EngineHandle::KernelV2(db.clone()),app,"manage_named_views",source_args).await.is_err());
-        let body=server.handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"record_view_revision","arguments":args}}})).await.unwrap();
+        let body=server.handle_guarded_plan_fixture_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":{"executor":"records_write","operation":"record_view_revision","arguments":args}}})).await.unwrap();
         let text=serde_json::to_string(&body).unwrap();
         assert!(text.contains(crate::named_views::MISSING),"{text}");
     }).await;

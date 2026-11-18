@@ -1599,6 +1599,7 @@ async fn postgres_query_sql_full_boundary_contract() {
             "schema_config",
             "SELECT id,layer,name,data,applies_to_collection_id,version_lineage,created_at,created_at_ms FROM schema_config WHERE id='fixture:config'",
         ),
+        ("viewer", "SELECT person_id,display_name FROM viewer"),
         (
             "body_task_items",
             "SELECT record_id,item_index,marker,checked,in_quote,start_offset,end_offset FROM body_task_items WHERE record_id='9c150000-0000-4000-8000-200000000002' ORDER BY item_index",
@@ -1630,6 +1631,15 @@ async fn postgres_query_sql_full_boundary_contract() {
             .await
             .unwrap();
         assert!(!postgres_result.rows.is_empty(), "{}", relation.name);
+        if relation_name == "viewer" {
+            assert_eq!(
+                postgres_result.rows,
+                [json!({
+                    "person_id": "9c150000-0000-4000-8000-002000000034",
+                    "display_name": "Alice",
+                })]
+            );
+        }
         if relation_name == "body_task_items" {
             let record_id = "9c150000-0000-4000-8000-200000000002";
             assert_eq!(

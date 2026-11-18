@@ -215,7 +215,9 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
     use LensToolPolicy::*;
     use ToolKind::*;
     match kind {
-        Some(ToolKind::OutboxStatus | ToolKind::ManageNamedViews) => UnsupportedRead,
+        Some(ToolKind::OutboxStatus | ToolKind::ManageNamedViews | ToolKind::ManagePublication) => {
+            UnsupportedRead
+        }
         Some(GetRecord | QueryRecord | Search) => FederatedRead,
         Some(
             SetIntent
@@ -227,6 +229,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | SaveAccount
             | UpdateRecord
             | ClaimUnownedRecord
+            | MergeBody
             | CorrectRecordType
             | DeleteRecord
             | ArchiveRecord
@@ -250,6 +253,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | ManageBindings
             | ManageRecordPolicy
             | ManageAccountConfig
+            | ManageSavedTabs
             | ResolveExternal
             | ObserveExternal
             | ManageInstructions
@@ -293,6 +297,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | QuerySql
             | Scan
             | GetWorkspaceSnapshot
+            | ReadAppBundle
             | ReadAttachment
             | RenderSuggestionReview
             | ExportSnapshot

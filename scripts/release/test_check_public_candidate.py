@@ -96,7 +96,7 @@ class PublicCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(candidate.CandidateError, "1.98.0"):
             candidate.check_toolchain(self.root)
 
-        self.metadata["packages"][0]["repository"] = "https://github.com/withnative/native-ce"
+        self.metadata["packages"][0]["repository"] = "https://example.test/org/other-repository"
         with self.assertRaisesRegex(candidate.CandidateError, "repository"):
             candidate.check_cargo_metadata(self.root, self.metadata)
 

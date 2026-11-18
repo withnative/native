@@ -101,3 +101,18 @@ cargo run --locked --features dev-tools --bin tool-inventory -- --check
 An inventory drift failure means registration, typed arguments, or checked-in
 documentation disagree. Update the generator inputs and regenerated artifact
 together; do not hand-edit the generated operation list.
+
+## Comment thread lifecycle
+
+`update_record` resolves a comment root with `lifecycle: "resolved"` and a
+nonblank `summary`. It reopens a resolved root with `lifecycle: "open"` and
+`summary: null` in the same update. Omitting the summary or retaining the old
+resolution does not reopen the thread. Replies never carry lifecycle or
+resolution summary, and informational roots cannot make either transition.
+The v1 and v2 engines agree on these transitions, including refusing an
+explicit `lifecycle: null`; `turso_local` shares the v1 transition validator.
+Lifecycle updates require Edit on the thread; authority to view or post a
+reply does not grant authority to reopen. Existing revision
+fences and idempotency rules apply. Posting a reply alone leaves root state
+unchanged; Docs v2 follows a confirmed reply to a resolved root with a separate
+reopen update and reports its outcome independently.

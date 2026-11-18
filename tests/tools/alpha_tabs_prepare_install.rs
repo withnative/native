@@ -9,6 +9,34 @@ fn prepare_args(artifact: &str, body: &str, declaration: Value) -> Value {
         "declaration": declaration, "reason": "Install the authored source."})
 }
 
+#[tokio::test]
+async fn approved_app_link_requires_no_source_and_changes_no_install_state() {
+    let (db, registry) = fixture().await;
+    let before = update_counts(&db).await;
+    let link = prepare(
+        &registry,
+        &db,
+        json!({"action":"install_link","package":"agent.notion-pages"}),
+    )
+    .await;
+    assert_eq!(link["install_path"], "/shell/?install=agent.notion-pages");
+    assert_eq!(link["installation_changed"], false);
+    assert_eq!(link["requires_person_consent"], true);
+    assert_eq!(update_counts(&db).await, before);
+    let list = prepare(&registry, &db, json!({"action":"list"})).await;
+    assert!(list["installs"].as_array().unwrap().is_empty());
+    assert!(call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({"action":"install_link","package":"agent.unapproved"})
+    )
+    .await
+    .is_err());
+    assert_eq!(update_counts(&db).await, before);
+}
+
 async fn prepare(registry: &ToolRegistry, db: &Db, args: Value) -> Value {
     call_as(
         registry,
@@ -478,4 +506,89 @@ async fn prepare_install_validates_historical_html_and_never_skips_a_body_clear(
                 .contains("script[src]"));
         }
     }
+}
+
+#[tokio::test]
+async fn prepare_install_explains_missing_package_marker_and_installs_after_repair() {
+    for extra in [
+        format!("<!--{}-->", "a".repeat(600_000)),
+        format!(
+            "<img alt=\"\" src=\"data:image/png,{}\">",
+            "a".repeat(300_000)
+        ),
+    ] {
+        let (db, registry) = fixture().await;
+        artifact(&registry, &db, ARTIFACT_A).await;
+        grant(&db, ARTIFACT_A, ALICE, Capability::View).await;
+        // Imported sources may predate current write-path validation.
+        let body = PREVIEW_BODY.replace("</main>", &format!("{extra}</main>"));
+        let pool = crate::common::fixture_write_pool(&db).await;
+        sqlx::query("INSERT INTO content_events (id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated',?,1,'complete')")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(ARTIFACT_A).bind(json!({"body": body}).to_string()).execute(&pool).await.unwrap();
+        let args = prepare_args(ARTIFACT_A, &body, json!({"needs": [], "effects": []}));
+        let before = update_counts(&db).await;
+        let refused = prepare(&registry, &db, args.clone()).await;
+        assert_eq!(refused["ready"], false);
+        assert!(refused["next_call"].is_null());
+        assert_eq!(
+            refused["findings"][0]["code"],
+            "app_package_marker_required"
+        );
+        assert!(refused["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("app_package:'true'"));
+        assert_eq!(update_counts(&db).await, before);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id": ARTIFACT_A, "facets": {"app_package": "true"},
+                    "reason": "Mark the existing app source as a package."
+                }),
+            )
+            .await
+            .unwrap();
+        let prepared = prepare(&registry, &db, args).await;
+        assert_eq!(prepared["ready"], true);
+        assert!(execute(&registry, &db, &prepared).await.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn prepare_install_builder_package_accepts_large_images_and_fonts() {
+    use base64::Engine as _;
+    let (db, registry) = fixture().await;
+    let payload = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 524_288]);
+    let body = PREVIEW_BODY.replace("</main>", &format!(
+        "<img alt=\"\" src=\"data:image/png;base64,{payload}\"><style>@font-face{{font-family:test;src:url(data:font/woff2;base64,{payload})}}</style></main>"
+    ));
+    // Follow the builder guide's create step, including its package marker.
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "create_record",
+            json!({
+                "id": ARTIFACT_A, "type": "Document", "kind": "artifact", "name": "App with assets",
+                "body": body, "facets": {"runtime": "native.html.v1", "app_package": "true"},
+                "reason": "Create the app package following the builder guide."
+            }),
+        )
+        .await
+        .unwrap();
+    grant(&db, ARTIFACT_A, ALICE, Capability::View).await;
+    let before = update_counts(&db).await;
+    let prepared = prepare(
+        &registry,
+        &db,
+        prepare_args(ARTIFACT_A, &body, json!({"needs": [], "effects": []})),
+    )
+    .await;
+    assert_eq!(prepared["ready"], true);
+    assert_eq!(prepared["source_bytes"], body.len());
+    assert_eq!(update_counts(&db).await, before);
+    assert!(execute(&registry, &db, &prepared).await.is_ok());
 }

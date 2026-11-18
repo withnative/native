@@ -4267,6 +4267,37 @@ async fn paged_query(
     caller: &Caller,
     base: &Value,
 ) -> Result<Vec<Value>> {
+    paged_collection_query(&mut CollectionQuerySource::Lens(lens), caller, base).await
+}
+
+enum CollectionQuerySource<'a, 'db> {
+    Lens(&'a lens::ReadLens<'db>),
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember(&'a mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession),
+}
+impl CollectionQuerySource<'_, '_> {
+    async fn query(&mut self, caller: &Caller, tool: &str, query: Value) -> Result<Value> {
+        match self {
+            Self::Lens(lens) => {
+                super::querying::execute_query_record_args_with_lens_as(lens, caller, tool, query)
+                    .await
+            }
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(session) => {
+                super::querying::execute_query_record_args_with_native_member_as(
+                    session, caller, tool, query,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn paged_collection_query(
+    source: &mut CollectionQuerySource<'_, '_>,
+    caller: &Caller,
+    base: &Value,
+) -> Result<Vec<Value>> {
     let mut records = Vec::new();
     let mut offset = 0_i64;
     loop {
@@ -4279,13 +4310,7 @@ async fn paged_query(
             .as_object_mut()
             .expect("query base is object")
             .insert("offset".into(), json!(offset));
-        let output = super::querying::execute_query_record_args_with_lens_as(
-            lens,
-            caller,
-            "Collection input",
-            query,
-        )
-        .await?;
+        let output = source.query(caller, "Collection input", query).await?;
         let page = output
             .get("records")
             .and_then(Value::as_array)
@@ -4346,6 +4371,22 @@ async fn paged_query_in(
     Ok(records)
 }
 
+fn collection_membership_query(id: &str, kind: &str) -> Option<Value> {
+    match kind {
+        "folder" => {
+            Some(json!({ "steps": [{ "step": "filter", "home_id": id }], "order": "name_asc" }))
+        }
+        "selection" => Some(json!({
+            "steps": [
+                { "step": "filter", "ids": [id] },
+                { "step": "traverse", "target": "links", "relationship": "member_of", "direction": "in" }
+            ],
+            "order": "name_asc"
+        })),
+        _ => None,
+    }
+}
+
 async fn collection_member_values(
     lens: &lens::ReadLens<'_>,
     caller: &Caller,
@@ -4353,25 +4394,11 @@ async fn collection_member_values(
     kind: &str,
 ) -> Result<Vec<Value>> {
     match kind {
-        "folder" => {
+        "folder" | "selection" => {
             paged_query(
                 lens,
                 caller,
-                &json!({ "steps": [{ "step": "filter", "home_id": id }], "order": "name_asc" }),
-            )
-            .await
-        }
-        "selection" => {
-            paged_query(
-                lens,
-                caller,
-                &json!({
-                    "steps": [
-                        { "step": "filter", "ids": [id] },
-                        { "step": "traverse", "target": "links", "relationship": "member_of", "direction": "in" }
-                    ],
-                    "order": "name_asc"
-                }),
+                &collection_membership_query(id, kind).expect("fixed membership kind"),
             )
             .await
         }
@@ -4391,7 +4418,9 @@ async fn collection_member_values(
                     // Full membership is explicit on this Collection; existing
                     // saved queries retain their authored/default page scope.
                     if all_matching.as_deref() == Some("all_matching")
-                        && query.get("limit").is_none() && query.get("offset").is_none() {
+                        && query.get("limit").is_none()
+                        && query.get("offset").is_none()
+                    {
                         return paged_query(lens, caller, &query).await;
                     }
                     let output = super::querying::execute_query_record_args_with_lens_as(
@@ -4407,19 +4436,21 @@ async fn collection_member_values(
                         .cloned()
                         .ok_or_else(|| Error::engine("Collection kind:query must resolve to records, not a count or aggregate"))
                 }
-                super::querying::SavedQueryInspection::GovernedSql { .. } => {
-                    Err(Error::engine(
-                        "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
-                    ))
-                }
-                super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(Error::engine("view_profile_unsupported: use hosted pinned SQL")),
+                super::querying::SavedQueryInspection::GovernedSql { .. } => Err(Error::engine(
+                    "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
+                )),
+                super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(
+                    Error::engine("view_profile_unsupported: use hosted pinned SQL"),
+                ),
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
-                | super::querying::SavedQueryInspection::UnsupportedVersion { diagnostic, .. } => {
-                    Err(Error::engine(diagnostic))
-                }
+                | super::querying::SavedQueryInspection::UnsupportedVersion {
+                    diagnostic, ..
+                } => Err(Error::engine(diagnostic)),
             }
         }
-        _ => Err(Error::engine(format!("unsupported Collection kind '{kind}'"))),
+        _ => Err(Error::engine(format!(
+            "unsupported Collection kind '{kind}'"
+        ))),
     }
 }
 
@@ -4877,13 +4908,27 @@ async fn open_collection_member(db: Db, caller: Caller, id: String) -> Result<Va
     }
     let read_lens = lens::ReadLens::live(&db);
     let raw = collection_member_values_member(&read_lens, &caller, &id, &kind).await?;
-    for value in &raw {
+    validate_member_collection_schema(&raw, &markers, crate::schema::ROOT_RECORD_ID)?;
+    let mut records = input_records_from_values_in_pool(db.write_pool(), raw).await?;
+    sort_input_records(&mut records);
+    Ok(json!({
+        "status": "opened",
+        "surface": "neutral_table",
+        "collection": { "id": id, "kind": kind },
+        "input": { "version": INPUT_ENVELOPE_VERSION, "records": records },
+        "renderers": incoming_artifacts_member(&db, &id).await?,
+    }))
+}
+
+fn validate_member_collection_schema(raw: &[Value], markers: &[String], root: &str) -> Result<()> {
+    const TOOL: &str = "open_collection";
+    for value in raw {
         if let Some(home) = value.get("home_id").and_then(Value::as_str) {
             if markers.iter().any(|marker| marker == home) {
                 return Err(Error::unavailable_offline(TOOL, "schema_incomplete"));
             }
         } else if value.get("home_id").is_some_and(Value::is_null)
-            && value.get("id").and_then(Value::as_str) != Some(crate::schema::ROOT_RECORD_ID)
+            && value.get("id").and_then(Value::as_str) != Some(root)
         {
             // The containing collection is excluded from the copy (its
             // `home_id` was nulled at produce time). Online enrichment reads
@@ -4902,15 +4947,7 @@ async fn open_collection_member(db: Db, caller: Caller, id: String) -> Result<Va
             return Err(Error::unavailable_offline(TOOL, "schema_provenance_hidden"));
         }
     }
-    let mut records = input_records_from_values_in_pool(db.write_pool(), raw).await?;
-    sort_input_records(&mut records);
-    Ok(json!({
-        "status": "opened",
-        "surface": "neutral_table",
-        "collection": { "id": id, "kind": kind },
-        "input": { "version": INPUT_ENVELOPE_VERSION, "records": records },
-        "renderers": incoming_artifacts_member(&db, &id).await?,
-    }))
+    Ok(())
 }
 
 /// `true` when a saved record query's definition uses an input the member
@@ -4989,6 +5026,15 @@ async fn collection_member_values_member(
 /// artifacts never appear and are never counted.
 async fn incoming_artifacts_member(db: &Db, collection_id: &str) -> Result<Vec<Value>> {
     let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
+    let mut connection = db.write_pool().acquire().await?;
+    incoming_artifacts_member_on(&mut connection, collection_id, &predicate).await
+}
+
+async fn incoming_artifacts_member_on(
+    connection: &mut SqliteConnection,
+    collection_id: &str,
+    predicate: &str,
+) -> Result<Vec<Value>> {
     let sql = format!(
         "SELECT r.id, r.name, f.value AS runtime
            FROM links l JOIN records r ON r.id = l.source_id
@@ -4999,7 +5045,7 @@ async fn incoming_artifacts_member(db: &Db, collection_id: &str) -> Result<Vec<V
     );
     let rows = sqlx::query(&sql)
         .bind(collection_id)
-        .fetch_all(db.write_pool())
+        .fetch_all(&mut *connection)
         .await?;
     Ok(rows
         .into_iter()
@@ -5012,6 +5058,26 @@ async fn incoming_artifacts_member(db: &Db, collection_id: &str) -> Result<Vec<V
         })
         .collect())
 }
+
+// Native descriptors and authenticated logical staging derive these strings
+// from the actual native definition pin. This is the native reader's existing
+// shape test, not the legacy catalogue resolver used by v1 member copies.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn native_collection_kind<'a>(
+    record_type: &str,
+    kind: Option<&'a str>,
+) -> Option<&'a str> {
+    (record_type == "Collection")
+        .then_some(kind)
+        .flatten()
+        .filter(|kind| matches!(*kind, "folder" | "selection" | "query"))
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "artifacts/native_member.rs"]
+mod native_member;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use native_member::open_collection as native_member_open_collection;
 
 #[path = "artifacts/advance_pin.rs"]
 mod advance_pin;

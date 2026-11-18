@@ -1,0 +1,16 @@
+{
+  "result": "Confirmed pre-fix private-W component defect; not an installed admission proof",
+  "implementation_commit": "35ee009721bc265f16aa08308cf0da14be944762",
+  "harness_file_sha256": "b9bfa3c6f331aacc81f835decca3c998031b22c46b1f4163b270e134b96b6433",
+  "producer": "79570567dc19b5fd1b91191d302a7a573265073f",
+  "base_fixture": "base.sqlite.gz",
+  "delta_fixture": "delta-response.json.gz",
+  "setup": "Production WorkingKernelSchema, exact WORKING_METADATA, production registered_primary_keys/Collector and same connection/top-level transaction",
+  "preconditions": "Working schema coordinates and WorkingFold::new both succeeded",
+  "failure": "kernel-v2 generation schema differs from compiled owned schema",
+  "execution_seconds": 0.42,
+  "rollback": true,
+  "source_published_bytes_preserved": true,
+  "log": "/fixtures/working95-repro.log",
+  "limitations": "Trusted delta mint is component-test-only; transport and sealed journal admission remain separate."
+}

@@ -608,23 +608,50 @@ async fn anchored_link_read_plans_use_both_endpoint_indexes_and_upgrade_old_data
     }
     ensure_link_read_indexes(&db).await.unwrap();
     ensure_link_read_indexes(&db).await.unwrap();
-    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
-        "EXPLAIN QUERY PLAN {}",
-        visible_generic_links_sql()
-    ))
-    .bind(serde_json::json!([{"id": KERNEL_ROOT_ID, "view": true}]).to_string())
-    .bind(&admin)
-    .bind(&a)
-    .fetch_all(db.pool())
-    .await
-    .unwrap();
-    // SQLite may prefer the active-triple index to source_page. Require an
-    // indexed equality search in each direction without forcing a named index.
-    for endpoint in ["source_id", "target_id"] {
+    for (candidate, sql) in [
+        (false, visible_generic_links_sql()),
+        (true, visible_generic_links_candidate_sql()),
+    ] {
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .bind(serde_json::json!([{"id": KERNEL_ROOT_ID, "view": true}]).to_string())
+                .bind(&admin)
+                .bind(&a)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        // SQLite may prefer the active-triple index to source_page. Require an
+        // indexed equality search in each direction without forcing a named index.
+        for endpoint in ["source_id", "target_id"] {
+            assert!(
+                plan.iter().any(|row| row.3.contains("SEARCH")
+                    && row.3.contains("idx_kernel_generic_links_")
+                    && row.3.contains(&format!("({endpoint}=?"))),
+                "{plan:?}"
+            );
+        }
         assert!(
-            plan.iter().any(|row| row.3.contains("SEARCH")
-                && row.3.contains("idx_kernel_generic_links_")
-                && row.3.contains(&format!("({endpoint}=?"))),
+            plan.iter()
+                .any(|row| row.3.starts_with("SEARCH r ") && row.3.contains("(id=?)")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|row| row.3 == "SCAN r" || row.3.starts_with("SCAN r ")),
+            "visibility must not scan every record: {plan:?}"
+        );
+        if candidate {
+            assert!(
+                plan.iter().any(|row| row.3 == "MATERIALIZE candidates"),
+                "{plan:?}"
+            );
+        }
+        assert!(
+            !plan.iter().any(|row| matches!(
+                row.3.as_str(),
+                "MATERIALIZE visible" | "MATERIALIZE endpoints"
+            )),
             "{plan:?}"
         );
     }
@@ -649,6 +676,341 @@ async fn anchored_link_read_plans_use_both_endpoint_indexes_and_upgrade_old_data
                 .any(|row| row.3.contains("SEARCH") && row.3.contains(index)),
             "{plan:?}"
         );
+    }
+    db.close().await;
+}
+
+async fn paired_endpoint_visibility(
+    db: &Db,
+    principal: &str,
+    anchors: &[String],
+    batch: bool,
+) -> Vec<GenericLink> {
+    let mut tx = db.pool().begin().await.unwrap();
+    let scope = visible_home_anchors_as(&mut tx, principal).await.unwrap();
+    let homes = serde_json::to_string(
+        &scope
+            .homes
+            .into_iter()
+            .filter(|h| h.policy_valid)
+            .map(|h| serde_json::json!({"id":h.home_id,"view":h.policy_view}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let argument = if batch {
+        serde_json::to_string(anchors).unwrap()
+    } else {
+        anchors[0].clone()
+    };
+    let mut results = Vec::new();
+    for mut sql in [
+        visible_generic_links_sql(),
+        visible_generic_links_candidate_sql(),
+    ] {
+        if batch {
+            sql = sql
+                .replace(
+                    "source_id<>?3",
+                    "source_id NOT IN (SELECT value FROM json_each(?3))",
+                )
+                .replace(
+                    "source_id=?3",
+                    "source_id IN (SELECT value FROM json_each(?3))",
+                )
+                .replace(
+                    "target_id=?3",
+                    "target_id IN (SELECT value FROM json_each(?3))",
+                );
+        }
+        let mut links: Vec<GenericLink> = sqlx::query_as(&sql)
+            .bind(&homes)
+            .bind(principal)
+            .bind(&argument)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        links.sort_by(|a, b| a.link_id.cmp(&b.link_id));
+        results.push(links);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "principal={principal}, anchors={anchors:?}, batch={batch}"
+    );
+    tx.rollback().await.unwrap();
+    results.pop().unwrap()
+}
+
+#[tokio::test]
+async fn bounded_generic_visibility_preserves_off_candidate_bearers_and_endpoint_gates() {
+    let (db, admin, _, anchor, ordinary) = Box::pin(world()).await;
+    let reader = create_principal(&db, "account", "Reader", "bounded:reader", &admin)
+        .await
+        .unwrap();
+    let outsider = create_principal(&db, "account", "Outsider", "bounded:outsider", &admin)
+        .await
+        .unwrap();
+    replace_home_policy(
+        &db,
+        &admin,
+        KERNEL_ROOT_ID,
+        &[(&admin, "manage"), (&reader, "view")],
+    )
+    .await
+    .unwrap();
+    let private = create_home(&db, KERNEL_ROOT_ID, Some(&[(&admin, "manage")]), &admin)
+        .await
+        .unwrap();
+    let mut records = std::collections::BTreeMap::new();
+    for (name, home) in [
+        ("private", private.as_str()),
+        ("owner-floor", private.as_str()),
+        ("terminal-visible", KERNEL_ROOT_ID),
+        ("terminal-floor", private.as_str()),
+        ("terminal-private", private.as_str()),
+        ("terminal-dead", KERNEL_ROOT_ID),
+        ("comment", KERNEL_ROOT_ID),
+        ("attachment", KERNEL_ROOT_ID),
+        ("hidden-bearer", KERNEL_ROOT_ID),
+        ("tombstone-bearer", KERNEL_ROOT_ID),
+        ("message-visible", KERNEL_ROOT_ID),
+        ("message-private", private.as_str()),
+        ("message-unsealed", KERNEL_ROOT_ID),
+        ("unsealed-bearer", KERNEL_ROOT_ID),
+        ("tombstone", KERNEL_ROOT_ID),
+        ("missing-bearer", KERNEL_ROOT_ID),
+        ("duplicate-bearer", KERNEL_ROOT_ID),
+        ("cycle-a", KERNEL_ROOT_ID),
+        ("cycle-b", KERNEL_ROOT_ID),
+    ] {
+        records.insert(
+            name,
+            Box::pin(create_record_as(&db, &admin, home)).await.unwrap(),
+        );
+    }
+    // Disposable imported-carrier projections exercise the exact serving gate,
+    // including invalid/orphan states that canonical writes correctly refuse.
+    // This fixture makes no importer or replay qualification claim.
+    let mut fixture = db.write_pool().acquire().await.unwrap();
+    let pin = crate::v2_standard::v1_compat::package().definitions[0]
+        .digest
+        .clone();
+    for (name, typ, kind) in [
+        ("comment", "Annotation", "comment"),
+        ("attachment", "Document", "attachment"),
+        ("hidden-bearer", "Annotation", "comment"),
+        ("tombstone-bearer", "Document", "attachment"),
+        ("unsealed-bearer", "Annotation", "comment"),
+        ("missing-bearer", "Annotation", "comment"),
+        ("duplicate-bearer", "Annotation", "comment"),
+        ("cycle-a", "Annotation", "comment"),
+        ("cycle-b", "Annotation", "comment"),
+        ("message-visible", "Message", "text"),
+        ("message-private", "Message", "text"),
+        ("message-unsealed", "Message", "text"),
+    ] {
+        let id = &records[name];
+        sqlx::query("UPDATE kernel_records SET primary_type='V1',kind='record',accession=id,pin_family='native.v1.record',pin_version=1,pin_digest=?,interpreter='native.defn/5' WHERE id=?")
+            .bind(&pin).bind(id).execute(&mut *fixture).await.unwrap();
+        for (field, value) in [("v1_type", typ), ("v1_kind", kind)] {
+            sqlx::query("INSERT INTO kernel_record_fields SELECT id,?,json_quote(?),created_seq FROM kernel_records WHERE id=?")
+                .bind(field).bind(value).bind(id).execute(&mut *fixture).await.unwrap();
+        }
+    }
+    for name in [
+        "owner-floor",
+        "terminal-floor",
+        "hidden-bearer",
+        "missing-bearer",
+    ] {
+        sqlx::query("UPDATE kernel_records SET owner_id=? WHERE id=?")
+            .bind(&reader)
+            .bind(&records[name])
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
+    }
+    for (name, audience) in [("message-visible", &admin), ("message-private", &reader)] {
+        let state = MessageState {
+            audience: std::collections::BTreeMap::from([(audience.clone(), "to".into())]),
+            author: Some(admin.clone()),
+            ..Default::default()
+        };
+        sqlx::query(
+            "INSERT INTO kernel_messages SELECT id,?,created_seq FROM kernel_records WHERE id=?",
+        )
+        .bind(serde_json::to_string(&state).unwrap())
+        .bind(&records[name])
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    }
+    // Foreign-key-off is restricted to this disposable fixture connection, so
+    // principal-only and absent generic targets can be checked explicitly.
+    sqlx::query("PRAGMA foreign_keys=OFF")
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    let mut links = vec![
+        ("basic", anchor.as_str(), ordinary.as_str(), "references", 1),
+        (
+            "incoming",
+            ordinary.as_str(),
+            anchor.as_str(),
+            "references",
+            1,
+        ),
+        ("self", anchor.as_str(), anchor.as_str(), "references", 1),
+        (
+            "inactive",
+            anchor.as_str(),
+            ordinary.as_str(),
+            "inactive",
+            0,
+        ),
+        (
+            "principal",
+            anchor.as_str(),
+            reader.as_str(),
+            "references",
+            1,
+        ),
+        (
+            "missing",
+            anchor.as_str(),
+            "bounded:missing-record",
+            "references",
+            1,
+        ),
+    ];
+    for name in [
+        "private",
+        "owner-floor",
+        "comment",
+        "attachment",
+        "hidden-bearer",
+        "tombstone-bearer",
+        "message-visible",
+        "message-private",
+        "unsealed-bearer",
+        "tombstone",
+        "missing-bearer",
+        "duplicate-bearer",
+        "cycle-a",
+    ] {
+        links.push((
+            name,
+            anchor.as_str(),
+            records[name].as_str(),
+            "references",
+            1,
+        ));
+    }
+    for (name, source, target) in [
+        ("bearer-comment", "comment", "terminal-visible"),
+        ("bearer-attachment", "attachment", "terminal-floor"),
+        ("bearer-hidden", "hidden-bearer", "terminal-private"),
+        ("bearer-tombstoned", "tombstone-bearer", "terminal-dead"),
+        ("bearer-unsealed", "unsealed-bearer", "message-unsealed"),
+        ("bearer-duplicate-a", "duplicate-bearer", "terminal-visible"),
+        ("bearer-duplicate-b", "duplicate-bearer", "terminal-floor"),
+        ("bearer-cycle-a", "cycle-a", "cycle-b"),
+        ("bearer-cycle-b", "cycle-b", "cycle-a"),
+    ] {
+        links.push((
+            name,
+            records[source].as_str(),
+            records[target].as_str(),
+            "part_of",
+            1,
+        ));
+    }
+    for (id, source, target, relationship, active) in links {
+        sqlx::query(
+            "INSERT INTO kernel_generic_links VALUES(?,?,?,?,?,'2026-11-09T00:00:00Z',?,?,1,1)",
+        )
+        .bind(id)
+        .bind(source)
+        .bind(target)
+        .bind(relationship)
+        .bind(format!("retained note {id}"))
+        .bind(&admin)
+        .bind(active)
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    }
+    sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    for name in ["tombstone", "terminal-dead"] {
+        sqlx::query("INSERT INTO kernel_import_tombstones SELECT id,'2026-11-09',created_seq FROM kernel_records WHERE id=?")
+            .bind(&records[name]).execute(&mut *fixture).await.unwrap();
+    }
+    drop(fixture);
+    for name in [
+        "terminal-visible",
+        "terminal-floor",
+        "terminal-private",
+        "terminal-dead",
+        "message-unsealed",
+    ] {
+        let incident: i64 = sqlx::query_scalar("SELECT count(*) FROM kernel_generic_links WHERE active=1 AND ((source_id=?1 AND target_id=?2) OR (target_id=?1 AND source_id=?2))")
+            .bind(&anchor).bind(&records[name]).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            incident, 0,
+            "bearer {name} must be outside endpoint candidates"
+        );
+    }
+    for (actor, extra) in [
+        (&reader, vec![]),
+        (&admin, vec!["private", "hidden-bearer", "message-private"]),
+        (&outsider, vec![]),
+    ] {
+        let mut expected = if actor == &outsider {
+            vec![]
+        } else {
+            vec![
+                "basic",
+                "incoming",
+                "self",
+                "owner-floor",
+                "comment",
+                "attachment",
+                "message-visible",
+            ]
+        };
+        expected.extend(extra);
+        expected.sort_unstable();
+        for batch in [false, true] {
+            let anchors = if batch {
+                vec![
+                    anchor.clone(),
+                    anchor.clone(),
+                    ordinary.clone(),
+                    "bounded:missing-anchor".into(),
+                ]
+            } else {
+                vec![anchor.clone()]
+            };
+            let actual = paired_endpoint_visibility(&db, actor, &anchors, batch).await;
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|link| link.link_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "actor={actor},batch={batch}"
+            );
+        }
+        for absent in [
+            "bounded:missing-anchor".to_owned(),
+            records["tombstone"].clone(),
+        ] {
+            assert!(paired_endpoint_visibility(&db, actor, &[absent], false)
+                .await
+                .is_empty());
+        }
     }
     db.close().await;
 }

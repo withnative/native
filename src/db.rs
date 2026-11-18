@@ -6,20 +6,59 @@
 //! connection by the pool's connect options rather than living in the DDL.
 
 mod body_connection;
+#[cfg(feature = "v2-kernel-probe")]
+mod kernel_retirement;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) mod kernel_settlement_tests;
 #[doc(hidden)]
 pub use body_connection::BodyHostAvailability;
 #[cfg(test)]
 mod body_lifecycle_tests;
 pub(crate) mod enrolled;
+pub(crate) mod writer_contract;
 
 type BodyRetirementFuture = futures::future::Shared<futures::future::BoxFuture<'static, bool>>;
+
+#[derive(Clone, Debug)]
+enum BodyRetirement {
+    Legacy(BodyRetirementFuture),
+    #[cfg(feature = "v2-kernel-probe")]
+    Kernel(Arc<kernel_retirement::Coordinator>),
+}
+
+#[cfg(test)]
+impl BodyRetirement {
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Legacy(a), Self::Legacy(b)) => a.ptr_eq(b),
+            #[cfg(feature = "v2-kernel-probe")]
+            (Self::Kernel(a), Self::Kernel(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "v2-kernel-probe")]
+            _ => false,
+        }
+    }
+}
+
+/// Evidence from an owned, borrowed kernel transaction. The caller retains the
+/// original Transaction and writer guards until it handles this outcome.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) enum KernelCommitOutcome {
+    Committed,
+    /// No COMMIT was attempted (for example, a nested savepoint was supplied).
+    Refused(crate::Error),
+    /// COMMIT failed and an explicit depth-zero rollback was acknowledged.
+    RolledBack(crate::Error),
+    /// Neither successful durability nor rollback settlement is established.
+    /// Retain/quarantine the transaction and its connection; never pool it.
+    Uncertain(crate::Error),
+}
 
 /// Closed, nonauthorizing handle/pool retirement custody for Hosting.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct BodyRetirementWitness {
     db: Db,
-    future: BodyRetirementFuture,
+    future: BodyRetirement,
 }
 impl BodyRetirementWitness {
     pub fn handle_id(&self) -> uuid::Uuid {
@@ -29,9 +68,17 @@ impl BodyRetirementWitness {
         self.db.body_jobs.retirement_ready()
     }
     pub fn retirement_complete(&self) -> bool {
+        #[cfg(feature = "v2-kernel-probe")]
+        if let BodyRetirement::Kernel(coordinator) = &self.future {
+            return coordinator.complete_for(&self.db);
+        }
         self.body_complete() && self.db.enrolled_retirement_complete()
     }
     pub async fn drain(&self) -> bool {
+        #[cfg(feature = "v2-kernel-probe")]
+        if let BodyRetirement::Kernel(coordinator) = &self.future {
+            return coordinator.drain().await && self.retirement_complete();
+        }
         // Ordinary readiness may recover after an independent cut/Leave or
         // retained writer close. Never cache that observation as physical ACK.
         if !self
@@ -42,7 +89,11 @@ impl BodyRetirementWitness {
         {
             return false;
         }
-        self.future.clone().await && self.retirement_complete()
+        match &self.future {
+            BodyRetirement::Legacy(future) => future.clone().await && self.retirement_complete(),
+            #[cfg(feature = "v2-kernel-probe")]
+            BodyRetirement::Kernel(_) => unreachable!("kernel drain selected above"),
+        }
     }
 }
 
@@ -71,12 +122,14 @@ use crate::schema::DDL_STATEMENTS;
 use crate::write_contention::WriteDomain;
 
 mod candidate_read_only;
-#[cfg(any(test, feature = "v2-kernel-probe"))]
-pub use candidate_read_only::open_marked_v2_database_read_only_at;
 #[cfg(all(feature = "v2-kernel-probe", any(test, feature = "dev-tools")))]
 pub(crate) use candidate_read_only::open_offline_v2_export_at;
 pub use candidate_read_only::{
     open_current_database_read_only_at, open_current_database_wal_read_only_at,
+};
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub use candidate_read_only::{
+    open_marked_v2_database_read_only_at, open_marked_v2_database_wal_read_only_at,
 };
 mod control_commit_test;
 #[doc(hidden)]
@@ -91,10 +144,61 @@ const INBOX_SNAPSHOT_MAX_ENTRIES: usize = 128;
 const INBOX_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug)]
-struct InboxSnapshotCacheEntry {
+pub(crate) struct InboxSnapshotCacheEntry {
     expires_at: Instant,
     value: serde_json::Value,
 }
+/// Ephemeral continuation state only; never canonical content or authority.
+pub(crate) type ReadSnapshotCache = Mutex<HashMap<String, InboxSnapshotCacheEntry>>;
+pub(crate) fn put_read_snapshot(
+    cache: &ReadSnapshotCache,
+    value: serde_json::Value,
+) -> Result<String> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut snapshots = cache
+        .lock()
+        .map_err(|_| Error::engine("Inbox snapshot store is unavailable"))?;
+    let now = Instant::now();
+    snapshots.retain(|_, entry| entry.expires_at > now);
+    if snapshots.len() >= INBOX_SNAPSHOT_MAX_ENTRIES {
+        let oldest = snapshots
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            snapshots.remove(&oldest);
+        }
+    }
+    snapshots.insert(
+        token.clone(),
+        InboxSnapshotCacheEntry {
+            expires_at: now + INBOX_SNAPSHOT_TTL,
+            value,
+        },
+    );
+    Ok(token)
+}
+
+pub(crate) fn get_read_snapshot(
+    cache: &ReadSnapshotCache,
+    token: &str,
+) -> Result<serde_json::Value> {
+    if token.len() != 36 || uuid::Uuid::parse_str(token).is_err() {
+        return Err(Error::engine(
+            "cursor_reset_required: invalid inbox snapshot",
+        ));
+    }
+    let mut snapshots = cache
+        .lock()
+        .map_err(|_| Error::engine("Inbox snapshot store is unavailable"))?;
+    let now = Instant::now();
+    snapshots.retain(|_, entry| entry.expires_at > now);
+    snapshots
+        .get(token)
+        .map(|entry| entry.value.clone())
+        .ok_or_else(|| Error::engine("cursor_reset_required: invalid inbox snapshot"))
+}
+
 // SQLite's documented default `SQLITE_MAX_LENGTH`. `query_sql` temporarily
 // lowers the per-connection runtime limit and restores the observed value;
 // pool release uses this as the cancellation/unwind backstop.
@@ -167,7 +271,7 @@ impl RollupCache {
 
 /// Engine schema stored in each ejectable user database's file header.
 /// This is independent of the product's SemVer and the catalog schema.
-pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 93;
+pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 94;
 /// The deliberately selected historical support baseline, once one exists.
 ///
 /// `None` is a product contract, not an implementation gap: development
@@ -610,6 +714,19 @@ pub(crate) const ENGINE_91_SHAPE_CONTRACT_SHA256: &str =
 pub(crate) const ENGINE_92_SHAPE_CONTRACT_SHA256: &str =
     "952a7c5ceb230e938d5e02afabf7d83b3b3d208af1c46faad973d2aec1d87b18";
 
+/// Measured directly from released engine93 DDL at 51a525e6, before engine94.
+pub(crate) const ENGINE_93_SHAPE_CONTRACT_SHA256: &str =
+    "55edd071da108a0df9bea1fdeab18fe0fde3c915862ff7f2351828e86fa19dfb";
+
+/// Fence token for a future v2 cross-request visible-set cache (Native
+/// b171a9d): an entry is valid only for the same incarnation and generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the slice 2 cache (Native b171a9d)
+pub(crate) struct AccessFence {
+    pub(crate) incarnation: uuid::Uuid,
+    pub(crate) generation: u64,
+}
+
 /// The SQLite authority granted to an open [`Db`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseOpenMode {
@@ -644,6 +761,20 @@ impl std::fmt::Display for DatabaseVersionState {
     }
 }
 
+/// Keep maintenance capabilities in the interner's existing allocation. `Db`
+/// is captured by large control-plane futures; adding fields to it can overflow
+/// the operator's main-thread stack before those futures reach an await.
+#[cfg(feature = "v2-kernel-probe")]
+#[derive(Debug, Default)]
+pub(crate) struct SqlEventProjectionHandle {
+    pub(crate) records: tokio::sync::Mutex<()>,
+    record_generation: std::sync::Mutex<Option<String>>,
+    pub(crate) interner: tokio::sync::Mutex<crate::kernel::sql_event_projection::Interner>,
+    /// Only an admitted writable server may maintain the disposable cache.
+    serving: AtomicBool,
+    barrier: OnceLock<crate::mcp::DeploymentMutationBarrier>,
+}
+
 /// An open native-ce database: a pool of connections to one SQLite file.
 ///
 /// Cheap to clone (all clones share all three pools). `close()` closes all
@@ -659,7 +790,10 @@ pub struct Db {
     execution_owner: Option<Arc<enrolled::ExecutionOwner>>,
     execution_jobs: Arc<enrolled::HandleJobs>,
     body_jobs: Arc<enrolled::BodyHandleJobs>,
-    body_retirement: Arc<OnceLock<BodyRetirementFuture>>,
+    body_retirement: Arc<OnceLock<BodyRetirement>>,
+    /// Explicit inactive cohort only; existing constructors never opt in.
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_lifecycle: Option<crate::coedit::live::KernelLifecycleRegistration>,
     capture_pool: Arc<tokio::sync::OnceCell<SqlitePool>>,
     pending_commit_probes: Option<Arc<control_commit_test::PoolProbeRegistry>>,
     /// Public observation pool opened by SQLite with `SQLITE_OPEN_READONLY`.
@@ -682,6 +816,8 @@ pub struct Db {
     /// new one. Lets callers (and the router tests) assert two connects share
     /// one underlying handle.
     handle_id: uuid::Uuid,
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) demand_root_aliases: Arc<crate::kernel::demand_root_aliases::Check>,
     /// The `embed()` seam (`crate::embed`). `None` in every v1 deployment — the
     /// hook is called on the write path regardless and does nothing. Per
     /// database rather than process-global because the hosted tier runs many
@@ -697,6 +833,18 @@ pub struct Db {
     /// authorization epoch, unit fence) — Tier 1.4, record `fd6c1f2`. Clones
     /// share it; reopening the same file deliberately starts cold.
     visible_set_cache: Arc<Mutex<crate::visible_set_cache::VisibleSetCache>>,
+    /// v2 visible-set access generation (Native b171a9d, slice 1 fence).
+    /// Bumped by writers that change visibility inputs without appending a
+    /// content event (full projection rebuild, database preparation, cache
+    /// invalidation). Clones share it; a fresh open starts a new incarnation
+    /// (`handle_id`). Nothing consults it yet: it is semantically inert until
+    /// a cache lands.
+    access_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this handle has been declared the only mutator of its file
+    /// (see [`Db::access_fence`]). False by default and never set in
+    /// production yet, so no handle carries a fence.
+    #[allow(dead_code)] // read by `access_fence`, consumed by the slice 2 cache
+    access_exclusive_owner: Arc<std::sync::atomic::AtomicBool>,
     /// Bounded, handle-local state behind opaque Inbox snapshot nonces. Exact
     /// Message ids and pinned item projections never travel in client tokens.
     inbox_snapshots: Arc<Mutex<HashMap<String, InboxSnapshotCacheEntry>>>,
@@ -711,6 +859,12 @@ pub struct Db {
     workspace_index: Arc<tokio::sync::RwLock<Option<crate::workspace_index::WorkspaceIndex>>>,
     /// At-most-one in-flight commit-wake fold for the index above.
     workspace_index_fold: Arc<AtomicBool>,
+    #[cfg(feature = "v2-kernel-probe")]
+    sql_event_projection_fold: Arc<AtomicBool>,
+    #[cfg(feature = "v2-kernel-probe")]
+    sql_event_projection_generation: Arc<std::sync::atomic::AtomicI64>,
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) sql_event_projection_handle: Arc<SqlEventProjectionHandle>,
     /// Bounded over-cap refusal marker (M4): the fences of the rejected
     /// snapshot itself — `(content_seq, relationship_seq,
     /// authorization_epoch)` — never a later live read, so a concurrent
@@ -1824,6 +1978,79 @@ impl Db {
         (self.write_pool.size(), self.write_pool.num_idle())
     }
 
+    /// Only for an unpublished disposable handle with no outstanding calls:
+    /// the v1 pending copy or the v2 undo collector's test fixture. This only
+    /// constrains pools; it does not fold, undo, or change either schema.
+    /// Interaction capture uses this same pool for unmanaged files. Governed
+    /// TEMP work shares its one slot; persistent triggers cover every checkout.
+    pub(crate) async fn constrain_pending_writer(&mut self) -> Result<()> {
+        if self.is_enrolled() || self.open_mode() != DatabaseOpenMode::ReadWrite {
+            return Err(Error::engine(
+                "pending writer requires private unmanaged v1 storage",
+            ));
+        }
+        self.drain_captures().await;
+        let pool = write_pool_options(
+            WritePoolKind::Workspace,
+            self.pending_commit_probes.clone(),
+            1,
+        )
+        .connect_with(self.write_pool.connect_options().as_ref().clone())
+        .await?;
+        self.write_pool.close().await;
+        self.governed_pool.close().await;
+        self.write_pool = pool.clone();
+        self.governed_pool = pool;
+        Ok(())
+    }
+
+    /// Undo can reuse revision numbers for different data. The owner excludes
+    /// calls and drains capture before this boundary; wait out index folding
+    /// before clearing every mutable memo and opaque snapshot.
+    pub(crate) async fn invalidate_pending_caches(&self) -> Result<()> {
+        #[cfg(feature = "v2-kernel-probe")]
+        {
+            self.demand_root_aliases.invalidate();
+            crate::kernel::demand_root_aliases::Check::start(self);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.workspace_index_fold.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::engine("pending cache fold did not drain"))?;
+        *self.rollup_cache.lock().unwrap_or_else(|e| e.into_inner()) = RollupCache::default();
+        self.bump_access_generation();
+        *self
+            .visible_set_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            crate::visible_set_cache::VisibleSetCache::default();
+        self.inbox_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.workspace_index.write().await = None;
+        *self
+            .workspace_index_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .workspace_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            crate::workspace_snapshot::SnapshotStore::default();
+        // These memos are now fresh. Future ordinary cache readers can safely
+        // use their existing locks without inheriting a prior poison flag.
+        self.rollup_cache.clear_poison();
+        self.visible_set_cache.clear_poison();
+        self.inbox_snapshots.clear_poison();
+        self.workspace_index_refused.clear_poison();
+        self.workspace_snapshots.clear_poison();
+        Ok(())
+    }
+
     /// Privileged engine pool. Crate-private by design: callers must not gain a
     /// raw route around `begin_write` and strict-portability enforcement.
     pub(crate) fn write_pool(&self) -> &SqlitePool {
@@ -1851,6 +2078,49 @@ impl Db {
     /// Identity of this open handle (shared by clones).
     pub fn handle_id(&self) -> uuid::Uuid {
         self.handle_id
+    }
+
+    /// The access fence for a future cross-request visible-set cache (Native
+    /// b171a9d): this handle's incarnation and current access generation.
+    ///
+    /// **Ownership invariant.** The generation is in-memory and per handle, so
+    /// it only sees rebuilds, preparation and invalidation performed through
+    /// this handle (or its clones). A rebuild through another handle or process
+    /// on the same file appends no content event and would not move it. A
+    /// handle therefore carries a fence only when it is `ReadWrite` *and* has
+    /// been declared its file's exclusive mutator via
+    /// [`Db::declare_exclusive_access_owner`]. Nothing in production declares
+    /// that yet; a future cache must either establish the invariant for the
+    /// handle it serves from, or move to a persisted epoch. Standby and member
+    /// handles never qualify (refresh, swap and FULL replay run elsewhere).
+    #[allow(dead_code)] // consumed by the slice 2 cache (Native b171a9d); exercised by kernel_v2 tests
+    pub(crate) fn access_fence(&self) -> Option<AccessFence> {
+        let owner = self
+            .access_exclusive_owner
+            .load(std::sync::atomic::Ordering::Acquire);
+        (owner && self.open_mode() == DatabaseOpenMode::ReadWrite).then(|| AccessFence {
+            incarnation: self.handle_id,
+            generation: self
+                .access_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        })
+    }
+
+    /// Declare that no other handle or process mutates this file, which is the
+    /// precondition for [`Db::access_fence`]. Only a caller that can prove it
+    /// (for example a single serving engine owning its workspace file) may call
+    /// this. Unused in production until a cache lands.
+    #[allow(dead_code)] // consumed by the slice 2 cache (Native b171a9d); exercised by kernel_v2 tests
+    pub(crate) fn declare_exclusive_access_owner(&self) {
+        self.access_exclusive_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Advance the access generation after a visibility-input change that
+    /// appends no content event. Inert until a cache consults the fence.
+    pub(crate) fn bump_access_generation(&self) {
+        self.access_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Whether both values are clones of the same physical pool handle.
@@ -1943,6 +2213,8 @@ impl Db {
         // The index folds off the same commit wake that drives the hub, on
         // the read-only pool only. Unbuilt handles no-op; see the method.
         self.spawn_workspace_index_fold();
+        #[cfg(feature = "v2-kernel-probe")]
+        self.spawn_sql_event_projection_fold();
         if REQUEST_REALTIME_COMPLETION
             .try_with(|completion| completion.mark_committed())
             .is_err()
@@ -1951,6 +2223,119 @@ impl Db {
                 hub.wake();
             }
         }
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn sql_record_projection_generation(&self) -> Option<String> {
+        self.sql_event_projection_handle
+            .record_generation
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn trust_sql_record_projection_generation(&self, generation: Option<String>) {
+        *self
+            .sql_event_projection_handle
+            .record_generation
+            .lock()
+            .unwrap() = generation;
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn sql_event_projection_generation(&self) -> Option<i64> {
+        let generation = self.sql_event_projection_generation.load(Ordering::Acquire);
+        (generation >= 0).then_some(generation)
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn trust_sql_event_projection_generation(&self, generation: i64) {
+        self.sql_event_projection_generation
+            .store(generation, Ordering::Release);
+    }
+
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn settle_sql_event_projection(&self) {
+        while self.sql_event_projection_fold.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Opt an admitted serving handle into disposable SQL event maintenance.
+    /// Call only after server admission succeeds. Inspection, cutover and
+    /// verification handles leave this disabled, even if their pools can write.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub fn start_serving_sql_event_projection(&self) {
+        if self.open_mode() != DatabaseOpenMode::ReadWrite {
+            return;
+        }
+        self.sql_event_projection_handle
+            .serving
+            .store(true, Ordering::Release);
+        self.spawn_sql_event_projection_fold();
+    }
+
+    /// Hosted serving obtains a deployment/database write lease for each
+    /// bounded fold batch, so a freeze refuses or drains maintenance writes.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub fn start_serving_sql_event_projection_with_barrier(
+        &self,
+        barrier: crate::mcp::DeploymentMutationBarrier,
+    ) {
+        self.sql_event_projection_handle
+            .barrier
+            .get_or_init(|| barrier);
+        self.start_serving_sql_event_projection();
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn sql_event_projection_write_admission(
+        &self,
+    ) -> Result<Option<crate::mcp::DeploymentAdmission>> {
+        self.sql_event_projection_handle
+            .barrier
+            .get()
+            .map(|barrier| {
+                barrier.admit(
+                    &crate::DeploymentReadOnlyOperation::server("sql_event_projection_fold"),
+                    crate::mcp::OperationAccess::Mutation,
+                )
+            })
+            .transpose()
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn spawn_sql_event_projection_fold(&self) {
+        if !self
+            .sql_event_projection_handle
+            .serving
+            .load(Ordering::Acquire)
+            || self.sql_event_projection_fold.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        // Skip cold maintenance immediately when writes are frozen. Each
+        // writer batch acquires its own retained lease after read validation.
+        if let Err(error) = self.sql_event_projection_write_admission() {
+            self.sql_event_projection_fold
+                .store(false, Ordering::SeqCst);
+            tracing::debug!(%error, "SQL event projection maintenance deferred by write admission");
+            return;
+        }
+        let db = self.clone();
+        tokio::spawn(async move {
+            let _guard = WorkspaceIndexFoldGuard::new(db.sql_event_projection_fold.clone());
+            if let Err(error) = crate::kernel::sql_event_projection::catch_up(&db).await {
+                tracing::warn!(%error,diagnostic="event_cache_fold_failed", "SQL event projection catch-up failed; original staging remains available");
+            }
+            if let Err(error) = crate::kernel::sql_record_projection::catch_up(&db).await {
+                db.trust_sql_record_projection_generation(None);
+                tracing::warn!(%error, diagnostic="record_projection_fold_failed", "record projection catch-up failed; original staging remains available");
+            }
+            // A commit racing the last batch may leave a short tail. Reads use
+            // the permanent staging path for it; the next wake/startup retries.
+        });
     }
 
     /// Commit a transaction which appended content events and wake the durable
@@ -2096,6 +2481,136 @@ impl Db {
         Ok(())
     }
 
+    /// Commit on the actual owned connection without consuming its Transaction.
+    /// The operation job must outlive its response receiver and retain all room
+    /// and open guards through this call and synchronous installation afterward.
+    /// A savepoint release is not durability: only depth 1 -> acknowledged 0
+    /// admits success. The ordinary consuming helper above is unchanged.
+    ///
+    /// SQLx 0.8.6's Transaction private `open` flag remains true after borrowed
+    /// TransactionManager completion. Dispose that original Transaction BEFORE
+    /// another BEGIN/reuse: its Drop queues start_rollback, which the pinned
+    /// SQLite worker treats as a no-op at depth zero. Do not forget it or try to
+    /// synthesize a connection. Uncertain outcomes retain it in quarantine.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn commit_owned_kernel_content(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> KernelCommitOutcome {
+        self.commit_owned_kernel_connection(tx, None).await
+    }
+
+    /// Native original-lease core. The caller arms commit-indeterminate custody
+    /// before polling and retains it through durability/install handoff.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) async fn commit_owned_kernel_connection(
+        &self,
+        tx: &mut SqliteConnection,
+        diagnostic_key: Option<usize>,
+    ) -> KernelCommitOutcome {
+        use sqlx::{sqlite::SqliteTransactionManager, TransactionManager};
+        if SqliteTransactionManager::get_transaction_depth(tx) != 1 {
+            return KernelCommitOutcome::Refused(crate::Error::engine(
+                "owned kernel commit requires a top-level transaction",
+            ));
+        }
+        #[cfg(test)]
+        if let Err(error) =
+            crate::coedit::live::kernel_writes::arm_commit_worker_for_test(self, tx).await
+        {
+            return KernelCommitOutcome::Uncertain(error);
+        }
+        let commit_timer = crate::write_diagnostics::Timer::new("sqlite_commit_ack");
+        let committed = {
+            let commit = SqliteTransactionManager::commit(tx);
+            tokio::pin!(commit);
+            #[cfg(test)]
+            match futures::poll!(commit.as_mut()) {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => {
+                    if let Err(error) = crate::coedit::live::kernel_writes::test_checkpoint(
+                        self,
+                        crate::coedit::live::kernel_writes::TestStage::BorrowedCommitPending,
+                    )
+                    .await
+                    {
+                        return KernelCommitOutcome::Uncertain(error);
+                    }
+                    commit.await
+                }
+            }
+            #[cfg(not(test))]
+            commit.await
+        };
+        let acknowledged =
+            committed.is_ok() && SqliteTransactionManager::get_transaction_depth(tx) == 0;
+        if acknowledged {
+            if let Some(key) = diagnostic_key {
+                crate::write_contention::commit_acknowledged(key);
+            }
+        }
+        commit_timer.finish(if acknowledged {
+            "acknowledged"
+        } else {
+            "unsettled"
+        });
+        match committed {
+            Ok(()) if acknowledged => {
+                let notifications =
+                    crate::write_diagnostics::Timer::new("post_commit_notifications");
+                self.complete_realtime_commit();
+                crate::coedit::live::kernel_writes::after_commit(self);
+                notifications.finish("completed");
+                KernelCommitOutcome::Committed
+            }
+            Ok(()) => KernelCommitOutcome::Uncertain(crate::Error::engine(
+                "kernel commit acknowledgement did not settle transaction depth",
+            )),
+            Err(error) => {
+                let settlement = crate::write_diagnostics::Timer::new("commit_error_rollback_ack");
+                let rollback = Self::rollback_owned_kernel_connection(tx).await;
+                settlement.finish(if rollback.is_ok() {
+                    "rolled_back"
+                } else {
+                    "uncertain"
+                });
+                match rollback {
+                    Ok(()) => KernelCommitOutcome::RolledBack(error.into()),
+                    Err(rollback) => KernelCommitOutcome::Uncertain(crate::Error::engine(format!(
+                        "kernel commit failed ({error}); rollback settlement unavailable ({rollback})"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Explicitly await rollback while the caller still owns the transaction
+    /// and all writer guards. Even depth zero gets a worker acknowledgement;
+    /// merely observing an atomic depth counter does not prove queue settlement.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn rollback_owned_kernel_content(
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> Result<()> {
+        Self::rollback_owned_kernel_connection(tx).await
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) async fn rollback_owned_kernel_connection(tx: &mut SqliteConnection) -> Result<()> {
+        use sqlx::{sqlite::SqliteTransactionManager, TransactionManager};
+        if SqliteTransactionManager::get_transaction_depth(tx) > 1 {
+            return Err(crate::Error::engine(
+                "owned kernel rollback refuses a nested transaction",
+            ));
+        }
+        SqliteTransactionManager::rollback(tx).await?;
+        if SqliteTransactionManager::get_transaction_depth(tx) != 0 {
+            return Err(crate::Error::engine(
+                "kernel rollback acknowledgement did not settle transaction depth",
+            ));
+        }
+        Ok(())
+    }
+
     /// Commit an authorization-domain transaction, then wake realtime
     /// invalidation after durability. The wake carries no policy detail: it
     /// only prompts connected callers to discard authorization-sensitive
@@ -2177,6 +2692,16 @@ impl Db {
             .unwrap_or((0, 0))
     }
 
+    /// Hosted indexes copy physical currency. Member copies drop
+    /// `records.is_current`; their index build must not name that column.
+    async fn build_workspace_index(&self) -> Result<crate::workspace_index::WorkspaceIndex> {
+        crate::workspace_index::build_on_with_currency(
+            &self.read_pool,
+            self.open_mode() != DatabaseOpenMode::MemberReadOnly,
+        )
+        .await
+    }
+
     /// Build the per-handle workspace index on first request (read-only
     /// pool), or return immediately when already built. The build runs inside
     /// one read transaction, so it is consistent by construction; this then
@@ -2198,7 +2723,7 @@ impl Db {
         if self.workspace_index_refusal_current().await? {
             return Ok(());
         }
-        let mut built = crate::workspace_index::build_on(&self.read_pool).await?;
+        let mut built = self.build_workspace_index().await?;
         if !built.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
             // Refuse rather than hold a subset: partially evicting records,
             // facets or links would silently break the equivalence contract.
@@ -2397,7 +2922,7 @@ impl Db {
             // Content folding cannot repair descendant policy anchors or
             // relationship-owned links. Rebuild the full physical index, then
             // require an exact fence match before intersecting.
-            let mut rebuilt = crate::workspace_index::build_on(&self.read_pool).await?;
+            let mut rebuilt = self.build_workspace_index().await?;
             if !rebuilt.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
                 *self.workspace_index.write().await = None;
                 return Ok(None);
@@ -2584,7 +3109,7 @@ impl Db {
     /// the marker (so steady over-cap reads skip the rebuild); a successful
     /// install clears it. The caller falls back — never a partial hold.
     async fn rebuild_workspace_index(&self) -> Result<()> {
-        let mut rebuilt = crate::workspace_index::build_on(&self.read_pool).await?;
+        let mut rebuilt = self.build_workspace_index().await?;
         if !rebuilt.within_cap(crate::workspace_index::MAX_INDEX_BYTES) {
             let refused = (
                 rebuilt.cursor_seq,
@@ -2915,48 +3440,10 @@ impl Db {
     }
 
     pub(crate) fn put_inbox_snapshot(&self, value: serde_json::Value) -> Result<String> {
-        let token = uuid::Uuid::new_v4().to_string();
-        let mut snapshots = self
-            .inbox_snapshots
-            .lock()
-            .map_err(|_| Error::engine("Inbox snapshot store is unavailable"))?;
-        let now = Instant::now();
-        snapshots.retain(|_, entry| entry.expires_at > now);
-        if snapshots.len() >= INBOX_SNAPSHOT_MAX_ENTRIES {
-            let oldest = snapshots
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                snapshots.remove(&oldest);
-            }
-        }
-        snapshots.insert(
-            token.clone(),
-            InboxSnapshotCacheEntry {
-                expires_at: now + INBOX_SNAPSHOT_TTL,
-                value,
-            },
-        );
-        Ok(token)
+        put_read_snapshot(&self.inbox_snapshots, value)
     }
-
     pub(crate) fn get_inbox_snapshot(&self, token: &str) -> Result<serde_json::Value> {
-        if token.len() != 36 || uuid::Uuid::parse_str(token).is_err() {
-            return Err(Error::engine(
-                "cursor_reset_required: invalid inbox snapshot",
-            ));
-        }
-        let mut snapshots = self
-            .inbox_snapshots
-            .lock()
-            .map_err(|_| Error::engine("Inbox snapshot store is unavailable"))?;
-        let now = Instant::now();
-        snapshots.retain(|_, entry| entry.expires_at > now);
-        snapshots
-            .get(token)
-            .map(|entry| entry.value.clone())
-            .ok_or_else(|| Error::engine("cursor_reset_required: invalid inbox snapshot"))
+        get_read_snapshot(&self.inbox_snapshots, token)
     }
 
     /// Mark all three pools closed before returning a future to their physical
@@ -2984,6 +3471,10 @@ impl Db {
     }
     #[doc(hidden)]
     pub fn enrolled_retirement_complete(&self) -> bool {
+        #[cfg(feature = "v2-kernel-probe")]
+        if !self.demand_root_aliases.retirement_complete() {
+            return false;
+        }
         self.execution_jobs
             .retirement_ready(self.execution_owner.as_ref())
             && self.write_pool.is_closed()
@@ -3029,14 +3520,20 @@ impl Db {
     /// and router retries cannot construct a new raw-close future or lose it.
     #[doc(hidden)]
     pub fn fence_body_retirement(&self) -> BodyRetirementWitness {
+        #[cfg(feature = "v2-kernel-probe")]
+        self.demand_root_aliases.fence();
         self.body_jobs.stop_submission();
         self.execution_jobs.stop_submission();
         let future = self
             .body_retirement
             .get_or_init(|| {
+                #[cfg(feature = "v2-kernel-probe")]
+                if self.kernel_lifecycle.is_some() {
+                    return BodyRetirement::Kernel(kernel_retirement::Coordinator::sealed(self));
+                }
                 use futures::FutureExt;
                 let db = self.clone();
-                async move { db.close_retained().await }.boxed().shared()
+                BodyRetirement::Legacy(async move { db.close_retained().await }.boxed().shared())
             })
             .clone();
         BodyRetirementWitness {
@@ -3046,10 +3543,16 @@ impl Db {
     }
 
     pub async fn close(&self) {
+        #[cfg(feature = "v2-kernel-probe")]
+        crate::mcp::kernel_v2::sql::visible_cache::stop_serving_on_close(self);
         let _ = self.fence_body_retirement().drain().await;
     }
 
     async fn close_retained(&self) -> bool {
+        #[cfg(feature = "v2-kernel-probe")]
+        if !self.demand_root_aliases.stop().await {
+            return false;
+        }
         // The SAME one-shot physical cleanup survives abandoned observers.
         // Ordinary readiness is retried outside this cached future.
         if !self.body_jobs.drain().await {
@@ -3122,7 +3625,9 @@ impl Db {
     }
 
     /// End a shared handle from a synchronous lifecycle boundary such as LRU
-    /// eviction. Unmanaged pools are marked closed before this function returns;
+    /// eviction. Unmanaged pools are marked closed before this function returns,
+    /// except explicitly registered kernel handles, which retain pools until
+    /// terminal kernel/body/enrolled readiness and original physical cleanup;
     /// enrolled jobs stop admission and drain before their response pools close.
     /// when a runtime is available it also drains their physical shutdown in
     /// the background.
@@ -3131,7 +3636,14 @@ impl Db {
     /// fail on the closed pool and are counted as failures (never silently
     /// lost). Use [`Self::close`] where captures must be kept.
     pub(crate) fn close_in_background(&self) {
+        #[cfg(feature = "v2-kernel-probe")]
+        crate::mcp::kernel_v2::sql::visible_cache::stop_serving_on_close(self);
         let witness = self.fence_body_retirement();
+        #[cfg(feature = "v2-kernel-probe")]
+        if let BodyRetirement::Kernel(coordinator) = &witness.future {
+            coordinator.start_background();
+            return;
+        }
         if self.execution_owner.is_none() {
             // Preserve main's unmanaged synchronous ordinary-pool fence.
             // This is NOT classification for body availability or guard setup.
@@ -3164,8 +3676,10 @@ async fn close_pool_and_drain(pool: &SqlitePool) {
 }
 
 /// Retire a cached hosted-router handle from a synchronous eviction or
-/// shutdown boundary. All pools refuse new work before this returns; a live
-/// runtime drains their physical shutdown in the background.
+/// shutdown boundary. Existing unmanaged pools refuse new work before return;
+/// explicitly registered kernel handles first seal supported body admission and
+/// retain required pools through terminal cleanup. A live runtime drives the
+/// same retained close coordinator; this function is never a retirement ACK.
 #[doc(hidden)]
 pub fn close_hosted_router_database_in_background(db: &Db) {
     db.close_in_background();
@@ -3328,6 +3842,24 @@ pub(crate) async fn begin_write(
     begin_write_in(pool, WriteDomain::Workspace, WRITER_DEADLINE, None).await
 }
 
+/// Fixed background labels also cover acquisitions that fail before a lease
+/// exists. Context is captured by the lease before this scope ends.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn begin_write_labelled(
+    pool: &SqlitePool,
+    operation: &'static str,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    let context = crate::write_diagnostics::Context::new(operation, None, None);
+    context
+        .scope(begin_write_in(
+            pool,
+            WriteDomain::Workspace,
+            WRITER_DEADLINE,
+            Some(operation),
+        ))
+        .await
+}
+
 pub(crate) const SQL_WORKSPACE_BUSY: &str = "sql_write: workspace busy; prepare again after the writer is available (this plan remains claimed; retry it only for receipt recovery)";
 
 /// Fixed operation labels for hosted control-plane catalog lock attribution.
@@ -3343,6 +3875,9 @@ pub const HOST_CATALOG_OP_OTHER: &str = "other";
 /// write lock across the whole guarded dispatch.
 #[doc(hidden)]
 pub const HOST_CATALOG_OP_SQL_COMMIT_GUARD: &str = "sql_commit_guard";
+/// Hosted publication membership and route guard.
+#[doc(hidden)]
+pub const HOST_CATALOG_OP_PUBLICATION_GUARD: &str = "publication_guard";
 /// One-time-code sign-in writes (issue, verify, consume).
 #[doc(hidden)]
 pub const HOST_CATALOG_OP_SIGN_IN: &str = "sign_in";
@@ -3395,12 +3930,7 @@ async fn begin_write_in(
     // discarded on every ordinary write, which is why nobody could say whether
     // the single-writer rule was under pressure. Retain both before the error
     // path can return.
-    crate::write_contention::record_begin(domain, retries, wait, failed);
-    crate::request_work::record_write_begin(
-        retries,
-        u64::try_from(wait.as_micros()).unwrap_or(u64::MAX),
-    );
-    crate::mcp::request_timing::record_write_wait(wait);
+    record_begin_result(domain, retries, wait, failed);
     let mut transaction = begun
         .map(|success| success.transaction)
         .map_err(|failure| failure.error)?;
@@ -3441,6 +3971,11 @@ pub(crate) struct CaptureBegin {
 /// call can stall up to the writer deadline on this write and still return
 /// 200, and the count is what distinguishes contention from a poisoned lock.
 pub(crate) async fn begin_capture_write(pool: &SqlitePool) -> Result<CaptureBegin> {
+    crate::write_diagnostics::Context::new("interaction_capture", None, None)
+        .scope(begin_capture_write_inner(pool))
+        .await
+}
+async fn begin_capture_write_inner(pool: &SqlitePool) -> Result<CaptureBegin> {
     let started_at = Instant::now();
     let begun =
         begin_write_attempts_with(|| pool.begin_with("BEGIN IMMEDIATE"), WRITER_DEADLINE).await;
@@ -3814,6 +4349,73 @@ pub(crate) struct BeginRetries {
     pub cleanup: usize,
 }
 
+/// Shared decision/metrics state only; it owns no connection or authority.
+pub(crate) struct BeginWriteRetry {
+    deadline: Instant,
+    pub(crate) retry_count: usize,
+    pub(crate) retries: BeginRetries,
+}
+impl BeginWriteRetry {
+    pub(crate) fn new(retry_for: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + retry_for,
+            retry_count: 0,
+            retries: BeginRetries::default(),
+        }
+    }
+    fn cleanup(error: &Error) -> bool {
+        matches!(error, Error::Sqlx(sqlx::Error::InvalidSavePointStatement))
+    }
+    pub(crate) fn should_retry(&self, error: &Error) -> bool {
+        (error.is_busy() || Self::cleanup(error)) && Instant::now() < self.deadline
+    }
+    pub(crate) fn outcome(&self, error: &Error) -> &'static str {
+        if error.is_busy() || Self::cleanup(error) {
+            "exhausted"
+        } else {
+            "not_retriable"
+        }
+    }
+    pub(crate) fn record_retry(&mut self, error: &Error) {
+        self.retry_count += 1;
+        if Self::cleanup(error) {
+            self.retries.cleanup += 1;
+        } else {
+            self.retries.busy += 1;
+        }
+    }
+}
+
+fn record_begin_result(domain: WriteDomain, retries: BeginRetries, wait: Duration, failed: bool) {
+    crate::write_contention::record_begin(domain, retries, wait, failed);
+    crate::request_work::record_write_begin(
+        retries,
+        u64::try_from(wait.as_micros()).unwrap_or(u64::MAX),
+    );
+    crate::mcp::request_timing::record_write_wait(wait);
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn record_owned_kernel_begin(retries: BeginRetries, wait: Duration, failed: bool) {
+    record_begin_result(WriteDomain::Workspace, retries, wait, failed);
+}
+
+/// Native caller already owns the exact acknowledged connection and all guards.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn prepare_owned_kernel_begin(
+    _db: &Db,
+    conn: &mut SqliteConnection,
+) -> Result<Option<usize>> {
+    let key = connection_key(conn).await;
+    if let Some(key) = key {
+        crate::write_contention::open_critical_section(WriteDomain::Workspace, key, None);
+    }
+    #[cfg(test)]
+    crate::coedit::live::kernel_writes::arm_policy_worker_for_test(_db, conn).await?;
+    crate::storage_profile::enforce_write_boundary_on(conn).await?;
+    Ok(key)
+}
+
 async fn begin_write_attempts_with<F, Fut>(
     mut begin: F,
     retry_for: Duration,
@@ -3824,48 +4426,28 @@ where
         Output = std::result::Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error>,
     >,
 {
-    let deadline = Instant::now() + retry_for;
-    let mut retry_count = 0;
-    let mut retries = BeginRetries::default();
+    let mut retry = BeginWriteRetry::new(retry_for);
     loop {
         match begin().await {
             Ok(transaction) => {
                 return Ok(BeginWriteSuccess {
                     transaction,
-                    retry_count,
-                    retries,
+                    retry_count: retry.retry_count,
+                    retries: retry.retries,
                 })
             }
             Err(sqlx_error) => {
                 let error = Error::from(sqlx_error);
-                // A canceled SQLite transaction queues its rollback on the
-                // connection worker. Under concurrent pool reuse, a custom
-                // BEGIN can briefly arrive while SQLx still reports non-zero
-                // transaction depth and reject it as an invalid savepoint
-                // statement. Like lock contention, this clears once cleanup
-                // drains; retry it within the same bounded writer deadline.
-                let cleanup_pending =
-                    matches!(&error, Error::Sqlx(sqlx::Error::InvalidSavePointStatement));
-                let retryable = error.is_busy() || cleanup_pending;
-                if !retryable || Instant::now() >= deadline {
+                if !retry.should_retry(&error) {
                     return Err(BeginWriteFailure {
+                        retry_outcome: retry.outcome(&error),
+                        retry_count: retry.retry_count,
+                        retries: retry.retries,
                         error,
-                        retry_count,
-                        retry_outcome: if retryable {
-                            "exhausted"
-                        } else {
-                            "not_retriable"
-                        },
-                        retries,
                     });
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                retry_count += 1;
-                if cleanup_pending {
-                    retries.cleanup += 1;
-                } else {
-                    retries.busy += 1;
-                }
+                retry.record_retry(&error);
             }
         }
     }
@@ -4251,6 +4833,7 @@ pub(crate) const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "agent_activity",
     "agent_activity_claims",
     "actors",
+    "viewer",
     "runs",
     "run_intents",
     "messages_awaiting_reply",
@@ -4534,24 +5117,45 @@ async fn open_pool_with_probes(
             "enrolled workspace storage cannot be opened as a host catalog",
         ));
     }
+    let pool = write_pool_options(kind, probes, 5)
+        .connect_with(connect_options(path, create_if_missing)?)
+        .await?;
+    Ok(pool)
+}
+
+/// The same checkout, enrollment, cancellation and cleanup hooks for every
+/// workspace writer, including the disposable node's one-slot pool.
+fn write_pool_options(
+    kind: WritePoolKind,
+    probes: Option<Arc<control_commit_test::PoolProbeRegistry>>,
+    max_connections: u32,
+) -> SqlitePoolOptions {
     let options = match kind {
         WritePoolKind::Workspace => SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             // Both hooks are required: SQLx uses `before_acquire` for an idle
             // connection and `after_connect` for a newly opened one.
-            .before_acquire(count_write_pool_reuse)
+            .before_acquire(|connection, metadata| {
+                Box::pin(async move {
+                    count_write_pool_reuse(connection, metadata).await?;
+                    // M4 writer-connection contract: a connection with a TEMP
+                    // shadow or disabled triggers is discarded and replaced.
+                    Ok(writer_contract::admit_checkout(connection).await)
+                })
+            })
             .after_connect(|connection, metadata| {
                 Box::pin(async move {
                     count_write_pool_new_connection(connection, metadata).await?;
+                    writer_contract::install(connection).await?;
                     install_enrolled_guard(connection, false).await
                 })
             }),
         WritePoolKind::HostCatalog => SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .before_acquire(attach_catalog_trace_on_reuse)
             .after_connect(attach_catalog_trace_on_connect),
     };
-    let pool = options
+    options
         // `query_sql` installs connection-local views, principal state, and a
         // SQLite progress callback. This hook is the structural cleanup and
         // cancellation/unwind backstop before a pooled physical connection can
@@ -4589,6 +5193,11 @@ async fn open_pool_with_probes(
                         return Ok(false);
                     }
                 }
+                // A connection that captured a protected write in a TEMP
+                // shadow never returns to the pool (writer contract, M4).
+                if !writer_contract::reusable_after_release(connection).await {
+                    return Ok(false);
+                }
                 let sanitized = sanitize_released_write_connection(connection).await?;
                 if sanitized {
                     if let Some(lease) = cleanup.as_ref() {
@@ -4598,9 +5207,6 @@ async fn open_pool_with_probes(
                 Ok(sanitized)
             })
         })
-        .connect_with(connect_options(path, create_if_missing)?)
-        .await?;
-    Ok(pool)
 }
 
 async fn sanitize_released_write_connection(
@@ -5026,9 +5632,24 @@ async fn open_governed_pool_with_size(
     let pool = SqlitePoolOptions::new()
         .max_connections(size.max(1))
         .acquire_timeout(GOVERNED_SQL_ACQUIRE_TIMEOUT)
-        .after_connect(|connection, _| Box::pin(install_enrolled_guard(connection, false)))
+        // Governed connections carry TEMP relations while leased and can
+        // write, so they hold the same writer contract (M4) as the write pool.
+        .before_acquire(|connection, _| {
+            Box::pin(async move { Ok(writer_contract::admit_checkout(connection).await) })
+        })
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                writer_contract::install(connection).await?;
+                install_enrolled_guard(connection, false).await
+            })
+        })
         .after_release(|connection, _metadata| {
-            Box::pin(sanitize_released_write_connection(connection))
+            Box::pin(async move {
+                if !writer_contract::reusable_after_release(connection).await {
+                    return Ok(false);
+                }
+                sanitize_released_write_connection(connection).await
+            })
         })
         .connect_with(connect_options(path, create_if_missing)?)
         .await?;
@@ -5292,6 +5913,8 @@ async fn open_database_with_write_pool_kind(
             execution_jobs: Arc::new(enrolled::HandleJobs::default()),
             body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
             body_retirement: Arc::new(OnceLock::new()),
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_lifecycle: None,
             capture_pool: Arc::new(tokio::sync::OnceCell::new()),
             write_pool,
             pending_commit_probes,
@@ -5302,16 +5925,26 @@ async fn open_database_with_write_pool_kind(
                 open_mode: DatabaseOpenMode::ReadWrite,
             }),
             handle_id: uuid::Uuid::new_v4(),
+            #[cfg(feature = "v2-kernel-probe")]
+            demand_root_aliases: Arc::default(),
             embedder: None,
             advisors: crate::mcp::advisors::startup::registry_with_defaults(),
             rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
             visible_set_cache: Arc::new(Mutex::new(
                 crate::visible_set_cache::VisibleSetCache::default(),
             )),
+            access_generation: Arc::default(),
+            access_exclusive_owner: Arc::default(),
             inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
             realtime_hub: None,
             workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
             workspace_index_fold: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "v2-kernel-probe")]
+            sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "v2-kernel-probe")]
+            sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            #[cfg(feature = "v2-kernel-probe")]
+            sql_event_projection_handle: Arc::default(),
             workspace_index_refused: Arc::new(Mutex::new(None)),
             workspace_snapshots: Arc::new(Mutex::new(
                 crate::workspace_snapshot::SnapshotStore::default(),
@@ -5348,6 +5981,8 @@ async fn open_database_with_write_pool_kind(
         execution_jobs: Arc::new(enrolled::HandleJobs::default()),
         body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
         body_retirement: Arc::new(OnceLock::new()),
+        #[cfg(feature = "v2-kernel-probe")]
+        kernel_lifecycle: None,
         capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
         pending_commit_probes,
@@ -5358,16 +5993,26 @@ async fn open_database_with_write_pool_kind(
             open_mode: DatabaseOpenMode::ReadWrite,
         }),
         handle_id: uuid::Uuid::new_v4(),
+        #[cfg(feature = "v2-kernel-probe")]
+        demand_root_aliases: Arc::default(),
         embedder: None,
         advisors: crate::mcp::advisors::startup::registry_with_defaults(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
         )),
+        access_generation: Arc::default(),
+        access_exclusive_owner: Arc::default(),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
         workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_handle: Arc::default(),
         workspace_index_refused: Arc::new(Mutex::new(None)),
         workspace_snapshots: Arc::new(Mutex::new(
             crate::workspace_snapshot::SnapshotStore::default(),
@@ -5676,10 +6321,6 @@ pub async fn validate_current_engine_shape_read_only(path: &Path) -> Result<()> 
     validate_current_engine_shape_body!(path, false)
 }
 
-pub(crate) async fn validate_current_engine_shape_immutable(path: &Path) -> Result<()> {
-    validate_current_engine_shape_body!(path, true)
-}
-
 /// Validate a supported migration source against its released structural
 /// shape, using the same contract comparison as current-schema admission.
 ///
@@ -5979,6 +6620,11 @@ pub(crate) async fn validate_engine_shape_on(
             schema_shape_contract_sha256(&actual_contract) == ENGINE_92_SHAPE_CONTRACT_SHA256
         );
     }
+    if version == 93 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_93_SHAPE_CONTRACT_SHA256
+        );
+    }
     if version != CURRENT_ENGINE_SCHEMA_VERSION {
         return Err(Error::engine(format!(
             "no frozen engine structural shape is registered for schema {version}"
@@ -6010,6 +6656,82 @@ async fn current_reference_shape_contract() -> Result<&'static CurrentShapeContr
             Ok(contract)
         })
         .await
+}
+
+/// Receiver-only shape admission. Canonical open/migration remains compiled
+/// version only. This connection is a read-only generation or private audit.
+pub(crate) async fn qualify_receiver_shape_on(
+    actual: &mut SqliteConnection,
+) -> Result<&'static crate::standby::shapes::Entry> {
+    use crate::standby::shapes::{self, Entry, Family};
+    refuse_v2_database(actual).await?;
+    // The v1 application marker describes historical interchange provenance,
+    // not physical shape. Preserve unknown-history disclosures; the complete
+    // structural contract, paired with user_version, is the admission fence.
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *actual)
+        .await?;
+    if !shapes::REGISTRY
+        .iter()
+        .any(|entry| entry.family == Family::V1 && entry.engine_schema == version)
+    {
+        return Err(Error::engine("receiver has an unsupported engine shape"));
+    }
+    static REFERENCES: tokio::sync::OnceCell<Vec<(&'static Entry, CurrentShapeContract)>> =
+        tokio::sync::OnceCell::const_new();
+    let references = REFERENCES
+        .get_or_try_init(|| async {
+            let mut references = Vec::new();
+            for entry in shapes::REGISTRY
+                .iter()
+                .filter(|entry| entry.family == Family::V1)
+            {
+                let options =
+                    SqliteConnectOptions::from_str("sqlite::memory:")?.create_if_missing(true);
+                let mut reference = SqliteConnection::connect_with(&options).await?;
+                for ddl in shapes::frozen_v1_ddl(entry)? {
+                    sqlx::query(&ddl).execute(&mut reference).await?;
+                }
+                let contract = schema_shape_contract(&mut reference).await?;
+                reference.close().await?;
+                references.push((entry, contract));
+            }
+            Ok::<_, Error>(references)
+        })
+        .await?;
+    let actual_contract = schema_shape_contract(actual).await?;
+    references
+        .iter()
+        .find(|(entry, contract)| entry.engine_schema == version && *contract == actual_contract)
+        .map(|(entry, _)| *entry)
+        .ok_or_else(|| Error::engine("receiver has an unsupported or drifted engine shape"))
+}
+
+#[cfg(test)]
+pub(crate) async fn validate_receiver_shape_on(actual: &mut SqliteConnection) -> Result<i64> {
+    Ok(qualify_receiver_shape_on(actual).await?.engine_schema)
+}
+
+pub(crate) async fn qualify_receiver_shape_read_only(
+    path: &Path,
+    immutable: bool,
+) -> Result<&'static crate::standby::shapes::Entry> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .immutable(immutable)
+        .foreign_keys(true);
+    let mut actual = SqliteConnection::connect_with(&options).await?;
+    let result = qualify_receiver_shape_on(&mut actual).await;
+    actual.close().await?;
+    result
+}
+
+pub(crate) async fn validate_receiver_shape_read_only(path: &Path, immutable: bool) -> Result<()> {
+    qualify_receiver_shape_read_only(path, immutable)
+        .await
+        .map(|_| ())
 }
 
 fn schema_shape_contract_sha256(contract: &BTreeMap<(String, String), Vec<String>>) -> String {
@@ -6349,6 +7071,8 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         execution_jobs: Arc::new(enrolled::HandleJobs::default()),
         body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
         body_retirement: Arc::new(OnceLock::new()),
+        #[cfg(feature = "v2-kernel-probe")]
+        kernel_lifecycle: None,
         capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
         pending_commit_probes,
@@ -6359,16 +7083,26 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
             open_mode: DatabaseOpenMode::ReadWrite,
         }),
         handle_id: uuid::Uuid::new_v4(),
+        #[cfg(feature = "v2-kernel-probe")]
+        demand_root_aliases: Arc::default(),
         embedder: None,
         advisors: crate::mcp::advisors::startup::registry_with_defaults(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
         )),
+        access_generation: Arc::default(),
+        access_exclusive_owner: Arc::default(),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
         workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_handle: Arc::default(),
         workspace_index_refused: Arc::new(Mutex::new(None)),
         workspace_snapshots: Arc::new(Mutex::new(
             crate::workspace_snapshot::SnapshotStore::default(),
@@ -6468,16 +7202,31 @@ async fn open_standby_read_only_inner(url: &str, kernel_v2: bool) -> Result<Db> 
         #[cfg(not(any(test, feature = "v2-kernel-probe")))]
         return Err(Error::engine("kernel-v2 standby requires v2-kernel-probe"));
     } else {
-        let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
-        if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
-            return Err(crate::error::Error::engine(format!(
-            "refusing standby read-only open of {}: {state}; expected engine schema {CURRENT_ENGINE_SCHEMA_VERSION}",
-            path.display()
-        )));
-        }
-
-        validate_current_engine_shape_read_only(path).await?;
+        validate_receiver_shape_read_only(path, false).await?;
     }
+    open_admitted_read_only_pools(url, kernel_v2).await
+}
+
+/// No accepted-generation assertion is made about private W. Only its audited
+/// owner can supply this capability; all three pools remain physically RO.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn open_audited_working_read_only(
+    admission: &crate::fork::working_v2::AuditedWorkingRead<'_>,
+) -> Result<Db> {
+    let path = admission
+        .checked_path()?
+        .to_str()
+        .ok_or_else(|| Error::engine("working path is not UTF-8"))?;
+    let db = open_admitted_read_only_pools(path, true).await?;
+    if let Err(error) = admission.checked_path() {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
+}
+
+async fn open_admitted_read_only_pools(url: &str, kernel_v2: bool) -> Result<Db> {
+    let path = path_from_url(url);
     let pending_commit_probes = None;
     let write_pool = open_standby_read_pool(url).await?;
     let read_pool = match open_standby_read_pool(url).await {
@@ -6505,6 +7254,8 @@ async fn open_standby_read_only_inner(url: &str, kernel_v2: bool) -> Result<Db> 
         execution_jobs: Arc::new(enrolled::HandleJobs::default()),
         body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
         body_retirement: Arc::new(OnceLock::new()),
+        #[cfg(feature = "v2-kernel-probe")]
+        kernel_lifecycle: None,
         capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
         pending_commit_probes,
@@ -6515,6 +7266,8 @@ async fn open_standby_read_only_inner(url: &str, kernel_v2: bool) -> Result<Db> 
             open_mode: DatabaseOpenMode::StandbyReadOnly,
         }),
         handle_id: uuid::Uuid::new_v4(),
+        #[cfg(feature = "v2-kernel-probe")]
+        demand_root_aliases: Arc::default(),
         embedder: None,
         // No default advisors: a read-only standby takes no writes, so no
         // write can fire them.
@@ -6523,10 +7276,18 @@ async fn open_standby_read_only_inner(url: &str, kernel_v2: bool) -> Result<Db> 
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
         )),
+        access_generation: Arc::default(),
+        access_exclusive_owner: Arc::default(),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
         workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_handle: Arc::default(),
         workspace_index_refused: Arc::new(Mutex::new(None)),
         workspace_snapshots: Arc::new(Mutex::new(
             crate::workspace_snapshot::SnapshotStore::default(),
@@ -6538,6 +7299,8 @@ async fn open_standby_read_only_inner(url: &str, kernel_v2: bool) -> Result<Db> 
         _tmp: None,
     };
     if kernel_v2 {
+        #[cfg(feature = "v2-kernel-probe")]
+        crate::kernel::demand_root_aliases::Check::start(&db);
         return Ok(db);
     }
     for (label, violations) in [
@@ -6602,39 +7365,74 @@ fn standby_head_writer_busy_timeout() -> Duration {
 /// connections, never needs `-wal`/`-shm` sidecars it cannot create. One
 /// connection serves every tier; nothing is migrated, repaired or seeded.
 pub(crate) async fn open_standby_head_writer(path: &Path) -> Result<Db> {
-    open_standby_head_writer_inner(path, false).await
+    open_standby_head_writer_inner(path, false, false, true).await
 }
 
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub(crate) async fn open_kernel_v2_head_writer(path: &Path) -> Result<Db> {
-    open_standby_head_writer_inner(path, true).await
+    open_standby_head_writer_inner(path, true, false, true).await
 }
 
-async fn open_standby_head_writer_inner(path: &Path, kernel_v2: bool) -> Result<Db> {
+/// Open a serving kernel-v2 generation for ONE in-place delta (epic c15a932).
+///
+/// Unlike [`open_kernel_v2_head_writer`], which writes a private scratch copy
+/// in rollback-journal mode, this writer is for the file the serving process
+/// is reading, so it uses WAL: readers keep the snapshot they began with and
+/// are never blocked by (nor block) the commit, and the file's content changes
+/// atomically at the WAL commit record. `synchronous=FULL` makes that commit
+/// durable before it returns, which the caller relies on to write its head
+/// record only afterwards. Readers need no change: standby read pools are
+/// `read_only` but not `immutable`, so they notice the `-wal`/`-shm` files.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn open_kernel_v2_in_place_writer(path: &Path) -> Result<Db> {
+    open_standby_head_writer_inner(path, true, true, true).await
+}
+
+/// A scratch writer that does not enforce foreign keys, to prove the fold
+/// refuses to run on one.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn open_kernel_v2_head_writer_without_foreign_keys(path: &Path) -> Result<Db> {
+    open_standby_head_writer_inner(path, true, false, false).await
+}
+
+async fn open_standby_head_writer_inner(
+    path: &Path,
+    kernel_v2: bool,
+    wal: bool,
+    foreign_keys: bool,
+) -> Result<Db> {
     if kernel_v2 {
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         crate::standby::kernel_v2::verify_path(path).await?;
         #[cfg(not(any(test, feature = "v2-kernel-probe")))]
         return Err(Error::engine("kernel-v2 standby requires v2-kernel-probe"));
     } else {
-        let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
-        if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
-            return Err(crate::error::Error::engine(format!(
-            "refusing standby head write to {}: {state}; expected engine schema {CURRENT_ENGINE_SCHEMA_VERSION}",
-            path.display()
-        )));
-        }
-        validate_current_engine_shape_read_only(path).await?;
+        validate_receiver_shape_read_only(path, false).await?;
     }
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
-        .journal_mode(SqliteJournalMode::Delete)
-        .foreign_keys(true)
+        .journal_mode(if wal {
+            SqliteJournalMode::Wal
+        } else {
+            SqliteJournalMode::Delete
+        })
+        .foreign_keys(foreign_keys)
         .with_regexp()
-        // A commit waits for in-flight serving reads to release their shared
-        // locks; give long reads room before the delta defers and retries.
+        // A rollback-journal commit waits for in-flight serving reads to
+        // release their shared locks; give long reads room before the delta
+        // defers and retries. (Entering WAL mode waits likewise, once.)
         .busy_timeout(standby_head_writer_busy_timeout());
+    let options = if wal {
+        options
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
+            .pragma(
+                "journal_size_limit",
+                WAL_JOURNAL_SIZE_LIMIT_BYTES.to_string(),
+            )
+    } else {
+        options
+    };
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -6644,6 +7442,8 @@ async fn open_standby_head_writer_inner(path: &Path, kernel_v2: bool) -> Result<
         execution_jobs: Arc::new(enrolled::HandleJobs::default()),
         body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
         body_retirement: Arc::new(OnceLock::new()),
+        #[cfg(feature = "v2-kernel-probe")]
+        kernel_lifecycle: None,
         capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool: pool.clone(),
         pending_commit_probes: None,
@@ -6654,16 +7454,26 @@ async fn open_standby_head_writer_inner(path: &Path, kernel_v2: bool) -> Result<
             open_mode: DatabaseOpenMode::ReadWrite,
         }),
         handle_id: uuid::Uuid::new_v4(),
+        #[cfg(feature = "v2-kernel-probe")]
+        demand_root_aliases: Arc::default(),
         embedder: None,
         advisors: AdvisorRegistry::default(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
         )),
+        access_generation: Arc::default(),
+        access_exclusive_owner: Arc::default(),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
         workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_handle: Arc::default(),
         workspace_index_refused: Arc::new(Mutex::new(None)),
         workspace_snapshots: Arc::new(Mutex::new(
             crate::workspace_snapshot::SnapshotStore::default(),
@@ -6788,6 +7598,8 @@ pub async fn open_member_database_read_only(url: &str) -> Result<Db> {
         execution_jobs: Arc::new(enrolled::HandleJobs::default()),
         body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
         body_retirement: Arc::new(OnceLock::new()),
+        #[cfg(feature = "v2-kernel-probe")]
+        kernel_lifecycle: None,
         capture_pool: Arc::new(tokio::sync::OnceCell::new()),
         write_pool,
         pending_commit_probes,
@@ -6798,16 +7610,26 @@ pub async fn open_member_database_read_only(url: &str) -> Result<Db> {
             open_mode: DatabaseOpenMode::MemberReadOnly,
         }),
         handle_id: uuid::Uuid::new_v4(),
+        #[cfg(feature = "v2-kernel-probe")]
+        demand_root_aliases: Arc::default(),
         embedder: None,
         advisors: AdvisorRegistry::default(),
         rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
         visible_set_cache: Arc::new(Mutex::new(
             crate::visible_set_cache::VisibleSetCache::default(),
         )),
+        access_generation: Arc::default(),
+        access_exclusive_owner: Arc::default(),
         inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
         realtime_hub: None,
         workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
         workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_fold: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_generation: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+        #[cfg(feature = "v2-kernel-probe")]
+        sql_event_projection_handle: Arc::default(),
         workspace_index_refused: Arc::new(Mutex::new(None)),
         workspace_snapshots: Arc::new(Mutex::new(
             crate::workspace_snapshot::SnapshotStore::default(),
@@ -6960,6 +7782,24 @@ mod standby_read_only_open_tests {
 
 pub async fn open_existing_database_at(path: &Path) -> Result<Db> {
     open_existing_database(&path.to_string_lossy()).await
+}
+
+/// Disposable fork only, after copying an admitted read-only generation. Keep
+/// ordinary canonical opens/migrations on their compiled emission version.
+pub(crate) async fn open_receiver_fork_at(path: &Path) -> Result<Db> {
+    if probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await
+        == DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION)
+    {
+        return open_existing_database_at(path).await;
+    }
+    validate_receiver_shape_read_only(path, false).await?;
+    open_database_with_write_pool_kind(
+        &path.to_string_lossy(),
+        WritePoolKind::Workspace,
+        false,
+        WorkspaceSchema::V1,
+    )
+    .await
 }
 
 /// Apply the full v1 candidate schema to a fresh database.

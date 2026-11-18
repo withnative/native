@@ -12,12 +12,31 @@ pub(crate) struct Deleted {
 }
 
 /// Runtime and event admission share the v1 Manage/CAS/source guards.
+/// The generic `delete_record` executor calls this entry point, so its
+/// rule stays Manage on the record itself for every type, Messages
+/// included. Event admission (`admit` below) additionally accepts, for
+/// a Message tombstone only, Manage on the Message's origin Collection:
+/// that is the `manage_messages.delete` moderation route, whose own
+/// gate has already required View on the Message and either authorship
+/// or that same channel Manage.
+#[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn validate_on(
     conn: &mut SqliteConnection,
     actor: &str,
     id: &str,
     expected: Option<i64>,
     before: i64,
+) -> Result<i64> {
+    validate_inner(conn, actor, id, expected, before, false).await
+}
+
+async fn validate_inner(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    id: &str,
+    expected: Option<i64>,
+    before: i64,
+    allow_origin_channel_manage: bool,
 ) -> Result<i64> {
     let record: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id=?)")
         .bind(id)
@@ -26,10 +45,7 @@ pub(crate) async fn validate_on(
     if !record {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
-    if !kernel_effective_capability_on(conn, actor, id)
-        .await?
-        .allows(Capability::Manage)
-    {
+    if !manages_subject_or_origin_channel(conn, actor, id, allow_origin_channel_manage).await? {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
     let head: Option<i64> =
@@ -41,7 +57,7 @@ pub(crate) async fn validate_on(
     let head = head.ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
     if expected.is_some_and(|expected| expected != head) {
         return Err(Error::engine(
-            "delete_record: content revision conflict; get the record and prepare again",
+            "delete_record: content revision conflict; get the record and retry with its current revision",
         ));
     }
     // Like v1, retired personas are still registered identities.
@@ -89,12 +105,66 @@ pub(crate) async fn validate_on(
     Ok(head)
 }
 
+/// Manage on the subject record, or — only when `allow_origin_channel`
+/// and the subject is a Message — View on the Message plus Manage on
+/// the Collection declared as its communication origin at send time
+/// (`MessageState.origin`, with `native:root` mapped to the kernel
+/// root home, exactly as the `manage_messages.delete` gate reads it).
+/// The View requirement mirrors the gate's non-disclosure check in
+/// admission itself, so no future append route can tombstone a Message
+/// its actor cannot see by managing its channel alone. A Conversation
+/// the Message was classified into never counts, and a direct Message
+/// has no channel. A channel id with no kernel record grants nothing.
+async fn manages_subject_or_origin_channel(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    id: &str,
+    allow_origin_channel: bool,
+) -> Result<bool> {
+    let on_subject = kernel_effective_capability_on(conn, actor, id).await?;
+    if on_subject.allows(Capability::Manage) {
+        return Ok(true);
+    }
+    if !allow_origin_channel || !on_subject.allows(Capability::View) {
+        return Ok(false);
+    }
+    let Some(state) = messaging::on(conn, id).await? else {
+        return Ok(false);
+    };
+    let channel = (state.origin["type"] == "collection")
+        .then(|| state.origin["collection_id"].as_str())
+        .flatten();
+    let Some(channel) = channel else {
+        return Ok(false);
+    };
+    let channel = if channel == "native:root" {
+        KERNEL_ROOT_ID
+    } else {
+        channel
+    };
+    match kernel_effective_capability_on(conn, actor, channel).await {
+        Ok(capability) => Ok(capability.allows(Capability::Manage)),
+        Err(Error::Engine(message)) if message == HIDDEN_OR_MISSING => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
     let p: Deleted = event_payload(event)?;
     if p.reason.trim().is_empty() {
         return Err(Error::engine("delete_record: reason must not be blank"));
     }
-    validate_on(
+    // Admission runs only on append — in production, live append only
+    // (the migration seam that also runs admission is `#[cfg(test)]`) —
+    // before insert, against projections folded from every earlier
+    // event, so the Message state, the channel record and its home
+    // policy/owner
+    // are all as of this event's position in the log. Replay never calls
+    // this: `project` below applies retained tombstones without
+    // re-evaluating authority, so widening admission here cannot change
+    // what an existing log replays to, and a moderator tombstone stays
+    // replayable even if the channel later moves or changes owner.
+    validate_inner(
         conn,
         event.actor.as_deref().unwrap_or_default(),
         &event.record_id,
@@ -104,6 +174,7 @@ pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Resu
         } else {
             event.local_seq
         },
+        true,
     )
     .await?;
     Ok(())

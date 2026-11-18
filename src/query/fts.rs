@@ -180,6 +180,86 @@ struct SearchPrincipal<'a> {
     /// `native:members` baseline. Required (rather than defaulted) so a
     /// construction that forgets the footing fails to compile.
     is_member: bool,
+    // Selected only by the sealed-session entry below, never by a canonical
+    // caller's options or a missing principal.
+    native_member: bool,
+}
+
+fn search_hidden_predicate(member: bool, native: bool) -> String {
+    #[cfg(feature = "v2-kernel-probe")]
+    if native {
+        return crate::mcp::kernel_v2::native_query_hidden_predicate("r", &[]);
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let _ = native;
+    if member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::not_hidden_predicate("r")
+    }
+}
+fn search_archived_filter(include_archived: bool, native: bool) -> String {
+    if include_archived {
+        String::new()
+    } else if native {
+        "AND r.archived=0".into()
+    } else {
+        format!("AND {NOT_ARCHIVED}")
+    }
+}
+async fn search_scope_ids(
+    conn: &mut SqliteConnection,
+    root: &str,
+    include_archived: bool,
+    native: bool,
+) -> Result<Vec<String>> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if native {
+        return tree::native_member_subtree_ids_in(conn, root, include_archived).await;
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let _ = native;
+    tree::subtree_ids_with_hidden_in(conn, root, false, false, include_archived).await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SearchMechanism {
+    Strict,
+    Prefix,
+    Infix,
+}
+
+/// Native callers must supply the admitted session itself. The internal mode
+/// cannot be chosen by a canonical connection or public FtsOptions flag.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_matches(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    input: &str,
+    opts: &FtsOptions,
+    mechanism: SearchMechanism,
+) -> Result<Vec<SearchHit>> {
+    if !opts.member {
+        return Err(crate::Error::copy_unavailable());
+    }
+    session.ensure_search_indexes().await?;
+    let actor = session.principal().to_owned();
+    let principal = SearchPrincipal {
+        credential: &actor,
+        trusted_local_bypass: false,
+        is_member: false,
+        native_member: true,
+    };
+    match mechanism {
+        SearchMechanism::Strict => {
+            search_in_context(session.transaction(), principal, input, opts).await
+        }
+        SearchMechanism::Prefix => {
+            name_prefix_in_context(session.transaction(), principal, input, opts).await
+        }
+        SearchMechanism::Infix => {
+            name_infix_in_context(session.transaction(), principal, input, opts).await
+        }
+    }
 }
 
 /// Match stream and parent redaction over the caller's connection, so one
@@ -205,16 +285,11 @@ async fn run_match(
     let limit = effective_limit(opts.limit)?;
     let scope_ids = match &opts.scope {
         Some(root) => Some(
-            tree::subtree_ids_with_hidden_in(conn, root, false, false, opts.include_archived)
-                .await?,
+            search_scope_ids(conn, root, opts.include_archived, principal.native_member).await?,
         ),
         None => None,
     };
-    let archived_filter = if opts.include_archived {
-        String::new()
-    } else {
-        format!("AND {NOT_ARCHIVED}")
-    };
+    let archived_filter = search_archived_filter(opts.include_archived, principal.native_member);
     let (scope_filter, scope_bind) = match &scope_ids {
         Some(ids) => {
             if ids.is_empty() {
@@ -231,11 +306,7 @@ async fn run_match(
         let (filter, bind) = set_filter("r.type", &opts.types)?;
         (filter, Some(bind))
     };
-    let not_hidden = if opts.member {
-        super::member_not_hidden_predicate("r")
-    } else {
-        super::not_hidden_predicate("r")
-    };
+    let not_hidden = search_hidden_predicate(opts.member, principal.native_member);
     // A member copy holds only E(m): lexical visibility is slice presence, so
     // the policy/Unit view predicate (and its four binds) is replaced.
     let view_filter = if opts.member {
@@ -548,6 +619,26 @@ pub(crate) async fn search_with_policy_bypass_in(
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
+    search_in_context(
+        conn,
+        SearchPrincipal {
+            credential,
+            trusted_local_bypass,
+            is_member,
+            native_member: false,
+        },
+        input,
+        opts,
+    )
+    .await
+}
+
+async fn search_in_context(
+    conn: &mut SqliteConnection,
+    principal: SearchPrincipal<'_>,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<Vec<SearchHit>> {
     let Some(match_expr) = quoted_terms(input) else {
         return Ok(Vec::new());
     };
@@ -564,11 +655,7 @@ pub(crate) async fn search_with_policy_bypass_in(
     let rank_terms = tokenize(input);
     run_match(
         conn,
-        SearchPrincipal {
-            credential,
-            trusted_local_bypass,
-            is_member,
-        },
+        principal,
         &index_sql,
         &match_expr,
         &rank_terms,
@@ -589,6 +676,30 @@ pub async fn search_pool_count(
     opts: &FtsOptions,
 ) -> Result<i64> {
     search_pool_count_with_policy_bypass(db, credential, false, is_member, input, opts).await
+}
+
+fn strict_count_sql(
+    opts: &FtsOptions,
+    not_hidden: &str,
+    view_filter: &str,
+    archived_filter: &str,
+    scope_filter: &str,
+    type_filter: &str,
+) -> String {
+    let exclude_filter = exclude_filter(opts);
+    format!(
+        "SELECT COUNT(*) AS n
+          FROM records_fts
+          JOIN records r ON r.rowid = records_fts.rowid
+          WHERE records_fts MATCH ?
+            AND r.deleted_at IS NULL
+            AND {not_hidden}
+            AND {view_filter}
+            {archived_filter}
+            {scope_filter}
+            {type_filter}
+            {exclude_filter}"
+    )
 }
 
 pub(crate) async fn search_pool_count_with_policy_bypass(
@@ -639,19 +750,13 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
     } else {
         view_predicate("r")
     };
-    let exclude_filter = exclude_filter(opts);
-    let sql = format!(
-        "SELECT COUNT(*) AS n
-          FROM records_fts
-          JOIN records r ON r.rowid = records_fts.rowid
-          WHERE records_fts MATCH ?
-            AND r.deleted_at IS NULL
-            AND {not_hidden}
-            AND {view_filter}
-            {archived_filter}
-            {scope_filter}
-            {type_filter}
-            {exclude_filter}"
+    let sql = strict_count_sql(
+        opts,
+        &not_hidden,
+        &view_filter,
+        &archived_filter,
+        &scope_filter,
+        &type_filter,
     );
     let mut query = sqlx::query(&sql).bind(&match_expr);
     if !opts.member {
@@ -668,6 +773,64 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
         query = query.bind(bind);
     }
     Ok(query.fetch_one(db.write_pool()).await?.try_get("n")?)
+}
+
+/// A real COUNT(*) over the same native match filters, before any candidate
+/// cap, byte ceiling, ranking or sample limit. Counts never use returned hits.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_pool_count(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<i64> {
+    if !opts.member {
+        return Err(crate::Error::copy_unavailable());
+    }
+    let Some(match_expr) = quoted_terms(input) else {
+        return Ok(0);
+    };
+    session.ensure_search_indexes().await?;
+    let scope = match &opts.scope {
+        Some(root) => {
+            Some(search_scope_ids(session.transaction(), root, opts.include_archived, true).await?)
+        }
+        None => None,
+    };
+    let (scope_filter, scope_bind) = match scope {
+        Some(ids) => {
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            let (filter, bind) = set_filter("r.id", &ids)?;
+            (filter, Some(bind))
+        }
+        None => (String::new(), None),
+    };
+    let (type_filter, type_bind) = if opts.types.is_empty() {
+        (String::new(), None)
+    } else {
+        let (filter, bind) = set_filter("r.type", &opts.types)?;
+        (filter, Some(bind))
+    };
+    let sql = strict_count_sql(
+        opts,
+        &search_hidden_predicate(true, true),
+        "1",
+        &search_archived_filter(opts.include_archived, true),
+        &scope_filter,
+        &type_filter,
+    );
+    let mut query = sqlx::query(&sql).bind(match_expr);
+    if let Some(bind) = scope_bind {
+        query = query.bind(bind);
+    }
+    if let Some(bind) = type_bind {
+        query = query.bind(bind);
+    }
+    Ok(query
+        .fetch_one(&mut **session.transaction())
+        .await?
+        .try_get("n")?)
 }
 
 /// Word-initial prefix search over `name`, against the UNSTEMMED sibling
@@ -714,6 +877,26 @@ pub(crate) async fn name_prefix_with_policy_bypass_in(
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
+    name_prefix_in_context(
+        conn,
+        SearchPrincipal {
+            credential,
+            trusted_local_bypass,
+            is_member,
+            native_member: false,
+        },
+        input,
+        opts,
+    )
+    .await
+}
+
+async fn name_prefix_in_context(
+    conn: &mut SqliteConnection,
+    principal: SearchPrincipal<'_>,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<Vec<SearchHit>> {
     let Some(terms) = quoted_terms(input) else {
         return Ok(Vec::new());
     };
@@ -729,11 +912,7 @@ pub(crate) async fn name_prefix_with_policy_bypass_in(
     let rank_terms = tokenize(input);
     run_match(
         conn,
-        SearchPrincipal {
-            credential,
-            trusted_local_bypass,
-            is_member,
-        },
+        principal,
         &index_sql,
         &match_expr,
         &rank_terms,
@@ -799,6 +978,26 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
     input: &str,
     opts: &FtsOptions,
 ) -> Result<Vec<SearchHit>> {
+    name_infix_in_context(
+        conn,
+        SearchPrincipal {
+            credential,
+            trusted_local_bypass,
+            is_member,
+            native_member: false,
+        },
+        input,
+        opts,
+    )
+    .await
+}
+
+async fn name_infix_in_context(
+    conn: &mut SqliteConnection,
+    principal: SearchPrincipal<'_>,
+    input: &str,
+    opts: &FtsOptions,
+) -> Result<Vec<SearchHit>> {
     let tokens = tokenize(input);
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -806,16 +1005,11 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
     let limit = effective_limit(opts.limit)?;
     let scope_ids = match &opts.scope {
         Some(root) => Some(
-            tree::subtree_ids_with_hidden_in(conn, root, false, false, opts.include_archived)
-                .await?,
+            search_scope_ids(conn, root, opts.include_archived, principal.native_member).await?,
         ),
         None => None,
     };
-    let archived_filter = if opts.include_archived {
-        String::new()
-    } else {
-        format!("AND {NOT_ARCHIVED}")
-    };
+    let archived_filter = search_archived_filter(opts.include_archived, principal.native_member);
     let (scope_filter, scope_bind) = match &scope_ids {
         Some(ids) => {
             if ids.is_empty() {
@@ -833,11 +1027,7 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
         (filter, Some(bind))
     };
     let predicates = vec!["r.name LIKE ? ESCAPE '\\'"; tokens.len()].join(" AND ");
-    let not_hidden = if opts.member {
-        super::member_not_hidden_predicate("r")
-    } else {
-        super::not_hidden_predicate("r")
-    };
+    let not_hidden = search_hidden_predicate(opts.member, principal.native_member);
     let view_filter = if opts.member {
         "1".to_string()
     } else {
@@ -871,10 +1061,10 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
     }
     if !opts.member {
         query = query
-            .bind(trusted_local_bypass)
-            .bind(credential)
-            .bind(is_member)
-            .bind(credential);
+            .bind(principal.trusted_local_bypass)
+            .bind(principal.credential)
+            .bind(principal.is_member)
+            .bind(principal.credential);
     }
     if let Some(bind) = scope_bind {
         query = query.bind(bind);
@@ -904,7 +1094,14 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
             hit.home_id = hit.raw_home_id.clone();
         }
     } else {
-        redact_parent_ids(conn, credential, trusted_local_bypass, is_member, &mut hits).await?;
+        redact_parent_ids(
+            conn,
+            principal.credential,
+            principal.trusted_local_bypass,
+            principal.is_member,
+            &mut hits,
+        )
+        .await?;
     }
     Ok(hits)
 }

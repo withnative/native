@@ -1,6 +1,6 @@
 {
-  "profile": "workspace-snapshot-resume/v1",
-  "codec": "fixed field order per domain; per field 0x00=null-or-missing, else 0x01 + u32 big-endian UTF-8 byte length + raw UTF-8; sha256 over domain tag (with trailing NUL) + encoded fields, lowercase hex. Missing and null encode identically by construction; empty string is a distinct present claim.",
+  "profile": "workspace-snapshot-resume/v2",
+  "codec": "fixed field order per domain; per field 0x00=null-or-missing, else 0x01 + u32 big-endian UTF-8 byte length + raw UTF-8; sha256 over domain tag (with trailing NUL) + encoded fields, lowercase hex. Missing and null encode identically by construction; empty string is a distinct present claim. Record domain is native.ws-resume/v2/record; facet and link stay v1. The record order appends canonical text is_current (1/0/null), updated_at_ms (decimal/null), archived (0/1).",
   "domains": {
     "record": [
       "id",
@@ -15,7 +15,10 @@
       "last_activity_at",
       "created_at",
       "updated_at",
-      "deleted_at"
+      "deleted_at",
+      "is_current",
+      "updated_at_ms",
+      "archived"
     ],
     "facet": [
       "record_id",
@@ -46,9 +49,12 @@
         "2026-05-01T00:00:00Z",
         "2026-01-01T00:00:00Z",
         "2026-06-01T12:00:00Z",
-        null
+        null,
+        "1",
+        "1717200000000",
+        "0"
       ],
-      "digest": "8cd656b245cbc13521eaac3681635ecc329d4ceb4761ea7645b8b125e6fbbf93"
+      "digest": "c2bdf56b0384114dedb9b3d42c058dc7254f6d64ca0f2580e951154d1567af37"
     },
     {
       "name": "record-unicode",
@@ -57,18 +63,21 @@
         "9e795001-0000-4000-8000-000000000002",
         "Document",
         "note",
-        "\ud834\udd1e Clef cafe\u0301",
-        "\ud83d\ude00",
+        "𝄞 Clef café",
+        "😀",
         null,
         "enduring",
         "draft",
-        "\u65e5\u672c\u8a9e\u306e\u8981\u7d04 \ud83c\udf89",
+        "日本語の要約 🎉",
         null,
         "2026-01-01T00:00:00Z",
         "2026-06-01T12:00:00Z",
-        null
+        null,
+        null,
+        null,
+        "1"
       ],
-      "digest": "61690d1d0481f1c92a816cf1c30e9b6fc2a5f222605da49924135c8e4ed4ef18"
+      "digest": "635a7617ec02ee3720c2bffcf9edc5c5cecc8dc66d4726322504b243991b12af"
     },
     {
       "name": "record-delimiters",
@@ -86,9 +95,12 @@
         null,
         "2026-01-01T00:00:00Z",
         "2026-06-01T12:00:00Z",
-        null
+        null,
+        "0",
+        null,
+        "0"
       ],
-      "digest": "ccc4c09fe0a18a9d469f075eca796e39de6aea58d51daf58c61cdc97592b0090"
+      "digest": "e780cf2bbf410f2b77af0052ec671b95eb517cd61c8671a19103928ffd292169"
     },
     {
       "name": "record-null-kind",
@@ -106,9 +118,12 @@
         null,
         "2026-01-01T00:00:00Z",
         "2026-06-01T12:00:00Z",
-        null
+        null,
+        "1",
+        "0",
+        "0"
       ],
-      "digest": "c09ae723fa04958514cd3c4b8e89944860a16b284b506f6ae10355fbd351ad25"
+      "digest": "3c910d2c6587bfa2f19a7b34b9ab3e3a0d7df6e39bc4032bd50e03aeb2ebc4cd"
     },
     {
       "name": "record-empty-kind",
@@ -126,9 +141,12 @@
         null,
         "2026-01-01T00:00:00Z",
         "2026-06-01T12:00:00Z",
-        null
+        null,
+        null,
+        "1719792000000",
+        "1"
       ],
-      "digest": "724958da6b5e237f81e5ca5c4d6aaf5f00dda2a768227fe769c35278c9925c74"
+      "digest": "d004033de55d810de045923967401525824a1afd78e21f88f9b00e8efb1abf8b"
     },
     {
       "name": "record-order-permuted",
@@ -146,9 +164,12 @@
         "note",
         "Document",
         "9e795001-0000-4000-8000-000000000001",
-        null
+        null,
+        "1",
+        null,
+        "0"
       ],
-      "digest": "6fbe7680e21d609f162d6d6232549b8a267af469848da2aa399c4b894d56ea7f"
+      "digest": "97e2a630aa42f1ff14eebe77e3ace4e18a23c544adb8f5dd306df2214738c07d"
     },
     {
       "name": "facet-value",
@@ -185,7 +206,7 @@
       "domain": "facet",
       "fields": [
         "rec-1",
-        "cle\u0301 \ud834\udd1e",
+        "clé 𝄞",
         "val\tue\n"
       ],
       "digest": "4c94b6b6b9509faa31c9462ecbf3e350e18c0a7c2bc63da2ff916817f248fe8d"

@@ -242,6 +242,156 @@ fn request() -> AppDataRequest {
 }
 
 #[tokio::test]
+async fn declarative_sql_prism_installed_single_and_batch_reads_match() {
+    let needs: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/kernel_v2_prism_reads.json"
+    ))
+    .unwrap();
+    let (_f, db, report) = fixture(&json!({"needs":needs,"effects":[]})).await;
+    let actor = &report.principals["account-a"];
+    let home = k::read_record_as(&db, actor, "note")
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let task = ordinary_kernel_call(&db,"account-a","create_record",json!({
+        "type":"WorkItem","kind":"task","name":"Prism fixture task","body":"Small selected body","home_id":home
+    })).await.unwrap()["id"].as_str().unwrap().to_owned();
+    ordinary_kernel_call(&db,"account-a","create_record",json!({
+        "type":"WorkItem","kind":"task","name":"Unrelated large task",
+        "body":"x".repeat(crate::query::sql::MAX_SQLITE_VALUE_BYTES as usize+4096),"home_id":home
+    })).await.unwrap();
+    for projected in [false, true] {
+        if projected {
+            k::sql_record_projection::catch_up(&db).await.unwrap();
+            k::sql_event_projection::catch_up(&db).await.unwrap();
+        }
+        let caller = Caller::authenticated("account-a");
+        let mut reads = Vec::new();
+        let mut expected = Vec::new();
+        for need in needs.as_array().unwrap() {
+            let snapshot = need["key"] == "prism.records";
+            let params = if snapshot {
+                json!({})
+            } else {
+                json!({"id":task})
+            };
+            let request = AppDataRequest {
+                need: if snapshot {
+                    None
+                } else {
+                    Some(need["key"].as_str().unwrap().into())
+                },
+                params: params.clone(),
+                ..request()
+            };
+            let result = NativeAppDataNeeds
+                .evaluate(&db, &caller, &request)
+                .await
+                .unwrap_or_else(|e| panic!("{} projected={projected}: {e}", need["key"]))
+                .result;
+            if need["key"] == "prism.body" {
+                assert_eq!(result["result"]["rows"][0]["body"], "Small selected body");
+            }
+            reads.push(if snapshot {
+                json!({"need":"attention.query.v1"})
+            } else {
+                json!({"need":need["key"],"params":params})
+            });
+            expected.push(result);
+        }
+        let batch=ordinary_kernel_call(&db,"account-a","manage_alpha_tabs",json!({"action":"live_read","package":"agent.notion-pages","expected_install_event_id":"install","reads":reads})).await.unwrap();
+        for (index, single) in expected.iter().enumerate() {
+            let actual = &batch["results"][index]["ok"];
+            assert!(
+                actual.is_object(),
+                "{}: {}",
+                needs[index]["key"],
+                batch["results"][index]
+            );
+            if index == 0 {
+                assert_eq!(actual, single);
+            } else {
+                assert_eq!(
+                    actual["result"]["rows"], single["result"]["rows"],
+                    "{} projected={projected}",
+                    needs[index]["key"]
+                );
+                assert_eq!(actual["result"]["columns"], single["result"]["columns"]);
+            }
+        }
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn declarative_launch_is_sample_only_before_separate_live_read() {
+    let (_f, db, _) = fixture(&declaration()).await;
+    let (db, hub) = crate::realtime::RealtimeHub::attach(db, None)
+        .await
+        .unwrap();
+    hub.set_app_data_needs(std::sync::Arc::new(NativeAppDataNeeds));
+    let caller = Caller::authenticated("account-a").with_hosting_context("account-a", "fixture");
+    // SAFETY: this fixture owns the synthetic same-origin cookie session.
+    let caller =
+        unsafe { caller.with_verified_hosting_session("11111111-1111-4111-8111-111111111111") };
+    let mut registry = crate::mcp::ToolRegistry::new();
+    registry.set_app_bundle_delivery(Some(crate::mcp::tools::alpha_tabs::AppBundleDelivery {
+        enabled: true,
+        runtime: crate::artifact_html::RuntimeConfig::new(
+            "http://localhost", "https://artifact.declarative.test",
+        ).unwrap(),
+        keyring: Some(std::sync::Arc::new(
+            native_artifact_runtime::deployment_keyring::DeploymentKeyring::from_json_bundle(
+                r#"{"active_key_id":"synthetic","keys":[{"id":"synthetic","key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]}"#,
+            ).unwrap(),
+        )),
+    }));
+    crate::mcp::register_builtin_tools(&mut registry).unwrap();
+    crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+    crate::mcp::kernel_v2::register_kernel_v2_tools(&mut registry).unwrap();
+    let launch = registry
+        .call_engine(
+            crate::mcp::EngineHandle::KernelV2(db.clone()),
+            caller.clone(),
+            "manage_alpha_tabs",
+            json!({"action":"launch","package":"agent.notion-pages",
+            "expected_install_event_id":"install","delivery":"reusable.v1"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(launch["launch"]["kind"], "reusable.v1");
+    assert_eq!(launch["input"]["mode"], "sample");
+    assert_eq!(launch["input"]["sample_preview"], true);
+    // The shell rejects sample launches marked live, including declarations
+    // without a native.app.v2 contract marker (as used by installed Prism).
+    assert_eq!(launch["live_reads"], false);
+    assert_eq!(launch["effects_wired"], false);
+    let read = registry
+        .call_engine(
+            crate::mcp::EngineHandle::KernelV2(db.clone()),
+            caller,
+            "manage_alpha_tabs",
+            json!({"action":"live_read","package":"agent.notion-pages",
+            "expected_install_event_id":"install"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["live_reads"], true);
+    // The shipping launcher requires the same snapshot mapping as v1,
+    // even when all consented reads are SQL needs rather than Attention.
+    assert_eq!(
+        read["declared_port"],
+        crate::mcp::tools::alpha_tabs::alpha_tab_attention_port_mapping()
+    );
+    assert_eq!(
+        read["input"]["sql"]["notion.recent"]["rows"][0]["id"],
+        "note"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
 async fn declarative_sql_snapshot_params_search_visibility_and_revocation() {
     let (_f, db, report) = fixture(&declaration()).await;
     let caller = Caller::authenticated("account-a");
@@ -845,6 +995,7 @@ async fn hosted_review_with_format(format: u32) {
         receipt_id: preview.receipt.receipt_id,
         nonce: preview.receipt.nonce,
         preview_session: preview.receipt.preview_session,
+        scope: None,
     };
     if format == 4 {
         let revision = k::read_record_as(&db, a, "secret")
@@ -1172,4 +1323,209 @@ async fn declarative_sql_bad_retained_install_isolated_from_lists_and_preparatio
     k::replay_all_projections(&db).await.unwrap();
     assert_eq!(before, k::dump_all_kernel_tables(&db).await.unwrap());
     db.close().await;
+}
+
+#[tokio::test]
+async fn installed_app_management_reads_do_not_wait_for_write_pool() {
+    let (_f, db, report) = fixture(&declaration()).await;
+    let principal = &report.principals["account-a"];
+    let mut expected_lists = Vec::new();
+    for view in ["full", "summary"] {
+        expected_lists.push(
+            k::app_installs::list_as(&db, principal, Some(view.into()), None)
+                .await
+                .unwrap(),
+        );
+    }
+    let mut expected_inspections = Vec::new();
+    for package in ["agent.notion-pages", "agent.docs", "agent.not-installed"] {
+        expected_inspections.push(
+            k::app_installs::inspect_as(&db, principal, package)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(expected_inspections[0]["installed"], true);
+    assert_eq!(expected_inspections[2]["installed"], false);
+
+    // Isolate the inventory handler body: outer dispatcher admission may still
+    // need the writer pool. These reads must not retain its scarce connections
+    // for the complete source/pending/visibility inventory transaction.
+    let mut held_writers = Vec::new();
+    for _ in 0..db.write_pool().options().get_max_connections() {
+        held_writers.push(db.write_pool().acquire().await.unwrap());
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            db.write_pool().acquire(),
+        )
+        .await
+        .is_err(),
+        "control: every writer connection must be held"
+    );
+
+    let reads = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for (view, expected) in ["full", "summary"].into_iter().zip(expected_lists) {
+            let actual = k::app_installs::list_as(&db, principal, Some(view.into()), None)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected, "{view} inventory changed");
+        }
+        for (package, expected) in ["agent.notion-pages", "agent.docs", "agent.not-installed"]
+            .into_iter()
+            .zip(expected_inspections)
+        {
+            let actual = k::app_installs::inspect_as(&db, principal, package)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected, "{package} inspection changed");
+        }
+    })
+    .await;
+    drop(held_writers);
+    reads.expect("inventory read handlers waited for the exhausted writer pool");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn installed_app_inventory_does_not_load_current_artifact_bodies() {
+    let (_f, db, report) = fixture(&declaration()).await;
+    let artifact = k::read_record_as(&db, &report.principals["account-a"], "secret")
+        .await
+        .unwrap()
+        .unwrap();
+    let title = artifact.fields["title"].clone();
+    assert!(title.as_str().is_some_and(|name| !name.is_empty()));
+    let mut expected = Vec::new();
+    for view in ["full", "summary"] {
+        let list = ordinary_kernel_call(
+            &db,
+            "account-a",
+            "manage_alpha_tabs",
+            json!({"action":"list", "view":view}),
+        )
+        .await
+        .unwrap();
+        let entry = list["installs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["package"] == "agent.notion-pages")
+            .unwrap();
+        assert_eq!(
+            entry["name"], title,
+            "{view} must expose the authored title"
+        );
+        expected.push(list);
+    }
+    // Fault-inject only the current-body storage. Inventory needs today's
+    // visibility, kind, name and archive state, plus the separately retained
+    // source pins; it must not fetch whole current HTML bundles for those.
+    sqlx::query("ALTER TABLE kernel_record_bodies RENAME TO inventory_test_bodies")
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    for (view, expected) in ["full", "summary"].into_iter().zip(expected) {
+        let actual = ordinary_kernel_call(
+            &db,
+            "account-a",
+            "manage_alpha_tabs",
+            json!({"action":"list", "view":view}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actual, expected,
+            "{view} inventory changed without metadata changes"
+        );
+    }
+    sqlx::query("ALTER TABLE inventory_test_bodies RENAME TO kernel_record_bodies")
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    // A missing artifact still yields an isolated unavailable target; it
+    // must not turn a partial install row into a failed whole inventory.
+    sqlx::query("UPDATE kernel_app_installs SET row_json=json_set(row_json,'$.artifact_id','missing-inventory-source') WHERE package='agent.notion-pages'")
+        .execute(db.write_pool()).await.unwrap();
+    for view in ["full", "summary"] {
+        let list = ordinary_kernel_call(
+            &db,
+            "account-a",
+            "manage_alpha_tabs",
+            json!({"action":"list", "view":view}),
+        )
+        .await
+        .unwrap();
+        let entry = list["installs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["package"] == "agent.notion-pages")
+            .unwrap();
+        assert_eq!(entry["target_resolves"], false);
+        assert_eq!(entry["target_skip_reason"], "unauthorized");
+        assert!(
+            entry["name"].is_null(),
+            "unavailable target must not disclose its name"
+        );
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn local_registry_keeps_installed_apps_usable_without_a_hosted_signer() {
+    let (_fixture, db, _) = fixture(&declaration()).await;
+    for local_copy in [false, true] {
+        let caller = if local_copy {
+            Caller::authenticated("account-a")
+        } else {
+            Caller::authenticated("account-a").with_hosting_context("account-a", "fixture")
+        };
+        let mut registry = crate::mcp::ToolRegistry::new();
+        registry.set_standby_read_only(local_copy);
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+        crate::mcp::kernel_v2::register_kernel_v2_tools(&mut registry).unwrap();
+        for args in [
+            json!({"action":"list"}),
+            json!({"action":"inspect","package":"agent.notion-pages"}),
+        ] {
+            let inspect = args["action"] == "inspect";
+            let result = registry
+                .call_engine(
+                    crate::mcp::EngineHandle::KernelV2(db.clone()),
+                    caller.clone(),
+                    "manage_alpha_tabs",
+                    args,
+                )
+                .await
+                .unwrap();
+            let entry = if inspect {
+                &result["install"]
+            } else {
+                result["installs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["package"] == "agent.notion-pages")
+                    .unwrap()
+            };
+            assert_eq!(entry["status"], "installed");
+            assert_eq!(entry["target_resolves"], true);
+            assert_eq!(
+                entry["launch_binding"]["reason"],
+                if local_copy {
+                    "launch_request_required"
+                } else {
+                    "delivery_unavailable"
+                }
+            );
+        }
+        if local_copy {
+            let bundle = registry.call_engine(crate::mcp::EngineHandle::KernelV2(db.clone()), caller.clone(),
+                "read_app_bundle", json!({"package":"agent.notion-pages","expected_install_event_id":"install", "parent_origin":"native-ui://app","offset":0,"length":128})).await.unwrap();
+            assert_eq!(bundle["length"], 128);
+        }
+    }
 }

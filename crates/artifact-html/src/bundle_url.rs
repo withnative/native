@@ -26,6 +26,10 @@ pub const PREVIEW_CAP_VERSION: u8 = 0x02;
 /// Opaque frozen artifact delivery; grants no install or preview authority.
 /// The former readable 0x03 format is deliberately no longer admitted.
 pub const ARTIFACT_CAP_VERSION: u8 = 0x04;
+/// Opaque frozen artifact delivery bound to a verified bearer JWT rather than
+/// a catalog session. Same sealing and bounds as 0x04, plus the token's
+/// revocation coordinates; its lifetime never exceeds the token's own `exp`.
+pub const ARTIFACT_JWT_CAP_VERSION: u8 = 0x05;
 /// Ordinary HTML only needs a short delivery lease, not an app session lease.
 pub const ARTIFACT_LIFETIME_SECONDS: u64 = 300;
 /// Supported clock skew in either direction (seconds).
@@ -44,6 +48,9 @@ pub const TAG_DOMAIN: &str = "native.bundle-url.v1";
 const TAG_BYTES: usize = 32;
 /// Payload ceiling including the bounded preview receipt (535 + 1 + 64).
 pub const MAX_PAYLOAD_BYTES: usize = 600;
+/// JWT-bound artifact payloads also carry the subject, optional `jti` and the
+/// token's `iat`/`exp`. The 1,536-byte URL bound still applies to the whole.
+pub const MAX_JWT_ARTIFACT_PAYLOAD_BYTES: usize = 1088;
 const MAX_PREVIEW_RECEIPT_BYTES: usize = 64;
 
 const MAX_KID_BYTES: usize = 16;
@@ -53,6 +60,42 @@ const SESSION_BYTES: usize = 36;
 const MAX_PACKAGE_BYTES: usize = 128;
 const MAX_INSTALL_EVENT_BYTES: usize = 64;
 const MAX_PARENT_ORIGIN_BYTES: usize = 128;
+const MAX_JWT_SUBJECT_BYTES: usize = 255;
+const MAX_JWT_ID_BYTES: usize = 255;
+
+/// The verified bearer token a JWT-bound artifact cap stands for. Only the
+/// coordinates the revocation ledger and identity link are keyed on: never
+/// the token itself. Issued only from a token the host has just verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwtBinding {
+    /// The token's `sub`, interpreted under the deployment's one issuer.
+    pub subject: String,
+    /// The token's `jti`, when it carried a non-empty one.
+    pub jti: Option<String>,
+    /// The token's `iat`, positioned against subject-wide logout cutoffs.
+    pub token_iat: u64,
+    /// The token's `exp`; the cap's own `exp` never exceeds it.
+    pub token_exp: u64,
+}
+
+/// What a verified cap must be re-admitted against on every serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapBinding {
+    /// A catalog session row (cookie ingress): canonical hyphenated UUID.
+    Session(String),
+    /// A verified bearer JWT; only ever on ordinary artifact-render caps.
+    Jwt(JwtBinding),
+}
+
+impl CapBinding {
+    /// The catalog session id, or `None` for a JWT binding.
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Session(id) => Some(id),
+            Self::Jwt(_) => None,
+        }
+    }
+}
 
 /// Why a cap was refused. Every variant maps to a 404 at the route; the
 /// granularity exists so later slices can meter skew versus forgery.
@@ -99,7 +142,8 @@ pub struct VerifiedFields {
     pub kid: String,
     pub principal: String,
     pub database: String,
-    pub session: String,
+    /// Session for 0x01/0x02/0x04 caps; JWT only for 0x05 artifact caps.
+    pub binding: CapBinding,
     pub package: String,
     pub install_event: String,
     pub parent_origin: String,
@@ -150,6 +194,20 @@ fn valid_hex(hex: &str) -> bool {
         && hex
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Bounded, non-empty, control-free subject; optional bounded `jti`; the
+/// token must be positioned in time and expire after it was issued.
+fn valid_jwt_binding(jwt: &JwtBinding) -> bool {
+    let printable = |value: &str| value.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
+    !jwt.subject.is_empty()
+        && jwt.subject.len() <= MAX_JWT_SUBJECT_BYTES
+        && printable(&jwt.subject)
+        && jwt
+            .jti
+            .as_deref()
+            .is_none_or(|jti| !jti.is_empty() && jti.len() <= MAX_JWT_ID_BYTES && printable(jti))
+        && jwt.token_iat < jwt.token_exp
 }
 
 fn canonical_session(value: &str) -> bool {
@@ -342,6 +400,7 @@ pub fn issue(
         artifact_origin,
         hex,
         fields,
+        &CapBinding::Session(fields.session.clone()),
         now,
         expires,
         None,
@@ -361,7 +420,49 @@ pub fn issue_artifact(
     let exp = now
         .checked_add(ARTIFACT_LIFETIME_SECONDS)
         .ok_or(IssueError::TimeOverflow)?;
-    issue_cap(key_ring, artifact_origin, hex, fields, now, exp, None, true)
+    issue_cap(
+        key_ring,
+        artifact_origin,
+        hex,
+        fields,
+        &CapBinding::Session(fields.session.clone()),
+        now,
+        exp,
+        None,
+        true,
+    )
+}
+
+/// Issue ordinary frozen artifact delivery bound to a verified bearer JWT.
+/// `fields.session` must be empty: the JWT replaces the session binding, it
+/// never accompanies one. `exp = min(now + 300, token_exp)`, so the cap can
+/// never outlive the token; a token already expired at `now` mints nothing.
+pub fn issue_artifact_for_jwt(
+    key_ring: &DeploymentKeyring,
+    artifact_origin: &str,
+    hex: &str,
+    fields: &IssueFields,
+    jwt: &JwtBinding,
+    now: u64,
+) -> Result<String, IssueError> {
+    if !fields.session.is_empty() {
+        return Err(IssueError::InvalidField("session"));
+    }
+    let exp = now
+        .checked_add(ARTIFACT_LIFETIME_SECONDS)
+        .ok_or(IssueError::TimeOverflow)?
+        .min(jwt.token_exp);
+    issue_cap(
+        key_ring,
+        artifact_origin,
+        hex,
+        fields,
+        &CapBinding::Jwt(jwt.clone()),
+        now,
+        exp,
+        None,
+        true,
+    )
 }
 
 /// Issue a preview URL with the receipt's exact expiry. Delivery must also
@@ -384,6 +485,7 @@ pub fn issue_preview(
         artifact_origin,
         hex,
         fields,
+        &CapBinding::Session(fields.session.clone()),
         now,
         expires,
         Some(receipt),
@@ -397,6 +499,7 @@ fn issue_cap(
     artifact_origin: &str,
     hex: &str,
     fields: &IssueFields,
+    binding: &CapBinding,
     now: u64,
     exp: u64,
     preview_receipt: Option<&str>,
@@ -417,8 +520,22 @@ fn issue_cap(
     if fields.database.is_empty() || fields.database.len() > MAX_DATABASE_BYTES {
         return Err(IssueError::InvalidField("database"));
     }
-    if !canonical_session(&fields.session) {
-        return Err(IssueError::InvalidField("session"));
+    match binding {
+        CapBinding::Session(session) => {
+            if !canonical_session(session) {
+                return Err(IssueError::InvalidField("session"));
+            }
+        }
+        CapBinding::Jwt(jwt) => {
+            // JWT binding exists only for ordinary artifact delivery; never
+            // for install or preview authority.
+            if !artifact_render || preview_receipt.is_some() {
+                return Err(IssueError::InvalidField("binding"));
+            }
+            if !valid_jwt_binding(jwt) || exp > jwt.token_exp {
+                return Err(IssueError::InvalidField("jwt"));
+            }
+        }
     }
     // Package syntax lives here so both the cap and the main crate's
     // `require_package` share one predicate; length is folded into it.
@@ -443,8 +560,14 @@ fn issue_cap(
         return Err(IssueError::InvalidField("expiry"));
     }
 
+    let jwt = match binding {
+        CapBinding::Session(_) => None,
+        CapBinding::Jwt(jwt) => Some(jwt),
+    };
     let mut payload = Vec::with_capacity(128);
-    payload.push(if artifact_render {
+    payload.push(if jwt.is_some() {
+        ARTIFACT_JWT_CAP_VERSION
+    } else if artifact_render {
         ARTIFACT_CAP_VERSION
     } else if preview_receipt.is_some() {
         PREVIEW_CAP_VERSION
@@ -454,7 +577,10 @@ fn issue_cap(
     push_field(&mut payload, key_ring.active_key_id().as_bytes());
     push_field(&mut payload, fields.principal.as_bytes());
     push_field(&mut payload, fields.database.as_bytes());
-    push_field(&mut payload, fields.session.as_bytes());
+    match binding {
+        CapBinding::Session(session) => push_field(&mut payload, session.as_bytes()),
+        CapBinding::Jwt(jwt) => push_field(&mut payload, jwt.subject.as_bytes()),
+    }
     push_field(&mut payload, fields.package.as_bytes());
     push_field(&mut payload, fields.install_event.as_bytes());
     push_field(&mut payload, fields.parent_origin.as_bytes());
@@ -463,6 +589,11 @@ fn issue_cap(
     push_int(&mut payload, exp);
     if let Some(receipt) = preview_receipt {
         push_field(&mut payload, receipt.as_bytes());
+    }
+    if let Some(jwt) = jwt {
+        push_field(&mut payload, jwt.jti.as_deref().unwrap_or("").as_bytes());
+        push_int(&mut payload, jwt.token_iat);
+        push_int(&mut payload, jwt.token_exp);
     }
 
     let secret = key_ring
@@ -517,10 +648,18 @@ pub fn verify(
     if tag.len() != TAG_BYTES {
         return Err(Refusal::Malformed);
     }
-    if wire_payload.len() > MAX_PAYLOAD_BYTES {
+    let payload_limit = if wire_payload.first() == Some(&ARTIFACT_JWT_CAP_VERSION) {
+        MAX_JWT_ARTIFACT_PAYLOAD_BYTES
+    } else {
+        MAX_PAYLOAD_BYTES
+    };
+    if wire_payload.len() > payload_limit {
         return Err(Refusal::Malformed);
     }
-    let payload = if wire_payload.first() == Some(&ARTIFACT_CAP_VERSION) {
+    let payload = if matches!(
+        wire_payload.first(),
+        Some(&ARTIFACT_CAP_VERSION | &ARTIFACT_JWT_CAP_VERSION)
+    ) {
         open_artifact_payload(key_ring, artifact_origin, hex, &wire_payload, &tag)?
     } else {
         wire_payload.clone()
@@ -528,13 +667,17 @@ pub fn verify(
     let (version, mut rest) = payload.split_first().ok_or(Refusal::Malformed)?;
     if !matches!(
         *version,
-        CAP_VERSION | PREVIEW_CAP_VERSION | ARTIFACT_CAP_VERSION
+        CAP_VERSION | PREVIEW_CAP_VERSION | ARTIFACT_CAP_VERSION | ARTIFACT_JWT_CAP_VERSION
     ) {
         return Err(Refusal::Malformed);
     }
-    let mut raw: [&[u8]; 11] = [&[]; 11];
+    let jwt_bound = *version == ARTIFACT_JWT_CAP_VERSION;
+    let artifact_render = *version == ARTIFACT_CAP_VERSION || jwt_bound;
+    let mut raw: [&[u8]; 13] = [&[]; 13];
     let field_count = if *version == PREVIEW_CAP_VERSION {
         11
+    } else if jwt_bound {
+        13
     } else {
         10
     };
@@ -565,8 +708,17 @@ pub fn verify(
     };
     let principal = text(1, MAX_PRINCIPAL_BYTES)?;
     let database = text(2, MAX_DATABASE_BYTES)?;
-    let session = text(3, SESSION_BYTES)?;
-    if !canonical_session(session) {
+    // Slot 3 is the session for every format except 0x05, where it is the
+    // JWT subject; the JWT's remaining coordinates follow the common fields.
+    let binding_text = text(
+        3,
+        if jwt_bound {
+            MAX_JWT_SUBJECT_BYTES
+        } else {
+            SESSION_BYTES
+        },
+    )?;
+    if !jwt_bound && !canonical_session(binding_text) {
         return Err(Refusal::Malformed);
     }
     let package = text(4, MAX_PACKAGE_BYTES)?;
@@ -590,6 +742,21 @@ pub fn verify(
     } else {
         None
     };
+    let binding = if jwt_bound {
+        let jti = std::str::from_utf8(raw[10]).map_err(|_| Refusal::Malformed)?;
+        let jwt = JwtBinding {
+            subject: binding_text.to_owned(),
+            jti: (!jti.is_empty()).then(|| jti.to_owned()),
+            token_iat: parse_int(raw[11]).ok_or(Refusal::Malformed)?,
+            token_exp: parse_int(raw[12]).ok_or(Refusal::Malformed)?,
+        };
+        if !valid_jwt_binding(&jwt) {
+            return Err(Refusal::Malformed);
+        }
+        CapBinding::Jwt(jwt)
+    } else {
+        CapBinding::Session(binding_text.to_owned())
+    };
 
     let secret = key_ring.secret(kid).ok_or(Refusal::UnknownKey)?;
     verify_tag(secret.as_slice(), artifact_origin, hex, &wire_payload, &tag)?;
@@ -601,13 +768,19 @@ pub fn verify(
     if iat >= exp {
         return Err(Refusal::Expired);
     }
-    let lifetime = if *version == ARTIFACT_CAP_VERSION {
+    let lifetime = if artifact_render {
         ARTIFACT_LIFETIME_SECONDS
     } else {
         MAX_LIFETIME_SECONDS
     };
     if exp - iat > lifetime {
         return Err(Refusal::Expired);
+    }
+    // A JWT-bound cap never outlives the token it stands for.
+    if let CapBinding::Jwt(jwt) = &binding {
+        if exp > jwt.token_exp || now >= jwt.token_exp {
+            return Err(Refusal::Expired);
+        }
     }
     if now >= exp {
         return Err(Refusal::Expired);
@@ -626,11 +799,11 @@ pub fn verify(
     }
 
     Ok(VerifiedFields {
-        artifact_render: *version == ARTIFACT_CAP_VERSION,
+        artifact_render,
         kid: kid.to_owned(),
         principal: principal.to_owned(),
         database: database.to_owned(),
-        session: session.to_owned(),
+        binding,
         package: package.to_owned(),
         install_event: install_event.to_owned(),
         parent_origin: parent_origin.to_owned(),
@@ -729,7 +902,10 @@ mod tests {
         let verified = verify(&test_keyring(), ORIGIN, HEX, &cap, IAT0 + 299).unwrap();
         assert_eq!(verified.principal, fields.principal);
         assert_eq!(verified.database, fields.database);
-        assert_eq!(verified.session, fields.session);
+        assert_eq!(
+            verified.binding,
+            CapBinding::Session(fields.session.clone())
+        );
         assert_eq!(verified.exp - verified.iat, ARTIFACT_LIFETIME_SECONDS);
         assert_eq!(
             verify(&ring, ORIGIN, HEX, &cap, IAT0 + 300),
@@ -743,6 +919,179 @@ mod tests {
             verify(&ring, ORIGIN, &"a".repeat(64), &cap, IAT0),
             Err(Refusal::BadTag)
         );
+    }
+
+    fn jwt_fields() -> IssueFields {
+        IssueFields {
+            session: String::new(),
+            package: "native.artifact-render".into(),
+            install_event: "artifact-1".into(),
+            ..test_fields()
+        }
+    }
+
+    fn jwt_binding() -> JwtBinding {
+        JwtBinding {
+            subject: "user_subject-0123456789abcdef".into(),
+            jti: Some("jti-0123456789abcdef".into()),
+            token_iat: IAT0 - 60,
+            token_exp: IAT0 + 3600,
+        }
+    }
+
+    #[test]
+    fn jwt_artifact_cap_round_trips_sealed_with_token_coordinates() {
+        let ring = test_keyring();
+        let fields = jwt_fields();
+        let jwt = jwt_binding();
+        let cap = issue_artifact_for_jwt(&ring, ORIGIN, HEX, &fields, &jwt, IAT0).unwrap();
+        let (payload, _) = cap.split_once('.').unwrap();
+        let wire = b64url().decode(payload).unwrap();
+        assert_eq!(wire[0], ARTIFACT_JWT_CAP_VERSION);
+        // Subject, jti, principal and database are sealed, never readable.
+        for value in [
+            jwt.subject.as_str(),
+            jwt.jti.as_deref().unwrap(),
+            fields.principal.as_str(),
+            fields.database.as_str(),
+        ] {
+            assert!(!wire
+                .windows(value.len())
+                .any(|part| part == value.as_bytes()));
+        }
+        let verified = verify(&test_keyring(), ORIGIN, HEX, &cap, IAT0 + 1).unwrap();
+        assert!(verified.artifact_render);
+        assert!(verified.preview_receipt.is_none());
+        assert_eq!(verified.binding, CapBinding::Jwt(jwt.clone()));
+        assert_eq!(verified.binding.session(), None);
+        assert_eq!(verified.principal, fields.principal);
+        assert_eq!(verified.database, fields.database);
+        assert_eq!(verified.install_event, fields.install_event);
+        assert_eq!(verified.exp, IAT0 + ARTIFACT_LIFETIME_SECONDS);
+        assert_eq!(
+            verify(&ring, ORIGIN, HEX, &cap, IAT0 + ARTIFACT_LIFETIME_SECONDS),
+            Err(Refusal::Expired)
+        );
+        assert_eq!(
+            verify(&ring, ORIGIN, &"a".repeat(64), &cap, IAT0),
+            Err(Refusal::BadTag)
+        );
+        assert_eq!(
+            verify(&other_keyring(), ORIGIN, HEX, &cap, IAT0),
+            Err(Refusal::UnknownKey)
+        );
+        // A token without jti is still bound to its iat for subject cutoffs.
+        let bare = JwtBinding { jti: None, ..jwt };
+        let cap = issue_artifact_for_jwt(&ring, ORIGIN, HEX, &fields, &bare, IAT0).unwrap();
+        assert_eq!(
+            verify(&ring, ORIGIN, HEX, &cap, IAT0).unwrap().binding,
+            CapBinding::Jwt(bare)
+        );
+    }
+
+    #[test]
+    fn jwt_artifact_cap_never_outlives_the_token() {
+        let ring = test_keyring();
+        let fields = jwt_fields();
+        let short = JwtBinding {
+            token_exp: IAT0 + 120,
+            ..jwt_binding()
+        };
+        let cap = issue_artifact_for_jwt(&ring, ORIGIN, HEX, &fields, &short, IAT0).unwrap();
+        let verified = verify(&ring, ORIGIN, HEX, &cap, IAT0 + 119).unwrap();
+        assert_eq!(verified.exp, IAT0 + 120);
+        assert_eq!(
+            verify(&ring, ORIGIN, HEX, &cap, IAT0 + 120),
+            Err(Refusal::Expired)
+        );
+        // An already-expired token mints nothing.
+        for token_exp in [IAT0, IAT0 - 1] {
+            let expired = JwtBinding {
+                token_exp,
+                token_iat: IAT0 - 600,
+                ..jwt_binding()
+            };
+            assert_eq!(
+                issue_artifact_for_jwt(&ring, ORIGIN, HEX, &fields, &expired, IAT0),
+                Err(IssueError::InvalidField("expiry"))
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_artifact_cap_refuses_ambiguous_or_unbounded_bindings() {
+        let ring = test_keyring();
+        // A JWT never accompanies a session binding.
+        assert_eq!(
+            issue_artifact_for_jwt(&ring, ORIGIN, HEX, &test_fields(), &jwt_binding(), IAT0),
+            Err(IssueError::InvalidField("session"))
+        );
+        for jwt in [
+            JwtBinding {
+                subject: String::new(),
+                ..jwt_binding()
+            },
+            JwtBinding {
+                subject: "has space".into(),
+                ..jwt_binding()
+            },
+            JwtBinding {
+                subject: "s".repeat(256),
+                ..jwt_binding()
+            },
+            JwtBinding {
+                jti: Some(String::new()),
+                ..jwt_binding()
+            },
+            JwtBinding {
+                jti: Some("j".repeat(256)),
+                ..jwt_binding()
+            },
+            JwtBinding {
+                token_iat: IAT0 + 3600,
+                ..jwt_binding()
+            },
+        ] {
+            assert_eq!(
+                issue_artifact_for_jwt(&ring, ORIGIN, HEX, &jwt_fields(), &jwt, IAT0),
+                Err(IssueError::InvalidField("jwt")),
+                "{jwt:?}"
+            );
+        }
+        // Maximum-size coordinates still fit the payload and URL bounds.
+        let max = JwtBinding {
+            subject: "s".repeat(255),
+            jti: Some("j".repeat(255)),
+            ..jwt_binding()
+        };
+        let cap = issue_artifact_for_jwt(&ring, ORIGIN, HEX, &jwt_fields(), &max, IAT0).unwrap();
+        assert_eq!(
+            verify(&ring, ORIGIN, HEX, &cap, IAT0).unwrap().binding,
+            CapBinding::Jwt(max)
+        );
+        // The JWT binding is never available to install or preview issuance.
+        assert_eq!(
+            issue_cap(
+                &ring,
+                ORIGIN,
+                HEX,
+                &jwt_fields(),
+                &CapBinding::Jwt(jwt_binding()),
+                IAT0,
+                IAT0 + 60,
+                None,
+                false,
+            ),
+            Err(IssueError::InvalidField("binding"))
+        );
+        // Re-labelling a sealed JWT cap as a session artifact cap fails.
+        let cap = issue_artifact_for_jwt(&ring, ORIGIN, HEX, &jwt_fields(), &jwt_binding(), IAT0)
+            .unwrap();
+        let (payload, tag) = cap.split_once('.').unwrap();
+        let mut bytes = b64url().decode(payload).unwrap();
+        bytes[0] = ARTIFACT_CAP_VERSION;
+        let forged = format!("{}.{}", b64url().encode(bytes), tag);
+        assert!(verify(&ring, ORIGIN, HEX, &forged, IAT0).is_err());
     }
 
     #[test]
@@ -1004,7 +1353,7 @@ mod tests {
         assert_eq!(got.kid, "test-key-1");
         assert_eq!(got.principal, "user-1");
         assert_eq!(got.database, "db-1");
-        assert_eq!(got.session, SESSION);
+        assert_eq!(got.binding, CapBinding::Session(SESSION.into()));
         assert_eq!(got.package, "example.app");
         assert_eq!(got.install_event, "evt-1");
         assert_eq!(got.parent_origin, "https://app.example");

@@ -608,6 +608,9 @@ async fn mint_candidate_in(
         caller_owner,
         reason,
         &super::mint::MintRequest {
+            origin: None,
+            persistence: None,
+            maturity: None,
             record_type: &candidate.record_type,
             kind: &candidate.kind,
             name: candidate.name.as_deref(),

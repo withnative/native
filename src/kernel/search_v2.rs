@@ -139,11 +139,21 @@ pub(crate) async fn refresh_search_row(conn: &mut SqliteConnection, record_id: &
         (false, Some(lane)) if !lane.is_empty() => format!("{field_body}\n{lane}"),
         _ => field_body,
     };
+    #[cfg(feature = "v2-kernel-probe")]
+    let timer = crate::mcp::kernel_v2::write_diagnostics::Timer::new(
+        crate::mcp::kernel_v2::write_diagnostics::Stage::SearchDelete,
+    );
     sqlx::query("DELETE FROM kernel_search_fts WHERE record_id = ?")
         .bind(record_id)
         .execute(&mut *conn)
         .await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    drop(timer);
     if !(title.is_empty() && summary.is_empty() && body.is_empty()) {
+        #[cfg(feature = "v2-kernel-probe")]
+        let _timer = crate::mcp::kernel_v2::write_diagnostics::Timer::new(
+            crate::mcp::kernel_v2::write_diagnostics::Stage::SearchInsert,
+        );
         sqlx::query(
             "INSERT INTO kernel_search_fts(record_id, title, summary, body) VALUES(?, ?, ?, ?)",
         )
@@ -225,6 +235,22 @@ type CandidateRow = (
     String,
 );
 
+/// A candidate row followed by the window's exact total (`count(*) OVER ()`).
+type CountedCandidateRow = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+);
+
 fn candidate_meta(row: CandidateRow) -> CandidateMeta {
     CandidateMeta {
         id: row.0,
@@ -289,14 +315,20 @@ pub(crate) struct BoundedQueryPage {
 /// group discovery that loaded every visible record in full.
 pub(crate) async fn distinct_groups(db: &Db) -> Result<Vec<(String, String)>> {
     let mut snapshot = db.pool().begin().await?;
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT DISTINCT pin_family, kind FROM kernel_records WHERE pin_family IS NOT NULL AND kind IS NOT NULL ORDER BY pin_family, kind",
-    )
-    .fetch_all(&mut *snapshot)
-    .await?;
+    let rows = distinct_groups_on(&mut snapshot).await?;
     snapshot.rollback().await?;
     Ok(rows)
 }
+pub(crate) async fn distinct_groups_on(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT DISTINCT pin_family, kind FROM kernel_records WHERE pin_family IS NOT NULL AND kind IS NOT NULL ORDER BY pin_family, kind",
+    )
+    .fetch_all(conn)
+    .await.map_err(Into::into)
+}
+
 const SCAN_FETCH: i64 = 500;
 
 /// Linked-to visibility gate, mirroring `query_as`: an unseen or nonexistent
@@ -374,8 +406,12 @@ fn linked_clause(direction: &str, first: usize) -> Result<String> {
 /// View — so hidden rows are never scanned, counted, or bounded.
 struct SqlScope {
     homes: String,
+    /// Folder-scoped apps never scan Message records: messages follow
+    /// audience rules, not folders. Derived records bearing on a
+    /// message are still dropped by the capability recheck per hit.
+    exclude_messages: bool,
 }
-fn sql_scope(scope: &VisibleHomeAnchors) -> Result<SqlScope> {
+fn sql_scope(scope: &VisibleHomeAnchors, exclude_messages: bool) -> Result<SqlScope> {
     Ok(SqlScope {
         homes: serde_json::to_string(
             &scope
@@ -385,14 +421,20 @@ fn sql_scope(scope: &VisibleHomeAnchors) -> Result<SqlScope> {
                 .map(|h| serde_json::json!({"id":h.home_id,"view":h.policy_view}))
                 .collect::<Vec<_>>(),
         )?,
+        exclude_messages,
     })
 }
 // Explicit parameter positions reuse the same snapshot across every arm of
 // the shared gate, including Message audiences and terminal-bearer checks.
-fn scope_clause(first: usize) -> String {
+fn scope_clause(first: usize, exclude_messages: bool) -> String {
     let homes = "SELECT id,view FROM _kernel_query_homes";
+    let messages = if exclude_messages {
+        " AND NOT (r.primary_type='Message' OR EXISTS(SELECT 1 FROM kernel_messages m WHERE m.message_id=r.id) OR EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id=r.id AND f.name='v1_type' AND f.value_json='\"Message\"'))"
+    } else {
+        ""
+    };
     format!(
-        " AND ({})",
+        " AND ({}){messages}",
         super::sql_record_visible("r", &format!("?{}", first + 1), homes, true)
     )
 }
@@ -424,7 +466,7 @@ async fn scan_group(
         "SELECT r.id, r.accession, r.home_id, r.owner_id, r.primary_type, r.kind, r.pin_family, r.pin_version, r.pin_digest, r.interpreter, r.created_at
          FROM kernel_records r WHERE r.pin_family = ?1 AND r.kind = ?2",
     );
-    sql.push_str(&scope_clause(3));
+    sql.push_str(&scope_clause(3, scope.exclude_messages));
     let mut next = 5;
     if let Some((_, _, direction)) = linked_to {
         sql.push_str(&linked_clause(direction, next)?);
@@ -560,27 +602,41 @@ async fn counted_query_window(
     };
     // Keep field decoding behind a materialized authority barrier. A hidden
     // malformed carrier must not turn a visible query into a JSON error.
-    let source = format!("(WITH admitted AS MATERIALIZED (SELECT r.id,r.accession,r.home_id,r.owner_id,r.primary_type,r.kind,r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_at FROM kernel_records r WHERE (r.pin_family,r.kind) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?3)){}) SELECT * FROM admitted) r", scope_clause(1));
+    let source = format!("(WITH admitted AS MATERIALIZED (SELECT r.id,r.accession,r.home_id,r.owner_id,r.primary_type,r.kind,r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_at FROM kernel_records r WHERE (r.pin_family,r.kind) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?3)){}) SELECT * FROM admitted) r", scope_clause(1, scope.exclude_messages));
     let predicate = format!("(?4='[]' OR ({}) IN (SELECT value FROM json_each(?4))) AND (?5='[]' OR ({}) IN (SELECT value FROM json_each(?5)))", label("primary_type","v1_type"),label("kind","v1_kind"));
     let groups = serde_json::to_string(groups)?;
     let types = serde_json::to_string(types.unwrap_or_default())?;
     let kinds = serde_json::to_string(kinds.unwrap_or_default())?;
-    let total: i64 = sqlx::query_scalar(&scope_sql(
-        1,
-        &format!("SELECT count(*) FROM {source} WHERE {predicate}"),
-    ))
-    .bind(&scope.homes)
-    .bind(principal)
-    .bind(&groups)
-    .bind(&types)
-    .bind(&kinds)
-    .fetch_one(&mut *conn)
-    .await?;
-    let rows: Vec<CandidateRow> = sqlx::query_as(&scope_sql(1,&format!("SELECT r.id,r.accession,r.home_id,r.owner_id,r.primary_type,r.kind,r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_at FROM {source} WHERE {predicate} ORDER BY r.id LIMIT ?6 OFFSET ?7")))
+    // One statement for the window AND its exact total: `count(*) OVER ()`
+    // is computed over every row the WHERE admits, before LIMIT/OFFSET, so the
+    // shared visibility gate runs once per call instead of once for a count
+    // and again for the page (each pass evaluates the caller's whole visible
+    // set; ~175 ms each on HQ). Only an empty page cannot carry its total —
+    // an offset at or past the end — so that case alone counts separately.
+    let rows: Vec<CountedCandidateRow> = sqlx::query_as(&scope_sql(1,&format!("SELECT r.id,r.accession,r.home_id,r.owner_id,r.primary_type,r.kind,r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_at,count(*) OVER () FROM {source} WHERE {predicate} ORDER BY r.id LIMIT ?6 OFFSET ?7")))
         .bind(&scope.homes).bind(principal).bind(&groups).bind(&types).bind(&kinds).bind(limit as i64).bind(i64::try_from(offset).unwrap_or(i64::MAX)).fetch_all(&mut *conn).await?;
+    let total: i64 = match rows.first() {
+        Some(row) => row.11,
+        None if offset == 0 => 0,
+        None => {
+            sqlx::query_scalar(&scope_sql(
+                1,
+                &format!("SELECT count(*) FROM {source} WHERE {predicate}"),
+            ))
+            .bind(&scope.homes)
+            .bind(principal)
+            .bind(&groups)
+            .bind(&types)
+            .bind(&kinds)
+            .fetch_one(&mut *conn)
+            .await?
+        }
+    };
     Ok((
         total as usize,
-        rows.into_iter().map(candidate_meta).collect(),
+        rows.into_iter()
+            .map(|r| candidate_meta((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10)))
+            .collect(),
     ))
 }
 
@@ -600,14 +656,43 @@ pub(crate) async fn bounded_query_as(
     offset: usize,
     counters: &S7aCounters,
 ) -> Result<BoundedQueryPage> {
-    let limit = limit.clamp(1, 500);
-    // Read-only snapshot: this path never writes.
     let mut tx = db.pool().begin().await?;
+    let page = bounded_query_on(
+        &mut tx,
+        principal_id,
+        groups,
+        filter_ids,
+        filter_types,
+        filter_kinds,
+        linked_to,
+        limit,
+        offset,
+        counters,
+    )
+    .await?;
+    tx.rollback().await?;
+    Ok(page)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn bounded_query_on(
+    tx: &mut SqliteConnection,
+    principal_id: &str,
+    groups: &[(String, String)],
+    filter_ids: Option<&[String]>,
+    filter_types: Option<&[String]>,
+    filter_kinds: Option<&[String]>,
+    linked_to: Option<(&str, &str, &str)>,
+    limit: usize,
+    offset: usize,
+    counters: &S7aCounters,
+) -> Result<BoundedQueryPage> {
+    let limit = limit.clamp(1, 500);
+    let started = std::time::Instant::now();
+    // Read-only snapshot: this path never writes.
     #[cfg(feature = "v2-kernel-probe")]
-    super::app_installs::admit_dispatched_on(&mut tx, principal_id).await?;
+    super::app_installs::admit_dispatched_on(&mut *tx, principal_id).await?;
     if let Some((_, linked_id, _)) = linked_to {
-        if !linked_anchor_visible(&mut tx, principal_id, linked_id).await? {
-            tx.rollback().await?;
+        if !linked_anchor_visible(&mut *tx, principal_id, linked_id).await? {
             return Ok(BoundedQueryPage {
                 total: 0,
                 records: Vec::new(),
@@ -616,13 +701,19 @@ pub(crate) async fn bounded_query_as(
     }
     // SQL-side visibility via the shared kernel gate: hidden rows never enter
     // the scans below, so their count cannot change answers or ordering.
-    let scope = sql_scope(&visible_home_anchors_as(&mut tx, principal_id).await?)?;
+    let app_scope = app_installs::scope::active_scope_on(&mut *tx, principal_id).await?;
+    let scope = sql_scope(
+        &visible_home_anchors_as(&mut *tx, principal_id).await?,
+        app_scope.is_some_and(|scope| scope.is_scoped()),
+    )?;
     // A malformed root falls back to no root capability (owner disclosure
     // off), exactly like `list_records_as` — never a call failure.
-    let root_visible = kernel_effective_capability_on(&mut tx, principal_id, KERNEL_ROOT_ID)
+    let root_visible = kernel_effective_capability_on(&mut *tx, principal_id, KERNEL_ROOT_ID)
         .await
         .unwrap_or(Capability::None)
         .allows(Capability::View);
+    tracing::debug!(target: "native_ce::read_staging", phase = "query_record_scope", elapsed_us = started.elapsed().as_micros() as u64);
+    let candidates_started = std::time::Instant::now();
     let mut counted_total = None;
     let mut matched: Vec<CandidateMeta> = Vec::new();
     if let Some(ids) = filter_ids {
@@ -631,7 +722,7 @@ pub(crate) async fn bounded_query_as(
                 let mut sql = String::from(
                     "SELECT r.id, r.accession, r.home_id, r.owner_id, r.primary_type, r.kind, r.pin_family, r.pin_version, r.pin_digest, r.interpreter, r.created_at FROM kernel_records r WHERE r.id = ?1",
                 );
-                sql.push_str(&scope_clause(2));
+                sql.push_str(&scope_clause(2, scope.exclude_messages));
                 if let Some((_, _, direction)) = linked_to {
                     sql.push_str(&linked_clause(direction, 4)?);
                 }
@@ -670,7 +761,7 @@ pub(crate) async fn bounded_query_as(
                 && !carriers.is_empty()
             {
                 counters.field_reads.fetch_add(1, Ordering::Relaxed);
-                carrier_labels(&mut tx, &carriers).await?
+                carrier_labels(&mut *tx, &carriers).await?
             } else {
                 HashMap::new()
             };
@@ -687,7 +778,7 @@ pub(crate) async fn bounded_query_as(
         if !types_constrain(filter_types) && !types_constrain(filter_kinds) {
             let bare: bool = sqlx::query_scalar(&scope_sql(1,&format!(
                 "SELECT EXISTS(SELECT 1 FROM kernel_records r WHERE (r.pin_family IS NULL OR r.kind IS NULL){})",
-                scope_clause(1)
+                scope_clause(1, scope.exclude_messages)
             )))
             .bind(&scope.homes)
             .bind(principal_id)
@@ -705,7 +796,7 @@ pub(crate) async fn bounded_query_as(
         let page_only = page_only && !FORCE_GROUP_SCAN.try_with(|v| *v).unwrap_or(false);
         if page_only {
             let (total, window) = counted_query_window(
-                &mut tx,
+                &mut *tx,
                 &scope,
                 principal_id,
                 groups,
@@ -726,7 +817,7 @@ pub(crate) async fn bounded_query_as(
                 // (one amortized page read, CPU-only visibility, no fields).
                 loop {
                     let (mut page, next) = scan_group(
-                        &mut tx,
+                        &mut *tx,
                         &scope,
                         family,
                         kind,
@@ -745,7 +836,7 @@ pub(crate) async fn bounded_query_as(
                             .map(|m| m.id.clone())
                             .collect();
                         counters.field_reads.fetch_add(1, Ordering::Relaxed);
-                        let labels = carrier_labels(&mut tx, &carriers).await?;
+                        let labels = carrier_labels(&mut *tx, &carriers).await?;
                         page.retain(|m| {
                             candidate_matches(m, &labels, filter_ids, filter_types, filter_kinds)
                         });
@@ -769,6 +860,8 @@ pub(crate) async fn bounded_query_as(
             }
         }
     }
+    tracing::debug!(target: "native_ce::read_staging", phase = "query_record_candidates", elapsed_us = candidates_started.elapsed().as_micros() as u64, matched = matched.len(), counted = counted_total.is_some());
+    let hydration_started = std::time::Instant::now();
     matched.sort_by(|a, b| a.id.cmp(&b.id));
     let total = counted_total.unwrap_or(matched.len());
     let window: Vec<CandidateMeta> = if counted_total.is_some() {
@@ -864,7 +957,7 @@ pub(crate) async fn bounded_query_as(
             fields,
         });
     }
-    tx.rollback().await?;
+    tracing::debug!(target: "native_ce::read_staging", phase = "query_record_hydration", elapsed_us = hydration_started.elapsed().as_micros() as u64, records = records.len());
     Ok(BoundedQueryPage { total, records })
 }
 /// One search hit: v1-shaped, corpus-independent score, short snippet.
@@ -1023,7 +1116,11 @@ pub(crate) async fn search_scoped_on(
     // Read-only snapshot: this path never writes.
     #[cfg(feature = "v2-kernel-probe")]
     super::app_installs::admit_dispatched_on(&mut *tx, principal_id).await?;
-    let scope = sql_scope(&visible_home_anchors_as(&mut *tx, principal_id).await?)?;
+    let app_scope = app_installs::scope::active_scope_on(tx, principal_id).await?;
+    let scope = sql_scope(
+        &visible_home_anchors_as(&mut *tx, principal_id).await?,
+        app_scope.is_some_and(|scope| scope.is_scoped()),
+    )?;
     let mut buckets: [Vec<SearchHitV2>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut scanned = 0usize;
     let mut truncated = false;
@@ -1034,9 +1131,9 @@ pub(crate) async fn search_scoped_on(
                     f.title,f.summary,lifecycle.archived
              FROM kernel_search_fts f JOIN kernel_records r ON r.id=f.record_id
              LEFT JOIN kernel_lifecycle lifecycle ON lifecycle.record_id=r.id
-             WHERE kernel_search_fts MATCH ?1",
+             WHERE kernel_search_fts MATCH ?1 AND (r.pin_family IS NULL OR r.pin_family!='native.saved_tabs.tab')",
         );
-        sql.push_str(&scope_clause(2));
+        sql.push_str(&scope_clause(2, scope.exclude_messages));
         // Restrict before the scan backstop and ranking/page limits: an
         // out-of-scope hit must never displace an in-scope result.
         sql.push_str(" AND (?4 IS NULL OR r.id IN (SELECT value FROM json_each(?5)))");
@@ -1196,8 +1293,23 @@ pub(crate) async fn pre_staging_visible_ids(
     actor: &str,
     ids: &[String],
 ) -> Result<HashSet<String>> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     pre_staging_filter::visible_ids(&mut tx, actor, ids).await
+}
+
+/// Exact lexical pool size over ids already admitted on the caller's pinned
+/// read snapshot. The bounded search path still selects/ranks its sample.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn scan_pool_count_on(
+    conn: &mut SqliteConnection,
+    query: &str,
+    visible_ids: &[String],
+) -> Result<i64> {
+    let Some(terms) = quoted_terms(query) else {
+        return Ok(0);
+    };
+    Ok(sqlx::query_scalar("SELECT count(*) FROM main.kernel_search_fts f JOIN main.kernel_records r ON r.id=f.record_id WHERE kernel_search_fts MATCH ?1 AND (r.pin_family IS NULL OR r.pin_family!='native.saved_tabs.tab') AND f.record_id IN (SELECT value FROM json_each(?2))")
+        .bind(terms).bind(serde_json::to_string(visible_ids)?).fetch_one(conn).await?)
 }
 
 /// Frozen pre-PR admission filter. Deliberately independent of the shared SQL

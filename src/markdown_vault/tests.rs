@@ -77,6 +77,108 @@ async fn source(db: &crate::Db, account: &str) -> SourceSnapshot {
 fn rendered(s: &SourceSnapshot) -> Rendered {
     render::render(s, &BTreeMap::new()).unwrap()
 }
+
+#[test]
+fn attachments_under_notes_share_the_ancestor_folder_and_avoid_collisions() {
+    let mut source = SourceSnapshot::default();
+    for (id, ty, kind, title, home, body) in [
+        ("native:root", "Collection", "folder", "Workspace", None, ""),
+        (
+            "folder",
+            "Collection",
+            "folder",
+            "Research",
+            Some("native:root"),
+            "",
+        ),
+        (
+            "note-a",
+            "Document",
+            "note",
+            "First note",
+            Some("folder"),
+            "first note",
+        ),
+        (
+            "note-b",
+            "Document",
+            "note",
+            "Second note",
+            Some("folder"),
+            "second note",
+        ),
+        (
+            "attachment-a",
+            "Document",
+            "attachment",
+            "report.json",
+            Some("note-a"),
+            "first attachment",
+        ),
+        (
+            "attachment-b",
+            "Document",
+            "attachment",
+            "report.json",
+            Some("note-b"),
+            "second attachment",
+        ),
+    ] {
+        let id = if id == "native:root" {
+            id.into()
+        } else {
+            fixture_id(id)
+        };
+        let home_id = home.map(|home| {
+            if home == "native:root" {
+                home.into()
+            } else {
+                fixture_id(home)
+            }
+        });
+        source.records.insert(
+            id.clone(),
+            SourceRecord {
+                id,
+                record_type: ty.into(),
+                kind: Some(kind.into()),
+                name: Some(title.into()),
+                body: Some(body.into()),
+                home_id,
+                ..Default::default()
+            },
+        );
+    }
+    let output = rendered(&source);
+    let note_path = path_for(&output, &fixture_id("note-a"));
+    let first = path_for(&output, &fixture_id("attachment-a"));
+    let second = path_for(&output, &fixture_id("attachment-b"));
+    assert_eq!(Path::new(&first).parent(), Path::new(&note_path).parent());
+    assert_eq!(Path::new(&second).parent(), Path::new(&note_path).parent());
+    assert_ne!(first.to_lowercase(), second.to_lowercase());
+    assert!(output.files[&first]
+        .contributors
+        .contains(&fixture_id("note-a")));
+    assert!(output.files[&second]
+        .contributors
+        .contains(&fixture_id("note-b")));
+    let rerendered = render::render(&source, &output.allocations).unwrap();
+    assert_eq!(path_for(&rerendered, &fixture_id("attachment-a")), first);
+    assert_eq!(path_for(&rerendered, &fixture_id("attachment-b")), second);
+
+    // Following non-folder homes must retain the existing cycle refusal.
+    source
+        .records
+        .get_mut(&fixture_id("note-a"))
+        .unwrap()
+        .home_id = Some(fixture_id("attachment-a"));
+    assert!(render::render(&source, &output.allocations)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("containment cycle"));
+}
+
 fn path_for(rendered: &Rendered, id: &str) -> String {
     rendered
         .files

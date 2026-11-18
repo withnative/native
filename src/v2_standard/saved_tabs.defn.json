@@ -1,0 +1,23 @@
+{
+  "family": "native.saved_tabs.tab",
+  "version": 1,
+  "interpreter": "native.defn/5",
+  "primary_type": "Configuration",
+  "kinds": [{
+    "token": "saved_tab",
+    "description": "Account-private durable working slot. Provision and mutate only through manage_saved_tabs; its canonical event admission enforces private policy, immutable app and initial location, guarded title changes and terminal retirement. Absent optional customTitle and recordId mean null in the host contract.",
+    "maturity": "current",
+    "identity": {"mode": "record"},
+    "fields": [
+      {"name": "title", "type": "text", "required": true},
+      {"name": "version", "type": "integer", "required": true},
+      {"name": "app", "type": "text", "required": true},
+      {"name": "customTitle", "type": "text", "required": false},
+      {"name": "initialLocation", "type": "object", "required": true, "fields": [
+        {"name": "recordId", "type": "text", "required": false}
+      ]},
+      {"name": "state", "type": "choice", "required": true, "values": ["active", "retired"]}
+    ],
+    "links": []
+  }]
+}

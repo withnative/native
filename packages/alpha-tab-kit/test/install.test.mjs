@@ -232,7 +232,7 @@ test("new plans create the complete artifact once, without a stage retry key", (
   const args = p.steps[0].arguments;
   assert.equal(args.type, "Document");
   assert.equal(args.kind, "artifact");
-  assert.deepEqual(args.facets, { runtime: "native.html.v1" });
+  assert.deepEqual(args.facets, { runtime: "native.html.v1", app_package: "true" });
   assert.equal(args.body_encoding, "gzip+base64");
   assert.equal(gunzipSync(Buffer.from(args.body, "base64")).toString("utf8"), html);
   assert.equal(args.response_mode, "summary");
@@ -699,7 +699,7 @@ test("updates carry only current name, icon and skin to a new artifact without c
       const result = await runInstall(p, native);
       assert.notEqual(result.record_id, result.previous_artifact_id);
       assert.equal(native.record.name, presentation.name);
-      assert.deepEqual(native.record.facets, { runtime: "native.html.v1", app_icon: icon, app_skin: skin });
+      assert.deepEqual(native.record.facets, { runtime: "native.html.v1", app_package: "true", app_icon: icon, app_skin: skin });
       assert.equal(native.record.body, html);
       assert.deepEqual(p.digests, plan({ chunked }).digests);
       assert.equal(result.source_revision, baselineResult.source_revision);
@@ -724,7 +724,7 @@ test("absent presentation facets retain the descriptor icon and leave skin absen
       await runInstall(plan({ descriptor: { ...descriptor, title: "Package name", icon: "BookOpen" },
         updateInstallEventId: "current", chunked, resetPresentation }), native);
       assert.equal(native.record.name, resetPresentation ? "Package name" : "Workspace name");
-      assert.deepEqual(native.record.facets, { runtime: "native.html.v1", app_icon: "BookOpen" });
+      assert.deepEqual(native.record.facets, { runtime: "native.html.v1", app_package: "true", app_icon: "BookOpen" });
       assert.equal(native.calls.some(c => c.operation === "get_record"), !resetPresentation);
     }
   }

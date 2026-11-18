@@ -65,6 +65,9 @@ use crate::query::sql::install_visible_records_in;
 use crate::query::QueryPrincipal;
 use crate::replica_generation::{ReplicaGenerationManifest, ReplicaOrdering};
 
+#[cfg(feature = "v2-kernel-probe")]
+mod native;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Catalog-supplied inputs to `scope_ref` (§1.5). All values arrive from the
@@ -341,6 +344,11 @@ pub(crate) const UNITS_STATE_FENCE_COVERS_UNIT_ID: bool = true;
 pub const MEMBER_COPY_REGISTRY_SCHEMA_VERSION: u32 = 2;
 
 const REGISTRY_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS native_member_ordinals (scope_ref TEXT PRIMARY KEY, ordinal INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS native_member_downloads (
+ handle TEXT PRIMARY KEY, account TEXT NOT NULL, scope_ref TEXT NOT NULL, route TEXT NOT NULL,
+ fence TEXT NOT NULL, manifest TEXT NOT NULL, file_path TEXT NOT NULL, expires_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS member_copy_registry_meta (
   singleton      INTEGER PRIMARY KEY CHECK (singleton = 1),
   schema_version INTEGER NOT NULL
@@ -1546,6 +1554,7 @@ mod tests {
 
     fn consumer() -> crate::standby_snapshot::StandbyConsumerIdentity {
         crate::standby_snapshot::StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,

@@ -55,6 +55,9 @@ shape the demo tabs use:
   "digest_version": "alpha-tab-digest.v1", "bundle_sha256": "…", "declaration_digest": "…", "digest": "sha256:…" }
 ```
 
+Authoring a shared task-metadata update: [`docs/shared-field-updates.md`](docs/shared-field-updates.md)
+with the complete example [`examples/shared-task-metadata.html`](examples/shared-task-metadata.html).
+
 ## What it guarantees, and where each rule comes from
 
 Line numbers are as of this commit; the symbol or function name is the durable
@@ -322,9 +325,11 @@ The parent page (`src/fake-host/shell.js`) mirrors the alpha shell,
   - `mode: "sample"` delivers the engine's own `alpha_tab_sample_input()` (alpha_tabs.rs:1318) and offers no needs, so every read throws in the frame.
   - `mode: "live"` delivers the live envelope.
   - `pushInput()` sends a new snapshot as an `input` message with an increasing `content_event_seq`, as the shell does (pending.js:381).
-- **Link handoff:** a trusted click on `[data-native-record-id]` or `[data-native-external-url]` reaches the host as `navigation` and is honoured only with host user activation. A printable record id of at most 128 characters, or an `n8v.to` / `app.withnative.ai` URL naming a record, opens that record in Native. Inbound reveal has no app acknowledgement, so link handoff does not attempt automatic in-app reveal. Any other credential-free `http(s)` URL opens in a new browser tab (`handleNavigation` in pending.js, `lib/appNavigation.js`).
+- **Link handoff:** a trusted click on `[data-native-record-id]` or `[data-native-external-url]` reaches the host as `navigation` and is honoured only with host user activation. A printable record id of at most 128 characters, or an `n8v.to` / `app.withnative.ai` URL naming a record, asks the host to open that record in the person's compatible default app, falling back to Native. Add `data-native-app="agent.tracker"` for a one-off app target, or `data-native-app="native"` for an explicit Native open; neither changes the person's default. The host resolves metadata and governs reveal/activation, and an unavailable explicit target offers Native instead. Older embedding shells retain their Native link behavior. Any other credential-free `http(s)` URL opens in a new browser tab (`handleNavigation` in pending.js, `lib/appNavigation.js`).
 - **`setViewState`** is accepted and logged. The alpha shell drops it; `holdViewState: true` re-delivers it on reload, as the Workbench host does (`mount.ts:1056`).
-- **`native.presentation.setFloatingChat({suppress})`** (host feature `app.presentation.v1`) asks the host to suppress the Desktop floating chat while this app is foreground. A whole-app policy calls once with `suppress: true` at startup; a per-view policy calls `true` on entering the relevant view and `false` on leaving it — the app owns its current view, the host owns document/foreground lifetime, so there are no view or scope keys. It resolves `Promise<boolean>`: `true` means the host accepted and stored the preference, not that the Desktop painted; `false` means refused or unavailable. On a host without the feature (older or web) `native.presentation` is absent — probe before calling. The Desktop applies the preference only while the calling app is the qualified foreground; a separate Desktop bridge (`nativeDesktop.presentation.setFloatingChatPolicy`) carries the host-minted owner, and the read-only pane is untouched.
+- **`native.presentation.setFloatingChat({suppress})`** (host feature `app.presentation.v1`) asks the host to suppress the Desktop floating chat while this app is foreground. A whole-app policy calls once with `suppress: true` at startup; a per-view policy calls `true` on entering the relevant view and `false` on leaving it — the app owns its current view, the host owns document/foreground lifetime, so there are no view or scope keys. It resolves `Promise<boolean>`: `true` means the host accepted and stored the preference, not that the Desktop painted; `false` means refused or unavailable. Probe `native.presentation?.setFloatingChat` before calling: presentation methods are negotiated independently. The Desktop applies the preference only while the calling app is the qualified foreground; a separate Desktop bridge (`nativeDesktop.presentation.setFloatingChatPolicy`) carries the host-minted owner, and the read-only pane is untouched.
+- **`native.presentation.setTabTitle({title})`** (host feature `app.tab-title.v1`) reports a contextual title for this app instance. Probe the method before calling; it may be offered independently of floating-chat presentation. Pass a string of at most 256 Unicode code points, with whitespace normalized and no control or bidi-control characters, or `null` to clear. An empty normalized string is refused. The returned `Promise<boolean>` acknowledges host storage, not paint or durable persistence. Update from committed view metadata and clear on navigation, unreadable content or teardown. Background instances may update their own titles. The shell keeps the app icon, resolves personal name → reported title → app label, and adds local suffixes for collisions. Reports cannot rename another instance or set the user's personal name.
+
 - Intents are rejected: `unsupported_host` live, `preview_sample_only` in sample mode. Effects are unwired in this slice.
 
 `audit()` / `expectHealthy()` report reads that were answered `busy` and never
@@ -537,22 +542,22 @@ duplicate gate. Regenerate older saved plans if creation reports
 `likely_duplicate`; the runner preserves saved arguments and stops on refusal.
 
 **Package bundles over 512 KiB.** An ordinary `native.html.v1` body is limited to
-512 KiB (`html.body_max_bytes`); an installed app package bundle may be up to 1 MiB
+512 KiB (`html.body_max_bytes`); an installed app package bundle may be up to 2 MiB
 (`html.package_body_max_bytes`). The engine grants the larger limit only to a record
 carrying the facet `app_package: "true"` (`install.package_facet_key` /
-`install.package_facet_value`), and `planInstall` sets it on the bundle record's create
-(on the re-kind for `--chunked`) whenever the bundle is over 512 KiB; smaller bundles'
-plans are unchanged. `validatePackage` validates as a package by default (`package: false`
+`install.package_facet_value`), and both the MCP-only builder guide and `planInstall` include it on every bundle
+record's create (on the re-kind for `--chunked`), including small bundles. `validatePackage` validates as a package by default (`package: false`
 opts out), and `validateHtml(html, { package: true })`,
 `completenessFindings(html, sqlNeeds, { package: true })` and
 `completenessAnalysis(html, sqlNeeds, budget, { package: true })` (budget
-`PACKAGE_LINT_BUDGET`) do the same for a single check. Ordinary HTML stays at 512 KiB.
+`PACKAGE_LINT_BUDGET`) do the same for a single check. Packages allow embedded images/fonts up to 512 KiB each and 1 MiB total in decoded
+bytes. Ordinary HTML stays at 512 KiB with asset caps of 256 KiB each / 384 KiB total.
 
 **Encoded body.** JSON escaping can inflate a raw HTML string several-fold against
 the hosted request limit, so the whole-body `create_record` sends `body` as gzip,
 then standard base64, with `body_encoding: "gzip+base64"`. The server decodes at the
 tool boundary, before validation, the applicable body limit (512 KiB for ordinary
-HTML, 1 MiB for an installed package record carrying the marker), `body_digest`
+HTML, 2 MiB for an installed package record carrying the marker), `body_digest`
 and storage, so
 the receipt digest still equals the local `bundle_sha256` and `expect.body_bytes` is
 the decoded size. Select another form with `--body-encoding utf8|base64|gzip+base64`
@@ -571,7 +576,7 @@ no encoding.
 database-scoped tool routes retain axum's default request-body extraction
 limit: axum-core `DEFAULT_LIMIT` is 2097152 bytes (**2 MiB encoded
 JSON**). Hosted `/mcp` allows request bodies up to 4 MiB, which carries a
-1 MiB package bundle sent as `gzip+base64` comfortably. A near-limit bundle
+2 MiB package bundle sent as `gzip+base64` comfortably. A near-limit bundle
 sent raw (`utf8`), where JSON escaping can inflate it several-fold, may still
 need the default encoded body (or `--chunked`) on a route with the 2 MiB
 default. Metadata also counts toward the encoded limit.
@@ -819,6 +824,18 @@ Messaging, starting and asking agents through Native Desktop (`native.agents`, `
 offers, the confirmation the person sees, the result codes and the timeouts are in
 `docs/app-agent-access.md` in the Native CE repository.
 
+## Subscription budgeting and diagnostics
+
+An app-v2 frame may hold at most **32 open subscriptions** (`limits.json`
+`bridge.pending_subscription_cap`), counted per `subscribe` call in the frame
+before the host's `readHub` deduplicates identical queries. Authoring patterns
+(active windows, unmounting hidden readers, retained snapshots that preserve
+definite-error and `scope_changed` clearing, lazy pickers, and the additive
+embed term) plus `tab.subscriptionDiagnostics()` and the worked example
+`examples/subscription-budget.html` are documented in
+`docs/subscription-budget-authoring.md`.
+
+
 ## Launcher icon authoring
 
 Supply an optional plain PascalCase Lucide name or `brand:<slug>` on the package descriptor:
@@ -1017,3 +1034,13 @@ production notice builder pins the complete contract, package metadata and
 licence bytes, and rechecks module identities and hashes before injection.
 This portable licence contract replaces a private source-policy build input.
 It is not a publication receipt or an approval to publish arbitrary sources.
+
+V2 packages have an empty installed declaration, so package validation cannot
+inspect SQL embedded in the app. Call the exported
+`lintSqlLimitOrder(sql, {profile: "query_sql", where: readKey})` in source-read
+tests: it checks each SELECT level, including scalar subqueries and recursive
+CTE bodies. The ad-hoc profile permits the host's top-level default-order repair
+(`assumed_order`), as used by a single-row count; saved declarations remain
+strict through `lintSql`. This lexical check cannot prove unique keys or replace
+executing every statement with representative parameters through real
+`query_sql`; schema, function and runtime policy remain host-authoritative.

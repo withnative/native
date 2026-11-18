@@ -62,6 +62,16 @@ no claim that today's container is public.
 Public dependency permissions are an exact versioned matrix and can name only
 public components.
 
+`web/apps/first-party-catalog.json` is public tier-1 metadata. The read-only
+approved-app link operation compiles this exact package/version allowlist;
+the selector includes only that JSON file, with no app bundles or hosted
+catalogue implementation.
+
+The HQ SQL staging benchmark embeds the exact query definitions in
+`experiments/demo-shell/public/lib/indexSql.js`. This one data-only SQL fixture
+is selected in `tier-1-node`, alongside the existing demo-shell SQL fixtures;
+the selection does not publish the rest of the demo shell.
+
 `web/generated` is public tier-1 source: `kinds.ts` and `tools.d.ts` are
 committed products of the public generators `src/bin/kind_types.rs` and
 `src/bin/tool_types.rs`. A public generator may not write into a held tree.

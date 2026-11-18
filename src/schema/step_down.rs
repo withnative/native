@@ -182,6 +182,10 @@ pub const ADDITIONS: &[EngineAddition] = &[
         version: 93,
         added: &[Added::Index("idx_records_unfiled_message_owner")],
     },
+    EngineAddition {
+        version: 94,
+        added: &[Added::Table("provenance_local_command_cancellations")],
+    },
 ];
 
 /// The columns of `records`, in definition order, copied (with `rowid`) when
@@ -545,13 +549,13 @@ mod tests {
         );
         assert_eq!(object_drop_statements(CURRENT, false), Vec::<String>::new());
         assert_eq!(
-            dropped_objects(CURRENT - 1),
-            vec![("index", "idx_records_unfiled_message_owner")]
+            dropped_objects(93),
+            vec![("table", "provenance_local_command_cancellations")]
         );
-        assert!(dropped_objects(CURRENT - 2).contains(&("table", "content_event_heads")));
-        assert!(
-            dropped_objects(CURRENT - 2).contains(&("index", "idx_records_unfiled_message_owner"))
-        );
+        assert!(dropped_objects(92).contains(&("index", "idx_records_unfiled_message_owner")));
+        assert!(!dropped_objects(92).contains(&("table", "content_event_heads")));
+        assert!(dropped_objects(91).contains(&("table", "content_event_heads")));
+        assert!(dropped_objects(91).contains(&("index", "idx_records_unfiled_message_owner")));
         assert!(dropped_objects(90).contains(&("table", "authorization_subject_revision")));
         assert!(!dropped_objects(90).contains(&("table", "sql_write_receipts")));
     }

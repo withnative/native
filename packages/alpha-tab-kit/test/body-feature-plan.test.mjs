@@ -181,7 +181,7 @@ test('replacement is an explicit normal remove source step and removed-generatio
   assert.equal(Object.hasOwn(plan().hostInstall.arguments, 'expected_install_event_id'), false);
 });
 
-test('chunked plans differ from immutable8951 vectors only by intentional source confirmation', () => {
+test('chunked plans differ from immutable8951 vectors only by intentional source confirmation and package marker', () => {
   const descriptor = read('fixtures/probe-descriptor.json');
   const probeHtml = readFileSync(new URL('fixtures/probe-queued.html', import.meta.url), 'utf8');
   const p = { descriptor, html: probeHtml, homeId: 'c59dffa3-a401-431a-a44b-c79cae9b8346', reason: 'Install the kit probe', chunkBytes: 700 };
@@ -189,6 +189,9 @@ test('chunked plans differ from immutable8951 vectors only by intentional source
     const actual = planInstall({ ...p, ...patch, chunked: true });
     assert.equal(actual.steps[0].arguments.confirm, true);
     delete actual.steps[0].arguments.confirm;
+    const packageFacets = actual.steps.find(step => step.arguments.facets)?.arguments.facets;
+    assert.equal(packageFacets.app_package, 'true');
+    delete packageFacets.app_package;
     assert.equal(createHash('sha256').update(JSON.stringify(actual)).digest('hex'), expected);
     assert.deepEqual(actual.digests, legacy.digests);
   }

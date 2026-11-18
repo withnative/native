@@ -61,16 +61,19 @@ pub fn is_counter_key(key: &str, value: &Value) -> bool {
 }
 
 /// Whether a string value is a counter-shaped token: `rec:<n>`, `obs:<n>`,
-/// `canvas:<n>` (a version or position by number), or a `schema-state-v1:`
+/// `canvas:<n>`, `saved-tab:<n>` (a version or position by number), or a `schema-state-v1:`
 /// revision, which embeds the meta and content heads.
 pub fn is_counter_value(text: &str) -> bool {
     if text.starts_with("schema-state-v1:") {
         return true;
     }
-    ["rec:", "obs:", "canvas:"].iter().any(|prefix| {
-        text.strip_prefix(prefix)
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-    })
+    ["rec:", "obs:", "canvas:", "saved-tab:"]
+        .iter()
+        .any(|prefix| {
+            text.strip_prefix(prefix).is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
 }
 
 /// Remove every counter-bearing key from one metadata object (not recursive).
@@ -242,6 +245,7 @@ mod tests {
             "rec:1",
             "obs:42",
             "canvas:7",
+            "saved-tab:42",
             "schema-state-v1:meta:3:content:9",
         ] {
             assert!(is_counter_value(text), "{text}");
@@ -252,6 +256,7 @@ mod tests {
             "rev:abc",
             "recx:1",
             "canvas:",
+            "saved-tab:de756fd4-09cf-4b08-a835-e43d7e665733",
             "schema-state-v2:x",
         ] {
             assert!(!is_counter_value(text), "{text}");

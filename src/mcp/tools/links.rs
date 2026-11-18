@@ -685,37 +685,10 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
             limit,
             cursor,
         } => {
-            let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
-            if !(1..=MAX_LIST_LIMIT).contains(&limit) {
-                return Err(Error::engine(
-                    "manage_links.list: limit must be between 1 and 200",
-                ));
-            }
-            let decoded = if let Some(cursor) = cursor.as_deref() {
-                let decoded: LinkListCursor =
-                    serde_json::from_value(db.get_inbox_snapshot(cursor).map_err(|_| {
-                        Error::engine("cursor_reset_required: invalid manage_links list cursor")
-                    })?)
-                    .map_err(|_| {
-                        Error::engine("cursor_reset_required: malformed manage_links list cursor")
-                    })?;
-                if decoded.schema != 1
-                    || decoded.account_id != caller.credential()
-                    || decoded.record_id != record_id
-                    || decoded.limit != limit
-                    || !matches!(decoded.direction_rank, 0 | 1)
-                    || decoded.relationship.is_empty()
-                    || decoded.created_at.is_empty()
-                    || decoded.link_id.is_empty()
-                {
-                    return Err(Error::engine(
-                        "cursor_reset_required: manage_links list cursor does not match this caller, record, or limit",
-                    ));
-                }
-                Some(decoded)
-            } else {
-                None
-            };
+            let (limit, decoded) =
+                decode_list_request(&caller, &record_id, limit, cursor.as_deref(), |token| {
+                    db.get_inbox_snapshot(token)
+                })?;
             if !caller.is_member_copy() {
                 if let Some(indexed) = try_indexed_links_list(
                     &db,
@@ -756,17 +729,160 @@ async fn list_governed(
     decoded: Option<&LinkListCursor>,
 ) -> Result<Value> {
     let mut tx = db.write_pool().begin().await?;
+    let response = list_in(
+        &mut tx,
+        caller,
+        record_id,
+        limit,
+        cursor,
+        decoded,
+        LinkReadSource::Canonical(db),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(response)
+}
+
+async fn native_endpoint_visible(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+) -> Result<bool> {
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        crate::query::read::ordinary_record_read_eligible_native_member_in(tx, id).await
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    {
+        let _ = (tx, id);
+        Err(Error::copy_unavailable())
+    }
+}
+
+fn decode_list_request(
+    caller: &Caller,
+    record_id: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    lookup: impl Fn(&str) -> Result<Value>,
+) -> Result<(usize, Option<LinkListCursor>)> {
+    let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+        return Err(Error::engine(
+            "manage_links.list: limit must be between 1 and 200",
+        ));
+    }
+    let decoded = if let Some(cursor) = cursor {
+        let decoded: LinkListCursor = serde_json::from_value(lookup(cursor).map_err(|_| {
+            Error::engine("cursor_reset_required: invalid manage_links list cursor")
+        })?)
+        .map_err(|_| Error::engine("cursor_reset_required: malformed manage_links list cursor"))?;
+        if decoded.schema != 1
+            || decoded.account_id != caller.credential()
+            || decoded.record_id != record_id
+            || decoded.limit != limit
+            || !matches!(decoded.direction_rank, 0 | 1)
+            || decoded.relationship.is_empty()
+            || decoded.created_at.is_empty()
+            || decoded.link_id.is_empty()
+        {
+            return Err(Error::engine(
+                        "cursor_reset_required: manage_links list cursor does not match this caller, record, or limit",
+                    ));
+        }
+        Some(decoded)
+    } else {
+        None
+    };
+    Ok((limit, decoded))
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_manage_links(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    let arguments = crate::mcp::record_ref::normalize_operation_record_selector(
+        "manage_links.list",
+        arguments,
+    )?;
+    let ManageLinksArgs::List {
+        record_id,
+        limit,
+        cursor,
+    } = parse_args("manage_links", arguments)?
+    else {
+        return Err(Error::unavailable_offline("manage_links", "write"));
+    };
+    let record_id =
+        super::lifecycle::native_member_resolve_reference(session, &record_id, "manage_links.list")
+            .await?;
+    let snapshots = session.read_snapshots();
+    let (limit, decoded) =
+        decode_list_request(caller, &record_id, limit, cursor.as_deref(), |token| {
+            crate::db::get_read_snapshot(&snapshots, token)
+        })?;
+    list_in(
+        session.transaction(),
+        caller,
+        &record_id,
+        limit,
+        cursor,
+        decoded.as_ref(),
+        LinkReadSource::NativeMember(&snapshots),
+    )
+    .await
+}
+
+// Native selection is private and only constructed after the sealed session
+// and member actor check; canonical/v1 retain their original authority path.
+enum LinkReadSource<'a> {
+    Canonical(&'a Db),
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember(&'a crate::db::ReadSnapshotCache),
+}
+impl LinkReadSource<'_> {
+    fn is_native(&self) -> bool {
+        match self {
+            Self::Canonical(_) => false,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => true,
+        }
+    }
+    fn put_snapshot(&self, value: Value) -> Result<String> {
+        match self {
+            Self::Canonical(db) => db.put_inbox_snapshot(value),
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(cache) => crate::db::put_read_snapshot(cache, value),
+        }
+    }
+}
+
+async fn list_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    record_id: &str,
+    limit: usize,
+    cursor: Option<String>,
+    decoded: Option<&LinkListCursor>,
+    source: LinkReadSource<'_>,
+) -> Result<Value> {
     // Member links have two slice-visible endpoints. Paging the shipped rows
     // therefore counts visible links; online retains its physical-page contract.
-    let anchor_visible = if caller.is_member_copy() {
+    let anchor_visible = if source.is_native() {
+        native_endpoint_visible(tx, record_id).await?
+    } else if caller.is_member_copy() {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND deleted_at IS NULL)",
         )
         .bind(record_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?
     } else {
-        can_record_in(&mut tx, caller, record_id, Capability::View).await?
+        can_record_in(tx, caller, record_id, Capability::View).await?
     };
     if !anchor_visible {
         return Err(Error::engine(format!("record {record_id} does not exist")));
@@ -795,7 +911,7 @@ async fn list_governed(
     .bind(after_created_at)
     .bind(after_link_id)
     .bind((limit + 1) as i64)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     let has_more = rows.len() > limit;
     let mut candidates = rows
@@ -808,21 +924,27 @@ async fn list_governed(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let visible = visible_ids_in(
-        &mut tx,
-        caller,
-        candidates
-            .iter()
-            .map(|candidate| {
-                if candidate.direction_rank == 0 {
-                    candidate.link.target_id.clone()
-                } else {
-                    candidate.link.source_id.clone()
-                }
-            })
-            .collect(),
-    )
-    .await?;
+    let endpoint_ids: Vec<String> = candidates
+        .iter()
+        .map(|candidate| {
+            if candidate.direction_rank == 0 {
+                candidate.link.target_id.clone()
+            } else {
+                candidate.link.source_id.clone()
+            }
+        })
+        .collect();
+    let visible = if source.is_native() {
+        let mut visible = std::collections::HashSet::new();
+        for id in endpoint_ids {
+            if native_endpoint_visible(tx, &id).await? {
+                visible.insert(id);
+            }
+        }
+        visible
+    } else {
+        visible_ids_in(tx, caller, endpoint_ids).await?
+    };
     candidates.retain(|candidate| {
         visible.contains(if candidate.direction_rank == 0 {
             &candidate.link.target_id
@@ -844,7 +966,7 @@ async fn list_governed(
         let last = rows
             .get(limit - 1)
             .ok_or_else(|| Error::engine("manage_links: cursor page made no progress"))?;
-        Some(db.put_inbox_snapshot(serde_json::to_value(LinkListCursor {
+        Some(source.put_snapshot(serde_json::to_value(LinkListCursor {
             schema: 1,
             account_id: caller.credential().into(),
             record_id: record_id.to_string(),
@@ -857,7 +979,6 @@ async fn list_governed(
     } else {
         None
     };
-    tx.commit().await?;
     let returned = links_out.len() + links_in.len();
     let next_call = next_cursor
         .as_ref()

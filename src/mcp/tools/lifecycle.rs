@@ -4043,7 +4043,11 @@ async fn create_record_inner(
     comment_plan: Option<ArtifactCommentPlan>,
     response: CreateRecordResponse<'_>,
 ) -> Result<Value> {
-    Box::pin(create_record_inner_impl(
+    let redirected_home = super::redirects_root_filing(
+        arguments.get("type").and_then(Value::as_str),
+        arguments.get("home_id").and_then(Value::as_str),
+    );
+    let mut receipt = Box::pin(create_record_inner_impl(
         db,
         caller,
         arguments,
@@ -4052,7 +4056,11 @@ async fn create_record_inner(
         comment_plan,
         response,
     ))
-    .await
+    .await?;
+    if redirected_home {
+        super::disclose_root_filing(&mut receipt);
+    }
+    Ok(receipt)
 }
 
 async fn create_record_inner_impl(
@@ -4084,6 +4092,9 @@ async fn create_record_inner_impl(
         arguments.remove("confirm");
     }
     let mut args: CreateRecordArgs = parse_args(TOOL, arguments)?;
+    if super::redirects_root_filing(Some(&args.record_type), args.home_id.as_deref()) {
+        args.home_id = Some(crate::schema::UNFILED_RECORD_ID.into());
+    }
     let response_mode = response.mode.unwrap_or(args.response_mode);
     // Only the digest is stored, so an unbounded key is a mild DoS surface:
     // the same 1..=200 bound `manage_relationships` enforces. Blank stays
@@ -8500,14 +8511,66 @@ struct GetRecordArgs {
     include_history_summary: Option<bool>,
 }
 
+impl GetRecordArgs {
+    fn validate_ids(&self) -> Result<()> {
+        if self.ids.is_empty() {
+            return Err(Error::engine("get_record: 'ids' must not be empty"));
+        }
+        if self.ids.len() > MAX_BATCH_GET {
+            return Err(Error::engine(format!(
+                "get_record: at most {MAX_BATCH_GET} ids per call"
+            )));
+        }
+        Ok(())
+    }
+    fn validate_interpretation_bound(&self) -> Result<()> {
+        if self.include_interpretation.unwrap_or(false)
+            && self.ids.len() > super::attribution::MAX_GENERIC_INTERPRETATION_BEARERS
+        {
+            return Err(Error::engine(format!(
+                "get_record: include_interpretation supports at most {} ids per call",
+                super::attribution::MAX_GENERIC_INTERPRETATION_BEARERS
+            )));
+        }
+        Ok(())
+    }
+    fn enrich_options(&self) -> read::EnrichOptions {
+        let defaults = read::EnrichOptions::default();
+        read::EnrichOptions {
+            children_limit: self.children_limit.unwrap_or(defaults.children_limit),
+            children_offset: self.children_offset.unwrap_or(defaults.children_offset),
+            links_limit: self.links_limit.unwrap_or(defaults.links_limit),
+            links_offset: self.links_offset.unwrap_or(defaults.links_offset),
+            link_summaries: true,
+            include_suggestions: self.include_suggestions.unwrap_or(false),
+            suggestions_limit: self.suggestions_limit.unwrap_or(defaults.suggestions_limit),
+            suggestions_offset: self
+                .suggestions_offset
+                .unwrap_or(defaults.suggestions_offset),
+            include_citations: self.include_citations.unwrap_or(false),
+            citations_limit: self.citations_limit.unwrap_or(defaults.citations_limit),
+            citations_offset: self.citations_offset.unwrap_or(defaults.citations_offset),
+            include_comments: self.include_comments.unwrap_or(false),
+            comments_limit: self.comments_limit.unwrap_or(defaults.comments_limit),
+            comments_offset: self.comments_offset.unwrap_or(defaults.comments_offset),
+        }
+    }
+}
+
 enum RecordSupplementSource<'a, 'db> {
     Lens(&'a ReadLens<'db>),
     Live(&'a mut Transaction<'db, Sqlite>),
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember(&'a mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession),
 }
 
 impl RecordSupplementSource<'_, '_> {
     async fn speaker(&mut self, message_id: &str) -> Result<Option<Value>> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => {
+                Err(Error::unavailable_offline("get_record", "message_audience"))
+            }
             Self::Lens(lens) => {
                 let mut conn = lens.projection().snapshot_pool().acquire().await?;
                 crate::persona::message_speaker(&mut conn, message_id).await
@@ -8518,6 +8581,10 @@ impl RecordSupplementSource<'_, '_> {
 
     async fn record_version(&mut self, record_id: &str) -> Result<String> {
         let event_seq: Option<i64> = match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => {
+                return Err(Error::unavailable_offline("get_record", "record_version"))
+            }
             Self::Lens(lens) => {
                 sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id=?")
                     .bind(record_id)
@@ -8545,6 +8612,11 @@ impl RecordSupplementSource<'_, '_> {
         recipient_id: &str,
     ) -> Result<crate::message_expectation::MessageExpectationDerivation> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => Err(Error::unavailable_offline(
+                "get_record",
+                "message_expectation",
+            )),
             Self::Lens(lens) => {
                 crate::message_expectation::derive_message_expectation_state_with_lens(
                     lens,
@@ -8566,6 +8638,10 @@ impl RecordSupplementSource<'_, '_> {
 
     async fn execute_saved_query(&mut self, caller: &Caller, query: Value) -> Result<Value> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => {
+                Err(Error::unavailable_offline("get_record", "query_resolution"))
+            }
             Self::Lens(lens) => {
                 super::querying::execute_query_record_args_with_lens_as(
                     lens,
@@ -8588,6 +8664,8 @@ impl RecordSupplementSource<'_, '_> {
         definition: &super::querying::SavedSqlDefinition,
     ) -> Result<Value> {
         match self {
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember(_) => Err(Error::unavailable_offline("get_record", "saved_governed_sql")),
             Self::Live(tx) => super::querying::execute_saved_sql_in(tx, caller, definition).await,
             Self::Lens(_) => Err(Error::engine(
                 "saved governed SQL is live-only; historical execution has no portable snapshot contract",
@@ -8614,6 +8692,22 @@ fn inject_member_record_markers(
     include_citations: bool,
     citation_targets: &std::collections::HashSet<String>,
 ) {
+    inject_member_record_markers_with_custody(
+        items,
+        include_history_summary,
+        include_citations,
+        citation_targets,
+        false,
+    );
+}
+
+fn inject_member_record_markers_with_custody(
+    items: &mut Value,
+    include_history_summary: bool,
+    include_citations: bool,
+    citation_targets: &std::collections::HashSet<String>,
+    custody_held: bool,
+) {
     let Some(items) = items.as_array_mut() else {
         return;
     };
@@ -8624,10 +8718,12 @@ fn inject_member_record_markers(
         let Some(object) = item.as_object_mut() else {
             continue;
         };
-        object.insert(
-            "custody_boundary".into(),
-            member_section_marker("custody_boundary"),
-        );
+        if !custody_held {
+            object.insert(
+                "custody_boundary".into(),
+                member_section_marker("custody_boundary"),
+            );
+        }
         object.insert("contribution".into(), member_section_marker("contribution"));
         // The citation `target` is a marker only where online would resolve
         // one: an Annotation with an `annotation_targets` row. A record with
@@ -8675,6 +8771,12 @@ async fn supplement_get_record_items(
     items: Vec<read::BatchGetItem>,
     resolve: bool,
 ) -> Result<Value> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if let RecordSupplementSource::NativeMember(session) = source {
+        if !caller.is_member_copy() || caller.actor() != session.principal() {
+            return Err(Error::copy_unavailable());
+        }
+    }
     let mut items = serde_json::to_value(items)?;
     for item in items
         .as_array_mut()
@@ -8870,20 +8972,12 @@ async fn get_record_from_lens(
     args: GetRecordArgs,
     index_db: Option<&Db>,
 ) -> Result<Value> {
-    const TOOL: &str = "get_record";
     debug_assert_eq!(
         lens.is_member(),
         caller.is_member_copy(),
         "member lens and member caller must agree (dispatch derives both from the Db open mode)"
     );
-    if args.ids.is_empty() {
-        return Err(Error::engine(format!("{TOOL}: 'ids' must not be empty")));
-    }
-    if args.ids.len() > MAX_BATCH_GET {
-        return Err(Error::engine(format!(
-            "{TOOL}: at most {MAX_BATCH_GET} ids per call"
-        )));
-    }
+    args.validate_ids()?;
     let include_interpretation = args.include_interpretation.unwrap_or(false);
     if include_interpretation && lens.temporal().is_some() {
         return Err(Error::engine(
@@ -8896,34 +8990,8 @@ async fn get_record_from_lens(
             "get_record: include_history_summary cannot be combined with as_of in v1",
         ));
     }
-    if include_interpretation
-        && args.ids.len() > super::attribution::MAX_GENERIC_INTERPRETATION_BEARERS
-    {
-        return Err(Error::engine(format!(
-            "get_record: include_interpretation supports at most {} ids per call",
-            super::attribution::MAX_GENERIC_INTERPRETATION_BEARERS
-        )));
-    }
-    let defaults = read::EnrichOptions::default();
-    let opts = read::EnrichOptions {
-        children_limit: args.children_limit.unwrap_or(defaults.children_limit),
-        children_offset: args.children_offset.unwrap_or(defaults.children_offset),
-        links_limit: args.links_limit.unwrap_or(defaults.links_limit),
-        links_offset: args.links_offset.unwrap_or(defaults.links_offset),
-        // `get_record` is the one read that renders the far end of each link.
-        link_summaries: true,
-        include_suggestions: args.include_suggestions.unwrap_or(false),
-        suggestions_limit: args.suggestions_limit.unwrap_or(defaults.suggestions_limit),
-        suggestions_offset: args
-            .suggestions_offset
-            .unwrap_or(defaults.suggestions_offset),
-        include_citations: args.include_citations.unwrap_or(false),
-        citations_limit: args.citations_limit.unwrap_or(defaults.citations_limit),
-        citations_offset: args.citations_offset.unwrap_or(defaults.citations_offset),
-        include_comments: args.include_comments.unwrap_or(false),
-        comments_limit: args.comments_limit.unwrap_or(defaults.comments_limit),
-        comments_offset: args.comments_offset.unwrap_or(defaults.comments_offset),
-    };
+    args.validate_interpretation_bound()?;
+    let opts = args.enrich_options();
     // A live get_record request writes nothing and carries its own read
     // transaction. Keep the governed body, admission and enrichment on one
     // physically read-only snapshot; historical replay retains its existing
@@ -9132,30 +9200,13 @@ async fn get_record_from_lens(
     // The windows are echoed back for the same reason `get_structure` echoes
     // its caps: a caller reading `child_count: 1501` next to 200 children needs
     // to know whether it asked for that window or inherited it.
-    let mut output = json!({
-        "records": items,
-        "resolve": resolve,
-        "children_limit": opts.children_limit,
-        "children_offset": opts.children_offset,
-        "links_limit": opts.links_limit,
-        "links_offset": opts.links_offset,
-        "include_suggestions": opts.include_suggestions,
-        "suggestions_limit": opts.suggestions_limit,
-        "suggestions_offset": opts.suggestions_offset,
-        "include_citations": opts.include_citations,
-        "citations_limit": opts.citations_limit,
-        "citations_offset": opts.citations_offset,
-        "include_comments": opts.include_comments,
-        "comments_limit": opts.comments_limit,
-        "comments_offset": opts.comments_offset,
-        "include_history_summary": include_history_summary,
-    });
-    if include_interpretation {
-        output
-            .as_object_mut()
-            .expect("get_record response is an object")
-            .insert("include_interpretation".into(), Value::Bool(true));
-    }
+    let output = get_record_window_response(
+        items,
+        resolve,
+        opts,
+        include_history_summary,
+        include_interpretation,
+    );
     // One decision per successful tool call. A held head rejected by the
     // read transaction's fence, or a batch with no *returned* indexed record,
     // counts as governed fallback. Later filtering can hide a record whose
@@ -9173,6 +9224,31 @@ async fn get_record_from_lens(
     });
     crate::mcp::request_timing::record_m4_index_decision(used_indexed_header);
     Ok(output)
+}
+
+fn get_record_window_response(
+    items: Value,
+    resolve: bool,
+    opts: read::EnrichOptions,
+    include_history_summary: bool,
+    include_interpretation: bool,
+) -> Value {
+    let mut output = json!({
+        "records": items, "resolve": resolve,
+        "children_limit": opts.children_limit, "children_offset": opts.children_offset,
+        "links_limit": opts.links_limit, "links_offset": opts.links_offset,
+        "include_suggestions": opts.include_suggestions, "suggestions_limit": opts.suggestions_limit, "suggestions_offset": opts.suggestions_offset,
+        "include_citations": opts.include_citations, "citations_limit": opts.citations_limit, "citations_offset": opts.citations_offset,
+        "include_comments": opts.include_comments, "comments_limit": opts.comments_limit, "comments_offset": opts.comments_offset,
+        "include_history_summary": include_history_summary,
+    });
+    if include_interpretation {
+        output
+            .as_object_mut()
+            .expect("get_record response is an object")
+            .insert("include_interpretation".into(), Value::Bool(true));
+    }
+    output
 }
 
 /// Stamp each found record with the shortest abbreviation that addresses it.
@@ -9289,6 +9365,39 @@ async fn annotate_display_references_in_pool(
     }
     Ok(())
 }
+
+#[cfg(feature = "v2-kernel-probe")]
+async fn annotate_native_member_references(
+    tx: &mut Transaction<'_, Sqlite>,
+    items: &mut Value,
+) -> Result<()> {
+    let array = items
+        .as_array_mut()
+        .expect("batch get serializes as an array");
+    let ids = collect_record_path_annotation_ids(array);
+    let references = member_display_references_in_tx(tx, &ids).await?;
+    let link_ids = collect_link_other_ids(array);
+    let link_references = member_display_references_in_tx(tx, &link_ids).await?;
+    for item in array {
+        if item.get("status").and_then(Value::as_str) != Some("found") {
+            continue;
+        }
+        apply_record_path_annotations(item, &references)?;
+        apply_enriched_record_path_annotations(item, &references)?;
+        apply_superseded_by_reference_annotations(item, &references)?;
+        apply_link_other_reference_annotations(item, &link_references)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "lifecycle/native_member.rs"]
+mod native_member;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use native_member::{
+    get_record as native_member_get_record, render_record as native_member_render_record,
+    resolve_reference as native_member_resolve_reference,
+};
 
 /// Far ends named by the link summaries of found records.
 fn collect_link_other_ids(items: &[Value]) -> Vec<String> {
@@ -9432,12 +9541,19 @@ async fn populate_superseded_references_in_pool(
     } else {
         batch_display_references_in_pool(pool, &ids).await?
     };
+    apply_typed_superseded_references(superseded, &references);
+    Ok(())
+}
+
+fn apply_typed_superseded_references(
+    superseded: &mut read::SupersededBy,
+    references: &std::collections::HashMap<String, Option<String>>,
+) {
     for item in &mut superseded.items {
         if let Some(reference) = references.get(&item.id).cloned().flatten() {
             item.display_reference = Some(reference);
         }
     }
-    Ok(())
 }
 
 /// Stamp short references onto named successors in serialized `get_record`
@@ -9654,6 +9770,24 @@ pub(crate) async fn annotate_superseded_by_in_tx(
     caller: &Caller,
     records: &mut [Value],
 ) -> Result<()> {
+    annotate_superseded_in_tx(tx, caller, records, true).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn annotate_superseded_refs_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    records: &mut [Value],
+) -> Result<()> {
+    annotate_superseded_in_tx(tx, caller, records, false).await
+}
+
+async fn annotate_superseded_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    records: &mut [Value],
+    include_names: bool,
+) -> Result<()> {
     let ids = records
         .iter()
         .filter_map(|record| record.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -9684,7 +9818,7 @@ pub(crate) async fn annotate_superseded_by_in_tx(
             references,
         )
     };
-    emit_superseded_by_annotations(records, &grouped, &visible, &references, true);
+    emit_superseded_by_annotations(records, &grouped, &visible, &references, include_names);
     Ok(())
 }
 
@@ -10543,6 +10677,7 @@ async fn replay_update_record_multi(
     ids: &[String],
     facet_sets: &[FacetWrite],
     replay: super::keyed_replay::KeyedReplay,
+    requested_home: Option<&str>,
 ) -> Result<Value> {
     let mut results = Vec::with_capacity(ids.len());
     let mut warnings = Vec::new();
@@ -10560,6 +10695,9 @@ async fn replay_update_record_multi(
             .fetch_one(&mut *tx)
             .await?;
         let record_type: String = row.try_get("type")?;
+        if super::redirects_root_filing(Some(&record_type), requested_home) {
+            super::disclose_root_filing(results.last_mut().expect("target receipt"));
+        }
         let kind: Option<String> = row.try_get("kind")?;
         for warning in crate::domain_transaction::governed_alias_warnings_for_sets(
             facet_sets,
@@ -10666,7 +10804,11 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
-    if let Some(new_home) = args.home_id.as_deref() {
+    if let Some(new_home) = args
+        .home_id
+        .as_deref()
+        .filter(|home| *home != crate::schema::ROOT_RECORD_ID)
+    {
         require_record_in(&mut tx, &caller, TOOL, new_home, Capability::Edit)
             .await
             .map_err(|_| {
@@ -10683,23 +10825,52 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
     let mut authorized = vec![false; args.ids.len()];
     let mut issues = Vec::new();
     for (index, id) in args.ids.iter().enumerate() {
-        let current_home: Option<String> =
-            sqlx::query_scalar("SELECT home_id FROM records WHERE id = ? AND deleted_at IS NULL")
+        let state: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT type, home_id FROM records WHERE id=? AND deleted_at IS NULL")
                 .bind(id)
                 .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-        let relocates = args
-            .home_id
-            .as_deref()
-            .is_some_and(|desired| current_home.as_deref() != Some(desired));
+                .await?;
+        let target_home = if super::redirects_root_filing(
+            state.as_ref().map(|(typ, _)| typ.as_str()),
+            args.home_id.as_deref(),
+        ) {
+            Some(crate::schema::UNFILED_RECORD_ID)
+        } else {
+            args.home_id.as_deref()
+        };
+        // Authority follows the applied destination, even when a historical
+        // root record requested its current home and the redirect moves it.
+        let current_home = state.as_ref().and_then(|(_, home)| home.as_deref());
+        let relocates = target_home.is_some_and(|desired| current_home != Some(desired));
         let required = if relocates {
             Capability::Manage
         } else {
             Capability::Edit
         };
         match require_record_in(&mut tx, &caller, TOOL, id, required).await {
-            Ok(()) => authorized[index] = true,
+            Ok(()) => {
+                // A mixed cohort can have different applied destinations.
+                // Authorize those destinations before replay or any writes;
+                // root View-only callers may still file notes in Unfiled.
+                if args.home_id.as_deref() == Some(crate::schema::ROOT_RECORD_ID) {
+                    let destination =
+                        target_home.expect("explicit root has an applied destination");
+                    if require_record_in(&mut tx, &caller, TOOL, destination, Capability::Edit)
+                        .await
+                        .is_err()
+                    {
+                        issues.push(MultiUpdateIssue {
+                            index,
+                            id: id.clone(),
+                            classification: "unavailable",
+                            message: "relocation destination is unavailable".into(),
+                        });
+                        continue;
+                    }
+                    assert_home_target_in(&mut tx, TOOL, destination).await?;
+                }
+                authorized[index] = true;
+            }
             Err(_) => issues.push(MultiUpdateIssue {
                 index,
                 id: id.clone(),
@@ -10718,7 +10889,14 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
                 .await?
         {
-            return replay_update_record_multi(tx, &args.ids, &facet_sets, replay).await;
+            return replay_update_record_multi(
+                tx,
+                &args.ids,
+                &facet_sets,
+                replay,
+                args.home_id.as_deref(),
+            )
+            .await;
         }
     }
     let schema_rows = cascade::schema_config_rows_in(&mut tx).await?;
@@ -10729,6 +10907,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
     // Alias warnings per prepared target, correlated by request index like
     // `create_many`. Unsets stay quiet (only `facet_sets` are judged) and
     // kinds the governed relationship does not admit stay quiet.
+    let mut redirected_targets = Vec::new();
     let mut batch_warnings = Vec::new();
 
     for (index, id) in args.ids.iter().enumerate() {
@@ -10751,6 +10930,13 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             continue;
         };
         let record_type: String = row.try_get("type")?;
+        let redirected_home =
+            super::redirects_root_filing(Some(&record_type), args.home_id.as_deref());
+        let target_home = if redirected_home {
+            Some(crate::schema::UNFILED_RECORD_ID)
+        } else {
+            args.home_id.as_deref()
+        };
         let kind: Option<String> = row.try_get("kind")?;
         let current_maturity: Option<String> = row.try_get("maturity")?;
         let current_home: Option<String> = row.try_get("home_id")?;
@@ -10856,7 +11042,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             continue;
         }
 
-        if let Some(new_home) = args.home_id.as_deref() {
+        if let Some(new_home) = target_home {
             if new_home == id {
                 issues.push(MultiUpdateIssue {
                     index,
@@ -10933,7 +11119,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
                 fields.insert("maturity".into(), desired.clone());
             }
         }
-        if let Some(desired) = args.home_id.as_deref() {
+        if let Some(desired) = target_home {
             if current_home.as_deref() != Some(desired) {
                 fields.insert("home_id".into(), json!(desired));
             }
@@ -10970,6 +11156,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             ));
         }
         prepared.push(target);
+        redirected_targets.push(redirected_home);
     }
 
     if !issues.is_empty() {
@@ -11082,12 +11269,17 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
 
     let results = prepared
         .into_iter()
-        .map(|target| {
-            json!({
+        .zip(redirected_targets)
+        .map(|(target, redirected_home)| {
+            let mut receipt = json!({
                 "index": target.index,
                 "id": target.id,
                 "status": if target.changed() { "changed" } else { "unchanged" },
-            })
+            });
+            if redirected_home {
+                super::disclose_root_filing(&mut receipt);
+            }
+            receipt
         })
         .collect::<Vec<_>>();
     // Alias warnings ride a top-level `warnings` array correlated by request
@@ -11151,7 +11343,7 @@ pub(crate) async fn prepare_session_version(
         let mut act_alloc = crate::act::ActAllocation::new();
         let metadata = crate::coedit::version_metadata::VersionMetadata {
             contributors: snapshot.contributors(), session_ref: &snapshot.session_id().0,
-            merged_offline: false, span_map: Some(snapshot.span_map()),
+            merged_offline: false, offline_interval: None, span_map: Some(snapshot.span_map()),
         };
         let fields = json!({"body": snapshot.body(), "reason": reason}).as_object().expect("object").clone();
         let outcome = record_update_in(RecordUpdateInput {
@@ -11202,6 +11394,7 @@ pub(crate) async fn write_live_version_in(
     session_ref: &str,
     reason: &str,
     span_map: Option<&crate::coedit::span_map::SpanMap>,
+    offline_interval: Option<crate::coedit::live::OfflineMerge>,
 ) -> Result<LiveVersionReceipt> {
     const PURPOSE: &str = "session.version";
     require_record_in(tx, caller, PURPOSE, record, Capability::Edit).await?;
@@ -11212,7 +11405,8 @@ pub(crate) async fn write_live_version_in(
     let metadata = crate::coedit::version_metadata::VersionMetadata {
         contributors,
         session_ref,
-        merged_offline: false,
+        merged_offline: offline_interval.is_some(),
+        offline_interval,
         span_map,
     };
     let fields = json!({"body": body, "reason": reason})
@@ -15856,6 +16050,21 @@ async fn replay_update_record(
 const KEYED_LIVE_REFUSAL: &str = "update_record: idempotency_key is not supported while a live editing session is routing this record's body; retry without a key";
 
 async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    let requested_home = arguments
+        .get("home_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut receipt = update_record_singular_impl(db, caller, arguments).await?;
+    if super::redirects_root_filing(
+        receipt.get("type").and_then(Value::as_str),
+        requested_home.as_deref(),
+    ) {
+        super::disclose_root_filing(&mut receipt);
+    }
+    Ok(receipt)
+}
+
+async fn update_record_singular_impl(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "update_record";
     reject_null_sources(TOOL, &arguments)?;
     // `body_replace: null` would fold to `None` through `Option<Vec<..>>`
@@ -16172,6 +16381,16 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         },
     )
     .await?;
+    if args.home_id.as_ref().and_then(Value::as_str) == Some(crate::schema::ROOT_RECORD_ID) {
+        let typ: String = sqlx::query_scalar("SELECT type FROM records WHERE id=?")
+            .bind(&args.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if super::redirects_root_filing(Some(&typ), Some(crate::schema::ROOT_RECORD_ID)) {
+            args.home_id = Some(json!(crate::schema::UNFILED_RECORD_ID));
+            fields.insert("home_id".into(), json!(crate::schema::UNFILED_RECORD_ID));
+        }
+    }
     if db.is_enrolled() {
         let row = sqlx::query("SELECT type,kind,deleted_at,EXISTS(SELECT 1 FROM facet_values WHERE record_id=records.id AND key='runtime') AS runtime_present FROM records WHERE id=?")
             .bind(&args.id).fetch_one(&mut *tx).await?;
@@ -16825,6 +17044,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                 contributors: &version.contributors,
                 session_ref: &version.session_ref,
                 merged_offline: false,
+                offline_interval: None,
                 span_map: Some(&version.span_map),
             });
     // Evaluate HTML and MDX policy over the complete prospective tuple under
@@ -18081,7 +18301,7 @@ fn update_record_input_schema() -> Value {
             "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" },
             "idempotency_key": super::keyed_replay::idempotency_key_schema(),
             "kind": { "type": "string", "minLength": 1 },
-            "home_id": { "type": "string", "description": "Move to a canonical browse home. Only the engine root may have null." },
+            "home_id": { "type": "string", "description": "Move to a canonical browse home. Non-Collection records sent to native:root by the caller are filed in Unfiled instead (messages and comments excepted); the receipt discloses the redirect. Only the engine root may have null." },
             "summary": { "type": ["string", "null"] },
             "lifecycle": { "type": ["string", "null"] },
             "owner_id": { "type": ["string", "null"] },
@@ -18143,7 +18363,7 @@ fn update_record_input_schema() -> Value {
             },
             "maturity": { "type": ["string", "null"] },
             "lifecycle": { "type": ["string", "null"] },
-            "home_id": { "type": "string" },
+            "home_id": { "type": "string", "description": "Explicit native:root filing redirects to Unfiled except for Collections, Messages and Annotations; disclosed per target." },
             "if_facets": {
                 "type": "object",
                 "minProperties": 1,
@@ -18205,7 +18425,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                 "name": { "type": "string" },
                 "body": { "type": "string" },
                 "body_encoding": super::body_encoding::schema(),
-                "home_id": { "type": "string", "description": "Live enduring folder; defaults to Unfiled." },
+                "home_id": { "type": "string", "description": "Live enduring folder; defaults to Unfiled. Non-Collection records sent to native:root by the caller are filed in Unfiled instead (messages and comments excepted); the receipt discloses the redirect." },
                 "summary": { "type": "string" },
                 "lifecycle": { "type": "string" },
                 "owner_id": { "type": "string" },
@@ -18360,6 +18580,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
             })
         },
     )?;
+    super::merge_body::register(registry)?;
     registry.register(
         ToolKind::ClaimUnownedRecord,
         "Exceptional ownership recovery for one exact, full record id naming a visible, live, ordinary record whose owner_id is null; abbreviated ids are not resolved. Host owners (or the standalone filesystem operator) may claim only for their own uniquely bound portable person identity. Engine records, Messages, semantic Units, derived annotations and attachments are excluded. Already-owned records and retries are refused without writing.",
@@ -24574,6 +24795,90 @@ mod comment_kernel_tests {
     }
 
     #[tokio::test]
+    async fn comment_reopen_requires_edit_and_clears_summary() {
+        let installed = kernel_fixture(
+            kernel_declaration(json!(["root", "reply"])),
+            "agent.comment-reopen",
+            true,
+        )
+        .await;
+        let db = &installed.db;
+        let registry = &installed.registry;
+        let local = Caller::local();
+        let viewer = Caller::authenticated(KERNEL_ACCOUNT);
+        let root = registry.call(db.clone(), local.clone(), "create_record", json!({
+            "type": "Annotation", "kind": "comment", "body": "Question", "lifecycle": "open",
+            "links": [{"target_id": KERNEL_BEARER, "relationship": "part_of"}],
+            "reason": "Reopen test."
+        })).await.unwrap();
+        let id = root["id"].as_str().unwrap();
+        registry.call(db.clone(), local.clone(), "update_record", json!({
+            "id": id, "lifecycle": "resolved", "summary": "Answered", "reason": "Reopen test."
+        })).await.unwrap();
+        crate::authorization::replace_explicit_policy(
+            db,
+            "test:policy",
+            KERNEL_BEARER,
+            vec![AllowEntry::account(KERNEL_ACCOUNT, Capability::View)],
+        )
+        .await
+        .unwrap();
+        let reply = registry.call(db.clone(), viewer.clone(), "create_record", json!({
+            "type": "Annotation", "kind": "comment", "body": "Another question",
+            "links": [{"target_id": id, "relationship": "part_of"}], "reason": "Reopen test."
+        })).await.unwrap();
+        let reopen = json!({"id": id, "lifecycle": "open", "summary": null,
+            "reason": "Reopen test.", "idempotency_key": "comment-reopen"});
+        let denied = registry
+            .call(db.clone(), viewer.clone(), "update_record", reopen.clone())
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("edit"), "{denied}");
+        for args in [
+            json!({"id": id, "lifecycle": "open", "reason": "Reopen test."}),
+            json!({"id": reply["id"], "lifecycle": "open", "summary": null, "reason": "Reopen test."}),
+        ] {
+            assert!(registry
+                .call(db.clone(), local.clone(), "update_record", args)
+                .await
+                .is_err());
+        }
+        crate::authorization::replace_explicit_policy(
+            db,
+            "test:policy",
+            KERNEL_BEARER,
+            vec![
+                AllowEntry::account(KERNEL_ACCOUNT, Capability::View),
+                AllowEntry::account(KERNEL_ACCOUNT, Capability::Edit),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut stale = reopen.clone();
+        stale["if_unmodified_since"] = json!("2000-01-01T00:00:00Z");
+        stale["idempotency_key"] = json!("comment-reopen-stale");
+        assert!(registry
+            .call(db.clone(), viewer.clone(), "update_record", stale)
+            .await
+            .is_err());
+        registry
+            .call(db.clone(), viewer.clone(), "update_record", reopen.clone())
+            .await
+            .unwrap();
+        registry
+            .call(db.clone(), viewer, "update_record", reopen)
+            .await
+            .unwrap();
+        let state: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT lifecycle,summary FROM records WHERE id=?")
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, (Some("open".into()), None));
+    }
+
+    #[tokio::test]
     async fn comment_resolved_root_conflicts_on_stale_token() {
         // Genuine open root via the ordinary path, replied once, then
         // resolved through the governed transition: a stale reply token
@@ -25335,6 +25640,7 @@ mod session_version_roundtrip_tests {
             contributors: snapshot.contributors(),
             session_ref: &snapshot.session_id().0,
             merged_offline: false,
+            offline_interval: None,
             span_map: Some(snapshot.span_map()),
         }
     }
@@ -25572,6 +25878,7 @@ mod session_version_roundtrip_tests {
             contributors: snapshot.contributors(),
             session_ref: "",
             merged_offline: false,
+            offline_interval: None,
             span_map: None,
         };
         let error = prepare_cut(&fixture, &fixture.caller, &snapshot, &invalid)
@@ -25661,5 +25968,73 @@ mod session_version_roundtrip_tests {
         assert_eq!(fixture.durable().await, before);
         assert_eq!(ledger(&core, &peer), pending);
         fixture.db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod member_marker_text_tests {
+    use serde_json::json;
+
+    /// Both member-copy adapters inject these markers; the default text must
+    /// say which sections the copy could not compute, not drop them.
+    #[test]
+    fn member_copy_markers_are_disclosed_in_default_text() {
+        for (record_type, custody_held) in [("Document", false), ("Message", true)] {
+            // Positive counts beside marked rows: the copy kept the totals
+            // but could not compute the rows.
+            let mut items = json!([{
+                "status":"found","id":"member-record","type":record_type,"name":"Held",
+                "body":"held body","version":"rec:1","body_digest":"digest-1",
+                "citation_count":2
+            }]);
+            if record_type == "Message" {
+                // Message mentions are marked; Document mentions stay at parity.
+                items[0]["mentions_out_count"] = json!(3);
+                items[0]["mentions_in_count"] = json!(1);
+            }
+            super::inject_member_record_markers_with_custody(
+                &mut items,
+                true,
+                true,
+                &std::collections::HashSet::from(["member-record".to_string()]),
+                custody_held,
+            );
+            let text = crate::mcp::render::render(
+                "get_record",
+                &json!({ "records": items, "include_citations": true, "citations_limit": 20 }),
+            )
+            .unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("  Unavailable offline in this copy: "))
+                .unwrap_or_else(|| panic!("markers must be disclosed:\n{text}"));
+            for section in ["contribution", "history_summary", "citations"] {
+                assert!(line.contains(&format!("{section} (")), "{section}: {text}");
+            }
+            assert_eq!(line.contains("custody_boundary"), !custody_held, "{text}");
+            if record_type == "Message" {
+                assert!(
+                    line.contains("communication_origin (message_audience"),
+                    "{text}"
+                );
+            }
+            assert!(line.contains("retry when_online"), "{text}");
+            assert!(line.contains("target (citation"), "{text}");
+            // A marked section is not paged, counted as a window, or restated.
+            for misleading in [
+                "more available",
+                "Citations",
+                "Mentions (",
+                "Target details",
+                "Contribution:",
+            ] {
+                assert!(!text.contains(misleading), "{misleading}: {text}");
+            }
+            // The guard tokens still render beside the disclosure.
+            assert!(
+                text.contains("version rec:1 · body_digest digest-1"),
+                "{text}"
+            );
+        }
     }
 }

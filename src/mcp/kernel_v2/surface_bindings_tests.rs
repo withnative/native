@@ -451,3 +451,221 @@ async fn kernel_v2_surface_bindings_keep_own_metadata_when_person_and_root_are_h
     f.source.close().await;
     f.target.close().await;
 }
+
+async fn filing_call(f: &Fixture, v2: bool, name: &str, args: Value) -> Value {
+    registry()
+        .call_engine(
+            if v2 {
+                EngineHandle::KernelV2(f.target.clone())
+            } else {
+                EngineHandle::Sqlite(f.source.clone())
+            },
+            caller(&f.owner, true),
+            name,
+            args,
+        )
+        .await
+        .unwrap()
+}
+async fn filing_home(f: &Fixture, v2: bool, id: &Value) -> Value {
+    filing_call(f, v2, "get_record", json!({"ids":[id]})).await["records"][0]["home_id"].clone()
+}
+
+#[tokio::test]
+async fn explicit_root_filing_redirects_and_replays_on_both_serving_engines() {
+    let f = fixture().await;
+    for v2 in [false, true] {
+        let policy = filing_call(
+            &f,
+            v2,
+            "manage_record_policy",
+            json!({"action":"list","record_id":"native:root"}),
+        )
+        .await;
+        filing_call(&f,v2,"manage_record_policy",json!({"action":"replace","record_id":"native:root","if_policy_revision":policy["policy_revision"],"entries":[{"subject":{"kind":"account","account_id":f.owner},"capability":"manage"},{"subject":{"kind":"account","account_id":f.member},"capability":"view"}],"reason":"fixture: root View only for the member"})).await;
+        let policy = filing_call(
+            &f,
+            v2,
+            "manage_record_policy",
+            json!({"action":"list","record_id":"native:unfiled"}),
+        )
+        .await;
+        filing_call(&f,v2,"manage_record_policy",json!({"action":"replace","record_id":"native:unfiled","if_policy_revision":policy["policy_revision"],"entries":[{"subject":{"kind":"account","account_id":f.owner},"capability":"manage"},{"subject":{"kind":"account","account_id":f.member},"capability":"edit"}],"reason":"fixture: Unfiled Edit independent of root View"})).await;
+        let root_folder=registry().call_engine(
+            if v2 { EngineHandle::KernelV2(f.target.clone()) } else { EngineHandle::Sqlite(f.source.clone()) },
+            caller(&f.member,false),"create_record",
+            json!({"type":"Collection","kind":"folder","name":"Member cannot file at root","home_id":"native:root","reason":"root Edit remains required for Collections"}),
+        ).await;
+        assert!(
+            root_folder.is_err(),
+            "root View must not admit a Collection create"
+        );
+        // Members can file in Unfiled even with only View on root. The
+        // requested destination must not add an unrelated root Edit gate.
+        let member_note = registry().call_engine(
+            if v2 { EngineHandle::KernelV2(f.target.clone()) } else { EngineHandle::Sqlite(f.source.clone()) },
+            caller(&f.member, false), "create_record",
+            json!({"type":"Document","kind":"note","name":"Member root filing","home_id":"native:root","reason":"applied destination authorization"}),
+        ).await.unwrap();
+        assert_eq!(member_note["redirected_home"]["applied"], "native:unfiled");
+        let member_move = if v2 {
+            json!({"id":member_note["id"],"home_id":"native:root","reason":"applied move authorization"})
+        } else {
+            json!({"ids":[member_note["id"]],"home_id":"native:root","reason":"applied move authorization"})
+        };
+        let moved = registry()
+            .call_engine(
+                if v2 {
+                    EngineHandle::KernelV2(f.target.clone())
+                } else {
+                    EngineHandle::Sqlite(f.source.clone())
+                },
+                caller(&f.member, false),
+                "update_record",
+                member_move,
+            )
+            .await
+            .unwrap();
+        let moved = if v2 { &moved } else { &moved["results"][0] };
+        assert_eq!(moved["redirected_home"]["applied"], "native:unfiled");
+        let folder = filing_call(&f,v2,"create_record",json!({"type":"Collection","kind":"folder","name":"Filing parent","home_id":"native:root","reason":"root filing regression"})).await;
+        assert!(folder.get("redirected_home").is_none());
+        assert_eq!(filing_home(&f, v2, &folder["id"]).await, "native:root");
+        let args = json!({"type":"Document","kind":"note","name":"Explicit root note","home_id":"native:root","reason":"root filing regression","idempotency_key":"root-note"});
+        let note = filing_call(&f, v2, "create_record", args.clone()).await;
+        assert_eq!(
+            note["redirected_home"],
+            json!({"requested":"native:root","applied":"native:unfiled"})
+        );
+        assert_eq!(filing_home(&f, v2, &note["id"]).await, "native:unfiled");
+        let replay = filing_call(&f, v2, "create_record", args).await;
+        assert_eq!(replay["id"], note["id"]);
+        assert_eq!(replay["redirected_home"], note["redirected_home"]);
+        let default = filing_call(&f,v2,"create_record",json!({"type":"Document","kind":"note","name":"Default filing note","reason":"root filing regression"})).await;
+        assert!(default.get("redirected_home").is_none());
+        // Preserve each engine's existing no-home default; this policy only
+        // changes caller-explicit native:root filing.
+        assert_eq!(
+            filing_home(&f, v2, &default["id"]).await,
+            if v2 { "native:root" } else { "native:unfiled" }
+        );
+        let child = filing_call(&f,v2,"create_record",json!({"type":"Collection","kind":"folder","name":"Moving folder","home_id":folder["id"],"reason":"root filing regression"})).await;
+        let moved_folder = filing_call(
+            &f,
+            v2,
+            "update_record",
+            json!({"id":child["id"],"home_id":"native:root","reason":"root filing regression"}),
+        )
+        .await;
+        assert!(moved_folder.get("redirected_home").is_none());
+        assert_eq!(filing_home(&f, v2, &child["id"]).await, "native:root");
+        filing_call(
+            &f,
+            v2,
+            "update_record",
+            json!({"id":note["id"],"home_id":folder["id"],"reason":"prepare rehome"}),
+        )
+        .await;
+        let move_args = json!({"id":note["id"],"home_id":"native:root","reason":"root filing regression","idempotency_key":"root-move"});
+        let moved = filing_call(&f, v2, "update_record", move_args.clone()).await;
+        assert_eq!(moved["redirected_home"], note["redirected_home"]);
+        assert_eq!(filing_home(&f, v2, &note["id"]).await, "native:unfiled");
+        assert_eq!(
+            filing_call(&f, v2, "update_record", move_args).await["redirected_home"],
+            note["redirected_home"]
+        );
+        let many = filing_call(&f,v2,"create_many",json!({"records":[{"type":"Document","kind":"note","name":"Bulk root note","home_id":"native:root"}],"reason":"root filing regression","idempotency_key":"root-many"})).await;
+        assert_eq!(filing_home(&f, v2, &many["ids"][0]).await, "native:unfiled");
+        assert_eq!(many["warnings"][0]["code"], "home_redirected");
+    }
+}
+
+#[tokio::test]
+async fn explicit_root_filing_legacy_bulk_moves_disclose_each_redirect() {
+    let f = fixture().await;
+    let folder = filing_call(
+        &f,
+        false,
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Bulk folder","reason":"bulk fixture"}),
+    )
+    .await;
+    let note=filing_call(&f,false,"create_record",json!({"type":"Document","kind":"note","name":"Bulk note","home_id":folder["id"],"reason":"bulk fixture"})).await;
+    let multi = json!({"ids":[folder["id"],note["id"]],"home_id":"native:root","reason":"bulk root filing","idempotency_key":"multi-root"});
+    let moved = filing_call(&f, false, "update_record", multi.clone()).await;
+    assert!(moved["results"][0].get("redirected_home").is_none());
+    assert_eq!(
+        moved["results"][1]["redirected_home"]["applied"],
+        "native:unfiled"
+    );
+    assert_eq!(filing_home(&f, false, &folder["id"]).await, "native:root");
+    assert_eq!(filing_home(&f, false, &note["id"]).await, "native:unfiled");
+    assert_eq!(
+        filing_call(&f, false, "update_record", multi).await["results"],
+        moved["results"]
+    );
+    filing_call(
+        &f,
+        false,
+        "update_record",
+        json!({"id":note["id"],"home_id":folder["id"],"reason":"prepare batch"}),
+    )
+    .await;
+    let batch = json!({"items":[{"op":"update","id":note["id"],"home_id":"native:root"}],"reason":"batch root filing","idempotency_key":"batch-root"});
+    let moved = filing_call(&f, false, "batch_write", batch.clone()).await;
+    assert_eq!(
+        moved["results"][0]["redirected_home"]["applied"],
+        "native:unfiled"
+    );
+    assert_eq!(filing_home(&f, false, &note["id"]).await, "native:unfiled");
+    assert_eq!(
+        filing_call(&f, false, "batch_write", batch).await["results"],
+        moved["results"]
+    );
+}
+
+#[tokio::test]
+async fn explicit_root_filing_preserves_collection_comment_cascade() {
+    let f = fixture().await;
+    let folder=filing_call(&f,true,"create_record",json!({"type":"Collection","kind":"folder","name":"Thread folder","home_id":"native:unfiled","reason":"derived placement proof"})).await;
+    let comment=filing_call(&f,true,"create_record",json!({"type":"Annotation","kind":"comment","body":"Folder discussion","links":[{"relationship":"part_of","target_id":folder["id"]}],"reason":"derived placement proof"})).await;
+    assert!(comment.get("redirected_home").is_none());
+    let moved = filing_call(
+        &f,
+        true,
+        "update_record",
+        json!({"id":folder["id"],"home_id":"native:root","reason":"derived placement proof"}),
+    )
+    .await;
+    assert!(moved.get("redirected_home").is_none());
+    assert_eq!(filing_home(&f, true, &folder["id"]).await, "native:root");
+    assert_eq!(filing_home(&f, true, &comment["id"]).await, "native:root");
+    let at_root=filing_call(&f,true,"create_record",json!({"type":"Annotation","kind":"comment","body":"Root folder discussion","links":[{"relationship":"part_of","target_id":folder["id"]}],"reason":"derived placement proof"})).await;
+    assert!(at_root.get("redirected_home").is_none());
+    assert_eq!(filing_home(&f, true, &at_root["id"]).await, "native:root");
+}
+
+#[tokio::test]
+async fn explicit_root_filing_legacy_historical_root_bulk_move_requires_manage() {
+    let f = fixture().await;
+    // Historical/imported data enters below ordinary MCP filing admission.
+    let id=crate::store::create_record(&f.source,json!({"type":"Document","kind":"note","name":"Historical root note","home_id":"native:root"})).await.unwrap();
+    let policy = registry()
+        .call(
+            f.source.clone(),
+            Caller::local(),
+            "manage_record_policy",
+            json!({"action":"list","record_id":id}),
+        )
+        .await
+        .unwrap();
+    registry().call(f.source.clone(),Caller::local(),"manage_record_policy",json!({"action":"replace","record_id":id,"if_policy_revision":policy["policy_revision"],"entries":[{"subject":{"kind":"account","account_id":f.owner},"capability":"manage"},{"subject":{"kind":"account","account_id":f.member},"capability":"edit"}],"reason":"fixture: Edit without Manage"})).await.unwrap();
+    let error=registry().call(f.source.clone(),caller(&f.member,false),"update_record",json!({"ids":[id],"home_id":"native:root","reason":"redirect must authorize the actual move"})).await.unwrap_err();
+    assert!(error.to_string().contains("unavailable"), "{error}");
+    let home: Option<String> = sqlx::query_scalar("SELECT home_id FROM records WHERE id=?")
+        .bind(id)
+        .fetch_one(f.source.pool())
+        .await
+        .unwrap();
+    assert_eq!(home.as_deref(), Some("native:root"));
+}

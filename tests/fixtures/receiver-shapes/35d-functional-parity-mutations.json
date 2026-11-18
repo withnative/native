@@ -1,0 +1,34 @@
+[
+  {
+    "mutation": "compiled-primary-parity-functional",
+    "head": "35d013d7937fe29fc58037bca6e6a8e183714389",
+    "path": "src/standby_snapshot.rs",
+    "original_sha256": "e54b401961ae73bdc5a373d72183f9d85beb64bdb662555a7c7169c427b35dd8",
+    "mutant_sha256": "7213998f053cb1fd33af66fb5df60258abdb1d40e6ecdd08df4bb14302c62836",
+    "tests": [
+      {
+        "test": "standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin' (2055773) panicked at src/standby/generation_store/receiver_shape_tests.rs:177:5:\nsame95 FULL must preserve95 predecessor rows\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7886 filtered out; finished in 0.40s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  },
+  {
+    "mutation": "star-prefix",
+    "head": "35d013d7937fe29fc58037bca6e6a8e183714389",
+    "path": "src/standby/generation_store.rs",
+    "original_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+    "mutant_sha256": "bc71b51d56f2d12190eb2add14bcb7d89ffc8ed57c9e8507db09af2abaa9f5a2",
+    "tests": [
+      {
+        "test": "standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off stdout ----\n\nthread 'standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off' (2082087) panicked at src/standby/refresh/tests/kernel_v2_refresh.rs:88:10:\nadvanced94 prefix must compare and hand off to95: StandbyAdmission { check: SuccessorPreservation, source: Sqlx(Database(SqliteError { code: 1, message: \"SELECTs to the left and right of EXCEPT do not have the same number of result columns\" })) }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7886 filtered out; finished in 0.45s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  }
+]

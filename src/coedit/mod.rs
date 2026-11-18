@@ -18,8 +18,19 @@
 //! [`Doc`]: yrs::Doc
 //! [`OffsetKind::Bytes`]: yrs::OffsetKind::Bytes
 
+#[allow(dead_code)] // Foundation seam; hosted kernel activation is a separate qualification.
+pub(crate) mod backend;
+pub(crate) mod body_merge;
 #[allow(dead_code)] // Inactive stage-1 consumer; no public ingress until follow-on review.
 pub(crate) mod driver;
+mod eligibility;
+#[cfg(feature = "v2-kernel-probe")]
+#[allow(dead_code)]
+pub(crate) mod kernel_v2;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod kernel_v2_tests;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod kernel_writer_tests;
 pub mod live;
 #[cfg(test)]
 mod live_tests;

@@ -26,6 +26,17 @@ use crate::standby_snapshot::StandbyConsumerIdentity;
 /// rejects a response that does not carry it.
 pub const MEMBER_COPY_API: &str = "native.member-copy.v1";
 
+/// Large workspaces may require substantial initial preparation. This is the
+/// total serialized attempt budget, including download and local admission.
+pub const MEMBER_COPY_ACQUISITION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(90 * 60);
+
+/// The existing start endpoint prepares synchronously. Leave five minutes of
+/// the total budget for download/admission; ordinary chunk requests retain
+/// their shorter transport timeout. A failed attempt never relaxes a fence.
+pub const MEMBER_COPY_PREPARATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(85 * 60);
+
 /// The one request body the transport sends to `POST .../member-copy`.
 /// `installed_*` are device *hints* only: the server decides the answer, and
 /// neither field can set the device's expected scope. `db_id` is the hosted
@@ -215,6 +226,7 @@ impl MemberCopyContext {
 #[cfg(test)]
 pub(crate) fn test_consumer() -> StandbyConsumerIdentity {
     StandbyConsumerIdentity {
+        kernel_v2_reader: Default::default(),
         contract: crate::standby_snapshot::STANDBY_CONSUMER_CONTRACT.to_owned(),
         version: 1,
         platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,

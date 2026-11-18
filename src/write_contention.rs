@@ -73,6 +73,9 @@ static BOUNDED_STANDBY_DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
 pub(crate) fn enable_bounded_standby_diagnostics() {
     BOUNDED_STANDBY_DIAGNOSTICS.store(true, Ordering::Relaxed);
 }
+pub(crate) fn uses_bounded_diagnostics() -> bool {
+    BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed)
+}
 
 /// Upper bounds, in microseconds, of the fixed histogram buckets. A reported
 /// percentile is the upper bound of the bucket the percentile falls in, so it
@@ -272,7 +275,7 @@ fn open_sections() -> &'static Mutex<HashMap<usize, OpenSection>> {
     SECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct OpenSection {
     opened: Instant,
     /// The pool the section was opened on, known at `BEGIN IMMEDIATE`. The
@@ -282,15 +285,17 @@ struct OpenSection {
     /// contaminate exactly the split this measurement depends on.
     domain: WriteDomain,
     /// The diagnosed operation holding the lock, if the opener names one.
-    /// Only the host-catalog journal names its operations today; workspace
-    /// writes pass `None` and stay domain-aggregated.
+    /// Catalog labels remain explicit. Workspace attribution is retained in
+    /// context independently of whichever task eventually releases the pool.
     operation: Option<&'static str>,
+    context: Option<crate::write_diagnostics::Context>,
+    commit_ack: Option<Instant>,
 }
 
 /// A hold at or above this age logs its operation (when labelled): ordinary
 /// catalog journal writes are milliseconds, so a seconds-long hold is the
 /// contention signal bbbd18b had to reconstruct from unattributed maxima.
-const SLOW_HOLD_LOG_AFTER: Duration = Duration::from_secs(1);
+const SLOW_HOLD_LOG_AFTER: Duration = crate::write_diagnostics::SLOW;
 
 /// Ceiling on tracked open sections. A pool holds at most `max_connections`
 /// physical write connections, so this is orders of magnitude above the live
@@ -318,6 +323,18 @@ pub(crate) fn record_begin(
     wait: Duration,
     failed: bool,
 ) {
+    if wait >= SLOW_HOLD_LOG_AFTER
+        && matches!(domain, WriteDomain::Workspace)
+        && !BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed)
+    {
+        let fields = crate::write_diagnostics::current()
+            .map(|c| c.fields())
+            .unwrap_or_else(|| {
+                "operation=unattributed attempt=none request=none retry=none".into()
+            });
+        crate::write_diagnostics::emit(&format!("write-acquire-slow domain=workspace {fields} wait_ms={} failed={failed} busy_retries={} cleanup_retries={}",
+            wait.as_millis(), retries.busy, retries.cleanup));
+    }
     let totals = registry().totals(domain);
     if failed {
         totals.failures.fetch_add(1, Ordering::Relaxed);
@@ -386,6 +403,8 @@ pub(crate) fn open_critical_section(
                 opened: now,
                 domain,
                 operation,
+                context: crate::write_diagnostics::current(),
+                commit_ack: None,
             },
         )
         .is_some()
@@ -399,6 +418,19 @@ pub(crate) fn open_critical_section(
     }
     #[cfg(test)]
     observed::note_open(connection_key);
+}
+
+/// Mark commit acknowledgement, not SQLite's physical unlock instant. Save it
+/// separately so post-commit/pool-return delay is visible.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn commit_acknowledged(connection_key: usize) {
+    if let Some(section) = open_sections()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(&connection_key)
+    {
+        section.commit_ack = Some(Instant::now());
+    }
 }
 
 /// Close the critical section for a released connection and record how long it
@@ -421,6 +453,8 @@ pub(crate) fn close_critical_section(domain: WriteDomain, connection_key: usize)
         return;
     }
     let held = section.opened.elapsed();
+    #[cfg(test)]
+    held_samples::record(domain, held);
     if held >= STALE_SECTION_AFTER {
         // Far more likely a stale entry whose connection was destroyed without
         // ever being released than a real five-minute transaction — but not
@@ -438,6 +472,34 @@ pub(crate) fn close_critical_section(domain: WriteDomain, connection_key: usize)
         return;
     }
     registry().totals(domain).held.record(held);
+    if held >= SLOW_HOLD_LOG_AFTER
+        && matches!(domain, WriteDomain::Workspace)
+        && !BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed)
+    {
+        let fields = section
+            .context
+            .as_ref()
+            .map(|c| c.fields())
+            .unwrap_or_else(|| {
+                format!(
+                    "operation={} attempt=none request=none retry=none",
+                    section.operation.unwrap_or("unattributed")
+                )
+            });
+        let commit_ms = section
+            .commit_ack
+            .map(|at| {
+                at.saturating_duration_since(section.opened)
+                    .as_millis()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let release_ms = section
+            .commit_ack
+            .map(|at| at.elapsed().as_millis().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        crate::write_diagnostics::emit(&format!("write-lease-slow domain=workspace {fields} begin_ack_to_pool_release_ms={} begin_ack_to_commit_ack_ms={commit_ms} commit_ack_to_pool_release_ms={release_ms} lock_duration=not_measured", held.as_millis()));
+    }
     if held >= SLOW_HOLD_LOG_AFTER && matches!(domain, WriteDomain::HostCatalog) {
         // Ordinary catalog journal writes are milliseconds, so a seconds-long
         // hold is the contention signal bbbd18b had to reconstruct from
@@ -626,6 +688,39 @@ pub(crate) mod observed {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(connection_key, (domain, operation, held));
+    }
+}
+
+/// Test-only capture of every workspace critical-section duration, so a
+/// measurement can compute exact percentiles of the write-lock hold rather
+/// than reading the coarse histogram buckets. Process-global: use it only in
+/// a test that runs alone.
+#[cfg(test)]
+pub(crate) mod held_samples {
+    use super::*;
+
+    static SAMPLES: Mutex<Option<Vec<Duration>>> = Mutex::new(None);
+
+    pub(crate) fn start() {
+        *SAMPLES.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+    }
+
+    /// Drain the samples recorded since the last call.
+    pub(crate) fn take() -> Vec<Duration> {
+        SAMPLES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    pub(super) fn record(domain: WriteDomain, held: Duration) {
+        if matches!(domain, WriteDomain::Workspace) {
+            if let Some(samples) = SAMPLES.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                samples.push(held);
+            }
+        }
     }
 }
 
@@ -833,6 +928,39 @@ fn mean_millis(total_micros: u64, count: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn workspace_lease_retains_opener_context_across_foreign_release_task() {
+        let key = 0xdef0_1234_usize;
+        let context = crate::write_diagnostics::Context::new(
+            "update_record",
+            Some("h1_original".into()),
+            Some("h1_retry_group".into()),
+        );
+        context
+            .scope(async {
+                super::open_critical_section(super::WriteDomain::Workspace, key, None);
+            })
+            .await;
+        let fields = tokio::spawn(async move {
+            assert!(crate::write_diagnostics::current().is_none());
+            let fields = super::open_sections()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap()
+                .fields();
+            super::close_critical_section(super::WriteDomain::Workspace, key);
+            fields
+        })
+        .await
+        .unwrap();
+        assert_eq!(fields, context.fields());
+        assert!(!super::open_sections().lock().unwrap().contains_key(&key));
+    }
+
     use super::*;
 
     fn histogram_of(samples: &[Duration]) -> HistogramSnapshot {
@@ -941,6 +1069,8 @@ mod tests {
                         opened: stale,
                         domain: WriteDomain::Workspace,
                         operation: None,
+                        context: None,
+                        commit_ack: None,
                     },
                 );
             }

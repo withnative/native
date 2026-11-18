@@ -1,0 +1,88 @@
+[
+  {
+    "mutation": "compiled-primary-parity",
+    "head": "28831a98b6e1b93e223769463966bec5748a6440",
+    "path": "src/standby_snapshot.rs",
+    "original_sha256": "f70dc29ec610b1c3ac95d942f56a0c4304c9161be8804b6ac1af9f748a12d448",
+    "mutant_sha256": "2972376f3548f2f969154300b53c5f15af74412d5a46da0207fb62843f9f0784",
+    "tests": [
+      {
+        "test": "standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin' (4122834) panicked at src/standby/generation_store/receiver_shape_tests.rs:48:5:\nassertion failed: !new.manifest.is_other_engine_revision()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7813 filtered out; finished in 0.25s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  },
+  {
+    "mutation": "custody-exact-bypass",
+    "head": "28831a98b6e1b93e223769463966bec5748a6440",
+    "path": "src/node/gate/receiver_contracts.rs",
+    "original_sha256": "a1e1dfd6d5e0f06160cd21208dd724f219e44c07e451f8bc10fea030b51610af",
+    "mutant_sha256": "6bc6eb67b277a3c60f819d4170bd98fbc88c3ede940a02ba06dd1e37b599bd8d",
+    "tests": [
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded' (16677) panicked at src/node/gate/v2_holding_tests.rs:2601:9:\nfutureB retained94 execution remains separately blocked\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7813 filtered out; finished in 0.13s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  },
+  {
+    "mutation": "custody-pair-disabled",
+    "head": "28831a98b6e1b93e223769463966bec5748a6440",
+    "path": "src/node/gate/receiver_contracts.rs",
+    "original_sha256": "a1e1dfd6d5e0f06160cd21208dd724f219e44c07e451f8bc10fea030b51610af",
+    "mutant_sha256": "b47f75f778934dd3fbe625ece84d29021780d600fb863734f356f1a47d31dd05",
+    "tests": [
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery' (7704) panicked at src/node/gate/v2_holding_tests.rs:2682:9:\n{\"jsonrpc\":\"2.0\",\"id\":11,\"error\":{\"code\":-32000,\"message\":\"Hosted v2 operation contract is incompatible; write was not held\",\"data\":{\"outcome\":\"not_sent\",\"held\":false}}}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7813 filtered out; finished in 0.32s\n\n"
+      },
+      {
+        "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery' (7716) panicked at src/node/gate/v2_holding_tests.rs:2787:5:\nassertion `left == right` failed\n  left: \"base\"\n right: \"base!\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7813 filtered out; finished in 1.02s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  },
+  {
+    "mutation": "star-prefix",
+    "head": "28831a98b6e1b93e223769463966bec5748a6440",
+    "path": "src/standby/generation_store.rs",
+    "original_sha256": "f206a5b38bae13239aed67c88760f102d19e341fbc5df15c5b72960ac894fa96",
+    "mutant_sha256": "4dda20c4f3c862b8c746a8e3d5d04639ea9268e527d96f26fe5bd2e1490fd46d",
+    "tests": [
+      {
+        "test": "standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off stdout ----\n\nthread 'standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off' (4134161) panicked at src/standby/refresh/tests/kernel_v2_refresh.rs:88:10:\nadvanced94 prefix must compare and hand off to95: StandbyAdmission { check: SuccessorPreservation, source: Sqlx(Database(SqliteError { code: 1, message: \"SELECTs to the left and right of EXCEPT do not have the same number of result columns\" })) }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7813 filtered out; finished in 0.48s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  },
+  {
+    "mutation": "v1-prewriter-bypass",
+    "head": "28831a98b6e1b93e223769463966bec5748a6440",
+    "path": "src/standby/refresh.rs",
+    "original_sha256": "36bcd18c6c100e137186063d6445c41041a40f30360c392b1fa6f0f2f564052e",
+    "mutant_sha256": "bc1eeff3a89806814e77e4e1b4ce6c1806b110816d393ed36f95a49091df0697",
+    "tests": [
+      {
+        "test": "standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94",
+        "exit": 101,
+        "result": "expected assertion failure",
+        "failure": "---- standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94 stdout ----\n\nthread 'standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94' (4186894) panicked at src/standby/refresh/tests/receiver_shapes.rs:177:9:\nFullRefreshRequired { reason: IntegrityOrApplyRefusal }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7813 filtered out; finished in 1.28s\n\n"
+      }
+    ],
+    "result": "bypass fails"
+  }
+]

@@ -2317,3 +2317,154 @@ async fn provider_link_read_projection_preparation_readiness_and_replay() {
     assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
     w.db.close().await;
 }
+
+async fn provider_readiness_without_writes(
+    connection: &mut sqlx::SqliteConnection,
+    expected_error: Option<&str>,
+) {
+    let before: (i64, i64) =
+        sqlx::query_as("SELECT total_changes(),schema_version FROM pragma_schema_version")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    let result = provider_link_reads::require_ready_on(connection).await;
+    match expected_error {
+        Some(expected) => {
+            let error = result.unwrap_err();
+            match &error {
+                Error::Engine(message) => assert_eq!(message, expected),
+                _ => assert!(error.to_string().contains(expected), "{error}"),
+            }
+        }
+        None => result.unwrap(),
+    }
+    let after: (i64, i64) =
+        sqlx::query_as("SELECT total_changes(),schema_version FROM pragma_schema_version")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(after, before, "readiness must not repair rows or schema");
+}
+
+#[tokio::test]
+async fn provider_link_readiness_refuses_incomplete_objects_and_older_coverage() {
+    let w = Box::pin(World::fresh()).await;
+    let mut empty = w.db.pool().acquire().await.unwrap();
+    provider_readiness_without_writes(&mut empty, None).await;
+    drop(empty);
+    let older = Box::pin(w.prepare("readiness-older")).await;
+    Box::pin(commit_provider_as(&w.db, &w.admin, &older))
+        .await
+        .unwrap();
+    let endpoint = create_record_as(&w.db, &w.admin, KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    let other_endpoint = create_record_as(&w.db, &w.admin, KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    let newer = Box::pin(prepare_provider_as(
+        &w.db,
+        &w.admin,
+        &other_endpoint,
+        &endpoint,
+        "readiness-newer",
+        Command::Assert { sources: vec![] },
+    ))
+    .await
+    .unwrap();
+    Box::pin(commit_provider_as(&w.db, &w.admin, &newer))
+        .await
+        .unwrap();
+    assert_ne!(older.aggregate_id, newer.aggregate_id);
+    let expected = projection_dump::dump(&w.db).await.unwrap();
+    const NOT_READY: &str = "v2 provider-link read projection is not ready; run explicit v2 import/preparation before serving";
+    for (kind, name) in [
+        ("TABLE", "kernel_provider_link_meta"),
+        ("TABLE", "kernel_provider_link_heads"),
+        ("TABLE", "kernel_provider_link_rows"),
+        ("INDEX", "idx_kernel_provider_link_identity"),
+        ("INDEX", "idx_kernel_provider_state_heads"),
+        ("INDEX", "idx_kernel_provider_link_coverage"),
+        ("INDEX", "idx_kernel_event_birth"),
+        ("INDEX", "idx_kernel_read_type"),
+        ("INDEX", "idx_kernel_read_kind"),
+    ] {
+        let mut tx = w.db.write_pool().begin().await.unwrap();
+        sqlx::query(&format!("DROP {kind} {name}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        provider_readiness_without_writes(&mut tx, Some(NOT_READY)).await;
+        tx.rollback().await.unwrap();
+    }
+    // All mutations are isolated in one connection/transaction per case. In
+    // particular, corrupting only the older aggregate leaves MAX(head) intact.
+    for (change, expected_error) in [
+        ("DELETE FROM kernel_provider_link_meta", NOT_READY),
+        ("UPDATE kernel_provider_link_meta SET version=0", NOT_READY),
+        ("UPDATE kernel_provider_link_heads SET head=head-1 WHERE aggregate_id=?1", NOT_READY),
+        ("DELETE FROM kernel_provider_link_rows WHERE aggregate_id=?1; DELETE FROM kernel_provider_link_heads WHERE aggregate_id=?1", NOT_READY),
+        ("INSERT INTO kernel_provider_link_heads SELECT 'readiness:orphan-head',head,pins_json,left_id,right_id,active,0 FROM kernel_provider_link_heads WHERE aggregate_id=?1", NOT_READY),
+        ("UPDATE kernel_provider_state SET provider_key='readiness.other-provider' WHERE id=?1", NOT_READY),
+        ("INSERT INTO kernel_provider_link_rows SELECT 'readiness:orphan-rows',ordinal,id,source_id,target_id,note,created_at,created_at_ms,raw_json,if_absent FROM kernel_provider_link_rows WHERE aggregate_id=?1", NOT_READY),
+        ("UPDATE kernel_provider_link_heads SET row_count=row_count+1 WHERE aggregate_id=?1", NOT_READY),
+        ("UPDATE kernel_provider_link_heads SET row_count=0 WHERE aggregate_id=?1", NOT_READY),
+        ("UPDATE kernel_provider_link_heads SET pins_json=json_set(pins_json,'$.provider','readiness.unknown/1') WHERE aggregate_id=?1", "unknown retained provider interpretation pins"),
+        ("UPDATE kernel_provider_link_heads SET pins_json='{' WHERE aggregate_id=?1", "EOF while parsing an object"),
+    ] {
+        let mut tx = w.db.write_pool().begin().await.unwrap();
+        let maximum: i64 = sqlx::query_scalar("SELECT max(head) FROM kernel_provider_link_heads")
+            .fetch_one(&mut *tx).await.unwrap();
+        let mut query = sqlx::query(change);
+        if change.contains("?1") {
+            query = query.bind(&older.aggregate_id);
+        }
+        query.execute(&mut *tx).await.unwrap();
+        let retained_maximum: i64 = sqlx::query_scalar("SELECT max(head) FROM kernel_provider_link_heads")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(retained_maximum, maximum, "{change}");
+        provider_readiness_without_writes(&mut tx, Some(expected_error)).await;
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    // Valid zero-row projections are permitted; their pins still get checked.
+    let mut tx = w.db.write_pool().begin().await.unwrap();
+    sqlx::query("DELETE FROM kernel_provider_link_rows WHERE aggregate_id=?1; UPDATE kernel_provider_link_heads SET row_count=0 WHERE aggregate_id=?1")
+        .bind(&older.aggregate_id).execute(&mut *tx).await.unwrap();
+    provider_readiness_without_writes(&mut tx, None).await;
+    tx.rollback().await.unwrap();
+    Box::pin(w.replay()).await;
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn provider_link_readiness_observes_its_pinned_snapshot_without_repair() {
+    let w = Box::pin(World::fresh()).await;
+    let request = Box::pin(w.prepare("readiness-snapshot")).await;
+    Box::pin(commit_provider_as(&w.db, &w.admin, &request))
+        .await
+        .unwrap();
+    let expected = projection_dump::dump(&w.db).await.unwrap();
+    let mut reader = w.db.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *reader).await.unwrap();
+    provider_readiness_without_writes(&mut reader, None).await;
+    sqlx::query("UPDATE kernel_provider_link_heads SET head=head+1 WHERE aggregate_id=?")
+        .bind(&request.aggregate_id)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    provider_readiness_without_writes(&mut reader, None).await;
+    sqlx::query("ROLLBACK").execute(&mut *reader).await.unwrap();
+    provider_readiness_without_writes(
+        &mut reader,
+        Some("v2 provider-link read projection is not ready; run explicit v2 import/preparation before serving"),
+    )
+    .await;
+    drop(reader);
+    // Only explicit replay restores the retained projection; neither snapshot
+    // observation above repaired the committed corruption.
+    Box::pin(replay_all_projections(&w.db)).await.unwrap();
+    assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    Box::pin(w.replay()).await;
+    w.db.close().await;
+}

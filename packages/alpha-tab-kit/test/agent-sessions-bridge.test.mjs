@@ -1045,3 +1045,58 @@ test("folder chooser carries only host identity and preserves cancel/choice thro
     assert.deepEqual(invalid, { ok: false, code: "invalid" });
   } finally { await tab.done(); }
 });
+
+test('message framing advertises support, classifies send/create and refuses unsupported or invalid origins', { skip }, async () => {
+  for (const supported of [false, true]) {
+    const tab = await open(['app.agent-sessions.v2', 'app.agent-sessions.create.v1', ...(supported ? ['app.agent-sessions.message-framing.v1'] : [])]);
+    try {
+      assert.equal(await tab.probe(() => window.native.agentSessions.messageFraming === true), supported);
+      if (supported) {
+        void tab.probe(() => window.native.agentSessions.send({ hostId: 'local', hostEpoch: 'epoch-1', sessionId: 's1', requestId: 'origin-send', text: 'hi', contentOrigin: 'typed' })).catch(() => {});
+        void tab.probe(() => window.native.agentSessions.create({ hostId: 'local', hostEpoch: 'epoch-1', requestId: 'origin-create', provider: 'claude', model: 'm1', workspaceId: 'w1', initialPrompt: 'go', contentOrigin: 'generated' })).catch(() => {});
+        await tab.page.waitForFunction(() => window.__host.received().some(m => m.type === 'agent-sessions-create'));
+        assert.equal((await tab.wire('agent-sessions-send'))[0].content_origin, 'typed');
+        assert.equal((await tab.wire('agent-sessions-create'))[0].content_origin, 'generated');
+      } else {
+        const answers = await tab.probe(() => Promise.all([
+          window.native.agentSessions.send({ hostId: 'local', hostEpoch: 'epoch-1', sessionId: 's1', requestId: 'origin-send', text: 'hi', contentOrigin: 'typed' }),
+          window.native.agentSessions.create({ hostId: 'local', hostEpoch: 'epoch-1', requestId: 'origin-create', provider: 'claude', model: 'm1', workspaceId: 'w1', initialPrompt: 'go', contentOrigin: 'generated' }),
+        ]));
+        assert.equal(answers[0].code, 'unavailable');
+        assert.equal(answers[1].error.code, 'create_unsupported');
+        assert.equal((await tab.wire('agent-sessions-send')).length, 0);
+      }
+      const invalid = await tab.probe(() => window.native.agentSessions.send({ hostId: 'local', hostEpoch: 'epoch-1', sessionId: 's1', requestId: 'origin-invalid', text: 'hi', contentOrigin: 'unknown' }));
+      assert.equal(invalid.code, 'invalid');
+    } finally { await tab.done(); }
+  }
+});
+
+
+test("16K messages and explicit message/history cutoffs survive the real frame bridge", { skip }, async () => {
+  const tab = await open(["app.agent-sessions.v2"]);
+  try {
+    await tab.probe(() => window.probe.follow("long", { hostId: "local", hostEpoch: "epoch-1", sessionId: "s1" }));
+    await tab.page.waitForFunction(() => window.__host.received().some(m => m.type === "agent-sessions-follow"));
+    const [message] = await tab.wire("agent-sessions-follow");
+    const items = [
+      { id: "complete", kind: "message", role: "assistant", text: "x".repeat(16384) },
+      { id: "excerpt", kind: "message", role: "assistant", text: "y".repeat(16384), truncated: true },
+    ];
+    const target = { subscription_id: message.subscription_id, session_id: "s1" };
+    await tab.host(pushEvent, { ...target, event: { kind: "snapshot", historyTruncated: true, items } });
+    await tab.host(answer, { type: "agent-sessions-follow-result", request_id: message.request_id, result: { ok: true, value: {} } });
+    await tab.probe(() => window.probe.followResult("long"));
+    assert.deepEqual((await tab.probe(() => window.probe.heard("long"))).map(h => h.event), [
+      { hostId: "local", hostEpoch: "epoch-1", sessionId: "s1", kind: "snapshot", historyTruncated: true, items },
+    ]);
+    // Invalid claims are refused, then a valid event acts as an ordered-port barrier.
+    await tab.host(pushEvent, { ...target, event: { kind: "update", items: [{ ...items[1], truncated: "true" }] } });
+    await tab.host(pushEvent, { ...target, event: { kind: "update", historyTruncated: false, items: [] } });
+    await tab.host(pushEvent, { ...target, event: { kind: "update", items: [items[0]] } });
+    const heard = await tab.probe(() => window.probe.heard("long"));
+    assert.equal(heard.length, 2);
+    assert.deepEqual(heard[1].event, { hostId: "local", hostEpoch: "epoch-1", sessionId: "s1", kind: "update", items: [items[0]] });
+    assert.equal(heard[0].frozen, true);
+  } finally { await tab.done(); }
+});

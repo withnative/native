@@ -732,7 +732,9 @@ async fn one_composite_call_creates_the_exploration_every_candidate_and_every_me
         let rendered = native_ce::mcp::render::render("get_record", &read).unwrap();
         // Default text keeps the membership link and a compact provenance cue.
         // JSON above retains the exact contribution envelope.
-        assert!(rendered.contains(&exploration_id), "{rendered}");
+        // The membership link names the exploration by its short reference,
+        // a prefix of its id.
+        assert!(rendered.contains(&exploration_id[..7]), "{rendered}");
         assert!(rendered.contains("Contribution:"), "{rendered}");
         for omitted in [
             "visible_member_count",

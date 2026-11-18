@@ -21,6 +21,14 @@ use crate::events::EventRow;
 use crate::mcp::registry::Caller;
 use crate::{Db, Error, Result};
 
+#[doc(hidden)]
+pub mod deferred_wire;
+
+pub(crate) mod cancellation;
+#[cfg(feature = "mcp-executor-prototype")]
+#[doc(hidden)]
+pub mod cancellation_request;
+
 /// The transport the server observed itself serving an accepted write on.
 ///
 /// This is deliberately a THIRD axis, separate from `executor_kind` and from
@@ -562,8 +570,62 @@ tokio::task_local! {
     static TRUSTED_PROVENANCE: ProvenanceDispatch;
 }
 
+/// Mint context uses only ingress-verified provenance slots, never run hints.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn record_mint_context() -> Result<String> {
+    TRUSTED_PROVENANCE
+        .try_with(|dispatch| {
+            crate::record_id::context(
+                dispatch
+                    .facts
+                    .app
+                    .as_ref()
+                    .map(|a| a.install_event_id.as_str()),
+                dispatch.facts.delegation_ref.as_deref(),
+            )
+        })
+        .map_err(|_| Error::engine("record ID minting requires trusted provenance dispatch"))
+}
+
+/// Observe only the genuine current first-party read dispatch. This supplies
+/// no original authorship or mutation authority; retained replay must still
+/// bind its immutable original and reauthorize on the actual writer snapshot.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn current_read_mint_context(caller: &Caller) -> Result<String> {
+    TRUSTED_PROVENANCE
+        .try_with(|dispatch| {
+            let (kind, executor, delegation) = verified_executor_attribution(caller);
+            if !matches!(
+                dispatch.facts.operation.as_str(),
+                "get_record" | "search" | "query_record"
+            ) || dispatch.facts.principal != caller.credential()
+                || dispatch.facts.executor_kind != kind
+                || dispatch.facts.executor_ref != executor
+                || dispatch.facts.delegation_ref != delegation
+                || dispatch.facts.app.is_some()
+                || caller.host_asserted_app().is_some()
+            {
+                return Err(Error::engine("current first-party read dispatch mismatch"));
+            }
+            Ok(())
+        })
+        .map_err(|_| Error::engine("current trusted read dispatch missing"))??;
+    record_mint_context()
+}
+
 pub(crate) fn current_dispatch() -> Option<ProvenanceDispatch> {
     TRUSTED_PROVENANCE.try_with(Clone::clone).ok()
+}
+
+/// The claimed app package on this dispatch, if any. Scope enforcement
+/// uses it only to *narrow*: an unverified claim can reduce access, never
+/// widen it, so kernel gates may consult it before admission re-runs.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) fn current_app_package() -> Option<String> {
+    TRUSTED_PROVENANCE
+        .try_with(|dispatch| dispatch.facts.app.as_ref().map(|app| app.package.clone()))
+        .ok()
+        .flatten()
 }
 
 /// The host assertion attached to this source-tool dispatch. This is a claim,
@@ -724,6 +786,76 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
     value
 }
 
+/// Expected command attribution, not authentication or a dispatch/cancel grant.
+/// Only a verified host boundary may select this expectation for private
+/// reconciliation. Ordinary handlers derive it from their actual Caller.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandAppContext(Option<crate::mcp::app_attribution::AppAttribution>);
+impl CommandAppContext {
+    pub fn no_app() -> Self {
+        Self(None)
+    }
+    /// Shape validation only. This does not verify a host assertion or install.
+    pub fn host_app(app: &crate::mcp::app_attribution::AppAttribution) -> Result<Self> {
+        Ok(Self(Some(
+            crate::mcp::app_attribution::AppAttribution::new(
+                &app.package,
+                &app.version,
+                &app.install_event_id,
+            )?,
+        )))
+    }
+    pub(crate) fn from_caller(caller: &Caller) -> Self {
+        Self(caller.host_asserted_app().cloned())
+    }
+    fn dispatched() -> Self {
+        Self(
+            TRUSTED_PROVENANCE
+                .try_with(|d| d.facts.app.as_deref().cloned())
+                .ok()
+                .flatten(),
+        )
+    }
+}
+
+async fn require_command_app_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    expected: &CommandAppContext,
+) -> Result<()> {
+    let row = sqlx::query("SELECT package,version,install_event_id,assertion FROM provenance_action_app_attributions WHERE action_attestation_id=?")
+        .bind(id).fetch_optional(&mut **tx).await?;
+    let conflict = || Error::engine(IDEMPOTENCY_CONFLICTING_INPUT);
+    let actual = match row {
+        None => CommandAppContext::no_app(),
+        Some(row) => {
+            if row
+                .try_get::<String, _>("assertion")
+                .map_err(|_| conflict())?
+                != crate::mcp::app_attribution::ASSERTION_HOST
+            {
+                return Err(conflict());
+            }
+            CommandAppContext(Some(
+                crate::mcp::app_attribution::AppAttribution::new(
+                    row.try_get::<String, _>("package")
+                        .map_err(|_| conflict())?,
+                    row.try_get::<String, _>("version")
+                        .map_err(|_| conflict())?,
+                    row.try_get::<String, _>("install_event_id")
+                        .map_err(|_| conflict())?,
+                )
+                .map_err(|_| conflict())?,
+            ))
+        }
+    };
+    if &actual != expected {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
 /// Recover the argument spelling of an already committed keyed create, for
 /// internal speculative execution. This is not authorization or a receipt:
 /// the ordinary handler must still authorize and replay the command itself.
@@ -733,10 +865,12 @@ pub async fn existing_create_replay_arguments(
     db: &Db,
     principal: &str,
     arguments: &Value,
+    expected_app: &CommandAppContext,
 ) -> Result<Option<(String, Value)>> {
     let Some(command) = command_identity_digest(arguments) else {
         return Ok(None);
     };
+    let mut tx = db.pool().begin().await?;
     let row = sqlx::query(
         "SELECT a.id,a.action_digest FROM provenance_action_attestations a
         JOIN provenance_local_attestation_authority l ON l.attestation_id=a.id
@@ -744,18 +878,19 @@ pub async fn existing_create_replay_arguments(
     )
     .bind(principal)
     .bind(command)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
         return Ok(None);
     };
+    require_command_app_in(&mut tx, &row.try_get::<String, _>("id")?, expected_app).await?;
     let id: String = sqlx::query_scalar(
         "SELECT DISTINCT e.record_id FROM provenance_action_outputs o
         JOIN content_events e ON e.id=o.output_event_id
         WHERE o.action_attestation_id=? AND o.output_domain='content' AND e.type='record.created'",
     )
     .bind(row.try_get::<String, _>("id")?)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
     let digest: String = row.try_get("action_digest")?;
     if digest == action_digest("create_record", arguments) {
@@ -1139,6 +1274,153 @@ pub(crate) async fn issue_action_attestation_in(
     issue_action_attestation_outputs_in(tx, draft, &outputs).await
 }
 
+/// Canonical bounded reference to a keyed result with no governed outputs.
+/// The fact does not manufacture local issuance authority on import/replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyedCommandReceiptAnchor {
+    pub attestation_id: String,
+}
+impl KeyedCommandReceiptAnchor {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if Uuid::parse_str(&self.attestation_id).is_err() {
+            return Err(Error::engine("invalid keyed receipt attestation identity"));
+        }
+        Ok(())
+    }
+}
+
+async fn append_keyed_receipt_anchor_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    attestation_id: &str,
+    principal: &str,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<()> {
+    crate::control::append_control_event_in(
+        tx,
+        crate::control::NewControlEvent::authored(
+            format!("provenance:keyed-receipt:{attestation_id}"),
+            attestation_id,
+            principal,
+            None,
+            "Retain a keyed command result for same-database recovery.",
+            crate::control::ControlEventPayload::KeyedCommandReceipt(KeyedCommandReceiptAnchor {
+                attestation_id: attestation_id.into(),
+            }),
+        )?,
+        act_alloc,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Explicit writable preparation for legacy locally issued empty anchors.
+/// Imported attestations without the separate local authority row are never
+/// promoted into local authority. One preparation transaction shares one act.
+pub async fn prepare_keyed_receipt_anchors(db: &Db) -> Result<()> {
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut acts = crate::act::ActAllocation::new();
+    let mut after = String::new();
+    loop {
+        let rows = uncarried_keyed_receipt_anchors_on(&mut tx, &after, 32).await?;
+        if rows.is_empty() {
+            break;
+        }
+        for (id, principal) in rows {
+            append_keyed_receipt_anchor_in(&mut tx, &id, &principal, &mut acts).await?;
+            after = id;
+        }
+    }
+    db.commit_control(tx).await?;
+    Ok(())
+}
+
+// Control payload identity is validated against this aggregate identity by
+// the codec. Keep both indexed bounds alongside the type/payload checks so
+// each candidate key probes its own receipt facts rather than all controls.
+const UNCARRIED_KEYED_RECEIPT_ANCHORS_SQL: &str = "SELECT a.id,a.principal FROM provenance_action_attestations a \
+         JOIN provenance_local_attestation_authority l ON l.attestation_id=a.id \
+           AND l.issuer_origin_database_id=a.issuer_origin_database_id \
+           AND l.principal=a.principal AND l.operation=a.operation \
+           AND l.command_identity_digest=a.command_identity_digest \
+         WHERE a.id>? AND a.command_identity_digest IS NOT NULL AND a.operation!='sql_write' \
+         AND NOT EXISTS(SELECT 1 FROM provenance_action_outputs o WHERE o.action_attestation_id=a.id) \
+         AND NOT EXISTS(SELECT 1 FROM provenance_action_events e WHERE e.action_attestation_id=a.id) \
+         AND NOT EXISTS(SELECT 1 FROM control_events c WHERE c.aggregate_kind='keyed_command_receipt' \
+             AND c.aggregate_id=a.id AND c.type='provenance.keyed_command_receipt.v1' \
+             AND json_extract(c.payload,'$.attestation_id')=a.id) ORDER BY a.id LIMIT ?";
+
+async fn uncarried_keyed_receipt_anchors_on(
+    conn: &mut sqlx::SqliteConnection,
+    after: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as(UNCARRIED_KEYED_RECEIPT_ANCHORS_SQL)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?)
+}
+
+/// Read-only admission: export cannot silently omit legacy receipt-only keys.
+pub(crate) async fn verify_keyed_receipt_anchor_coverage_on(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<()> {
+    if !uncarried_keyed_receipt_anchors_on(conn, "", 1)
+        .await?
+        .is_empty()
+    {
+        return Err(Error::engine(
+            "keyed command receipts require writable preparation before standby export",
+        ));
+    }
+    // Portable receipt facts remain evidence only. Verify their immutable
+    // attestation references once the complete companion set is available;
+    // imported facts need no receiver-local issuance authority.
+    let mut after_seq = 0_i64;
+    loop {
+        let rows = sqlx::query(
+            "SELECT c.seq,c.actor,c.payload,a.id,a.schema_version,a.operation,a.issuer, \
+             a.command_identity_digest,a.output_event_set_digest,a.principal, \
+             EXISTS(SELECT 1 FROM provenance_action_outputs o WHERE o.action_attestation_id=a.id) AS has_outputs \
+             FROM control_events c LEFT JOIN provenance_action_attestations a \
+               ON a.id=json_extract(c.payload,'$.attestation_id') \
+             WHERE c.type='provenance.keyed_command_receipt.v1' AND c.seq>? ORDER BY c.seq LIMIT 32"
+        ).bind(after_seq).fetch_all(&mut *conn).await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            after_seq = row.try_get("seq")?;
+            let fact: KeyedCommandReceiptAnchor =
+                serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
+            fact.validate()?;
+            let id: Option<String> = row.try_get("id")?;
+            if id.is_none() {
+                return Err(Error::engine(
+                    "keyed receipt fact references a missing attestation",
+                ));
+            }
+            let command: Option<String> = row.try_get("command_identity_digest")?;
+            if row.try_get::<String, _>("actor")? != row.try_get::<String, _>("principal")?
+                || row.try_get::<bool, _>("has_outputs")?
+                || !is_empty_keyed_anchor_shape(
+                    row.try_get("schema_version")?,
+                    &row.try_get::<String, _>("operation")?,
+                    &row.try_get::<String, _>("issuer")?,
+                    command.as_deref(),
+                    &row.try_get::<String, _>("output_event_set_digest")?,
+                )
+            {
+                return Err(Error::engine(
+                    "keyed receipt fact does not match an empty keyed attestation",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Persist an output-less command attestation for an idempotency key.
 ///
 /// Composite batch handlers issue one attestation per changed item, but
@@ -1152,7 +1434,42 @@ pub(crate) async fn issue_action_attestation_in(
 pub(crate) async fn issue_empty_command_attestation_in(
     tx: &mut Transaction<'static, Sqlite>,
 ) -> Result<String> {
+    let mut act_alloc = crate::act::ActAllocation::new();
+    issue_empty_command_attestation_with_act_in(tx, &mut act_alloc).await
+}
+
+/// Batch producers share the memo used by their per-item output appends.
+pub(crate) async fn issue_empty_command_attestation_with_act_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<String> {
     let draft = reserve_action_attestation()?;
+    let empty_digest = ordered_output_set_digest(&[]);
+    // Producer and reader share admission: never persist an empty anchor
+    // which this engine's conformance checker would later reject. A new
+    // reachable no-op must extend the contract and its real-producer proof.
+    if !is_empty_keyed_anchor_shape(
+        ACTION_ATTESTATION_SCHEMA_VERSION,
+        &draft.facts.operation,
+        ISSUER,
+        draft.facts.command_identity_digest.as_deref(),
+        &empty_digest,
+    ) {
+        return Err(Error::engine(format!(
+            "zero-output command attestation is not admitted for operation {}",
+            draft.facts.operation
+        )));
+    }
+    cancellation::guard_in(
+        tx,
+        &draft.facts.principal,
+        &draft.facts.operation,
+        draft.facts.command_identity_digest.as_deref(),
+        &draft.facts.action_digest,
+        draft.facts.intent_digest.as_deref(),
+        &cancellation::app_digest(draft.facts.app.as_deref()),
+    )
+    .await?;
     upsert_interaction_receipt_in(tx, &draft).await?;
     let issued_at = crate::store::now_iso();
     let issuer_origin_database_id: String =
@@ -1183,7 +1500,7 @@ pub(crate) async fn issue_empty_command_attestation_in(
     .bind(&draft.facts.operation)
     .bind(&draft.facts.action_commitment)
     .bind(&draft.facts.action_digest)
-    .bind(ordered_output_set_digest(&[]))
+    .bind(&empty_digest)
     .bind(ISSUER)
     .bind(&issuer_origin_database_id)
     .bind(&issued_at)
@@ -1205,6 +1522,11 @@ pub(crate) async fn issue_empty_command_attestation_in(
     .execute(&mut **tx)
     .await?;
     record_app_attribution_in(tx, &draft).await?;
+    // SQL already has an act-stamped sql_write_receipts row referencing this
+    // anchor. Other output-less keyed results need their own bounded edge.
+    if draft.facts.operation != "sql_write" {
+        append_keyed_receipt_anchor_in(tx, &draft.id, &draft.facts.principal, act_alloc).await?;
+    }
     note_pending_attestation(draft.id.clone());
     Ok(draft.id)
 }
@@ -1405,6 +1727,16 @@ pub(crate) async fn issue_action_attestation_outputs_in(
         }
     }
 
+    cancellation::guard_in(
+        tx,
+        &draft.facts.principal,
+        &draft.facts.operation,
+        draft.facts.command_identity_digest.as_deref(),
+        &draft.facts.action_digest,
+        draft.facts.intent_digest.as_deref(),
+        &cancellation::app_digest(draft.facts.app.as_deref()),
+    )
+    .await?;
     if draft.facts.interaction.is_some() {
         upsert_interaction_receipt_in(tx, &draft).await?;
     }
@@ -1643,6 +1975,37 @@ pub(crate) async fn lookup_authorized_command_identity_in(
     arguments: &Value,
     intent: Option<&str>,
 ) -> Result<Option<String>> {
+    lookup_command_identity_with_app_in(
+        tx,
+        principal,
+        operation,
+        command,
+        arguments,
+        intent,
+        &CommandAppContext::dispatched(),
+    )
+    .await
+}
+
+async fn lookup_command_identity_with_app_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    principal: &str,
+    operation: &str,
+    command: &str,
+    arguments: &Value,
+    intent: Option<&str>,
+    expected_app: &CommandAppContext,
+) -> Result<Option<String>> {
+    cancellation::guard_in(
+        tx,
+        principal,
+        operation,
+        Some(command),
+        &action_digest(operation, arguments),
+        intent.map(|value| digest_json(&json!(value))).as_deref(),
+        &cancellation::app_digest(expected_app.0.as_ref()),
+    )
+    .await?;
     let row = sqlx::query(
         "SELECT a.id,a.action_digest,a.intent_digest
            FROM provenance_action_attestations a
@@ -1657,6 +2020,9 @@ pub(crate) async fn lookup_authorized_command_identity_in(
     let Some(row) = row else {
         return Ok(None);
     };
+    // A different app context learns no action/intent comparison details.
+    let id: String = row.try_get("id")?;
+    require_command_app_in(tx, &id, expected_app).await?;
     if row.try_get::<String, _>("action_digest")? != action_digest(operation, arguments) {
         return Err(Error::engine(IDEMPOTENCY_CONFLICTING_INPUT));
     }
@@ -1664,7 +2030,7 @@ pub(crate) async fn lookup_authorized_command_identity_in(
     if row.try_get::<Option<String>, _>("intent_digest")? != expected_intent {
         return Err(Error::engine(IDEMPOTENCY_DIFFERENT_INTENT));
     }
-    Ok(Some(row.try_get("id")?))
+    Ok(Some(id))
 }
 
 /// Internal lookup-only recovery for a signed deferred command. This acquires
@@ -1679,11 +2045,91 @@ pub async fn reconcile_deferred_command(
     arguments: &Value,
     intent: Option<&str>,
 ) -> Result<Option<String>> {
+    // Historical V1 never captures app attribution. Ambient dispatch is irrelevant.
+    reconcile_command_context(
+        db,
+        None,
+        principal,
+        operation,
+        arguments,
+        intent,
+        &CommandAppContext::no_app(),
+    )
+    .await
+}
+
+/// Lookup-only proof for a separately authenticated signed command. Neither
+/// context nor raw principal grants authority, a Caller, execution or cancellation.
+/// The trusted caller must verify the envelope/release key and keep the result
+/// on its private coordinator transport. No production V2 caller is admitted.
+#[doc(hidden)]
+pub async fn reconcile_deferred_command_with_context(
+    db: &Db,
+    expected_origin: &str,
+    principal: &str,
+    operation: &str,
+    arguments: &Value,
+    intent: Option<&str>,
+    expected_app: &CommandAppContext,
+) -> Result<Option<String>> {
+    reconcile_command_context(
+        db,
+        Some(expected_origin),
+        principal,
+        operation,
+        arguments,
+        intent,
+        expected_app,
+    )
+    .await
+}
+
+async fn reconcile_command_context(
+    db: &Db,
+    expected_origin: Option<&str>,
+    principal: &str,
+    operation: &str,
+    arguments: &Value,
+    intent: Option<&str>,
+    expected_app: &CommandAppContext,
+) -> Result<Option<String>> {
+    if db.is_enrolled() {
+        return Err(Error::engine("deferred reconciliation engine unsupported"));
+    }
     let mut connection = db.write_pool().acquire().await?;
     let mut tx = sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await?;
-    let result =
-        lookup_authorized_command_attestation_in(&mut tx, principal, operation, arguments, intent)
-            .await;
+    let result = async {
+        // This proof is qualified only for legacy engine94, not any SQLite DB.
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        if version != 94 {
+            return Err(Error::engine("deferred reconciliation engine unsupported"));
+        }
+        let origin: String =
+            sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
+                .fetch_one(&mut *tx)
+                .await?;
+        if !crate::identity::is_database_id(&origin)
+            || expected_origin.is_some_and(|expected| expected != origin)
+        {
+            return Err(Error::engine("deferred reconciliation database mismatch"));
+        }
+        let Some(command) = command_identity_digest(arguments) else {
+            return Ok(None);
+        };
+        lookup_command_identity_with_app_in(
+            &mut tx,
+            principal,
+            operation,
+            &command,
+            arguments,
+            intent,
+            expected_app,
+        )
+        .await
+    }
+    .await;
     tx.rollback().await?;
     result
 }
@@ -1697,10 +2143,12 @@ pub(crate) async fn lookup_authorized_command_attestation(
     operation: &str,
     arguments: &Value,
     intent: Option<&str>,
+    expected_app: &CommandAppContext,
 ) -> Result<Option<String>> {
     let Some(command) = command_identity_digest(arguments) else {
         return Ok(None);
     };
+    let mut tx = db.write_pool().begin().await?;
     let row = sqlx::query(
         "SELECT a.id,a.action_digest,a.intent_digest
            FROM provenance_action_attestations a
@@ -1710,11 +2158,14 @@ pub(crate) async fn lookup_authorized_command_attestation(
     .bind(principal)
     .bind(operation)
     .bind(command)
-    .fetch_optional(db.write_pool())
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
         return Ok(None);
     };
+    // A different app context learns no action/intent comparison details.
+    let id: String = row.try_get("id")?;
+    require_command_app_in(&mut tx, &id, expected_app).await?;
     if row.try_get::<String, _>("action_digest")? != action_digest(operation, arguments) {
         return Err(Error::engine(IDEMPOTENCY_CONFLICTING_INPUT));
     }
@@ -1722,7 +2173,8 @@ pub(crate) async fn lookup_authorized_command_attestation(
     if row.try_get::<Option<String>, _>("intent_digest")? != expected_intent {
         return Err(Error::engine(IDEMPOTENCY_DIFFERENT_INTENT));
     }
-    Ok(Some(row.try_get("id")?))
+    tx.rollback().await?;
+    Ok(Some(id))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1874,13 +2326,24 @@ pub(crate) fn state_violations_in<'a>(
     Box::pin(async move { state_violations_on(tx).await })
 }
 
-/// A keyed `batch_write` has a deliberate zero-output v2 anchor. Its local
+/// A keyed write can deliberately produce a zero-output v2 anchor. Its local
 /// issuance authority is not portable: canonical interchange carries the
 /// attestation but intentionally omits that receiver-local table. Conformance
 /// therefore checks the portable shape here and validates any local authority
 /// independently below. A foreign row with the same shape is structurally
 /// valid, but this check alone does not claim verified local issuance.
-fn is_empty_batch_anchor_shape(
+// These keyed tools can commit through `anchor_noop_in`. Other keyed tools
+// always append outputs and must not gain a zero-output conformance exception.
+const KEYED_NOOP_ANCHOR_OPERATIONS: &[&str] = &[
+    "update_record",
+    "archive_record",
+    "manage_messages",
+    "manage_renderer_binding",
+    "manage_artifact_inputs",
+    "manage_surface_bindings",
+];
+
+fn is_empty_keyed_anchor_shape(
     schema_version: i64,
     operation: &str,
     issuer: &str,
@@ -1888,13 +2351,37 @@ fn is_empty_batch_anchor_shape(
     stored_digest: &str,
 ) -> bool {
     schema_version == ACTION_ATTESTATION_SCHEMA_VERSION
-        && matches!(operation, "batch_write" | "sql_write")
+        && (matches!(operation, "batch_write" | "sql_write")
+            || KEYED_NOOP_ANCHOR_OPERATIONS.contains(&operation))
         && issuer == ISSUER
         && command_digest.is_some_and(is_sha256_hex)
         && stored_digest == ordered_output_set_digest(&[])
 }
 
 async fn state_violations_on(connection: &mut sqlx::SqliteConnection) -> Result<Vec<String>> {
+    state_violations_on_with_cancellations(connection, true).await
+}
+
+/// Check immutable receipts on the original migration source using this
+/// candidate's reader. Schema 90 introduced the last prerequisite (SQL
+/// receipts); cancellation authority only exists from schema 94. Earlier
+/// sources retain their concrete transition checks and post-migration FULL
+/// verification. Never infer applicability from a missing table: missing
+/// required source tables must fail closed.
+pub(crate) async fn migration_source_violations_on(
+    connection: &mut sqlx::SqliteConnection,
+    source_version: i64,
+) -> Result<Vec<String>> {
+    if source_version < 90 {
+        return Ok(Vec::new());
+    }
+    state_violations_on_with_cancellations(connection, source_version >= 94).await
+}
+
+async fn state_violations_on_with_cancellations(
+    connection: &mut sqlx::SqliteConnection,
+    include_cancellations: bool,
+) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT id,schema_version,principal,operation,action_commitment,action_digest,output_event_set_digest,
                 interaction_receipt_id,issuer_origin_database_id,command_identity_digest,issuer
@@ -1987,7 +2474,7 @@ async fn state_violations_on(connection: &mut sqlx::SqliteConnection) -> Result<
         .fetch_all(&mut *connection)
         .await?;
         if qualified_members.is_empty()
-            && !is_empty_batch_anchor_shape(
+            && !is_empty_keyed_anchor_shape(
                 row.try_get("schema_version")?,
                 row.try_get::<String, _>("operation")?.as_str(),
                 row.try_get::<String, _>("issuer")?.as_str(),
@@ -2161,6 +2648,9 @@ async fn state_violations_on(connection: &mut sqlx::SqliteConnection) -> Result<
                 "attestation {id} local issuance authority is inconsistent"
             ));
         }
+    }
+    if include_cancellations {
+        violations.extend(cancellation::state_violations_on(connection).await?);
     }
     Ok(violations)
 }
@@ -2582,8 +3072,40 @@ pub(crate) async fn inspect_action_attestation_summaries_in(
     Ok(inspections)
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
+pub(crate) use cancellation::{
+    fingerprint as held_stop_fingerprint, initialize as initialize_held_stop,
+    lookup as lookup_held_stop, preflight as preflight_held_stop, stage as stage_held_stop,
+    LocalEvidenceData, StagedCancellation as HeldStopDecision,
+};
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn keyed_receipt_coverage_probes_control_aggregate_identity_index() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {UNCARRIED_KEYED_RECEIPT_ANCHORS_SQL}");
+        let plan = sqlx::query(&explain)
+            .bind("")
+            .bind(1_i64)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let details: Vec<String> = plan.iter().map(|row| row.get("detail")).collect();
+        assert!(
+            details.iter().any(|detail| detail
+                .contains("SEARCH c USING INDEX idx_control_events_aggregate")
+                && detail.contains("aggregate_kind=?")
+                && detail.contains("aggregate_id=?")),
+            "receipt closure must probe both indexed aggregate identity bounds: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|detail| detail.contains("SCAN c")),
+            "receipt closure must not scan unrelated control history: {details:?}"
+        );
+        db.close().await;
+    }
+
     use super::*;
     use crate::mcp::{CustomInteractionPolicy, ToolExposure, ToolRegistry};
     use crate::store::{append_batch, AppendSpec};
@@ -3507,6 +4029,7 @@ mod tests {
                 "create_record",
                 &arguments,
                 None,
+                &CommandAppContext::no_app(),
             )
             .await
             .unwrap(),
@@ -3518,6 +4041,7 @@ mod tests {
             "create_record",
             &json!({"idempotency_key":"same","name":"different"}),
             None,
+            &CommandAppContext::no_app(),
         )
         .await
         .unwrap_err();
@@ -3528,6 +4052,7 @@ mod tests {
             "create_record",
             &arguments,
             Some("different resolved intent"),
+            &CommandAppContext::no_app(),
         )
         .await
         .unwrap_err();
@@ -3853,6 +4378,184 @@ mod tests {
         .unwrap();
         assert!(state_violations(&db).await.unwrap().is_empty());
         db.close().await;
+    }
+
+    #[tokio::test]
+    async fn empty_anchor_issuance_retains_reader_admission_for_every_supported_shape() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        for operation in KEYED_NOOP_ANCHOR_OPERATIONS
+            .iter()
+            .copied()
+            .chain(["batch_write", "sql_write"])
+        {
+            let args = json!({"idempotency_key":operation});
+            let dispatch =
+                ProvenanceDispatch::from_caller(&Caller::local(), operation, &args, None);
+            dispatch
+                .scope(async {
+                    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                    let id = issue_empty_command_attestation_in(&mut tx).await.unwrap();
+                    if operation == "sql_write" {
+                        // SQL adds its durable envelope after issuing the
+                        // anchor in the same transaction. Exercise constructor
+                        // admission here without committing an unfinished SQL
+                        // protocol; real SQL receipt tests cover that commit.
+                        tx.rollback().await.unwrap();
+                    } else {
+                        tx.commit().await.unwrap();
+                    }
+                    assert!(!id.is_empty());
+                })
+                .await;
+        }
+        let violations = state_violations(&db).await.unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn empty_anchor_issuance_refuses_unsupported_or_unkeyed_shapes_before_storage() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let counts = |pool: sqlx::SqlitePool| async move {
+            sqlx::query_as::<_, (i64,i64,i64)>("SELECT (SELECT count(*) FROM provenance_action_attestations),(SELECT count(*) FROM provenance_local_attestation_authority),(SELECT count(*) FROM provenance_interaction_receipts)")
+                .fetch_one(&pool).await.unwrap()
+        };
+        let before = counts(db.write_pool().clone()).await;
+        for (operation, key) in [
+            ("unknown_keyed_write", Some("a".repeat(64))),
+            ("manage_links", Some("b".repeat(64))),
+            ("archive_record", None),
+            ("archive_record", Some("malformed".to_owned())),
+        ] {
+            let dispatch =
+                ProvenanceDispatch::from_caller(&Caller::local(), operation, &json!({}), None)
+                    .with_command_identity(key);
+            dispatch
+                .scope(async {
+                    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+                    let error = issue_empty_command_attestation_in(&mut tx)
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("zero-output command attestation is not admitted"),
+                        "{error}"
+                    );
+                    // Commit the otherwise empty transaction deliberately: refusal
+                    // itself must not have written a receipt or issuance authority.
+                    tx.commit().await.unwrap();
+                })
+                .await;
+            assert_eq!(counts(db.write_pool().clone()).await, before);
+        }
+        assert!(state_violations(&db).await.unwrap().is_empty());
+        db.close().await;
+    }
+
+    #[test]
+    fn zero_output_producers_are_wired_to_keyed_replay() {
+        for operation in KEYED_NOOP_ANCHOR_OPERATIONS {
+            assert!(
+                crate::mcp::tools::keyed_replay::KEYED_REPLAY_WRITES
+                    .iter()
+                    .any(|(tool, _)| tool == operation),
+                "no-op producer is not a keyed replay tool: {operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conformance_rejects_empty_anchors_for_always_writing_keyed_tools() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let operations = [
+            "create_many",
+            "instantiate_artifact",
+            "attach_from_url",
+            "manage_mdx_modules",
+            "manage_links",
+            "manage_facet_observations",
+            "claim_unowned_record",
+            "manage_citations",
+            "manage_attributions",
+            "resolve_suggestions",
+            "manage_participants",
+        ];
+        for operation in operations {
+            let commitment = action_commitment(operation, &json!({"idempotency_key": operation}));
+            let canonical =
+                String::from_utf8(crate::canonical_json::canonical_json(&commitment)).unwrap();
+            sqlx::query("INSERT INTO provenance_action_attestations
+                (id,schema_version,principal,executor_kind,operation,action_commitment,
+                 action_digest,output_event_set_digest,issuer,issuer_origin_database_id,issued_at,command_identity_digest)
+                VALUES (?,2,'acct:anchor','authenticated_principal',?,?,?,?,'native-ce',?,'2026-11-05T00:00:00.000Z',?)")
+                .bind(operation).bind(operation).bind(canonical).bind(digest_json(&commitment))
+                .bind(ordered_output_set_digest(&[])).bind(&origin).bind(digest_json(&json!(operation)))
+                .execute(db.write_pool()).await.unwrap();
+        }
+        let violations = state_violations(&db).await.unwrap();
+        for operation in operations {
+            assert!(
+                violations.contains(&format!("attestation {operation} has no output events")),
+                "engine-impossible empty anchor accepted: {operation}; {violations:?}"
+            );
+        }
+        db.close().await;
+    }
+
+    #[test]
+    fn empty_keyed_anchor_still_requires_exact_provenance_shape() {
+        let key = "a".repeat(64);
+        let empty = ordered_output_set_digest(&[]);
+        assert!(is_empty_keyed_anchor_shape(
+            2,
+            "archive_record",
+            ISSUER,
+            Some(&key),
+            &empty
+        ));
+        for (version, operation, issuer, digest, outputs) in [
+            (
+                1,
+                "archive_record",
+                ISSUER,
+                Some(key.as_str()),
+                empty.as_str(),
+            ),
+            (
+                2,
+                "unknown_write",
+                ISSUER,
+                Some(key.as_str()),
+                empty.as_str(),
+            ),
+            (
+                2,
+                "archive_record",
+                "foreign-issuer",
+                Some(key.as_str()),
+                empty.as_str(),
+            ),
+            (2, "archive_record", ISSUER, None, empty.as_str()),
+            (
+                2,
+                "archive_record",
+                ISSUER,
+                Some("not-sha256"),
+                empty.as_str(),
+            ),
+            (
+                2,
+                "archive_record",
+                ISSUER,
+                Some(key.as_str()),
+                key.as_str(),
+            ),
+        ] {
+            assert!(!is_empty_keyed_anchor_shape(version, operation, issuer, digest, outputs),
+                "invalid empty anchor accepted: {version}/{operation}/{issuer}/{digest:?}/{outputs}");
+        }
     }
 
     #[tokio::test]
@@ -4537,5 +5240,336 @@ mod tests {
             })
             .await;
         db.close().await;
+    }
+    #[tokio::test]
+    async fn exact_app_reconciliation_is_lookup_only_and_v1_is_explicit_no_app() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let args = json!({"idempotency_key":"context-proof","name":"first"});
+        let caller = Caller::authenticated("acct:writer");
+        let dispatch = ProvenanceDispatch::from_caller(&caller, "create_record", &args, None);
+        dispatch
+            .scope(crate::store::append(
+                &db,
+                create_spec("b40ce000-0000-4000-8000-000000000071", "first"),
+            ))
+            .await
+            .unwrap();
+        let before_events: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let expected = CommandAppContext::no_app();
+        let receipt = reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            caller.credential(),
+            "create_record",
+            &args,
+            None,
+            &expected,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let app =
+            crate::mcp::app_attribution::AppAttribution::new("agent.test", "1", "install").unwrap();
+        let context = CommandAppContext::host_app(&app).unwrap();
+        // Merely surrounding a lookup with an app dispatch cannot change V1's identity.
+        let ambient = ProvenanceDispatch::from_caller(
+            &caller.clone().with_host_asserted_app(app),
+            "create_record",
+            &args,
+            None,
+        );
+        assert_eq!(
+            ambient
+                .scope(reconcile_deferred_command(
+                    &db,
+                    caller.credential(),
+                    "create_record",
+                    &args,
+                    None
+                ))
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert!(reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            caller.credential(),
+            "create_record",
+            &args,
+            None,
+            &context
+        )
+        .await
+        .unwrap_err()
+        .is_idempotency_conflict());
+        assert!(reconcile_deferred_command_with_context(
+            &db,
+            "ndb_11111111111111111111111111111111",
+            caller.credential(),
+            "create_record",
+            &args,
+            None,
+            &expected
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("database mismatch"));
+        let mut changed = args.clone();
+        changed["name"] = json!("different");
+        assert!(reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            caller.credential(),
+            "create_record",
+            &changed,
+            None,
+            &expected
+        )
+        .await
+        .unwrap_err()
+        .is_idempotency_conflict());
+        assert!(reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            caller.credential(),
+            "create_record",
+            &args,
+            Some("different"),
+            &expected
+        )
+        .await
+        .unwrap_err()
+        .is_idempotency_conflict());
+        // Portable attestation with otherwise exact identity is not a local commit.
+        let foreign = json!({"idempotency_key":"portable-only","name":"first"});
+        sqlx::query("INSERT INTO provenance_action_attestations (id,schema_version,principal,executor_kind,operation,action_commitment,action_digest,output_event_set_digest,issuer,issuer_origin_database_id,issued_at,command_identity_digest) VALUES ('portable-only',2,'acct:writer','authenticated_principal','create_record',?,?,?,'foreign-native',?,'2026-11-05T00:00:00Z',?)")
+            .bind(action_commitment("create_record",&foreign).to_string()).bind(action_digest("create_record",&foreign)).bind(ordered_output_set_digest(&[])).bind(&origin).bind(command_identity_digest(&foreign)).execute(db.write_pool()).await.unwrap();
+        assert_eq!(
+            reconcile_deferred_command_with_context(
+                &db,
+                &origin,
+                caller.credential(),
+                "create_record",
+                &foreign,
+                None,
+                &expected
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        // Missing app row is exact no-app, not a wildcard; adding a historical
+        // host row is fixture evidence only, never admission to a live install.
+        sqlx::query("INSERT INTO provenance_action_app_attributions VALUES (?,'agent.test','1','install','host')").bind(&receipt).execute(db.write_pool()).await.unwrap();
+        assert!(
+            reconcile_deferred_command(&db, caller.credential(), "create_record", &args, None)
+                .await
+                .unwrap_err()
+                .is_idempotency_conflict()
+        );
+        assert_eq!(
+            reconcile_deferred_command_with_context(
+                &db,
+                &origin,
+                caller.credential(),
+                "create_record",
+                &args,
+                None,
+                &context
+            )
+            .await
+            .unwrap(),
+            Some(receipt)
+        );
+        let opaque = reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            caller.credential(),
+            "create_record",
+            &args,
+            Some("probe another intent"),
+            &expected,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(opaque.to_string(), IDEMPOTENCY_CONFLICTING_INPUT);
+        let attachment = lookup_authorized_command_attestation(
+            &db,
+            caller.credential(),
+            "create_record",
+            &args,
+            Some("probe another intent"),
+            &expected,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attachment.to_string(), IDEMPOTENCY_CONFLICTING_INPUT);
+        for wrong in [
+            crate::mcp::app_attribution::AppAttribution::new("agent.other", "1", "install")
+                .unwrap(),
+            crate::mcp::app_attribution::AppAttribution::new("agent.test", "2", "install").unwrap(),
+            crate::mcp::app_attribution::AppAttribution::new("agent.test", "1", "reinstalled")
+                .unwrap(),
+        ] {
+            assert!(reconcile_deferred_command_with_context(
+                &db,
+                &origin,
+                caller.credential(),
+                "create_record",
+                &args,
+                None,
+                &CommandAppContext::host_app(&wrong).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .is_idempotency_conflict());
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap(),
+            before_events
+        );
+        sqlx::query("PRAGMA user_version=95")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert!(reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            caller.credential(),
+            "create_record",
+            &args,
+            None,
+            &context
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("engine unsupported"));
+    }
+
+    #[tokio::test]
+    async fn malformed_committed_app_context_never_becomes_no_app_or_a_receipt() {
+        for (package, assertion) in [("bad package", "host"), ("agent.test", "unknown")] {
+            let db = crate::create_database(":memory:").await.unwrap();
+            let caller = Caller::authenticated("acct:writer");
+            let args = json!({"idempotency_key":"bad-context"});
+            let dispatch = ProvenanceDispatch::from_caller(&caller, "create_record", &args, None);
+            dispatch
+                .scope(crate::store::append(
+                    &db,
+                    create_spec("b40ce000-0000-4000-8000-000000000072", "first"),
+                ))
+                .await
+                .unwrap();
+            let receipt = dispatch.receipt_ids().pop().unwrap();
+            let before_events: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+            // Isolated corruption fixture, never a normal engine write route.
+            let mut c = db.write_pool().acquire().await.unwrap();
+            sqlx::query("PRAGMA ignore_check_constraints=ON")
+                .execute(&mut *c)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO provenance_action_app_attributions VALUES (?,?,'1','install',?)",
+            )
+            .bind(&receipt)
+            .bind(package)
+            .bind(assertion)
+            .execute(&mut *c)
+            .await
+            .unwrap();
+            sqlx::query("PRAGMA ignore_check_constraints=OFF")
+                .execute(&mut *c)
+                .await
+                .unwrap();
+            drop(c);
+            let origin = crate::identity::database_id(&db).await.unwrap();
+            assert!(reconcile_deferred_command_with_context(
+                &db,
+                &origin,
+                caller.credential(),
+                "create_record",
+                &args,
+                None,
+                &CommandAppContext::no_app()
+            )
+            .await
+            .unwrap_err()
+            .is_idempotency_conflict());
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            assert!(dispatch
+                .scope(lookup_authorized_command_attestation_in(
+                    &mut tx,
+                    caller.credential(),
+                    "create_record",
+                    &args,
+                    None
+                ))
+                .await
+                .unwrap_err()
+                .is_idempotency_conflict());
+            tx.rollback().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+                    .fetch_one(db.write_pool())
+                    .await
+                    .unwrap(),
+                before_events
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_checks_origin_after_serialized_writer_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::create_database(dir.path().join("snapshot.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let old_origin = crate::identity::database_id(&db).await.unwrap();
+        let mut c = db.write_pool().acquire().await.unwrap();
+        let mut writer = sqlx::Connection::begin_with(&mut *c, "BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let new_origin = "ndb_22222222222222222222222222222222";
+        sqlx::query("UPDATE database_identity SET origin_db_id=? WHERE singleton=1")
+            .bind(new_origin)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let copy = db.clone();
+        let task = tokio::spawn(async move {
+            reconcile_deferred_command_with_context(
+                &copy,
+                &old_origin,
+                "acct:writer",
+                "create_record",
+                &json!({"idempotency_key":"not-found"}),
+                None,
+                &CommandAppContext::no_app(),
+            )
+            .await
+        });
+        // Writer commits the changed origin before any later serialized lookup
+        // may decide a matching receipt OR even a miss. No pre-lock identity read
+        // can authorize a proof from the previous database identity.
+        writer.commit().await.unwrap();
+        assert!(task
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("database mismatch"));
     }
 }

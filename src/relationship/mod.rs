@@ -61,6 +61,39 @@ pub(crate) use projector::{
 };
 pub const RELATIONSHIP_TYPE_SCHEMA_VERSION: u64 = 1;
 pub const CORE_RELATIONSHIP_TYPE_MANIFEST_JSON: &str = include_str!("core_relationship_types.json");
+pub const INTERIM_READ_DISCLOSURES_JSON: &str = include_str!("read_disclosures.json");
+
+/// One interim rule: the relationship name plus its future-shape disclosure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterimReadDisclosure {
+    pub relationship: String,
+    pub read_disclosure: ReadDisclosure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterimReadDisclosureTable {
+    #[serde(default)]
+    pub note: Option<String>,
+    pub disclosures: Vec<InterimReadDisclosure>,
+}
+
+/// Interim read-disclosure entries for not-yet-governed relationships,
+/// each in exactly the future `read_disclosure` shape.
+pub fn interim_read_disclosures() -> Result<Vec<InterimReadDisclosure>> {
+    let table: InterimReadDisclosureTable = serde_json::from_str(INTERIM_READ_DISCLOSURES_JSON)?;
+    let mut seen = BTreeSet::new();
+    for entry in &table.disclosures {
+        if entry.relationship.trim().is_empty() || !seen.insert(entry.relationship.as_str()) {
+            return Err(Error::engine(
+                "invalid interim read disclosure relationship",
+            ));
+        }
+        entry.read_disclosure.validate()?;
+    }
+    Ok(table.disclosures)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +158,68 @@ pub struct PresentationLabels {
     pub proposition: String,
 }
 
+/// Which side of a relationship a read disclosure names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisclosureDirection {
+    Inverse,
+    Forward,
+}
+
+/// Disclosure strength: an authored `claim` about the graph versus a `fact`
+/// derived from link metadata (ordering, clocks, lifecycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisclosureKind {
+    Claim,
+    Fact,
+}
+
+fn default_disclosure_max_items() -> u8 {
+    3
+}
+
+/// Optional read-time disclosure declared by a relationship definition.
+///
+/// Absent means "no disclosure". All filtering is data: the disclosure path
+/// matches `links` by relationship string and applies these flags, with no
+/// per-name branches. Wording also comes from data: `summary_template`
+/// carries one `{list}` slot the builder fills with the named items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDisclosure {
+    pub direction: DisclosureDirection,
+    pub kind: DisclosureKind,
+    /// Keep only sources created after the anchor's last substantive change.
+    #[serde(default)]
+    pub newer_than_target: bool,
+    /// Keep only sources with a governed nonterminal (`open`) lifecycle.
+    /// Unknown or unclassified status never counts as open.
+    #[serde(default)]
+    pub open_source_only: bool,
+    /// Named items per anchor, newest first; the remainder is counted.
+    #[serde(default = "default_disclosure_max_items")]
+    pub max_items: u8,
+    /// Wording template with one `{list}` slot, e.g. `"superseded by {list}"`.
+    pub summary_template: String,
+}
+
+impl ReadDisclosure {
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=3).contains(&self.max_items) {
+            return Err(Error::engine(
+                "relationship read disclosure max_items must be 1..=3",
+            ));
+        }
+        if self.summary_template.trim().is_empty() || !self.summary_template.contains("{list}") {
+            return Err(Error::engine(
+                "relationship read disclosure summary_template must carry one {list} slot",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelationshipTypeDefinition {
@@ -137,6 +232,9 @@ pub struct RelationshipTypeDefinition {
     pub assertion_admission_classes: Vec<AssertionAdmissionClass>,
     pub reducer: ReducerDefinition,
     pub labels: PresentationLabels,
+    /// Optional read disclosure; absent (the default) declares none.
+    #[serde(default)]
+    pub read_disclosure: Option<ReadDisclosure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +349,9 @@ impl RelationshipTypeDefinition {
             })
         {
             return Err(Error::engine("invalid assertion admission class"));
+        }
+        if let Some(disclosure) = &self.read_disclosure {
+            disclosure.validate()?;
         }
         Ok(())
     }

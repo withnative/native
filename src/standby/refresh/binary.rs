@@ -26,6 +26,11 @@ type BinaryFuture<T> = Pin<Box<dyn Future<Output = std::result::Result<T, Attemp
 pub(super) struct BinaryExport {
     pub handle: String,
     pub transfer: SnapshotTransfer,
+    pub selected: Option<crate::standby::shapes::Shape>,
+    /// Explicit pending-poll observation, retained until the actual Ready shape is known.
+    pub poll_selection: Option<crate::standby::shapes::Shape>,
+    /// Bound after Ready, including legacy94 exports without a selection.
+    pub actual_shape: Option<crate::standby::shapes::Shape>,
 }
 
 impl BinaryExport {
@@ -33,15 +38,66 @@ impl BinaryExport {
         ledger.transfer().validate()?;
         Ok(Self {
             handle: ledger.export_handle.clone(),
+            poll_selection: None,
             transfer: ledger.transfer(),
+            actual_shape: ledger
+                .manifest
+                .as_ref()
+                .and_then(crate::standby::shapes::manifest)
+                .map(crate::standby::shapes::Entry::shape),
+            selected: ledger
+                .manifest
+                .as_ref()
+                .and_then(crate::standby::shapes::manifest)
+                .filter(|entry| entry.observation_envelope)
+                .map(crate::standby::shapes::Entry::shape),
         })
     }
 
+    #[cfg(test)]
     fn identity(handle: String) -> Self {
         Self {
             handle,
             transfer: SnapshotTransfer::IdentityV1,
+            selected: None,
+            poll_selection: None,
+            actual_shape: None,
         }
+    }
+
+    fn observe_poll(
+        &mut self,
+        selected: Option<&crate::standby::shapes::Shape>,
+    ) -> std::result::Result<(), AttemptError> {
+        self.validate_selection(selected)?;
+        if let Some(selected) = selected {
+            self.poll_selection = Some(selected.clone());
+        }
+        Ok(())
+    }
+
+    fn validate_selection(
+        &self,
+        selected: Option<&crate::standby::shapes::Shape>,
+    ) -> std::result::Result<(), AttemptError> {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|expected| selected != Some(expected))
+            || self
+                .poll_selection
+                .as_ref()
+                .zip(selected)
+                .is_some_and(|(observed, selected)| observed != selected)
+            || self
+                .actual_shape
+                .as_ref()
+                .zip(selected)
+                .is_some_and(|(actual, selected)| actual != selected)
+        {
+            return Err(protocol("standby binary selected shape changed"));
+        }
+        Ok(())
     }
 }
 
@@ -101,8 +157,9 @@ pub(super) trait BinarySnapshotClient: Send + Sync {
 }
 
 pub(super) enum BinaryPoll {
-    Pending,
+    Pending(Option<crate::standby::shapes::Shape>),
     Ready {
+        selected: Option<crate::standby::shapes::Shape>,
         manifest: Box<StandbySnapshotManifest>,
         size: u64,
         sha256: String,
@@ -113,7 +170,7 @@ pub(super) enum BinaryPoll {
 /// Liveness of retained resume state from one authorized poll.
 pub(super) enum ResumeProbe {
     Absent,
-    Live,
+    Live(Box<(binary_resume::ResumeBinding, BinaryExport)>),
     Gone,
 }
 
@@ -135,7 +192,9 @@ fn throttled_by_cooldown() -> AttemptError {
 }
 
 pub(super) struct HttpBinarySnapshotClient {
+    pub(super) compatibility: crate::client_compatibility::Monitor,
     client: reqwest::Client,
+    pub(super) install_key: Option<crate::node_credential::InstallKey>,
 }
 
 impl HttpBinarySnapshotClient {
@@ -150,7 +209,11 @@ impl HttpBinarySnapshotClient {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|_| Error::engine("cannot build standby binary HTTP client"))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            compatibility: Default::default(),
+            install_key: None,
+        })
     }
 }
 
@@ -326,20 +389,49 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
         transfer: SnapshotTransfer,
     ) -> BinaryFuture<BinaryExport> {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
+        let origin = if install_key.is_some() {
+            format!("{origin}{}", crate::node_credential::REFRESH_PATH_PREFIX)
+        } else {
+            origin
+        };
         Box::pin(async move {
             transfer
                 .validate()
                 .map_err(|_| protocol("standby binary transfer representation mismatch"))?;
-            let response = client
+            let request = client
                 .post(url(&origin, &database, transfer, None, false))
+                .header(
+                    crate::client_compatibility::HEADER,
+                    crate::client_compatibility::advertisement(),
+                )
                 .bearer_auth(bearer)
                 .header(ACCEPT_ENCODING, "identity")
+                .header(
+                    crate::standby::shapes::ACCEPTED_SHAPES_HEADER,
+                    crate::standby::shapes::advertisement(),
+                )
                 .json(
                     &json!({"contract": transfer.route_api(), "version": 1, "consumer": consumer}),
-                )
-                .send()
-                .await
-                .map_err(network_error)?;
+                );
+            let response =
+                crate::node_credential::send_request(&client, request, install_key.as_ref())
+                    .await
+                    .map_err(|error| match error {
+                        crate::node_credential::SendError::Http(error) => network_error(error),
+                        crate::node_credential::SendError::Proof => {
+                            protocol("standby install proof unavailable")
+                        }
+                    })?;
+            let response = crate::client_compatibility::inspect(
+                response,
+                &compatibility,
+                "snapshot-binary",
+                "start",
+            )
+            .await
+            .map_err(super::classify_delta_transport_error)?;
             if response.status() != reqwest::StatusCode::ACCEPTED {
                 if transfer != SnapshotTransfer::IdentityV1
                     && response.status() == reqwest::StatusCode::NOT_FOUND
@@ -358,6 +450,8 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                 return Err(status_error(response.status()));
             }
             require_api(response.headers(), transfer)?;
+            let selected = crate::standby::delta_transport::selected_header(response.headers())
+                .map_err(|_| protocol("standby binary selected shape was invalid"))?;
             let body: StartBody =
                 serde_json::from_slice(&bounded_body(response, MAX_METADATA_BYTES).await?)
                     .map_err(|_| {
@@ -370,13 +464,12 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
             {
                 return Err(protocol("standby binary start response was invalid"));
             }
-            Ok(if transfer == SnapshotTransfer::IdentityV1 {
-                BinaryExport::identity(body.export_handle)
-            } else {
-                BinaryExport {
-                    handle: body.export_handle,
-                    transfer,
-                }
+            Ok(BinaryExport {
+                handle: body.export_handle,
+                transfer,
+                selected,
+                poll_selection: None,
+                actual_shape: None,
             })
         })
     }
@@ -389,8 +482,15 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
         handle: BinaryExport,
     ) -> BinaryFuture<BinaryPoll> {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
+        let origin = if install_key.is_some() {
+            format!("{origin}{}", crate::node_credential::REFRESH_PATH_PREFIX)
+        } else {
+            origin
+        };
         Box::pin(async move {
-            let response = client
+            let request = client
                 .get(url(
                     &origin,
                     &database,
@@ -398,15 +498,40 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                     Some(&handle.handle),
                     false,
                 ))
+                .header(
+                    crate::client_compatibility::HEADER,
+                    crate::client_compatibility::advertisement(),
+                )
                 .bearer_auth(bearer)
                 .header(ACCEPT_ENCODING, "identity")
-                .send()
-                .await
-                .map_err(network_error)?;
+                .header(
+                    crate::standby::shapes::ACCEPTED_SHAPES_HEADER,
+                    crate::standby::shapes::advertisement(),
+                );
+            let response =
+                crate::node_credential::send_request(&client, request, install_key.as_ref())
+                    .await
+                    .map_err(|error| match error {
+                        crate::node_credential::SendError::Http(error) => network_error(error),
+                        crate::node_credential::SendError::Proof => {
+                            protocol("standby install proof unavailable")
+                        }
+                    })?;
+            let response = crate::client_compatibility::inspect(
+                response,
+                &compatibility,
+                "snapshot-binary",
+                "poll",
+            )
+            .await
+            .map_err(super::classify_delta_transport_error)?;
             if response.status() != reqwest::StatusCode::OK {
                 return Err(status_error(response.status()));
             }
             require_api(response.headers(), handle.transfer)?;
+            let selected = crate::standby::delta_transport::selected_header(response.headers())
+                .map_err(|_| protocol("standby binary selected shape was invalid"))?;
+            handle.validate_selection(selected.as_ref())?;
             let bytes = bounded_body(response, MAX_METADATA_BYTES).await?;
             let (body, encoded) = if handle.transfer == SnapshotTransfer::IdentityV1 {
                 (
@@ -469,7 +594,7 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                         && body.sha256.is_none()
                         && body.error_code.is_none() =>
                 {
-                    Ok(BinaryPoll::Pending)
+                    Ok(BinaryPoll::Pending(selected))
                 }
                 "ready" if body.error_code.is_none() => {
                     let (Some(manifest), Some(size), Some(sha256)) =
@@ -483,6 +608,12 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                             Error::engine("standby binary manifest was invalid"),
                         )
                     })?;
+                    let actual = crate::standby::shapes::manifest(&manifest).ok_or_else(|| {
+                        protocol("standby binary manifest has an unsupported shape")
+                    })?;
+                    crate::standby::shapes::check_selection(selected.as_ref(), actual).map_err(
+                        |_| protocol("standby binary selected shape disagrees with manifest"),
+                    )?;
                     if size == 0
                         || manifest.snapshot.size_bytes != size
                         || manifest.snapshot.sha256 != sha256
@@ -493,6 +624,7 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                         ));
                     }
                     Ok(BinaryPoll::Ready {
+                        selected,
                         manifest: Box::new(manifest),
                         size,
                         sha256,
@@ -515,6 +647,8 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
 
     fn read(&self, request: BinaryReadRequest) -> BinaryFuture<Vec<u8>> {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
         Box::pin(async move {
             let BinaryReadRequest {
                 origin,
@@ -526,6 +660,11 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                 size,
                 sha256,
             } = request;
+            let origin = if install_key.is_some() {
+                format!("{origin}{}", crate::node_credential::REFRESH_PATH_PREFIX)
+            } else {
+                origin
+            };
             if length == 0
                 || length > MAX_CHUNK_BYTES
                 || offset
@@ -535,7 +674,7 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                 return Err(protocol("standby binary range request was invalid"));
             }
             let end = offset + length as u64 - 1;
-            let response = client
+            let request = client
                 .get(url(
                     &origin,
                     &database,
@@ -543,17 +682,42 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                     Some(&handle.handle),
                     true,
                 ))
+                .header(
+                    crate::client_compatibility::HEADER,
+                    crate::client_compatibility::advertisement(),
+                )
                 .bearer_auth(bearer)
                 .header(ACCEPT_ENCODING, "identity")
-                .header(RANGE, format!("bytes={offset}-{end}"))
-                .send()
-                .await
-                .map_err(network_error)?;
+                .header(
+                    crate::standby::shapes::ACCEPTED_SHAPES_HEADER,
+                    crate::standby::shapes::advertisement(),
+                )
+                .header(RANGE, format!("bytes={offset}-{end}"));
+            let response =
+                crate::node_credential::send_request(&client, request, install_key.as_ref())
+                    .await
+                    .map_err(|error| match error {
+                        crate::node_credential::SendError::Http(error) => network_error(error),
+                        crate::node_credential::SendError::Proof => {
+                            protocol("standby install proof unavailable")
+                        }
+                    })?;
+            let response = crate::client_compatibility::inspect(
+                response,
+                &compatibility,
+                "snapshot-binary",
+                "read",
+            )
+            .await
+            .map_err(super::classify_delta_transport_error)?;
             if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                 return Err(status_error(response.status()));
             }
             let headers = response.headers();
             require_api(headers, handle.transfer)?;
+            let selected = crate::standby::delta_transport::selected_header(headers)
+                .map_err(|_| protocol("standby binary selected shape was invalid"))?;
+            handle.validate_selection(selected.as_ref())?;
             if one_header(headers, &CONTENT_RANGE).map(str::to_owned)
                 != Some(format!("bytes {offset}-{end}/{size}"))
                 || one_header(headers, &ETAG).map(str::to_owned) != Some(format!("\"{sha256}\""))
@@ -589,8 +753,15 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
         handle: BinaryExport,
     ) -> BinaryFuture<()> {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
+        let origin = if install_key.is_some() {
+            format!("{origin}{}", crate::node_credential::REFRESH_PATH_PREFIX)
+        } else {
+            origin
+        };
         Box::pin(async move {
-            let response = client
+            let request = client
                 .delete(url(
                     &origin,
                     &database,
@@ -598,10 +769,32 @@ impl BinarySnapshotClient for HttpBinarySnapshotClient {
                     Some(&handle.handle),
                     false,
                 ))
+                .header(
+                    crate::client_compatibility::HEADER,
+                    crate::client_compatibility::advertisement(),
+                )
                 .bearer_auth(bearer)
-                .send()
-                .await
-                .map_err(network_error)?;
+                .header(
+                    crate::standby::shapes::ACCEPTED_SHAPES_HEADER,
+                    crate::standby::shapes::advertisement(),
+                );
+            let response =
+                crate::node_credential::send_request(&client, request, install_key.as_ref())
+                    .await
+                    .map_err(|error| match error {
+                        crate::node_credential::SendError::Http(error) => network_error(error),
+                        crate::node_credential::SendError::Proof => {
+                            protocol("standby install proof unavailable")
+                        }
+                    })?;
+            let response = crate::client_compatibility::inspect(
+                response,
+                &compatibility,
+                "snapshot-binary",
+                "cancel",
+            )
+            .await
+            .map_err(super::classify_delta_transport_error)?;
             if response.status() != reqwest::StatusCode::OK {
                 return Err(status_error(response.status()));
             }
@@ -796,6 +989,7 @@ impl StandbyRefreshController {
         poll: &BinaryPoll,
     ) -> std::result::Result<(), AttemptError> {
         let BinaryPoll::Ready {
+            selected: _,
             manifest,
             size,
             sha256,
@@ -841,12 +1035,15 @@ impl StandbyRefreshController {
         let retained = lease
             .run(move || Self::load_retained_resume(&dir, &saved_binding))
             .await?;
-        let handle = match &retained {
+        let mut handle = match &retained {
             None => return Ok(ResumeProbe::Absent),
             Some(Ok(ledger)) => BinaryExport::from_ready(ledger).map_err(local_io)?,
             Some(Err(pending)) => BinaryExport {
                 handle: pending.pending.export_handle.clone(),
                 transfer: pending.transfer,
+                selected: None,
+                poll_selection: None,
+                actual_shape: None,
             },
         };
         let bearer = read_credential(&self.config.credential_file)?;
@@ -863,9 +1060,13 @@ impl StandbyRefreshController {
                 if let Some(Ok(ready)) = &retained {
                     Self::check_saved_poll(ready, &poll)?;
                 }
+                let selected = match &poll {
+                    BinaryPoll::Pending(selected) | BinaryPoll::Ready { selected, .. } => selected,
+                };
+                handle.observe_poll(selected.as_ref())?;
                 Ok(poll)
             }) {
-            Ok(_) => Ok(ResumeProbe::Live),
+            Ok(_) => Ok(ResumeProbe::Live(Box::new((binding, handle)))),
             Err(error) if Self::is_binary_handle_gone(&error) => {
                 discard_owned(&lease, &self.refresh_dir).await?;
                 Ok(ResumeProbe::Gone)
@@ -895,7 +1096,7 @@ impl StandbyRefreshController {
     async fn start_durable_export(
         &self,
         binding: &binary_resume::ResumeBinding,
-        mut progress: Option<&mut AttemptProgress>,
+        progress: Option<&mut AttemptProgress>,
         lease: &binary_work::TransferLease,
     ) -> std::result::Result<
         (BinaryExport, transfer_repr::PendingTransfer, CancelHandle),
@@ -904,7 +1105,7 @@ impl StandbyRefreshController {
         let bearer = read_credential(&self.config.credential_file)?;
         // Record the actual start invocation, including an uncertain response
         // or cancellation while POST is in flight, to retain capture cooldown.
-        if let Some(progress) = progress.as_deref_mut() {
+        if let Some(progress) = progress {
             self.record_full_start(progress)?;
         }
         let preferred = SnapshotTransfer::GzipV1 {
@@ -925,9 +1126,8 @@ impl StandbyRefreshController {
                 // Only the initial empty, unmarked v2 route 404 authorizes
                 // compatibility. Reread credentials for this distinct request.
                 let bearer = read_credential(&self.config.credential_file)?;
-                if let Some(progress) = progress {
-                    self.record_full_start(progress)?;
-                }
+                // This is one durable export start, not a second transition
+                // attempt. The preferred route's invocation was recorded above.
                 self.binary_client
                     .start(
                         binding.origin.clone(),
@@ -1030,6 +1230,9 @@ impl StandbyRefreshController {
                         let handle = BinaryExport {
                             handle: saved.pending.export_handle.clone(),
                             transfer: saved.transfer,
+                            selected: None,
+                            poll_selection: None,
+                            actual_shape: None,
                         };
                         pending = Some(saved);
                         handle
@@ -1050,6 +1253,16 @@ impl StandbyRefreshController {
         // replacement already started is terminal: at most one fresh export
         // per attempt. Auth/network/timeout failures preserve custody;
         // terminal protocol/integrity errors discard and cancel it.
+        if let Some(progress) = progress.as_deref() {
+            if let Some((observed_binding, observed_handle)) = &progress.resume_observation {
+                if observed_binding == &binding
+                    && observed_handle.handle == handle.handle
+                    && observed_handle.transfer == handle.transfer
+                {
+                    handle.poll_selection = observed_handle.poll_selection.clone();
+                }
+            }
+        }
         let mut capture_update = tokio::time::Instant::now();
         let (manifest, decoded_size, decoded_sha, encoded) = loop {
             match self
@@ -1087,9 +1300,16 @@ impl StandbyRefreshController {
                 Err(error) => {
                     return Err(error);
                 }
-                Ok(BinaryPoll::Pending) => {
+                Ok(BinaryPoll::Pending(selected)) => {
+                    if let Err(error) = handle.observe_poll(selected.as_ref()) {
+                        cancel.arm();
+                        discard_owned(&lease, &dir).await?;
+                        return Err(error);
+                    }
                     if let Some(saved) = &ledger {
-                        if let Err(error) = Self::check_saved_poll(saved, &BinaryPoll::Pending) {
+                        if let Err(error) =
+                            Self::check_saved_poll(saved, &BinaryPoll::Pending(None))
+                        {
                             cancel.arm();
                             discard_owned(&lease, &dir).await?;
                             return Err(error);
@@ -1102,15 +1322,34 @@ impl StandbyRefreshController {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
                 Ok(BinaryPoll::Ready {
+                    selected,
                     manifest,
                     size,
                     sha256,
                     encoded,
                 }) => {
+                    if let Err(error) = handle.observe_poll(selected.as_ref()) {
+                        cancel.arm();
+                        discard_owned(&lease, &dir).await?;
+                        return Err(error);
+                    }
                     break (manifest, size, sha256, encoded);
                 }
             }
         };
+        if let Some(entry) = crate::standby::shapes::manifest(&manifest) {
+            // Pending responses cannot contradict the later manifest, even
+            // when this legacy94 start supplied no selected-shape header.
+            if let Err(error) = handle.validate_selection(Some(&entry.shape())) {
+                cancel.arm();
+                discard_owned(&lease, &dir).await?;
+                return Err(error);
+            }
+            handle.actual_shape = Some(entry.shape());
+            if entry.observation_envelope {
+                handle.selected = Some(entry.shape());
+            }
+        }
         // Adopt the Ready identity: a saved ready ledger must equal the
         // poll; a pending capture upgrades. Changed ready metadata refuses
         // reuse outright instead of splicing captures.
@@ -1119,6 +1358,7 @@ impl StandbyRefreshController {
                 if Self::check_saved_poll(
                     &saved,
                     &BinaryPoll::Ready {
+                        selected: None,
                         manifest: manifest.clone(),
                         size: decoded_size,
                         sha256: decoded_sha.clone(),
@@ -1187,6 +1427,11 @@ impl StandbyRefreshController {
             }
         };
         let size = ledger.range_size();
+        // attempt.lock and TransferLease own all competing transfer work.
+        // Refuse before preparing a partial file or issuing any range GET.
+        let disk_budget = self
+            .transition_transfer_budget(&manifest, size)
+            .map_err(local_io)?;
         let sha256 = ledger.range_sha().to_owned();
         let prepare_dir = dir.clone();
         let prepared = lease
@@ -1211,6 +1456,7 @@ impl StandbyRefreshController {
             other => other?,
         };
         let mut completed: u64 = ledger.completed.iter().map(|range| range.length).sum();
+        let persisted_bytes = std::sync::atomic::AtomicU64::new(completed);
         self.record_transfer_stage(
             StandbyTransferStage::Download,
             Some((size, completed)),
@@ -1247,12 +1493,17 @@ impl StandbyRefreshController {
                     size,
                     sha256: sha256.clone(),
                 };
+                let disk_budget = disk_budget.as_ref();
+                let persisted_bytes = &persisted_bytes;
                 async move {
-                    (
-                        offset,
-                        length,
-                        self.read_binary_chunk_with_retry(request).await,
-                    )
+                    let result = match self.check_transition_transfer_budget(
+                        disk_budget,
+                        persisted_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    ) {
+                        Ok(()) => self.read_binary_chunk_with_retry(request).await,
+                        Err(error) => Err(local_io(error)),
+                    };
+                    (offset, length, result)
                 }
             })
             .buffer_unordered(MAX_IN_FLIGHT_RANGES);
@@ -1274,6 +1525,8 @@ impl StandbyRefreshController {
                     Error::engine("standby binary range length mismatch"),
                 ));
             }
+            self.check_transition_transfer_budget(disk_budget.as_ref(), completed)
+                .map_err(local_io)?;
             let write_dir = dir.clone();
             let persisted = lease
                 .run(move || {
@@ -1295,6 +1548,7 @@ impl StandbyRefreshController {
                 other => other?,
             };
             completed += length as u64;
+            persisted_bytes.store(completed, std::sync::atomic::Ordering::Relaxed);
             if completed == size || last_update.elapsed() >= transfer_progress::BYTE_UPDATE_INTERVAL
             {
                 self.record_transfer_stage(
@@ -1315,6 +1569,8 @@ impl StandbyRefreshController {
         // handoff succeeds, including identity-v1, so cancellation can resume.
         let complete_dir = dir.clone();
         let dest = snapshot_path.to_owned();
+        self.check_transition_transfer_budget(disk_budget.as_ref(), size)
+            .map_err(local_io)?;
         let output = match lease
             .run(move || binary_work::complete_snapshot(&complete_dir, &dest, &ledger))
             .await
@@ -1453,6 +1709,7 @@ mod tests {
 
     fn wire_consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,
@@ -1530,5 +1787,91 @@ mod tests {
             assert_eq!(error.class, class);
             assert_eq!(error.detail, detail);
         }
+    }
+    #[tokio::test]
+    async fn every_binary_transport_records_update_before_status_or_fallback() {
+        use axum::{http::HeaderMap, routing::any, Json, Router};
+        let app = Router::new().fallback(any(|headers:HeaderMap| async move {
+            assert_eq!(headers[crate::client_compatibility::HEADER],crate::client_compatibility::advertisement());
+            (axum::http::StatusCode::UPGRADE_REQUIRED,Json(json!({"error_code":"client_update_required","outcome":"refused","applied":false})))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpBinarySnapshotClient::new().unwrap();
+        let handle: BinaryExport = "12345678-1234-1234-1234-1234567890ab".into();
+        let errors = vec![
+            client
+                .start(
+                    origin.clone(),
+                    "db".into(),
+                    "secret".into(),
+                    wire_consumer(),
+                    SnapshotTransfer::IdentityV1,
+                )
+                .await
+                .err()
+                .unwrap(),
+            client
+                .poll(origin.clone(), "db".into(), "secret".into(), handle.clone())
+                .await
+                .err()
+                .unwrap(),
+            client
+                .read(BinaryReadRequest {
+                    origin: origin.clone(),
+                    database: "db".into(),
+                    bearer: "secret".into(),
+                    handle: handle.clone(),
+                    offset: 0,
+                    length: 1,
+                    size: 1,
+                    sha256: "a".repeat(64),
+                })
+                .await
+                .err()
+                .unwrap(),
+            client
+                .cancel(origin, "db".into(), "secret".into(), handle)
+                .await
+                .err()
+                .unwrap(),
+        ];
+        for error in errors {
+            assert_eq!(error.class, RefreshFailureClass::Compatibility);
+        }
+        assert_eq!(
+            client.compatibility.status()["demands"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn inspected_json_without_exact_size_hint_keeps_per_chunk_ceiling() {
+        let body = vec![b' '; 32 * 1024];
+        let response: reqwest::Response = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, body.len())
+            .body(reqwest::Body::from(body))
+            .unwrap()
+            .into();
+        assert_eq!(response.content_length(), Some(32 * 1024));
+        let response = crate::client_compatibility::inspect(
+            response,
+            &Default::default(),
+            "snapshot-binary",
+            "poll",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.headers()[CONTENT_LENGTH], "32768");
+        assert_eq!(response.content_length(), None);
+        let error = bounded_body(response, 128).await.unwrap_err();
+        assert_eq!(error.class, RefreshFailureClass::Protocol);
+        assert!(error.source.to_string().contains("exceeded its bound"));
     }
 }

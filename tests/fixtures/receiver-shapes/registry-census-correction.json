@@ -1,0 +1,36 @@
+{
+  "failed_head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+  "ci_run": 43670345138,
+  "job": 132678931918,
+  "functional_default_result": "2031 passed; 0 failed; 3 ignored",
+  "census_failure": "expected9253 observed9256; three probe-owned registry cases compiled under default",
+  "change": "Only tests module cfg(test) -> cfg(all(test, feature = v2-kernel-probe)); existing authority and required probe selectors unchanged.",
+  "default": {
+    "binary": "/fixtures/receiver/target/debug/deps/native_ce-4f333b7e5c545198",
+    "binary_sha256": "9047b33ea854a1de21331203b2c69dedde4594641926e4b47f103236bee5daf1",
+    "list_sha256": "cad85f82afb829f2536590c77adb24ce9f5dc59db681d4b7dbe65fd5982f93d7",
+    "registry_cases": 0,
+    "absent": [
+      "compiled_emission_is_an_exact_registry_member",
+      "exact_registry_and_directed_transitions",
+      "frozen_95_ddl_is_independent_of_emission"
+    ]
+  },
+  "probe": {
+    "binary": "/fixtures/receiver/target/debug/deps/native_ce-9dd1640e9412816c",
+    "binary_sha256": "b536cc5a99467f2c879185c8da8fe91ea60a3a21cd7618b4e9ab055ef8ff593a",
+    "list_sha256": "f57f772f625084d837260bfe8e526a6144ed18c424a69b306a18a24f2052a205",
+    "registry_cases": 4,
+    "present": [
+      "compiled_emission_is_an_exact_registry_member",
+      "exact_registry_and_directed_transitions",
+      "frozen_95_ddl_is_independent_of_emission",
+      "frozen_owned_shapes_and_exact_marking_normalization"
+    ],
+    "test_exit": 0,
+    "test_log_sha256": "e6f698d56f8838846f441477834a1412282b8b9c28452b8e29f2b51de3fc946a"
+  },
+  "policy": "passed:106 jobs,14350 source tests,9 doctests",
+  "census_unit": "all15 passed with NATIVE_TEST_V2_GRAPH_SCOPES=1; source-derived selector unit proof, distinct from real compiled lists",
+  "shipping_change": false
+}

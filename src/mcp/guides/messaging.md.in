@@ -34,6 +34,68 @@ unaddressed channel post puts an obligation on nobody and inherits the
 Collection's audience. A non-`none` expectation with nobody addressed is
 rejected: nobody carries the obligation.
 
+## Completing an action request on someone's behalf
+
+A completed action and human awareness are separate facts. Ordinary authenticated
+MCP calls can record work for their account; they do not attest that the person
+saw a Message, nor establish a server-verified agent executor or delegation.
+
+For an `action` request the person confirms is done:
+
+1. Read the Message and look for an existing work item for the requested action.
+   Reuse it when it belongs to the recipient; do not close an unrelated task.
+2. Create or update a recipient-authored `WorkItem`, with a `derived_from` link
+   **from the work item to the Message**. Record what was done and the basis for
+   completion. Attribute a person's report as their report; do not imply you
+   independently checked an external service. Keep the evidence in an appropriate
+   home and preserve its audience.
+3. Set its `lifecycle` to a positively completed value in its governing lifecycle
+   vocabulary. Use the actual vocabulary, rather than assuming a value such as
+   `done` or treating cancellation as completion.
+4. Check `manage_messages.list_message_state` for that Message. Its
+   `message_expectation_state` should be `satisfied`, with evidence kind
+   `completed_work_item`. If it remains open, inspect the work item's authorship,
+   link authorship and direction, visibility and governing lifecycle; do not
+   report success. The recipient must author the `derived_from` link too.
+
+For example, when the governing lifecycle vocabulary uses `completed`, this
+`create_record` call records the person's confirmation privately to their account:
+
+```json
+{
+  "type": "WorkItem",
+  "kind": "task",
+  "name": "Complete the requested action",
+  "body": "The recipient confirmed the requested action was completed. This records their report, not an independent external check.",
+  "home_id": "<appropriate-home>",
+  "lifecycle": "completed",
+  "access_policy": "account_only",
+  "idempotency_key": "<unique-completion-key>",
+  "sources": ["<message-id>"],
+  "links": [{"target_id": "<message-id>", "relationship": "derived_from"}],
+  "reason": "Record the recipient's confirmed completion"
+}
+```
+
+This applies to direct and Collection messages. Satisfaction is derived from
+live evidence: reopening the work item or removing its link can reopen the
+expectation. It does not mark the Message read or advance human awareness, and
+one recipient's work does not complete another recipient's obligation. Inspect
+`list_inbox` when the aim is to clear `needs_me`: explicit routing is a separate
+axis and an explicit open route takes precedence over derived satisfaction.
+Changing that route still needs an attested principal choice or trusted policy.
+
+A threaded reply satisfies `ack` or `reply`, not `action` or `decision`.
+`mark_read` changes unread state only. `mark_no_longer_relevant` records that
+work is no longer needed; it must not stand for completed work.
+
+If `set_routing`, `set_agent_disposition` or `mutate_human_awareness` refuses
+missing attestation, do not invent attestation fields or use another lane to
+claim a human interaction. Use the work-evidence path for action completion.
+If an explicit route must change, ask the person to change it in an attested
+client such as their inbox. Human awareness and verified agent disposition
+remain separate and require their supported host attestations.
+
 ## New messages, replies, corrections
 
 - **New message.** Supply `body`, `origin`, `addressed_to`, `expectation`,

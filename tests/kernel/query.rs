@@ -1440,6 +1440,7 @@ async fn pipeline_pages_and_orders() {
         &steps,
         None,
         &pipeline::PipelineOptions {
+            metadata_only: false,
             facet_order: None,
             order: pipeline::Order::NameAsc,
             limit: 3,

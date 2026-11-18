@@ -19,6 +19,7 @@ pub mod foci_wire;
 pub mod relates_to;
 pub(crate) mod relates_to_retained;
 pub mod relates_to_v1;
+pub mod saved_tabs;
 pub mod v1_compat;
 // Preserve the frozen version, including its superseded discovery helpers.
 #[allow(dead_code)]
@@ -129,6 +130,7 @@ fn compiled_packages() -> Vec<PackageManifest> {
         relates_to::package(),
         claims_v1::package(),
         foci::package(),
+        saved_tabs::package(),
         v1_compat::package(),
     ]);
     packages

@@ -25,13 +25,33 @@ use sha2::{Digest, Sha256};
 /// change is `body_append` (see [`is_holdable`]). Each must accept
 /// `idempotency_key` in its contract; a test checks that against the engine's
 /// own contracts. Everything else keeps slice 2A's behaviour.
-pub(super) const HOLDABLE: [(&str, &str); 5] = [
+pub(super) const HOLDABLE: [(&str, &str); 6] = [
     ("records_write", "create_record"),
     ("records_write", "create_many"),
     ("records_write", "manage_links.add"),
     ("records_write", "attach_text"),
     ("records_write", "update_record"),
+    ("records_write", "merge_body"),
 ];
+
+/// Writes the node holds today even though their acceptance declaration says
+/// they are queued and shown as waiting (`requires_acceptance`; see
+/// `mcp::executor_prototype::acceptance`). Held writes are exactly
+/// [`HOLDABLE`]; the declaration describes how a write shows while it waits
+/// and does not decide what the node holds. Tests keep the two in step: every
+/// holdable write must be declared, and it may be declared as requiring
+/// acceptance only if it is listed here.
+///
+/// `create_many` is the one exception. Replaying it creates its records
+/// again, so it is declared `ReplayDuplicates`. It stays held because it
+/// always has been and this list does not change what is held. Whether to stop
+/// holding it, or make its replay safe, is a later change; delete this entry
+/// when it lands.
+///
+/// Only the tests read this list; it records the exceptions they enforce.
+#[cfg(test)]
+pub(super) const HELD_DESPITE_REQUIRING_ACCEPTANCE: [(&str, &str); 1] =
+    [("records_write", "create_many")];
 
 /// What the node worked out about a held write from its arguments.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -49,7 +69,7 @@ pub(super) fn creates(operation: &str) -> bool {
 }
 
 /// Whether this call's operation and shape are eligible to be held. The gate
-/// must also establish matching cached hosted/local contracts and validate the
+/// must also establish compatible cached hosted/local contracts and validate the
 /// original and prepared call when it decides to hold. Online admission stays
 /// with hosted.
 pub(super) fn is_holdable(executor: &str, operation: &str, arguments: &Value) -> bool {
@@ -207,7 +227,7 @@ pub(super) fn prepare(operation: &str, arguments: &mut Value, key: &str, intent:
                 }),
             record_ids: Vec::new(),
         },
-        "update_record" => Plan {
+        "merge_body" | "update_record" => Plan {
             title: None,
             record_id: text(object.get("id")).or_else(|| text(object.get("record_id"))),
             record_ids: Vec::new(),
@@ -243,7 +263,7 @@ pub(super) fn references(operation: &str, arguments: &Value) -> Vec<String> {
     }
     let mut found = Vec::new();
     match operation {
-        "update_record" => {
+        "merge_body" | "update_record" => {
             push(&mut found, arguments.get("id"));
             push(&mut found, arguments.get("record_id"));
         }
@@ -287,6 +307,19 @@ pub(super) fn is_deployment_read_only(reply: &str) -> bool {
     let Ok(reply) = serde_json::from_str::<Value>(reply) else {
         return false;
     };
+    if [
+        "/result/structuredContent",
+        "/error/data",
+        "/error/data/upstream_body",
+        "/error/data/upstream_body/error",
+    ]
+    .into_iter()
+    .filter_map(|pointer| reply.pointer(pointer))
+    .any(|body| {
+        super::has_uncertain_outcome(body) || body.get("applied") == Some(&Value::Bool(true))
+    }) {
+        return false;
+    }
     let is = |pointer: &str| reply.pointer(pointer).and_then(Value::as_str) == Some(CODE);
     // An engine refusal says `applied: false`; anything else is not this one.
     let applied_false = |pointer: &str| {
@@ -306,6 +339,42 @@ pub(super) fn is_deployment_read_only(reply: &str) -> bool {
             && applied_false("/error/data/upstream_body/applied"))
 }
 
+/// Schedule only an actual known-unapplied deployment response. The existing
+/// classifier owns contradiction/partial-outcome rejection; this adds no verdict.
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) fn deployment_read_only_retry_not_before(reply: &str, now_ms: u64) -> Option<u64> {
+    if !is_deployment_read_only(reply) {
+        return None;
+    }
+    let reply = serde_json::from_str::<Value>(reply).ok()?;
+    let body = [
+        "/result/structuredContent",
+        "/error/data",
+        "/error/data/upstream_body",
+        "/error/data/upstream_body/error",
+    ]
+    .into_iter()
+    .filter_map(|pointer| reply.pointer(pointer))
+    .find(|body| {
+        body.get("applied") == Some(&Value::Bool(false))
+            && ["/error_code", "/code", "/error/code"]
+                .into_iter()
+                .any(|pointer| {
+                    body.pointer(pointer).and_then(Value::as_str) == Some("DEPLOYMENT_READ_ONLY")
+                })
+    })?;
+    let minimum = crate::mcp::deployment_read_only::DEPLOYMENT_READ_ONLY_RETRY_AFTER_SECS;
+    let fallback = now_ms.checked_add(minimum.checked_mul(1000)?)?;
+    // Missing/invalid/overflowing hints use the existing canonical minimum;
+    // never wrap a huge hint into an immediate retry or shorten a valid one.
+    body.get("retry_after_secs")
+        .and_then(Value::as_u64)
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| seconds.max(minimum).checked_mul(1000))
+        .and_then(|millis| now_ms.checked_add(millis))
+        .or(Some(fallback))
+}
+
 /// The one reply for a write the node holds: the first time, and again for
 /// every repeat of the call while it is still waiting.
 pub(super) fn pending_reply(
@@ -318,6 +387,7 @@ pub(super) fn pending_reply(
     let key = entry.idempotency_key.as_deref().unwrap_or_default();
     let why = match reason {
         HoldReason::DeploymentReadOnly => "hosted is read-only for a deployment",
+        HoldReason::ClientUpdateRequired => "client update demand recorded; updater unavailable",
         HoldReason::HostedUnreachable => "hosted is unreachable",
         HoldReason::Other => "hosted cannot take writes",
     };
@@ -335,6 +405,28 @@ pub(super) fn pending_reply(
         ),
         "attribution_note": "A held write commits under the run's intent at the time it is sent, so its attribution can differ slightly from the intent at the time of this call.",
     });
+    if entry.version == super::journal::V2_EVIDENCE_VERSION {
+        info["preview_available"] = json!(false);
+    }
+    if let Some(compatibility) = entry.custody_compatibility {
+        info["contract_compatibility"] = json!(compatibility);
+        info["preview_available"] = json!(false);
+    }
+    if let Some(message) = entry.compatibility_message() {
+        info["status"] = json!(if entry.waiting_for.is_some() {
+            "waiting_behind"
+        } else if entry.compatibility_block
+            == Some(super::journal::CompatibilityBlock::EvidenceMissing)
+        {
+            "pending"
+        } else {
+            "needs_you"
+        });
+        info["compatibility_block"] = json!(entry.compatibility_block);
+        info["waiting_for"] = json!(entry.waiting_for);
+        info["recovery"] = json!(message);
+        info["how_to_check"] = json!("Repeat this exact keyed call to check its status. Before replacing it, explicitly acknowledge the original, checking canonical history first if it may have applied. Then use a new key.");
+    }
     let object = info.as_object_mut().expect("object");
     if creates(&entry.operation) {
         if let Some(record) = &entry.record_id {
@@ -364,6 +456,9 @@ pub(super) fn pending_reply(
         "To check: repeat the same call with idempotency_key={key}. It returns 'pending' while the write waits, then the original receipt or the refusal."
     ));
     lines.push("It commits under the run's intent at the time it is sent, which can differ slightly from the intent now.".into());
+    if let Some(message) = entry.compatibility_message() {
+        lines = vec![message.into()];
+    }
     super::tool_reply(
         id,
         json!({

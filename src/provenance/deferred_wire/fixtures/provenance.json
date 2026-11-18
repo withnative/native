@@ -1,0 +1,24 @@
+{
+  "format": "native.deferred-wire.pre-extraction-fixtures/v1",
+  "source_head": "e8b7fcc9538a29c9dbabaa30094c6f4245539c85",
+  "capture_binary_sha256": "ae134c8b6e22db36499f78dfb2775f29cd92f9038052038dac4a702561fecee6",
+  "description": "Original Hosting validator, signer and message functions; DATA-only fixtures, not authenticated acceptance. V1 fixture copies are unchanged historical bytes.",
+  "sha256": {
+    "intent-entry.json": "5324c9a7a864c6af9f3cebd6e4a24555ab8ce02a5c354499269d9bfed459c26d",
+    "intent-message.bin": "e72c6007e0f3df01dcde69bcfb1b6b8be7c9373ae34c35cfa6f112dd4464cc69",
+    "key.json": "7ef6d7756297c1dcf0a4f56bbef9dcb57f61420a1f6123927274fda7b10e2d37",
+    "null-intent-entry.json": "7c6e2589ae7ed6dd88bc96ec3c6758a1a28f5dab8834cc21a63c90b00855669e",
+    "null-intent-message.bin": "c13dc6eca1bf3edfac2220ff8f03ec774f5b941fa33f5ff63fc4f11cc4116bde",
+    "v1-default-ingress.json": "28d4dd74023b7e86ff484d6f4e5ace57345ce52b051dc9c6532b78189957d718",
+    "v1-entry.json": "e010f76bc9e3cabc60aea090d4ad24815505978ae9f16c0d45e5d9790573b7d1",
+    "v1-key.json": "7ef6d7756297c1dcf0a4f56bbef9dcb57f61420a1f6123927274fda7b10e2d37",
+    "v1-message.bin": "b3c7362cd4570b50798c472e37ca02d48a8cf42f9d979a3b092214ba4c6d50a9",
+    "v1-missing-ingress.json": "3a7ca61201f6e85b11c914c65644d704d45e2ff9da3140050e4d8aff18517dca"
+  },
+  "original_source_sha256": {
+    "held/hosting/src/hosting/maintenance_outbox/deferred_auth.rs": "52cf8df4ee520dba20aad8ace07f4d396ab8dca92cb6d4ef35345ba51fee27b9",
+    "held/hosting/src/hosting/maintenance_outbox/deferred_v2.rs": "7e4df035fcdb8574fc10bc43228fef89c5e8bf95891e11ba69edd087daadaae3",
+    "held/hosting/src/hosting/maintenance_outbox/journal.rs": "30359491bb0f7b0e88aa193ce77c15e49aba7b6bb967b1a771dcd782d8c56f71"
+  },
+  "capture_source_sha256": "42b180cf356db2d0e1edb612a58decf1fec51f0551cbda500241f553dae0199b"
+}

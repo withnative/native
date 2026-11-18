@@ -1,6 +1,152 @@
 use super::*;
 use transfer_repr::SnapshotTransfer;
 
+#[tokio::test]
+async fn receiver_first_full_space_covers_both_real_copies_without_a_pin_margin() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let (bytes, manifest) = snapshot_fixture(&db).await;
+    let first_peak = manifest.snapshot.size_bytes * 3 + 16 * 1024 * 1024;
+    for ample in [false, true] {
+        let fixture = acquisition_fixture(bytes.clone(), manifest.clone());
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = controller(&dir, manifest.origin_database_id.clone(), port);
+        assert_eq!(
+            controller.store.full_predecessor_scratch_bytes().unwrap(),
+            0
+        );
+        // Identity wireD plus decoded stagingD and owned publicationD. No
+        // previous generation exists to incur a generic pin's late margin.
+        controller.kernel_available_space = Some(if ample { first_peak } else { first_peak - 1 });
+        let snapshot = controller.store.staging_dir().join("first-full.db");
+        let result = controller
+            .download_binary_and_install(
+                "secret".into(),
+                &snapshot,
+                &controller.store.staging_dir().join("first-full.json"),
+                binary::FreshCaptureBudget::Allowed,
+                &mut AttemptProgress::new(RefreshCause::Scheduled),
+            )
+            .await;
+        if ample {
+            let (generation, _) = result.unwrap();
+            assert_eq!(fs::read(generation.snapshot_path).unwrap(), bytes);
+            assert!(controller.store.accepted_identity_hint().unwrap().is_some());
+            assert!(!fixture.ranges.lock().unwrap().is_empty());
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.source.to_string().contains("transition_disk_budget"),
+                "{error:?}"
+            );
+            assert!(
+                fixture.ranges.lock().unwrap().is_empty(),
+                "refuse before the body transfer"
+            );
+            assert!(!snapshot.exists());
+            assert!(controller.store.accepted_identity_hint().unwrap().is_none());
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        controller.store.maintenance_idle().await;
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn receiver_legacy94_full_rejects_contradictory_poll_and_range_selection() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let (bytes, manifest) = snapshot_fixture(&db).await;
+    for fault in [
+        BinaryWireFault::WrongPollSelection,
+        BinaryWireFault::WrongRangeSelection,
+    ] {
+        let mut fixture = acquisition_fixture(bytes.clone(), manifest.clone());
+        fixture.fault = fault;
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let controller = controller(&dir, manifest.origin_database_id.clone(), port);
+        if matches!(fault, BinaryWireFault::WrongPollSelection) {
+            // A retained94 Ready identity must constrain even a later Pending
+            // poll. It has no selected header in the old protocol.
+            let ledger = binary_resume::new_ready_ledger(
+                &controller.resume_binding(),
+                BINARY_TEST_HANDLE.into(),
+                manifest.snapshot.size_bytes,
+                manifest.snapshot.sha256.clone(),
+                manifest.clone(),
+                now(),
+            );
+            binary_resume::prepare_partial_file(&controller.refresh_dir, bytes.len() as u64)
+                .unwrap();
+            binary_resume::save_resume_ledger(&controller.refresh_dir, &ledger).unwrap();
+            let result = controller.probe_binary_resume().await;
+            assert!(
+                result.is_err(),
+                "a95 poll selection cannot replace a bound94 export"
+            );
+            assert_eq!(result.err().unwrap().class, RefreshFailureClass::Protocol);
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        } else {
+            let error = controller
+                .download_binary_only(
+                    "secret".into(),
+                    &dir.path().join("contradictory.db"),
+                    binary::FreshCaptureBudget::Allowed,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.class, RefreshFailureClass::Protocol);
+            assert!(!fixture.ranges.lock().unwrap().is_empty());
+        }
+        assert!(controller.store.accepted_identity_hint().unwrap().is_none());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn receiver_missing_gzip_route_consumes_one_transition_capture_start() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let (bytes, manifest) = snapshot_fixture(&db).await;
+    // The fixture serves only the original identity route: the preferred
+    // gzip POST returns a bare404 before one real capture starts.
+    let fixture = acquisition_fixture(bytes, manifest.clone());
+    let (port, server) = serve_binary_fixture(fixture.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let controller = controller(&dir, manifest.origin_database_id.clone(), port);
+    controller
+        .observe_transition(
+            super::super::super::shapes::v1(94, super::super::super::shapes::V1_94).unwrap(),
+            super::super::super::shapes::v1(95, super::super::super::shapes::V1_95).unwrap(),
+        )
+        .unwrap();
+    let mut progress = AttemptProgress::new(RefreshCause::Scheduled);
+    progress.transition = true;
+    controller
+        .download_binary_and_install(
+            "secret".into(),
+            &controller.store.staging_dir().join("one-start.db"),
+            &controller.store.staging_dir().join("one-start.json"),
+            binary::FreshCaptureBudget::Allowed,
+            &mut progress,
+        )
+        .await
+        .unwrap();
+    let episode: Value = serde_json::from_slice(
+        &fs::read(controller.refresh_dir.join("shape-transition.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(episode["attempts"], 1);
+    assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+    assert!(progress.full_started_at.is_some());
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    controller.store.maintenance_idle().await;
+    db.close().await;
+}
+
 fn controller(dir: &tempfile::TempDir, origin: String, port: u16) -> StandbyRefreshController {
     let mut controller = controller_for_origin(
         dir,

@@ -2,20 +2,77 @@
 //!
 //! Only TEMP state is written. The physical connection is discarded even on
 //! cancellation, so neither scoped rows nor VM guards can reach another caller.
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) mod working_snapshot;
+
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+// Semantic selector inputs shared with the disposable projector.
+pub(crate) const SELECTOR_EXCLUSION_GLOBS_SQL: &str =
+    "e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT GLOB 'kernel.webhook_*'";
+pub(crate) const IMPORT_EVENT_PATTERN: &str = "kernel.import_*";
+pub(crate) fn native_event_globs_sql() -> String {
+    format!("{SELECTOR_EXCLUSION_GLOBS_SQL} AND e.type NOT GLOB '{IMPORT_EVENT_PATTERN}'")
+}
+pub(crate) const RECORD_EVENT_EXCLUSIONS_SQL: &str = "'kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1','kernel.identity_bindings_reconciled.v1','kernel.account_config_bound.v1','kernel.app_state_imported.v1','kernel.import_receipt.v1','kernel.v1_state_imported.v1','kernel.message_state.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.mcp_write_receipt_recorded.v1','kernel.mcp_write_fenced.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1','kernel.provider_outcome.v1','kernel.link_added.v2','kernel.link_added.v1','kernel.link_removed.v1'";
+pub(crate) const PROJECTED_EVENT_EXCLUSIONS_SQL: &str = "'kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1','kernel.identity_bindings_reconciled.v1','kernel.account_config_bound.v1','kernel.app_state_imported.v1','kernel.v1_state_imported.v1','kernel.message_state.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.mcp_write_receipt_recorded.v1','kernel.mcp_write_fenced.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1'";
+pub(crate) const V1_LINK_TYPES_SQL: &str = "'kernel.link_added.v1','kernel.link_removed.v1'";
+pub(crate) const GENERIC_LINK_PATTERN: &str = "kernel.generic_link_%";
+pub(crate) const LINK4_TYPE: &str = "kernel.link_added.v2";
+pub(crate) const PROVIDER_TYPE: &str = "kernel.provider_outcome.v1";
+
 mod activity;
 mod connection;
+pub(crate) mod demand;
+#[cfg(test)]
+pub(crate) mod event_equivalence;
+#[cfg(test)]
+pub(crate) mod event_profile;
+mod event_projection;
+mod event_scope;
+#[cfg(test)]
+mod event_staging_baseline;
+#[cfg(test)]
+pub(crate) use event_scope::with_full_staging as with_full_event_staging;
 mod facet_times;
 mod facets;
+mod guard_diagnostics;
 mod lifecycle;
 mod named_views;
+mod observation_scope;
 mod predicates;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod read_diagnostics;
 mod record_classes;
+mod record_projection;
+#[cfg(test)]
+pub(crate) use record_projection::with_oracle as with_record_projection_oracle;
+#[cfg(test)]
+#[path = "sql_read_cost.rs"]
+pub(crate) mod read_cost;
 mod record_scope;
+mod union_sections;
+pub(crate) mod visible_cache;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) use read_diagnostics::{with_candidate_diagnostics, with_session_lifecycle};
+
+#[cfg(test)]
+pub(crate) async fn with_full_union_staging<F: std::future::Future>(work: F) -> F::Output {
+    union_sections::with_full_staging(work).await
+}
+
+#[cfg(test)]
+tokio::task_local! { static ALL_MOVED_CANDIDATES: (); }
+
+/// Same-fixture baseline for Get/render before logical move narrowing.
+#[cfg(test)]
+pub(crate) async fn with_all_moved_candidates<F: std::future::Future>(work: F) -> F::Output {
+    ALL_MOVED_CANDIDATES.scope((), work).await
+}
 
 #[cfg(test)]
 pub(crate) async fn with_full_record_scope_staging<F: std::future::Future>(work: F) -> F::Output {
@@ -35,6 +92,18 @@ pub(crate) async fn with_full_lifecycle_staging<F: std::future::Future>(work: F)
 #[cfg(test)]
 pub(crate) async fn with_full_record_class_staging<F: std::future::Future>(work: F) -> F::Output {
     predicates::with_full_staging(work).await
+}
+
+/// Today's full-staging read: every finite-scope narrowing off, permanent
+/// oracle cells. The reference that demand-scoped staging must equal.
+#[cfg(test)]
+pub(crate) async fn with_full_read_oracle<F: std::future::Future>(work: F) -> F::Output {
+    record_projection::with_oracle(record_scope::with_full_staging(
+        predicates::with_full_staging(event_scope::with_full_staging(
+            union_sections::with_full_staging(work),
+        )),
+    ))
+    .await
 }
 
 use futures::TryStreamExt;
@@ -63,6 +132,7 @@ pub(crate) fn columns(relation: &str) -> Option<&'static [&'static str]> {
         "runs",
         "run_intents",
         "actors",
+        "viewer",
         "comment_anchors",
         "vocabularies",
         "vocabulary_values",
@@ -79,6 +149,7 @@ pub(crate) fn columns(relation: &str) -> Option<&'static [&'static str]> {
         "messages_awaiting_reply",
         "catalog_relations",
         "catalog_columns",
+        "catalog_operations",
         "catalog_view_definitions",
     ]
     .contains(&relation)
@@ -125,15 +196,150 @@ fn unsupported(relation: &str, column: &str) -> Error {
 // is task-local, handle/caller-bound, never cached across requests, and its
 // physical connection is discarded on cancellation just like ordinary SQL.
 struct ReadSession {
+    #[cfg(test)]
+    cost_probe: Option<usize>,
     db: Db,
     actor: String,
     connection: connection::ReadConnection,
     reads: BTreeSet<(String, String)>,
     as_of_seq: i64,
     cache_identity: Option<kernel::read_cache::Key>,
+    admission_cache: std::sync::Arc<kernel::app_installs::ReadAdmissions>,
+    demand_enabled: bool,
+    staging: SessionStaging,
+    staging_failure: Option<String>,
 }
 tokio::task_local! {
     static READ_SESSION: std::sync::Arc<tokio::sync::Mutex<ReadSession>>;
+    static SNAPSHOT_VM_DEADLINE: Instant;
+}
+
+/// The external fixture owns release. Cancelling the scoped reader drops only
+/// its task-local clone; panic/cancellation of the fixture releases the worker.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(super) struct CurrentCloseProbe {
+    inner: std::sync::Arc<connection::CloseProbe>,
+}
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+impl CurrentCloseProbe {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: connection::CloseProbe::new(),
+        }
+    }
+    pub(super) fn scope<F>(
+        &self,
+        work: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'static>>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        Box::pin(async move { connection::with_close_probe(inner, work).await })
+    }
+    pub(super) async fn pending(&self) {
+        self.inner.pending().await;
+    }
+    pub(super) fn acknowledged(&self) -> bool {
+        self.inner.acknowledged()
+    }
+    pub(super) fn handle(&self) -> usize {
+        self.inner.handle()
+    }
+    pub(super) fn release_worker(&self) {
+        self.inner.release_worker();
+    }
+}
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+impl Drop for CurrentCloseProbe {
+    fn drop(&mut self) {
+        self.inner.release_worker();
+    }
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(super) async fn with_failed_current_close_ack<F: std::future::Future>(work: F) -> F::Output {
+    connection::with_failed_close_ack(work).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+tokio::task_local! { static CURRENT_OWNED_SQL: (); }
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) fn require_no_read_session() -> Result<()> {
+    if READ_SESSION.try_with(|_| ()).is_ok() || CURRENT_OWNED_SQL.try_with(|_| ()).is_ok() {
+        return Err(Error::engine(
+            "current body read rejects an ambient or nested SQL session",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) struct ClosedCurrentGet<T>(T);
+#[cfg(feature = "v2-kernel-probe")]
+impl<T> ClosedCurrentGet<T> {
+    pub(super) fn into_owned(self) -> T {
+        self.0
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) async fn with_current_materialization<T, F, Fut>(
+    db: &Db,
+    caller: &super::Caller,
+    reads: &[(&str, &str)],
+    ids: &[String],
+    work: F,
+) -> Result<ClosedCurrentGet<T>>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    require_no_read_session()?;
+    let session = open_scoped_session(
+        db,
+        "",
+        reads,
+        LinkScope::PartOf,
+        Some(ReadCandidates::Anchors(ids)),
+        None,
+        Some(caller),
+    )
+    .await?;
+    let actor = {
+        let mut owned = session.lock().await;
+        // Reject obvious oversize visible body/metadata before native hydration
+        // can copy them into a response Value. No text is fetched by this guard.
+        // Counts are deliberately conservative and apply only to this lane.
+        let bytes: i64 = sqlx::query_scalar(
+            "WITH requested(id) AS (SELECT value FROM json_each(?1)), visible(id) AS (SELECT r.id FROM temp.records r JOIN requested q ON q.id=r.id) SELECT coalesce(sum(bytes),0) FROM (SELECT length(CAST(b.body AS BLOB)) AS bytes FROM main.kernel_record_bodies b JOIN visible v ON v.id=b.record_id UNION ALL SELECT length(CAST(f.name AS BLOB))+length(CAST(f.value_json AS BLOB)) FROM main.kernel_record_fields f JOIN visible v ON v.id=f.record_id UNION ALL SELECT length(CAST(f.key AS BLOB))+length(CAST(f.value AS BLOB))+coalesce(length(CAST(f.vocab_ref AS BLOB)),0) FROM main.kernel_facets f JOIN visible v ON v.id=f.record_id WHERE f.value IS NOT NULL AND f.key!='archived')"
+        ).bind(serde_json::to_string(ids)?).fetch_one(&mut *owned.connection).await?;
+        if bytes < 0 || bytes as u64 > contract::MAX_RESULT_ENCODED_BYTES as u64 {
+            return Err(Error::engine(
+                "current get_record exceeds staging byte limit; no partial result",
+            ));
+        }
+        owned.actor.clone()
+    };
+    let result = CURRENT_OWNED_SQL
+        .scope((), READ_SESSION.scope(session.clone(), work(actor)))
+        .await;
+    let session = std::sync::Arc::try_unwrap(session).map_err(|_| {
+        Error::engine("current body SQL session ownership escaped; no validation permitted")
+    })?;
+    let ReadSession { mut connection, .. } = session.into_inner();
+    let rollback = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+    #[cfg(test)]
+    let boundary =
+        super::current_body_read::checkpoint(db, super::current_body_read::Stage::SqlRolledBack)
+            .await;
+    let closed = connection.close_owned().await;
+    rollback?;
+    #[cfg(test)]
+    boundary?;
+    closed?;
+    result.map(ClosedCurrentGet)
 }
 
 pub(super) async fn with_read_session<T>(
@@ -143,6 +349,27 @@ pub(super) async fn with_read_session<T>(
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     with_scoped_read_session(db, actor, reads, LinkScope::All, None, None, work).await
+}
+
+/// Closed exact-name resolution only. Candidates are a structural superset;
+/// the normal record View gate and final logical-name predicate still apply.
+pub(super) async fn with_name_read_session<T>(
+    db: &Db,
+    actor: &str,
+    reads: &[(&str, &str)],
+    names: &[String],
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    with_scoped_read_session(
+        db,
+        actor,
+        reads,
+        LinkScope::All,
+        Some(ReadCandidates::Names(names)),
+        None,
+        work,
+    )
+    .await
 }
 
 /// Share staging for a closed count/page pair. Hydration runs after this
@@ -164,7 +391,119 @@ pub(super) async fn with_query_read_session<T>(
         .iter()
         .map(|(r, c)| (r.as_str(), c.as_str()))
         .collect::<Vec<_>>();
-    with_read_session(db, actor, &reads, work).await
+    event_scope::scope(statements, with_read_session(db, actor, &reads, work)).await
+}
+
+/// Declared SQL already has validated bindings. Carry them into demand
+/// planning before staging, while retaining the ordinary snapshot and gates.
+#[cfg(test)]
+pub(crate) async fn with_bound_query_read_session_for_test<T>(
+    db: &Db,
+    actor: &str,
+    queries: &[Value],
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    with_bound_query_read_session(db, actor, queries, work).await
+}
+
+pub(super) async fn with_bound_query_read_session<T>(
+    db: &Db,
+    actor: &str,
+    queries: &[Value],
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if READ_SESSION.try_with(|_| ()).is_ok() {
+        return work.await;
+    }
+    let mut reads = BTreeSet::new();
+    let mut prepared = Vec::new();
+    let mut finite = Some(BTreeSet::new());
+    let mut plan = demand::plan_for(db);
+    let mut home_chain = false;
+    for args in queries {
+        // Invalid batch items retain their ordinary per-item refusal when
+        // executed; they cannot contribute a staging dependency or demand.
+        let Ok((query, dependencies)) = prepare_read(actor, args.clone(), false) else {
+            continue;
+        };
+        if let Some(ids) = &mut finite {
+            if let Some((bound, chain)) = record_scope::ids_with(
+                &query.statement,
+                &query.parameters,
+                &dependencies,
+                plan.docs_page,
+            ) {
+                home_chain |= chain;
+                ids.extend(bound);
+                if ids.len() > 1000 {
+                    finite = None;
+                }
+            } else {
+                finite = None;
+            }
+        }
+        reads.extend(dependencies);
+        prepared.push(query);
+    }
+    let reads = reads
+        .iter()
+        .map(|(r, c)| (r.as_str(), c.as_str()))
+        .collect::<Vec<_>>();
+    // An empty declaration can still use closed non-SQL snapshot helpers.
+    let ids = if prepared.is_empty() { None } else { finite };
+    let ids_json = ids.as_ref().map(serde_json::to_string).transpose()?;
+    let candidates = ids_json.as_deref().map(|arg| ReadCandidates::ExactFrom {
+        sql: "SELECT value FROM json_each(?1)",
+        arg,
+    });
+    plan.home_chain = home_chain && ids.is_some();
+    demand::scoped_for_db(
+        db,
+        plan,
+        event_scope::bound_scope(
+            &prepared,
+            with_scoped_read_session(db, actor, &reads, LinkScope::All, candidates, None, work),
+        ),
+    )
+    .await
+}
+
+/// `with_query_read_session` staging only the ids `candidate_sql` yields on
+/// the session's own snapshot (see `ReadCandidates::ExactFrom`). The compiled
+/// statements, visibility gate and guards are unchanged; a NULL candidate row
+/// falls back to full staging in the same session.
+pub(super) async fn with_query_read_session_exact<T>(
+    db: &Db,
+    actor: &str,
+    statements: &[&str],
+    candidate_sql: &str,
+    candidate_arg: &str,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if READ_SESSION.try_with(|_| ()).is_ok() {
+        return work.await;
+    }
+    let mut reads = BTreeSet::new();
+    for statement in statements {
+        reads.extend(guard::public_reads_ad_hoc(statement)?);
+    }
+    let reads = reads
+        .iter()
+        .map(|(r, c)| (r.as_str(), c.as_str()))
+        .collect::<Vec<_>>();
+    with_scoped_read_session(
+        db,
+        actor,
+        &reads,
+        LinkScope::All,
+        Some(ReadCandidates::ExactFrom {
+            sql: candidate_sql,
+            arg: candidate_arg,
+        }),
+        None,
+        work,
+    )
+    .await
 }
 
 /// Get's composed SQL only consumes part_of edges for annotation windows.
@@ -176,7 +515,16 @@ pub(super) async fn with_part_of_read_session<T>(
     ids: &[String],
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    with_scoped_read_session(db, actor, reads, LinkScope::PartOf, Some(ids), None, work).await
+    with_scoped_read_session(
+        db,
+        actor,
+        reads,
+        LinkScope::PartOf,
+        Some(ReadCandidates::Anchors(ids)),
+        None,
+        work,
+    )
+    .await
 }
 
 /// Only the closed renderer lookup may use this narrowed relation.
@@ -220,6 +568,19 @@ pub(super) async fn with_history_read_session<T>(
     with_scoped_read_session(db, actor, reads, LinkScope::All, None, Some(window), work).await
 }
 
+/// Label only the extended query_record composition; never accept caller text
+/// as a diagnostic tool or phase. The label is captured before SQLite's worker.
+pub(super) async fn with_query_record_guard_diagnostics<F: std::future::Future>(
+    work: F,
+) -> F::Output {
+    guard_diagnostics::query_record(work).await
+}
+
+/// Label the current query_record's computed shape for deadline diagnostics.
+pub(super) fn set_query_record_shape(shape: &'static str) {
+    guard_diagnostics::set_query_record_shape(shape);
+}
+
 /// Hydration and SQL enrichment borrow the same caller-bound read snapshot.
 /// The closure must only use connection-scoped kernel helpers.
 pub(super) async fn in_snapshot<T>(
@@ -234,26 +595,45 @@ pub(super) async fn in_snapshot<T>(
         if !session.db.same_handle(db) || session.actor != actor {
             return Err(Error::engine("read snapshot caller/database mismatch"));
         }
+        if let Some(error) = &session.staging_failure {
+            return Err(Error::engine(error.clone()));
+        }
         // Hydration is bounded per subject, not by time already spent on
         // other ids. Keep the transaction and staging, reset only the VM
         // work budget; composed SQL independently applies the same deadline.
         let started = Instant::now();
+        let budget = snapshot_budget();
+        let deadline = started + budget;
+        let mut vm_deadline = guard_diagnostics::VmDeadline::new(
+            started,
+            budget,
+            guard_diagnostics::Stage::SnapshotHydration,
+        );
         session
             .connection
             .lock_handle()
             .await?
-            .set_progress_handler(guard::PROGRESS_OPS, move || {
-                started.elapsed() < Duration::from_millis(contract::QUERY_DEADLINE_MS)
-            });
+            .set_progress_handler(guard::PROGRESS_OPS, move || vm_deadline.evaluate().0);
         let identity = session.cache_identity.clone();
-        kernel::read_cache::in_pinned_snapshot(
-            identity,
-            kernel::read_cache::connection_id(&mut session.connection),
-            work(&mut session.connection),
-        )
-        .await
+        SNAPSHOT_VM_DEADLINE
+            .scope(
+                deadline,
+                kernel::read_cache::in_pinned_snapshot_with_admissions(
+                    identity,
+                    kernel::read_cache::connection_id(&mut session.connection),
+                    session.admission_cache.clone(),
+                    work(&mut session.connection),
+                ),
+            )
+            .await
     } else {
-        let mut tx = db.write_pool().begin().await?;
+        #[cfg(feature = "v2-kernel-probe")]
+        if CURRENT_OWNED_SQL.try_with(|_| ()).is_ok() {
+            return Err(Error::engine(
+                "current body read lost its owned SQL session",
+            ));
+        }
+        let mut tx = db.pool().begin().await?;
         kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
         let identity = kernel::read_cache::key_on(&mut tx, actor, "read_snapshot").await?;
         let result = kernel::read_cache::in_pinned_snapshot(
@@ -274,21 +654,231 @@ enum LinkScope {
     Renderers,
 }
 
+#[derive(Clone, Copy)]
+enum ReadCandidates<'a> {
+    Anchors(&'a [String]),
+    Names(&'a [String]),
+    /// Stage exactly the ids this query yields (still behind the ordinary
+    /// visibility gate, plus direct placement dependencies), computed on the
+    /// session's own connection after BEGIN so candidates and staging share
+    /// one snapshot. A NULL row means "not narrowable here": full staging.
+    ExactFrom {
+        sql: &'a str,
+        arg: &'a str,
+    },
+}
+
+struct SessionStaging {
+    link_scope: LinkScope,
+    names: Option<Vec<String>>,
+    anchors: Option<Vec<String>>,
+    exact: Option<Vec<String>>,
+    history: Option<HistoryWindow>,
+    home_chain: bool,
+}
+impl SessionStaging {
+    fn new(
+        link_scope: LinkScope,
+        candidates: Option<ReadCandidates<'_>>,
+        exact: Option<Vec<String>>,
+        history: Option<HistoryWindow>,
+        home_chain: bool,
+    ) -> Self {
+        Self {
+            link_scope,
+            names: match candidates {
+                Some(ReadCandidates::Names(ids)) => Some(ids.to_vec()),
+                _ => None,
+            },
+            anchors: match candidates {
+                Some(ReadCandidates::Anchors(ids)) => Some(ids.to_vec()),
+                _ => None,
+            },
+            exact,
+            history,
+            home_chain,
+        }
+    }
+    async fn install(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        db: &Db,
+        actor: &str,
+        reads: &BTreeSet<(String, String)>,
+    ) -> Result<()> {
+        let candidates = self
+            .names
+            .as_deref()
+            .map(ReadCandidates::Names)
+            .or_else(|| self.anchors.as_deref().map(ReadCandidates::Anchors));
+        // Closure is structural candidate scope, retained even when the
+        // independent demand evaluator is disabled for the retry.
+        let mut plan = demand::current();
+        plan.home_chain = self.home_chain;
+        demand::scoped(
+            plan,
+            Box::pin(install_relations(
+                conn,
+                actor,
+                reads,
+                self.link_scope,
+                candidates,
+                self.history,
+                None,
+                self.exact.as_deref(),
+                None,
+                chrono::Utc::now().timestamp_millis(),
+                false,
+                None,
+                db.sql_event_projection_generation(),
+                db.sql_record_projection_generation().as_deref(),
+            )),
+        )
+        .await
+    }
+}
+
 async fn with_scoped_read_session<T>(
     db: &Db,
     actor: &str,
     reads: &[(&str, &str)],
     link_scope: LinkScope,
-    candidate_ids: Option<&[String]>,
+    candidates: Option<ReadCandidates<'_>>,
     history_window: Option<HistoryWindow>,
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if CURRENT_OWNED_SQL.try_with(|_| ()).is_ok() {
+        return Err(Error::engine(
+            "current body read refuses nested SQL materialization",
+        ));
+    }
+    let session = open_scoped_session(
+        db,
+        actor,
+        reads,
+        link_scope,
+        candidates,
+        history_window,
+        None,
+    )
+    .await?;
+    let result = READ_SESSION.scope(session.clone(), work).await;
+    // Roll back TEMP state explicitly on success/error; cancellation closes the
+    // owned physical connection, so no TEMP state or VM guard can be borrowed.
+    let mut session = session.lock().await;
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    read_diagnostics::observe_session(&mut session.connection, "before_rollback", None).await;
+    #[cfg(test)]
+    {
+        let probe = session.cost_probe.take();
+        read_cost::detach(&mut session.connection, probe).await?;
+    }
+    rollback_read_session(&mut session.connection).await?;
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    read_diagnostics::observe_session(&mut session.connection, "after_rollback", None).await;
+    session.connection.finish().await;
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    {
+        let reusable = session.connection.reusable_for_diagnostic();
+        read_diagnostics::observe_session(&mut session.connection, "after_finish", Some(reusable))
+            .await;
+    }
+    result
+}
+
+/// SQLITE_INTERRUPT during a TEMP write can roll back the whole transaction.
+/// Consult SQLite itself before cleanup; the original interrupted read must
+/// not be replaced by a second rollback's "no transaction is active" error.
+async fn rollback_read_session(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    let active = {
+        let mut handle = conn.lock_handle().await?;
+        handle.remove_progress_handler();
+        // SAFETY: this locked handle is exclusively borrowed and live.
+        unsafe { libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) == 0 }
+    };
+    if active {
+        sqlx::query("ROLLBACK").execute(conn).await?;
+    }
+    Ok(())
+}
+
+async fn open_scoped_session(
+    db: &Db,
+    actor: &str,
+    reads: &[(&str, &str)],
+    link_scope: LinkScope,
+    candidates: Option<ReadCandidates<'_>>,
+    history_window: Option<HistoryWindow>,
+    current_caller: Option<&super::Caller>,
+) -> Result<std::sync::Arc<tokio::sync::Mutex<ReadSession>>> {
+    let home_chain = demand::current().home_chain;
+    let (result, attempted, _) = demand::attempt(Box::pin(open_scoped_session_once(
+        db,
+        actor,
+        reads,
+        link_scope,
+        candidates,
+        history_window,
+        current_caller,
+        home_chain,
+    )))
+    .await;
+    if attempted && result.is_err() {
+        #[cfg(test)]
+        let _ = STATS.try_with(|s| s.borrow_mut().demand_fallbacks += 1);
+        return demand::with_legacy(Box::pin(open_scoped_session_once(
+            db,
+            actor,
+            reads,
+            link_scope,
+            candidates,
+            history_window,
+            current_caller,
+            home_chain,
+        )))
+        .await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_scoped_session_once(
+    db: &Db,
+    actor: &str,
+    reads: &[(&str, &str)],
+    link_scope: LinkScope,
+    candidates: Option<ReadCandidates<'_>>,
+    history_window: Option<HistoryWindow>,
+    current_caller: Option<&super::Caller>,
+    home_chain: bool,
+) -> Result<std::sync::Arc<tokio::sync::Mutex<ReadSession>>> {
     // Retain the governed slot, not an ordinary write-pool slot: enrichment
     // borrows ordinary connections too. Concurrent batches must not each hold
     // one ordinary slot while all wait for a second one.
+    let queued = Instant::now();
     let mut connection = connection::ReadConnection::new(db.governed_pool().acquire().await?);
+    tracing::debug!(target: "native_ce::read_staging", phase = "composed_pool_wait", elapsed_us = queued.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    let _ = STATS.try_with(|s| s.borrow_mut().pool_wait_us += queued.elapsed().as_micros() as u64);
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    read_diagnostics::observe_session(&mut connection, "acquire_before_begin", None).await;
+    #[cfg(test)]
+    let cost_probe = read_cost::attach(&mut connection).await?;
     sqlx::query("BEGIN").execute(&mut *connection).await?;
+    let actual_actor;
+    let actor = if let Some(caller) = current_caller {
+        actual_actor = super::principal_on(&mut connection, caller).await?;
+        &actual_actor
+    } else {
+        actor
+    };
     kernel::app_installs::admit_dispatched_on(&mut connection, actor).await?;
+    if current_caller.is_some_and(|caller| caller.host_asserted_app().is_some())
+        || (current_caller.is_some() && crate::provenance::current_app_claim().is_some())
+    {
+        return Err(Error::engine("current body read: installed-app same-snapshot data-needs qualification is not supported"));
+    }
     let as_of_seq = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM main.content_events")
         .fetch_one(&mut *connection)
         .await?;
@@ -297,32 +887,113 @@ async fn with_scoped_read_session<T>(
         .map(|(r, c)| (r.to_string(), c.to_string()))
         .collect();
     let started = Instant::now();
+    let budget = Duration::from_millis(contract::QUERY_DEADLINE_MS);
+    #[cfg(test)]
+    let budget = read_cost::budget(budget);
+    #[cfg(test)]
+    let staging_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    read_diagnostics::register_progress(&staging_progress);
+    #[cfg(test)]
+    let _measurement = ComposedStagingMeasurement {
+        started,
+        progress: staging_progress.clone(),
+    };
     {
         let mut handle = connection.lock_handle().await?;
+        // SQLite executes this callback on its worker, outside the async
+        // task's tracing context. Carry only the bounded bootstrap attempt
+        // span, so an actual guard expiry can be distinguished from another
+        // interruption source when bootstrap's phase subsequently fails.
+        let bootstrap_span = tracing::Span::current();
+        let bootstrap_attempt = bootstrap_span
+            .metadata()
+            .is_some_and(|m| m.target() == "native_ce::bootstrap");
+        #[cfg(test)]
+        let staging_progress = staging_progress.clone();
+        let mut vm_deadline = guard_diagnostics::VmDeadline::new(
+            started,
+            budget,
+            guard_diagnostics::Stage::ComposedStaging,
+        );
         handle.set_progress_handler(guard::PROGRESS_OPS, move || {
-            started.elapsed() < Duration::from_millis(contract::QUERY_DEADLINE_MS)
+            #[cfg(test)]
+            staging_progress.fetch_add(
+                guard::PROGRESS_OPS as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let (permit, elapsed) = vm_deadline.evaluate();
+            if !permit && bootstrap_attempt {
+                bootstrap_span.in_scope(|| {
+                    tracing::warn!(target: "native_ce::bootstrap", stage = "composed_staging", pool = "governed", interrupt_source = "vm_deadline", elapsed_ms = elapsed.as_millis() as u64, budget_ms = contract::QUERY_DEADLINE_MS, "bootstrap staging guard expired");
+                });
+            }
+            permit
         });
     }
+    sqlx::query("SAVEPOINT demand_stage")
+        .execute(&mut *connection)
+        .await?;
     let cache_identity =
         kernel::read_cache::key_on(&mut connection, actor, "pinned_snapshot").await?;
-    kernel::read_cache::in_pinned_snapshot(
+    let admission_cache = std::sync::Arc::<kernel::app_installs::ReadAdmissions>::default();
+    let (candidates, exact): (Option<ReadCandidates<'_>>, Option<Vec<String>>) = match candidates {
+        Some(ReadCandidates::ExactFrom { sql, arg }) => {
+            let rows: Vec<Option<String>> = sqlx::query_scalar(sql)
+                .bind(arg)
+                .fetch_all(&mut *connection)
+                .await?;
+            if rows.iter().any(Option::is_none) {
+                guard_diagnostics::mark_selected_plan_staged_in_full();
+                (None, None)
+            } else {
+                (None, Some(rows.into_iter().flatten().collect()))
+            }
+        }
+        other => (other, None),
+    };
+    let staging = SessionStaging::new(link_scope, candidates, exact, history_window, home_chain);
+    kernel::read_cache::in_pinned_snapshot_with_admissions(
         cache_identity.clone(),
         kernel::read_cache::connection_id(&mut connection),
-        install_relations(
-            &mut connection,
-            actor,
-            &reads,
-            link_scope,
-            candidate_ids,
-            history_window,
-            None,
-            None,
-            None,
-            chrono::Utc::now().timestamp_millis(),
-            false,
-        ),
+        admission_cache.clone(),
+        visible_cache::scoped(db, staging.install(&mut connection, db, actor, &reads)),
     )
     .await?;
+    Box::pin(materialize_composed_records(&mut connection, &reads)).await?;
+    if started.elapsed() >= budget {
+        return Err(contract::categorized_error(
+            contract::QuerySqlErrorCategory::Timeout,
+            "SQL relation staging exceeded query deadline",
+        ));
+    }
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    read_diagnostics::observe_session(&mut connection, "after_staging", None).await;
+    #[cfg(test)]
+    {
+        drop(_measurement);
+        read_cost::staged(&mut connection, &cost_probe).await?;
+    }
+    Ok(std::sync::Arc::new(tokio::sync::Mutex::new(ReadSession {
+        #[cfg(test)]
+        cost_probe,
+        db: db.clone(),
+        actor: actor.into(),
+        connection,
+        reads,
+        as_of_seq,
+        cache_identity,
+        admission_cache,
+        demand_enabled: demand::served(),
+        staging,
+        staging_failure: None,
+    })))
+}
+
+async fn materialize_composed_records(
+    connection: &mut sqlx::SqliteConnection,
+    reads: &BTreeSet<(String, String)>,
+) -> Result<()> {
     let materialization_started = Instant::now();
     // Composed enrichment consumes a closed metadata column set many times.
     // Materialize it once and index filing; otherwise each child count would
@@ -339,11 +1010,13 @@ async fn with_scoped_read_session<T>(
         {
             return Err(Error::engine("invalid composed record column"));
         }
-        // Names and source birth clocks are only consumed by returned pages.
-        // Keep them lazy instead of decoding them for every visible record.
+        // Display values may be needed only for a bounded returned page.
+        // Keep them lazy instead of decoding them for every visible record;
+        // predicates still evaluate them through the same snapshot's view.
         let lazy_pages = record_columns.contains(&"id");
-        let lazy =
-            |column: &&str| lazy_pages && ["name", "created_at", "created_at_ms"].contains(column);
+        let lazy = |column: &&str| {
+            lazy_pages && ["name", "body", "created_at", "created_at_ms"].contains(column)
+        };
         let eager_columns = record_columns
             .iter()
             .copied()
@@ -356,13 +1029,26 @@ async fn with_scoped_read_session<T>(
         .persistent(false)
         .execute(&mut *connection)
         .await?;
-        let projection = record_columns.iter().map(|column| {
-            if lazy(column) {
-                format!("(SELECT v.{column} FROM temp._v2_record_values v WHERE v.id=c.id) AS {column}")
-            } else {
-                format!("c.{column}")
-            }
-        }).collect::<Vec<_>>().join(",");
+        let projection = record_columns
+            .iter()
+            .map(|column| {
+                if lazy(column) {
+                    // Bodies are never cached. Looking through the cache UNION
+                    // lets SQLite build an automatic covering index of every
+                    // visible body before applying this id, under the caller's
+                    // SQL cell ceiling. Use the same visible-id oracle directly.
+                    let source = if *column == "body" {
+                        "_v2_record_oracle"
+                    } else {
+                        "_v2_record_values"
+                    };
+                    format!("(SELECT v.{column} FROM temp.{source} v WHERE v.id=c.id) AS {column}")
+                } else {
+                    format!("c.{column}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         sqlx::query(&format!("DROP VIEW temp.records; CREATE TEMP VIEW records AS SELECT {projection} FROM temp._v2_composed_records c"))
             .persistent(false).execute(&mut *connection).await?;
         if record_columns.contains(&"type") && record_columns.contains(&"kind") {
@@ -383,31 +1069,10 @@ async fn with_scoped_read_session<T>(
     }
 
     tracing::debug!(target: "native_ce::read_staging", phase = "composed_records", elapsed_us = materialization_started.elapsed().as_micros() as u64);
-    if started.elapsed() >= Duration::from_millis(contract::QUERY_DEADLINE_MS) {
-        return Err(contract::categorized_error(
-            contract::QuerySqlErrorCategory::Timeout,
-            "SQL relation staging exceeded query deadline",
-        ));
-    }
-    let session = std::sync::Arc::new(tokio::sync::Mutex::new(ReadSession {
-        db: db.clone(),
-        actor: actor.into(),
-        connection,
-        reads,
-        as_of_seq,
-        cache_identity,
-    }));
-    let result = READ_SESSION.scope(session.clone(), work).await;
-    // Roll back TEMP state explicitly on success/error; cancellation closes the
-    // owned physical connection, so no TEMP state or VM guard can be borrowed.
-    let mut session = session.lock().await;
-    sqlx::query("ROLLBACK")
-        .execute(&mut *session.connection)
-        .await?;
-    session.connection.finish().await;
-    result
+    Ok(())
 }
 
+#[derive(Clone)]
 struct PreparedRead {
     statement: String,
     persistent: bool,
@@ -462,6 +1127,19 @@ fn metadata_pulse_ids(
 
 pub(crate) async fn query_sql(db: &Db, actor: &str, args: Value) -> Result<Value> {
     execute(db, actor, args, false)
+        .await
+        .map_err(contract::ensure_categorized)
+}
+
+/// Only executor ad-hoc dispatch carries a trusted serving catalogue. Internal
+/// composed reads and saved definitions keep the ordinary entry point above.
+pub(super) async fn query_sql_for_caller(
+    db: &Db,
+    actor: &str,
+    caller: &super::Caller,
+    args: Value,
+) -> Result<Value> {
+    execute_with_catalog(db, actor, args, false, caller.catalog_operations())
         .await
         .map_err(contract::ensure_categorized)
 }
@@ -724,6 +1402,66 @@ fn prepare_read_with_views(
 /// Cancellation drops the enclosing write transaction. The write pool's
 /// sanitize_released_write_connection removes progress handlers and closes
 /// connections with unrolled-back transactions before reuse.
+/// Relations a folder-scoped app may read through `query_sql`: every row
+/// is staged from the folder-filtered visible set, plus the two pure
+/// schema catalogues (names/types only, no record data). Anything else
+/// — runs, intents, activity, messaging state, vocabularies, bindings,
+/// named views — refuses `outside_app_scope` rather than silently
+/// staging person-level rows.
+const SCOPED_SQL_RELATIONS: [&str; 11] = [
+    "records",
+    "links",
+    "blobs",
+    "facet_values",
+    "facet_observations",
+    "facet_times",
+    "record_lifecycle_interpretations",
+    "comment_anchors",
+    "content_events",
+    "catalog_relations",
+    "catalog_columns",
+];
+
+/// Whether this dispatch is a folder-scoped app for `actor`, resolved on
+/// the caller's own snapshot.
+#[inline(never)]
+fn scoped_app_folders_on<'a>(
+    conn: &'a mut sqlx::SqliteConnection,
+    actor: &'a str,
+) -> futures::future::BoxFuture<'a, Result<bool>> {
+    Box::pin(async move {
+        Ok(
+            match kernel::app_installs::scope::active_scope_cached(actor) {
+                kernel::app_installs::scope::ActiveScope::None => false,
+                kernel::app_installs::scope::ActiveScope::Known(scope) => scope.is_scoped(),
+                kernel::app_installs::scope::ActiveScope::Unresolved(_) => {
+                    kernel::app_installs::scope::active_scope_on(conn, actor)
+                        .await?
+                        .is_some_and(|scope| scope.is_scoped())
+                }
+            },
+        )
+    })
+}
+
+/// Refuse user SQL that reaches any relation outside the scoped allowlist.
+async fn refuse_out_of_scope_relations(
+    conn: &mut sqlx::SqliteConnection,
+    actor: &str,
+    reads: &BTreeSet<(String, String)>,
+) -> Result<()> {
+    if !scoped_app_folders_on(conn, actor).await? {
+        return Ok(());
+    }
+    if reads
+        .iter()
+        .any(|(relation, _)| !SCOPED_SQL_RELATIONS.contains(&relation.as_str()))
+    {
+        return Err(Error::engine(kernel::OUTSIDE_APP_SCOPE));
+    }
+    Ok(())
+}
+
 pub(super) async fn query_sql_on(
     connection: &mut sqlx::SqliteConnection,
     actor: &str,
@@ -731,6 +1469,7 @@ pub(super) async fn query_sql_on(
     row_limit: usize,
 ) -> Result<Value> {
     let (prepared, reads) = prepare_read(actor, args, false)?;
+    refuse_out_of_scope_relations(connection, actor, &reads).await?;
     let was_query_only: bool = sqlx::query_scalar("PRAGMA query_only")
         .fetch_one(&mut *connection)
         .await?;
@@ -780,6 +1519,46 @@ pub(super) async fn query_sql_on(
 }
 
 async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Value> {
+    execute_with_catalog(db, actor, args, stored, None).await
+}
+
+async fn execute_with_catalog(
+    db: &Db,
+    actor: &str,
+    args: Value,
+    stored: bool,
+    catalogue: Option<&crate::query::principal::CatalogOperationsSnapshot>,
+) -> Result<Value> {
+    let (result, attempted, caller_started) = demand::attempt(Box::pin(execute_with_catalog_once(
+        db,
+        actor,
+        args.clone(),
+        stored,
+        catalogue,
+    )))
+    .await;
+    if attempted
+        && result
+            .as_ref()
+            .is_err_and(|error| !caller_started || demand::retry_caller(error))
+    {
+        #[cfg(test)]
+        let _ = STATS.try_with(|s| s.borrow_mut().demand_fallbacks += 1);
+        return demand::with_legacy(Box::pin(execute_with_catalog_once(
+            db, actor, args, stored, catalogue,
+        )))
+        .await;
+    }
+    result
+}
+
+async fn execute_with_catalog_once(
+    db: &Db,
+    actor: &str,
+    args: Value,
+    stored: bool,
+    catalogue: Option<&crate::query::principal::CatalogOperationsSnapshot>,
+) -> Result<Value> {
     let pinned = if stored {
         args.get("_named_view_pins").cloned().map(serde_json::from_value::<std::collections::BTreeMap<String,crate::named_views::Pin>>).transpose()?
     } else {
@@ -801,6 +1580,16 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
     }
     let request_started = Instant::now();
     let preflight = prepare_read(actor, args.clone(), stored);
+    if preflight
+        .as_ref()
+        .is_ok_and(|(_, reads)| reads.iter().any(|(r, _)| r == "catalog_operations"))
+        && (catalogue.is_none() || stored || READ_SESSION.try_with(|_| ()).is_ok())
+    {
+        return Err(contract::categorized_error(
+            contract::QuerySqlErrorCategory::UnauthorizedRelation,
+            "catalog_operations requires this server's serving executor catalogue in standalone executor ad-hoc query_sql; saved SQL, internal reads and member/offline copies cannot supply it",
+        ));
+    }
     if preflight
         .as_ref()
         .is_ok_and(|(_, reads)| reads.iter().any(|(r, _)| r == "catalog_view_definitions"))
@@ -831,6 +1620,9 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
         if !session.db.same_handle(db) || session.actor != actor {
             return Err(Error::engine("composed SQL read caller/database differs"));
         }
+        if let Some(error) = &session.staging_failure {
+            return Err(Error::engine(error.clone()));
+        }
         if reads.iter().any(|(r, c)| {
             !session.reads.contains(&(r.clone(), c.clone()))
                 && !(c.is_empty() && session.reads.iter().any(|(sr, _)| sr == r))
@@ -839,9 +1631,113 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
                 "composed SQL read exceeds declared relations/columns",
             ));
         }
+        // Composed SQL (declared app-data reads, subscriptions) returns
+        // early, before the standalone path's allowlist check. A folder-
+        // scoped app must meet the same relation allowlist here, or a
+        // declaration naming e.g. `run_intents` would bypass it.
+        refuse_out_of_scope_relations(&mut session.connection, actor, &reads).await?;
         let as_of_seq = session.as_of_seq;
-        return execute_prepared(&mut session.connection, prepared, as_of_seq, Instant::now())
+        let started = Instant::now();
+        let result = execute_prepared(
+            &mut session.connection,
+            prepared.clone(),
+            as_of_seq,
+            started,
+        )
+        .await;
+        #[cfg(test)]
+        let result = if session.demand_enabled && demand::fail_caller() {
+            demand::injected_caller_error(&mut session.connection).await
+        } else {
+            result
+        };
+        let result = if session.demand_enabled && result.as_ref().is_err_and(demand::retry_caller) {
+            #[cfg(test)]
+            let _ = STATS.try_with(|s| s.borrow_mut().demand_fallbacks += 1);
+            // Poison BEFORE the first destructive/fallible step. This also
+            // fences later uses if the retry future is cancelled mid-restage.
+            session.staging_failure =
+                Some("query_sql [engine]: composed SQL restaging was interrupted".into());
+            session.demand_enabled = false;
+            let restaged = Box::pin(async {
+                // Caller SELECT errors cannot commit or mutate main. Restaging
+                // TEMP data from before installation preserves the pinned snapshot.
+                session
+                    .connection
+                    .lock_handle()
+                    .await?
+                    .remove_progress_handler();
+                sqlx::query("PRAGMA query_only=OFF; ROLLBACK TO demand_stage")
+                    .execute(&mut *session.connection)
+                    .await?;
+                let started = Instant::now();
+                let budget = Duration::from_millis(contract::QUERY_DEADLINE_MS);
+                #[cfg(test)]
+                let budget = read_cost::budget(budget);
+                let mut deadline = guard_diagnostics::VmDeadline::new(
+                    started,
+                    budget,
+                    guard_diagnostics::Stage::ComposedStaging,
+                );
+                session
+                    .connection
+                    .lock_handle()
+                    .await?
+                    .set_progress_handler(guard::PROGRESS_OPS, move || deadline.evaluate().0);
+                let ReadSession {
+                    connection,
+                    db,
+                    reads,
+                    cache_identity,
+                    admission_cache,
+                    staging,
+                    ..
+                } = &mut *session;
+                demand::with_legacy(kernel::read_cache::in_pinned_snapshot_with_admissions(
+                    cache_identity.clone(),
+                    kernel::read_cache::connection_id(connection),
+                    admission_cache.clone(),
+                    async {
+                        visible_cache::scoped(db, staging.install(connection, db, actor, reads))
+                            .await?;
+                        #[cfg(test)]
+                        if demand::fail_restage() {
+                            sqlx::query("DELETE FROM temp._v2_visible")
+                                .execute(&mut **connection)
+                                .await?;
+                            let error =
+                                demand::injected_caller_error(connection).await.unwrap_err();
+                            return Err(match error {
+                                Error::Sqlx(error) => guard::map_stream_error(error),
+                                other => other,
+                            });
+                        }
+                        Box::pin(materialize_composed_records(connection, reads)).await?;
+                        if started.elapsed() >= budget {
+                            return Err(contract::categorized_error(
+                                contract::QuerySqlErrorCategory::Timeout,
+                                "SQL relation staging exceeded query deadline",
+                            ));
+                        }
+                        Ok::<_, Error>(())
+                    },
+                ))
+                .await?;
+                Ok::<_, Error>(())
+            })
             .await;
+            if let Err(error) = restaged {
+                let error = contract::ensure_categorized(error);
+                session.staging_failure = Some(error.to_string());
+                return Err(error);
+            }
+            session.staging_failure = None;
+            execute_prepared(&mut session.connection, prepared, as_of_seq, Instant::now()).await
+        } else {
+            result
+        };
+        tracing::debug!(target: "native_ce::read_staging", phase = "composed_caller", elapsed_us = started.elapsed().as_micros() as u64);
+        return result;
     }
 
     // An ordinary pool slot, exclusively held and armed for physical close.
@@ -851,8 +1747,19 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
     // each waits for a second slot, and never borrow an ordinary writer slot.
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_validation", elapsed_us = request_started.elapsed().as_micros() as u64);
     let acquire_started = Instant::now();
+    #[cfg(feature = "v2-kernel-probe")]
+    if CURRENT_OWNED_SQL.try_with(|_| ()).is_ok() {
+        return Err(Error::engine(
+            "current body read lost its staged SQL session",
+        ));
+    }
     let mut connection = connection::ReadConnection::new(db.governed_pool().acquire().await?);
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_pool_wait", elapsed_us = acquire_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    let _ = STATS
+        .try_with(|s| s.borrow_mut().pool_wait_us += acquire_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    let cost_probe = read_cost::attach(&mut connection).await?;
     let admission_started = Instant::now();
     let mut tx = sqlx::Connection::begin(&mut *connection).await?;
     let admitted_app = crate::kernel::app_installs::admit_dispatched_on(&mut tx, actor)
@@ -919,6 +1826,9 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
         registry.validators = None;
         (registry, prepared, reads)
     };
+    // Same snapshot as staging: refuse relations the folder scope does
+    // not filter before any rows are staged for this statement.
+    refuse_out_of_scope_relations(&mut tx, actor, &reads).await?;
     if reads.iter().any(|(r, _)| r == "agent_activity") {
         prepared
             .now_ms_ms
@@ -949,6 +1859,10 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
     };
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_admission", elapsed_us = admission_started.elapsed().as_micros() as u64);
     #[cfg(test)]
+    let _ = STATS.try_with(|s| {
+        s.borrow_mut().sql_admission_us += admission_started.elapsed().as_micros() as u64
+    });
+    #[cfg(test)]
     let started = started
         - TEST_ELAPSED
             .try_with(|elapsed| elapsed.0)
@@ -958,6 +1872,8 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
     } else {
         contract::QUERY_DEADLINE_MS
     });
+    #[cfg(test)]
+    let staging_budget = read_cost::budget(staging_budget);
     #[cfg(test)]
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
@@ -973,36 +1889,73 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
             started.elapsed() < staging_budget
         });
     }
+    let mut plan = demand::plan_for(db);
     let pulse_ids = if view_bearing || record_scope::full_staging() {
         None
     } else {
-        record_scope::ids(&prepared.statement, &prepared.parameters, &reads)
-            .or_else(|| metadata_pulse_ids(&prepared.statement, &prepared.parameters))
+        record_scope::ids_with(
+            &prepared.statement,
+            &prepared.parameters,
+            &reads,
+            plan.docs_page,
+        )
+        .map(|(ids, chain)| {
+            plan.home_chain = chain;
+            ids
+        })
+        .or_else(|| metadata_pulse_ids(&prepared.statement, &prepared.parameters))
     };
     let class_scope = if view_bearing || record_scope::full_staging() {
         None
     } else {
         record_classes::plan(&prepared.statement, &prepared.parameters, &reads)
     };
+    // Keep original reads authoritative for validation, scope planning and
+    // execution. Only population is reduced, in this admitted snapshot; the
+    // unconditional TEMP schema still supports every original UNION arm.
+    let section_reads = if admitted_app && !stored && !registry_needed && !view_bearing {
+        union_sections::staging_reads(&prepared.statement, &prepared.parameters, &reads)
+    } else {
+        None
+    };
     let staging_started = Instant::now();
-    install_relations(
-        &mut tx,
-        actor,
-        &reads,
-        LinkScope::All,
-        None,
-        None,
-        if view_bearing || record_scope::full_staging() {
-            None
-        } else {
-            id_ordered_record_limit(&prepared.statement)
-        },
-        pulse_ids.as_deref(),
-        class_scope.as_ref(),
-        prepared
-            .now_ms_ms
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-        !view_bearing,
+    // Preserve benchmark diagnostics even if relation installation times out.
+    #[cfg(test)]
+    let staging_measurement = ComposedStagingMeasurement {
+        started: staging_started,
+        progress: progress.clone(),
+    };
+    demand::scoped_for_db(
+        db,
+        plan,
+        event_scope::bound_scope(
+            std::slice::from_ref(&prepared),
+            visible_cache::scoped(
+                db,
+                install_relations(
+                    &mut tx,
+                    actor,
+                    section_reads.as_ref().unwrap_or(&reads),
+                    LinkScope::All,
+                    None,
+                    None,
+                    if view_bearing || record_scope::full_staging() {
+                        None
+                    } else {
+                        id_ordered_record_limit(&prepared.statement)
+                    },
+                    pulse_ids.as_deref(),
+                    class_scope.as_ref(),
+                    prepared
+                        .now_ms_ms
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+                    !view_bearing,
+                    catalogue,
+                    db.sql_event_projection_generation(),
+                    db.sql_record_projection_generation().as_deref(),
+                ),
+            ),
+        ),
     )
     .await
     .map_err(|error| {
@@ -1019,9 +1972,6 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
             error
         }
     })?;
-    #[cfg(test)]
-    let _ = STATS
-        .try_with(|s| s.borrow_mut().staging_us = staging_started.elapsed().as_micros() as u64);
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_staging", elapsed_us = staging_started.elapsed().as_micros() as u64);
     // A link join revisits record identity metadata once per edge. Decode the
     // caller's closed scalar column set once per visible record instead. Bodies
@@ -1068,9 +2018,7 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
     }
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_join_metadata", elapsed_us = metadata_started.elapsed().as_micros() as u64);
     #[cfg(test)]
-    let _ = STATS.try_with(|s| {
-        s.borrow_mut().staging_vm_ops = progress.load(std::sync::atomic::Ordering::Relaxed)
-    });
+    drop(staging_measurement);
     // Many individually small SQL statements (or provider decoding in Rust)
     // may never invoke the VM callback. They still consume the same budget.
     if started.elapsed() >= staging_budget {
@@ -1105,7 +2053,14 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
             "named view compilation exceeded query deadline",
         ));
     }
+    #[cfg(test)]
+    read_cost::staged(&mut tx, &cost_probe).await?;
     let execution_started = Instant::now();
+    demand::caller_started();
+    #[cfg(test)]
+    if demand::served() && demand::fail_caller() {
+        return demand::injected_caller_error(&mut tx).await;
+    }
     let mut result = execute_prepared(&mut tx, prepared, as_of_seq, caller_started).await?;
     if !registry.generated_drift.is_empty() {
         result["view_provenance"] = json!({"generated_source_drift":registry.generated_drift,"generated_unknown_reason":registry.generated_unknown_reason});
@@ -1145,6 +2100,8 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
         result["view_provenance"] = json!({"roots":registry.pins,"closure_digest":plan.digest,"static_relations":static_relations,"has_generated_nodes":generated,"generated_diagnostics":summaries,"generated_source_drift":drift,"generated_unknown_reason":reasons});
     }
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_caller", elapsed_us = execution_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    read_cost::detach(&mut tx, cost_probe).await?;
     let cleanup_started = Instant::now();
     tx.rollback().await?;
     connection.finish().await;
@@ -1178,6 +2135,8 @@ async fn execute_prepared_mode(
     query_only: bool,
     row_limit: usize,
 ) -> Result<Value> {
+    #[cfg(test)]
+    let _ = STATS.try_with(|s| s.borrow_mut().caller_executions += 1);
     let PreparedRead {
         statement,
         persistent,
@@ -1192,11 +2151,12 @@ async fn execute_prepared_mode(
         - TEST_ELAPSED
             .try_with(|elapsed| elapsed.1)
             .unwrap_or_default();
+    let budget = Duration::from_millis(contract::QUERY_DEADLINE_MS);
+    #[cfg(test)]
+    let budget = read_cost::budget(budget);
     {
         let mut handle = connection.lock_handle().await?;
-        handle.set_progress_handler(guard::PROGRESS_OPS, move || {
-            started.elapsed() < Duration::from_millis(contract::QUERY_DEADLINE_MS)
-        });
+        handle.set_progress_handler(guard::PROGRESS_OPS, move || started.elapsed() < budget);
     }
     if query_only {
         sqlx::query("PRAGMA query_only=ON")
@@ -1222,6 +2182,18 @@ async fn execute_prepared_mode(
         }
         let query =
             guard::bind_parameters(sqlx::query(&capped).persistent(persistent), &parameters)?;
+        #[cfg(test)]
+        let prepare_started = Instant::now();
+        #[cfg(test)]
+        if read_cost::active() {
+            use sqlx::Executor;
+            (&mut *connection).prepare(&capped).await?;
+            let _ = STATS.try_with(|s| {
+                s.borrow_mut().caller_prepare_us += prepare_started.elapsed().as_micros() as u64
+            });
+        }
+        #[cfg(test)]
+        let execute_started = Instant::now();
         let mut stream = query.fetch(&mut *connection);
         let mut rows = Vec::new();
         let mut bytes = serde_json::to_vec(&output_columns)?.len() + 2;
@@ -1246,6 +2218,10 @@ async fn execute_prepared_mode(
             rows.push(value);
         }
         drop(stream);
+        #[cfg(test)]
+        let _ = STATS.try_with(|s| {
+            s.borrow_mut().caller_execute_us += execute_started.elapsed().as_micros() as u64
+        });
         Ok(json!(contract::QuerySqlResult {
             columns: output_columns,
             row_count: rows.len(),
@@ -1277,23 +2253,55 @@ async fn execute_prepared_mode(
 }
 
 #[cfg(test)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, serde::Serialize)]
 pub(crate) struct Stats {
+    pub demand_rechecked: u64,
+    pub demand_recheck_rejections: u64,
+    pub demand_fallbacks: u64,
+    pub visibility_us: u64,
+    pub caller_prepare_us: u64,
+    pub caller_execute_us: u64,
+    pub pool_wait_us: u64,
+    pub sql_admission_us: u64,
     pub staging_vm_ops: u64,
     pub named_registry_loads: usize,
     pub uncached_caller_statements: usize,
+    pub caller_executions: usize,
     pub staging_us: u64,
     pub installations: usize,
+    pub record_projection_installations: usize,
     pub home_checks: usize,
     pub failed_homes: usize,
     pub staged_records: u64,
+    pub staged_currency_records: u64,
+    pub native_event_rows: u64,
+    pub legacy_event_rows: u64,
     pub staged_metadata_records: u64,
     pub staged_relations: usize,
     pub provider_states_decoded: usize,
     pub invalid_facet_time_rows: usize,
+    /// Shape served by demand-scoped visibility, or the fallback reason.
+    pub demand: Option<&'static str>,
 }
 #[cfg(test)]
 tokio::task_local! { static STATS: std::cell::RefCell<Stats>; }
+// Record failed and successful staging alike. In particular a deadline error
+// must not look like a request that performed no work.
+#[cfg(test)]
+struct ComposedStagingMeasurement {
+    started: Instant,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+#[cfg(test)]
+impl Drop for ComposedStagingMeasurement {
+    fn drop(&mut self) {
+        let _ = STATS.try_with(|s| {
+            let mut stats = s.borrow_mut();
+            stats.staging_us += self.started.elapsed().as_micros() as u64;
+            stats.staging_vm_ops += self.progress.load(std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+}
 #[cfg(test)]
 pub(crate) async fn measured<T>(work: impl std::future::Future<Output = T>) -> (T, Stats) {
     STATS
@@ -1323,7 +2331,7 @@ fn records_ddl() -> String {
         crate::v2_standard::v1_compat::FAMILY
     );
     let values = format!(
-        r#"CREATE TEMP VIEW _v2_record_values AS SELECT r.id,
+        r#"CREATE TEMP VIEW _v2_record_oracle AS SELECT r.id,
  CASE WHEN {carrier} THEN {v1_type} ELSE r.primary_type END AS type,
  CASE WHEN {carrier} THEN {v1_kind} ELSE r.kind END AS kind,
  -- V1 records.name is NOT NULL DEFAULT ''. Import carriers intentionally
@@ -1358,7 +2366,7 @@ fn records_ddl() -> String {
         updated_ms = millis(&updated)
     );
     format!(
-        "{values}; CREATE TEMP VIEW records AS SELECT {} FROM temp._v2_record_values",
+        "{values}; CREATE TEMP VIEW _v2_record_values AS SELECT * FROM temp._v2_record_oracle; CREATE TEMP VIEW records AS SELECT {} FROM temp._v2_record_values",
         columns("records").expect("records contract").join(",")
     )
 }
@@ -1369,8 +2377,12 @@ CREATE TEMP TABLE _v2_home_map(home_id TEXT PRIMARY KEY,record_id TEXT);
 -- Only populated when the statement reads home_id. No caller expression can
 -- force a retained body through the metadata/provenance lookup.
 CREATE TEMP TABLE _v2_record_homes(id TEXT PRIMARY KEY,home_id TEXT);
+-- Folder-scoped calls only: granted folder ids the person can View. They
+-- authorise a logical home cell by id; they admit no row and no values.
+CREATE TEMP TABLE _v2_authorized_homes(id TEXT PRIMARY KEY);
 CREATE TEMP TABLE catalog_relations(relation_name TEXT, identity TEXT, semantic_version INTEGER, caller_relative INTEGER, completeness TEXT, profiles TEXT, comment TEXT);
 CREATE TEMP TABLE catalog_columns(relation_name TEXT,column_name TEXT,column_position INTEGER);
+CREATE TEMP TABLE catalog_operations(executor TEXT, operation TEXT, surface TEXT, access TEXT, plan_required INTEGER, direct_execution_enabled INTEGER, contract_version TEXT, contract_digest TEXT, source_tool TEXT, selector_field TEXT, selector_value TEXT, advertised_directly INTEGER, requires_acceptance INTEGER);
 CREATE TEMP TABLE catalog_view_definitions(relation_name TEXT,view_id TEXT,revision_id TEXT,definition_sha256 TEXT,schema_sha256 TEXT,origin TEXT,description TEXT,scope_json TEXT,source_pins_json TEXT,dependencies_json TEXT,columns_json TEXT);
 CREATE TEMP TABLE _v2_facet_rows(id TEXT,record_id TEXT,key TEXT,value TEXT,value_num REAL,vocab_ref TEXT,created_at TEXT,created_at_ms INTEGER);
 CREATE INDEX _v2_facet_record_key ON _v2_facet_rows(record_id,key);
@@ -1439,6 +2451,7 @@ pub(super) fn logical_home_rows_sql() -> String {
         r#"INSERT INTO temp._v2_record_homes WITH placement AS ({placement})
  SELECT p.id,CASE WHEN (p.candidate='native:unfiled' AND p.direct_home='native:unfiled')
  OR EXISTS(SELECT 1 FROM temp._v2_visible v WHERE v.id=p.candidate)
+ OR EXISTS(SELECT 1 FROM temp._v2_authorized_homes a WHERE a.id=p.candidate)
  OR (p.candidate='native:root' AND NOT EXISTS(SELECT 1 FROM main.kernel_records WHERE id='native:root') AND EXISTS(SELECT 1 FROM temp._v2_home_map m JOIN temp._v2_scopes h ON h.home_id=m.home_id WHERE m.record_id='native:root' AND h.home_view))
  OR (NOT EXISTS(SELECT 1 FROM main.kernel_records hidden WHERE hidden.id=p.candidate) AND EXISTS(SELECT 1 FROM temp._v2_scopes h WHERE h.home_id=p.candidate AND h.home_view)) THEN p.candidate ELSE NULL END AS home_id FROM placement p"#,
         placement = logical_home_placement_sql()
@@ -1454,7 +2467,19 @@ const FACET_ROWS: &str = r#"INSERT INTO temp._v2_facet_rows SELECT printf('v2:fa
 // actor, app origin, and the rest of the retained envelope never enter SQL.
 // Legacy event_seq follows the public v2 content_events namespace, so joins
 // remain exact. IDs and all other fields retain their v1 representation.
-const FACET_OBSERVATION_ROWS: &str = r#"INSERT INTO temp.facet_observations
+fn facet_observation_rows(scoped: bool) -> String {
+    let legacy = if scoped {
+        "FROM json_each(?1) requested CROSS JOIN temp._v2_visible v ON v.id=requested.value CROSS JOIN main.kernel_legacy_sql_events h ON h.record_id=v.id CROSS JOIN main.content_events e ON e.seq=h.seq"
+    } else {
+        "FROM main.kernel_legacy_sql_events h JOIN main.content_events e ON e.seq=h.seq JOIN temp._v2_visible v ON v.id=h.record_id"
+    };
+    let native = if scoped {
+        "FROM json_each(?1) requested CROSS JOIN temp._v2_visible v ON v.id=requested.value CROSS JOIN main.content_events e ON e.record_id=v.id"
+    } else {
+        "FROM main.content_events e JOIN temp._v2_visible v ON v.id=e.record_id"
+    };
+    format!(
+        r#"INSERT INTO temp.facet_observations
 WITH candidates AS (
  SELECT h.record_id,json_extract(e.payload,'$.legacy.payload.key') AS key,
  CASE h.event_type WHEN 'facet.set' THEN json_extract(e.payload,'$.legacy.payload.value') END AS value,
@@ -1463,8 +2488,7 @@ WITH candidates AS (
  coalesce(json_extract(e.payload,'$.legacy.payload.as_of'),h.created_at) AS as_of,
  h.created_at AS observed_at,h.seq AS event_seq,0 AS native,
  json_extract(e.payload,'$.legacy.source.metadata.seq') AS ordering
- FROM main.kernel_legacy_sql_events h JOIN main.content_events e ON e.seq=h.seq
- JOIN temp._v2_visible v ON v.id=h.record_id
+ {legacy}
  WHERE h.source_stream='content_events' AND h.event_type IN ('facet.set','facet.unset')
  AND json_type(e.payload,'$.legacy.payload.key')='text'
  AND json_type(e.payload,'$.legacy.source.metadata.seq')='integer'
@@ -1472,13 +2496,13 @@ WITH candidates AS (
  SELECT e.record_id,json_extract(e.payload,'$.key'),json_extract(e.payload,'$.value'),
  CASE WHEN json_extract(e.payload,'$.value') IS NULL THEN 'unset' ELSE 'set' END,
  json_extract(e.payload,'$.vocab_ref'),json_extract(e.payload,'$.as_of'),e.created_at,e.seq,1,e.seq
- FROM main.content_events e JOIN temp._v2_visible v ON v.id=e.record_id
+ {native}
  WHERE e.type='kernel.facet_observed.v1'
  UNION ALL
  SELECT e.record_id,'archived',CASE WHEN json_extract(e.payload,'$.archived') THEN 'true' END,
  CASE WHEN json_extract(e.payload,'$.archived') THEN 'set' ELSE 'unset' END,
  NULL,e.created_at,e.created_at,e.seq,1,e.seq
- FROM main.content_events e JOIN temp._v2_visible v ON v.id=e.record_id
+ {native}
  WHERE e.type='kernel.archive_changed.v1'
 ), latest AS (
  SELECT *,row_number() OVER(PARTITION BY record_id,key,as_of ORDER BY native DESC,ordering DESC,event_seq DESC) AS rank
@@ -1486,7 +2510,9 @@ WITH candidates AS (
 )
 SELECT 'fo:'||record_id||':'||key||':'||as_of,record_id,key,value,op,vocab_ref,as_of,
  strftime('%Y-%m-%dT%H:%M:%fZ',observed_at),(CAST(strftime('%s',observed_at) AS INTEGER)*1000+CAST(substr(strftime('%f',observed_at),4,3) AS INTEGER)),event_seq
- FROM latest WHERE rank=1"#;
+ FROM latest WHERE rank=1"#
+    )
+}
 
 fn events_ddl() -> String {
     format!(
@@ -1505,6 +2531,16 @@ CREATE TEMP VIEW actors AS SELECT DISTINCT e.actor,r.id AS person_id,coalesce(js
  LEFT JOIN main.kernel_records r ON r.id=v.id
  LEFT JOIN main.kernel_record_fields n ON n.record_id=r.id AND n.name='title'
  WHERE e.actor IS NOT NULL;
+CREATE TEMP TABLE _v2_viewer_principal(principal_id TEXT);
+CREATE TEMP VIEW viewer AS SELECT r.id AS person_id,coalesce(json_extract(n.value_json,'$'),p.display_label) AS display_name
+ FROM temp._v2_viewer_principal own
+ LEFT JOIN main.kernel_principals p ON p.principal_id=own.principal_id
+ LEFT JOIN main.kernel_v1_state d ON d.section='account_directory' AND d.account_principal=p.principal_id
+ LEFT JOIN main.kernel_message_people mp ON mp.principal_id=p.principal_id
+ LEFT JOIN temp._v2_visible v ON v.id=coalesce(d.record_id,mp.person_id)
+ LEFT JOIN main.kernel_records r ON r.id=v.id
+ LEFT JOIN main.kernel_record_fields n ON n.record_id=r.id AND n.name='title'
+ ORDER BY r.id IS NULL,d.source_id,r.id LIMIT 1;
 CREATE TEMP VIEW comment_anchors AS SELECT a.annotation_id,a.target_record_id,a.purpose,a.selectors,a.body_revision AS source_event_seq,a.body_sha256 AS source_sha256
  FROM main.kernel_comment_anchors a JOIN temp._v2_visible c ON c.id=a.annotation_id JOIN temp._v2_visible t ON t.id=a.target_record_id JOIN main.kernel_records r ON r.id=a.annotation_id
  WHERE a.source_slot='body' AND {};
@@ -1515,7 +2551,7 @@ CREATE TEMP VIEW comment_anchors AS SELECT a.annotation_id,a.target_record_id,a.
 
 // Keep every retained-header join after the tiny selected-position set.
 // Fencing only a/m lets SQLite move the JSON subject scan ahead of both.
-pub(super) const LEGACY_ADMISSION_SQL: &str = "INSERT INTO temp._v2_legacy_admitted SELECT m.seq FROM temp._v2_event_ids a CROSS JOIN main.kernel_legacy_sql_events m ON m.seq=a.seq CROSS JOIN main.kernel_legacy_history h ON h.seq=m.seq CROSS JOIN temp._v2_visible r ON r.id=m.record_id WHERE m.source_stream='content_events' AND NOT h.hidden AND (?1 OR NOT h.restricted OR h.owner=?2) AND NOT EXISTS(SELECT 1 FROM json_each(h.subjects) subject WHERE NOT EXISTS(SELECT 1 FROM temp._v2_legacy_visible_subjects visible WHERE visible.id=subject.value))";
+pub(super) const LEGACY_ADMISSION_SQL: &str = "INSERT INTO temp._v2_legacy_admitted SELECT m.seq FROM temp._v2_event_ids a CROSS JOIN main.kernel_legacy_sql_events m ON m.seq=a.seq CROSS JOIN main.kernel_legacy_history h ON h.seq=m.seq CROSS JOIN temp._v2_visible r ON r.id=m.record_id WHERE m.source_stream='content_events' AND NOT h.hidden AND (?1 OR NOT h.restricted OR h.owner=?2) AND EXISTS(SELECT 1 FROM temp._v2_legacy_subject_sets subjects WHERE subjects.subjects=h.subjects AND subjects.admitted)";
 
 /// Share W5 disclosure checks. Only replayed header facts are read here;
 /// source bodies and immutable retained envelopes stay outside ordinary SQL.
@@ -1525,6 +2561,22 @@ async fn install_events(
     root_visible: bool,
     bounded: bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    if event_equivalence::baseline_enabled() {
+        return event_staging_baseline::install_events(tx, actor, root_visible, bounded).await;
+    }
+    install_events_after(tx, actor, root_visible, bounded, 0, false).await
+}
+
+async fn install_events_after(
+    tx: &mut sqlx::SqliteConnection,
+    actor: &str,
+    root_visible: bool,
+    bounded: bool,
+    after: i64,
+    oracle_only: bool,
+) -> Result<()> {
+    let event_started = Instant::now();
     let logical_types = super::LOGICAL_EVENT_TYPES
         .iter()
         .map(|(native, logical)| format!("WHEN '{native}' THEN '{logical}'"))
@@ -1535,6 +2587,7 @@ async fn install_events(
         .map(|event| format!("'{event}'"))
         .collect::<Vec<_>>()
         .join(",");
+    let native_globs = native_event_globs_sql();
     let native_sql = format!(
         r#"INSERT INTO temp._v2_event_rows
  SELECT e.seq,e.id,e.record_id,
@@ -1544,14 +2597,31 @@ async fn install_events(
  CASE WHEN ?1 OR e.actor=?2 THEN 'unknown' END,
  e.created_at,NULL
  FROM temp._v2_event_ids a CROSS JOIN main.content_events e ON e.seq=a.seq
- WHERE e.type!='kernel.legacy_recorded.v1' AND e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT GLOB 'kernel.import_*' AND e.type NOT IN ({imported})"#
+ WHERE e.type!='kernel.legacy_recorded.v1' AND {native_globs} AND e.type NOT IN ({imported})"#
     );
-    sqlx::query(&native_sql)
+    #[cfg(test)]
+    let native_phase = event_profile::Phase::new("native_insert");
+    let native_rows = sqlx::query(&native_sql)
         .bind(root_visible)
         .bind(actor)
         .execute(&mut *tx)
-        .await?;
-    install_reaction_headers(tx, actor, root_visible, bounded).await?;
+        .await?
+        .rows_affected();
+    #[cfg(test)]
+    let _ = STATS.try_with(|s| s.borrow_mut().native_event_rows += native_rows);
+    #[cfg(not(test))]
+    let _ = native_rows;
+    tracing::debug!(target: "native_ce::read_staging", phase = "events_native", elapsed_us = event_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    drop(native_phase);
+    #[cfg(test)]
+    let reaction_phase = event_profile::Phase::new("reaction_synthesis");
+    install_reaction_headers(tx, actor, root_visible, bounded, after, oracle_only).await?;
+    tracing::debug!(target: "native_ce::read_staging", phase = "events_reactions", elapsed_us = event_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    drop(reaction_phase);
+    #[cfg(test)]
+    let subject_phase = event_profile::Phase::new("legacy_subject_sets_and_visibility");
     let headers: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='kernel_legacy_sql_events')").fetch_one(&mut *tx).await?;
     if !headers {
         let retained: bool =
@@ -1598,8 +2668,8 @@ async fn install_events(
     // Resolve each subject once, with the same W5 helper as before. Admission
     // of the many historical rows is then a set operation inside this exact
     // authority snapshot, rather than decoding/inserting each row in Rust.
-    for subjects in subject_sets {
-        for subject in serde_json::from_str::<Vec<String>>(&subjects)? {
+    for subjects in &subject_sets {
+        for subject in serde_json::from_str::<Vec<String>>(subjects)? {
             kernel::legacy_history_visible(&mut *tx, actor, &subject, &mut visibility).await?;
         }
     }
@@ -1618,17 +2688,45 @@ async fn install_events(
         });
         insert.build().execute(&mut *tx).await?;
     }
+    #[cfg(test)]
+    drop(subject_phase);
+    tracing::debug!(target: "native_ce::read_staging", phase = "events_subjects", elapsed_us = event_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    let admission_phase = event_profile::Phase::new("legacy_admission");
+    // Preserve the exact SQLite json_each/value comparison, but evaluate it
+    // once per distinct raw subject set. Clear on every history window: its
+    // visible subject set can grow within the same authority snapshot.
+    sqlx::query("CREATE TEMP TABLE IF NOT EXISTS _v2_legacy_subject_sets(subjects TEXT PRIMARY KEY,admitted INTEGER NOT NULL DEFAULT 0); DELETE FROM temp._v2_legacy_subject_sets").execute(&mut *tx).await?;
+    for chunk in subject_sets.chunks(500) {
+        let mut insert = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO temp._v2_legacy_subject_sets(subjects) ",
+        );
+        insert.push_values(chunk, |mut row, subjects| {
+            row.push_bind(subjects);
+        });
+        insert.build().execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE temp._v2_legacy_subject_sets SET admitted=NOT EXISTS(SELECT 1 FROM json_each(_v2_legacy_subject_sets.subjects) subject WHERE NOT EXISTS(SELECT 1 FROM temp._v2_legacy_visible_subjects visible WHERE visible.id=subject.value))").execute(&mut *tx).await?;
     sqlx::query(LEGACY_ADMISSION_SQL)
         .bind(admin)
         .bind(&binding)
         .execute(&mut *tx)
         .await?;
+    #[cfg(test)]
+    drop(admission_phase);
+    tracing::debug!(target: "native_ce::read_staging", phase = "events_admission", elapsed_us = event_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    let disclosure_phase = event_profile::Phase::new("legacy_actor_disclosure");
     // Same v1 rule as get_history: self, or an actor's verified Person
     // visible under current policy. Root visibility is not a substitute.
     for principal in kernel::v1_state::disclosed_accounts_on(tx, actor).await? {
         sqlx::query("INSERT OR IGNORE INTO temp._v2_disclosed_legacy_actors SELECT 'v1:'||auth_binding FROM main.kernel_principals WHERE principal_id=?")
             .bind(principal).execute(&mut *tx).await?;
     }
+    // Resolve each disclosed source alias once. auth_binding is UNIQUE, so
+    // this preserves the old per-event LEFT JOIN's row cardinality and NULL
+    // fallback. Undisclosed aliases never acquire a public principal here.
+    sqlx::query("CREATE TEMP TABLE IF NOT EXISTS _v2_disclosed_legacy_principals(actor TEXT PRIMARY KEY,principal_id TEXT); DELETE FROM temp._v2_disclosed_legacy_principals; INSERT INTO temp._v2_disclosed_legacy_principals SELECT d.actor,p.principal_id FROM temp._v2_disclosed_legacy_actors d LEFT JOIN main.kernel_principals p ON p.auth_binding=substr(d.actor,4) AND d.actor LIKE 'v1:%' AND p.kind='account'").execute(&mut *tx).await?;
     // SQL uses one verified principal identity across imported and native
     // activity. Otherwise apps mistake a source alias and that principal's
     // first native event for two different accounts bound to the same Person.
@@ -1636,34 +2734,87 @@ async fn install_events(
     // history keep the exact v1 actor. Never coalesce accounts by Person/name.
     // Copy admitted headers in one set operation, never one round trip per
     // historical event. No source payload enters the ordinary SQL surface.
-    sqlx::query(r#"INSERT INTO temp._v2_event_rows
+    #[cfg(test)]
+    drop(disclosure_phase);
+    tracing::debug!(target: "native_ce::read_staging", phase = "events_disclosure", elapsed_us = event_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    let legacy_phase = event_profile::Phase::new("legacy_insert");
+    let (legacy_native, legacy_logical) = super::LEGACY_RECEIPT_MAPPING;
+    let legacy_rows = sqlx::query(&format!(r#"INSERT INTO temp._v2_event_rows
       SELECT m.seq,m.source_id,m.record_id,
-       CASE WHEN m.event_type='receipt.committed.v1' THEN 'record.updated' ELSE m.event_type END,
-       CASE WHEN d.actor IS NOT NULL THEN coalesce(p.principal_id,m.actor) END,
+       CASE WHEN m.event_type='{legacy_native}' THEN '{legacy_logical}' ELSE m.event_type END,
+       CASE WHEN d.actor IS NOT NULL THEN coalesce(d.principal_id,m.actor) END,
        CASE WHEN d.actor IS NOT NULL AND (NOT h.claim_sensitive OR m.actor='v1:'||?1) THEN m.run_key END,
        CASE WHEN d.actor IS NOT NULL AND (NOT h.claim_sensitive OR m.actor='v1:'||?1) THEN m.parent_key END,
        CASE WHEN d.actor IS NOT NULL THEN 'unknown' END,
        m.created_at,NULL
       FROM temp._v2_legacy_admitted a CROSS JOIN main.kernel_legacy_sql_events m ON m.seq=a.seq
       CROSS JOIN main.kernel_legacy_history h ON h.seq=m.seq
-      LEFT JOIN temp._v2_disclosed_legacy_actors d ON d.actor=m.actor
-      LEFT JOIN main.kernel_principals p ON p.auth_binding=substr(m.actor,4) AND m.actor LIKE 'v1:%' AND p.kind='account'"#)
-        .bind(&binding).execute(&mut *tx).await?;
+      LEFT JOIN temp._v2_disclosed_legacy_principals d ON d.actor=m.actor"#))
+        .bind(&binding).execute(&mut *tx).await?.rows_affected();
+    #[cfg(test)]
+    let _ = STATS.try_with(|s| s.borrow_mut().legacy_event_rows += legacy_rows);
+    #[cfg(not(test))]
+    let _ = legacy_rows;
+    tracing::debug!(target: "native_ce::read_staging", phase = "events_legacy", elapsed_us = event_started.elapsed().as_micros() as u64);
+    #[cfg(test)]
+    drop(legacy_phase);
     Ok(())
 }
 
 async fn select_event_ids(tx: &mut sqlx::SqliteConnection, bounded: bool) -> Result<()> {
-    let candidate = if bounded {
-        " AND e.seq IN (SELECT seq FROM temp._v2_history_candidates)"
-    } else {
-        ""
-    };
-    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN temp._v2_visible v ON v.id=e.record_id WHERE e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT IN ('kernel.identity_binding_added.v1','kernel.account_config_bound.v1','kernel.app_state_imported.v1','kernel.import_receipt.v1','kernel.v1_state_imported.v1','kernel.message_state.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1','kernel.provider_outcome.v1','kernel.link_added.v2','kernel.link_added.v1','kernel.link_removed.v1') AND e.type NOT LIKE 'kernel.generic_link_%'{candidate}")).execute(&mut *tx).await?;
+    #[cfg(test)]
+    if event_equivalence::baseline_enabled() {
+        return event_staging_baseline::select_event_ids(tx, bounded).await;
+    }
+    select_event_ids_after(tx, bounded, 0, false).await
+}
 
-    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN main.kernel_link4_edges l ON l.created_seq=e.seq JOIN temp._v2_visible s ON s.id=l.source_id JOIN temp._v2_visible t ON t.id=l.target_id WHERE e.type='kernel.link_added.v2'{candidate}")).execute(&mut *tx).await?;
-    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN temp._v2_visible s ON s.id=e.record_id JOIN temp._v2_visible t ON t.id=json_extract(e.payload,'$.target_id') WHERE e.type IN ('kernel.link_added.v1','kernel.link_removed.v1'){candidate}")).execute(&mut *tx).await?;
-    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN main.kernel_generic_links l ON l.link_id=json_extract(e.payload,'$.link_id') JOIN temp._v2_visible s ON s.id=l.source_id JOIN temp._v2_visible t ON t.id=l.target_id WHERE e.type LIKE 'kernel.generic_link_%'{candidate}")).execute(&mut *tx).await?;
-    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN temp._v2_visible anchor ON anchor.id=e.record_id WHERE e.type='kernel.provider_outcome.v1' AND EXISTS(SELECT 1 FROM main.kernel_provider_subjects s WHERE s.aggregate_id=e.record_id) AND NOT EXISTS(SELECT 1 FROM main.kernel_provider_subjects s WHERE s.aggregate_id=e.record_id AND s.subject_id NOT IN (SELECT id FROM temp._v2_visible)){candidate}")).execute(&mut *tx).await?;
+async fn select_event_ids_after(
+    tx: &mut sqlx::SqliteConnection,
+    bounded: bool,
+    after: i64,
+    oracle_only: bool,
+) -> Result<()> {
+    #[cfg(test)]
+    let _phase = event_profile::Phase::new("select_event_ids");
+    let candidate = if bounded {
+        " AND e.seq IN (SELECT seq FROM temp._v2_history_candidates)".to_owned()
+    } else if oracle_only {
+        " AND e.seq IN (SELECT seq FROM temp._v2_oracle_events)".to_owned()
+    } else {
+        format!(" AND e.seq>{after}")
+    };
+    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN temp._v2_visible v ON v.id=e.record_id WHERE {SELECTOR_EXCLUSION_GLOBS_SQL} AND e.type NOT IN ({RECORD_EVENT_EXCLUSIONS_SQL}) AND e.type NOT LIKE '{GENERIC_LINK_PATTERN}'{candidate}")).execute(&mut *tx).await?;
+
+    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN main.kernel_link4_edges l ON l.created_seq=e.seq JOIN temp._v2_visible s ON s.id=l.source_id JOIN temp._v2_visible t ON t.id=l.target_id WHERE e.type='{LINK4_TYPE}'{candidate}")).execute(&mut *tx).await?;
+    if bounded || oracle_only {
+        let source = if oracle_only {
+            // Keep payload evaluation after the visible-source gate even for
+            // malformed hidden V1 links. Candidates drive point seeks.
+            "temp._v2_oracle_events c CROSS JOIN main.content_events e ON e.seq=c.seq CROSS JOIN temp._v2_visible s ON s.id=e.record_id CROSS JOIN temp._v2_visible t ON t.id=json_extract(e.payload,'$.target_id')"
+        } else {
+            "main.content_events e JOIN temp._v2_visible s ON s.id=e.record_id JOIN temp._v2_visible t ON t.id=json_extract(e.payload,'$.target_id')"
+        };
+        sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM {source} WHERE e.type IN ({V1_LINK_TYPES_SQL}){candidate}")).execute(&mut *tx).await?;
+        let generic_source = if oracle_only {
+            // Preserve the permanent generic selector's evaluation order: JSON
+            // identity decoding precedes retained endpoint admission.
+            "temp._v2_oracle_events c CROSS JOIN main.content_events e ON e.seq=c.seq CROSS JOIN main.kernel_generic_links l ON l.link_id=json_extract(e.payload,'$.link_id') CROSS JOIN temp._v2_visible s ON s.id=l.source_id CROSS JOIN temp._v2_visible t ON t.id=l.target_id"
+        } else {
+            "main.content_events e JOIN main.kernel_generic_links l ON l.link_id=json_extract(e.payload,'$.link_id') JOIN temp._v2_visible s ON s.id=l.source_id JOIN temp._v2_visible t ON t.id=l.target_id"
+        };
+        sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM {generic_source} WHERE e.type LIKE '{GENERIC_LINK_PATTERN}'{candidate}")).execute(&mut *tx).await?;
+    } else {
+        // Seek each authorized source's two V1 event types through the existing
+        // (record_id,type,seq) index, then apply the unchanged target fence.
+        sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM temp._v2_visible s CROSS JOIN main.content_events e INDEXED BY idx_kernel_hosted_event_lookup ON e.record_id=s.id CROSS JOIN temp._v2_visible t ON t.id=json_extract(e.payload,'$.target_id') WHERE e.type IN ({V1_LINK_TYPES_SQL}){candidate}")).execute(&mut *tx).await?;
+        // Generic admission uses the projected endpoints, not e.record_id.
+        // Read only positions/types in the covering index before fetching the
+        // comparatively few generic payloads. Keep LIKE's exact semantics.
+        sqlx::query(&format!("WITH candidates AS MATERIALIZED (SELECT e.seq FROM main.content_events e INDEXED BY idx_kernel_hosted_event_lookup WHERE e.type LIKE '{GENERIC_LINK_PATTERN}'{candidate}) INSERT INTO temp._v2_event_ids SELECT e.seq FROM candidates c CROSS JOIN main.content_events e ON e.seq=c.seq CROSS JOIN main.kernel_generic_links l ON l.link_id=json_extract(e.payload,'$.link_id') CROSS JOIN temp._v2_visible s ON s.id=l.source_id CROSS JOIN temp._v2_visible t ON t.id=l.target_id")).execute(&mut *tx).await?;
+    }
+    sqlx::query(&format!("INSERT INTO temp._v2_event_ids SELECT e.seq FROM main.content_events e JOIN temp._v2_visible anchor ON anchor.id=e.record_id WHERE e.type='{PROVIDER_TYPE}' AND EXISTS(SELECT 1 FROM main.kernel_provider_subjects s WHERE s.aggregate_id=e.record_id) AND NOT EXISTS(SELECT 1 FROM main.kernel_provider_subjects s WHERE s.aggregate_id=e.record_id AND s.subject_id NOT IN (SELECT id FROM temp._v2_visible)){candidate}")).execute(&mut *tx).await?;
     Ok(())
 }
 
@@ -1732,7 +2883,7 @@ async fn install_history_window(
         };
         inclusive = false;
         let positions: Vec<i64> = sqlx::query_scalar(&format!(
-            "SELECT e.seq FROM main.content_events e WHERE e.seq{comparison}?1 AND e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT GLOB 'kernel.import_*' AND e.type NOT IN ({imported},'kernel.identity_binding_added.v1','kernel.account_config_bound.v1','kernel.app_state_imported.v1','kernel.v1_state_imported.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1') AND (e.type!='kernel.legacy_recorded.v1' OR EXISTS(SELECT 1 FROM main.kernel_legacy_sql_events m WHERE m.seq=e.seq AND m.source_stream='content_events')) ORDER BY e.seq {direction} LIMIT {fetch}"
+            "SELECT e.seq FROM main.content_events e WHERE e.seq{comparison}?1 AND e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT GLOB 'kernel.webhook_*' AND e.type NOT GLOB 'kernel.import_*' AND e.type NOT IN ({imported},'kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1','kernel.identity_bindings_reconciled.v1','kernel.account_config_bound.v1','kernel.app_state_imported.v1','kernel.v1_state_imported.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.mcp_write_receipt_recorded.v1','kernel.mcp_write_fenced.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1') AND (e.type!='kernel.legacy_recorded.v1' OR EXISTS(SELECT 1 FROM main.kernel_legacy_sql_events m WHERE m.seq=e.seq AND m.source_stream='content_events')) ORDER BY e.seq {direction} LIMIT {fetch}"
         )).bind(cursor).fetch_all(&mut *tx).await?;
         if positions.is_empty() {
             break;
@@ -1787,21 +2938,66 @@ async fn install_reaction_headers(
     actor: &str,
     root_visible: bool,
     bounded: bool,
+    after: i64,
+    oracle_only: bool,
 ) -> Result<()> {
-    let candidate = if bounded {
-        " AND seq IN (SELECT seq FROM temp._v2_history_candidates)"
+    // No messages means no reaction transitions, including on ordinary
+    // scans of document-only workspaces. Avoid preparing the state window.
+    let messages: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.kernel_messages m JOIN temp._v2_visible v ON v.id=m.message_id)")
+        .fetch_one(&mut *tx).await?;
+    if !messages {
+        return Ok(());
+    }
+    if bounded {
+        let transitions: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM temp._v2_history_candidates c CROSS JOIN main.content_events e ON e.seq=c.seq JOIN main.kernel_messages m ON m.message_id=e.record_id JOIN temp._v2_visible v ON v.id=m.message_id WHERE e.type='kernel.message_state.v1')")
+            .fetch_one(&mut *tx).await?;
+        if !transitions {
+            return Ok(());
+        }
+    }
+    // Drive bounded reads from selected positions. An IN over positions
+    // inside a message-driven join lets SQLite probe every position for
+    // every visible message, even though only a tiny window is requested.
+    let scoped: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='_v2_event_subjects')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let source = if bounded {
+        "FROM temp._v2_history_candidates c CROSS JOIN main.content_events e ON e.seq=c.seq CROSS JOIN main.kernel_messages m ON m.message_id=e.record_id CROSS JOIN temp._v2_visible v ON v.id=m.message_id"
+    } else {
+        "FROM main.kernel_messages m JOIN temp._v2_visible v ON v.id=m.message_id CROSS JOIN main.content_events e"
+    };
+    let subjects = if scoped {
+        " AND m.message_id IN (SELECT id FROM temp._v2_event_subjects)"
     } else {
         ""
+    };
+    // Only the immediately preceding authoritative state is needed for a
+    // closed window. The unbounded path retains its complete LAG window.
+    let previous = if bounded {
+        // An explicit alias keeps JSON paths intact (notably $.state.message).
+        let state = kernel::messaging::PREVIOUS_STATE_JSON_SQL;
+        format!("(SELECT json_extract({state},'$.reactions') FROM main.content_events p WHERE p.record_id=states.record_id AND p.seq<states.seq AND p.type IN {} AND json_type({state})='object' ORDER BY p.seq DESC LIMIT 1)",kernel::messaging::STATE_EVENTS_SQL)
+    } else {
+        "lag(reactions) OVER (PARTITION BY record_id ORDER BY seq)".to_owned()
+    };
+    // Retain the full LAG window for sparse oracle/tail staging: earlier
+    // authoritative states can raise JSON errors even when not predecessors
+    // of selected positions. Restricting evaluation would change that behavior.
+    let remainder = if oracle_only {
+        "seq IN (SELECT seq FROM temp._v2_oracle_events) AND ?3>=0"
+    } else {
+        "seq>?3"
     };
     sqlx::query(&format!(r#"WITH states AS (
       SELECT e.seq,e.id,e.record_id,e.type,e.actor,e.run_key,e.parent_key,e.created_at,
        json_extract({state_json},'$.reactions') AS reactions
-      FROM main.kernel_messages m JOIN temp._v2_visible v ON v.id=m.message_id
-      CROSS JOIN main.content_events e
-      WHERE e.record_id=m.message_id AND e.type IN {state_events}
+      {source}
+      WHERE e.record_id=m.message_id {subjects} AND e.type IN {state_events}
        AND json_type({state_json})='object'
      ), transitions AS (
-      SELECT *,lag(reactions) OVER (PARTITION BY record_id ORDER BY seq) AS previous FROM states
+      SELECT *,{previous} AS previous FROM states
      ), changes AS (
       SELECT *,
        EXISTS(SELECT p.key,emoji.value FROM json_each(reactions) p,json_each(p.value) emoji
@@ -1817,8 +3013,8 @@ async fn install_reaction_headers(
       CASE WHEN ?1 THEN run_key END,CASE WHEN ?1 THEN parent_key END,
       CASE WHEN ?1 OR actor=?2 THEN 'unknown' END,
       created_at,NULL
-     FROM changes WHERE (added OR removed){candidate}"#, state_json=kernel::messaging::STATE_JSON_SQL, state_events=kernel::messaging::STATE_EVENTS_SQL))
-        .bind(root_visible).bind(actor).execute(tx).await?;
+     FROM changes WHERE (added OR removed) AND {remainder}"#, state_json=kernel::messaging::STATE_JSON_SQL, state_events=kernel::messaging::STATE_EVENTS_SQL))
+        .bind(root_visible).bind(actor).bind(after).execute(tx).await?;
     Ok(())
 }
 
@@ -1839,6 +3035,9 @@ pub(crate) async fn install(
         None,
         chrono::Utc::now().timestamp_millis(),
         false,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -1849,18 +3048,39 @@ async fn install_relations(
     actor: &str,
     reads: &BTreeSet<(String, String)>,
     link_scope: LinkScope,
-    candidate_ids: Option<&[String]>,
+    candidates: Option<ReadCandidates<'_>>,
     history_window: Option<HistoryWindow>,
     record_limit: Option<i64>,
     exact_record_ids: Option<&[String]>,
     class_scope: Option<&record_classes::Plan>,
     observed_ms: i64,
     project_facet_columns: bool,
+    catalogue: Option<&crate::query::principal::CatalogOperationsSnapshot>,
+    event_cache_generation: Option<i64>,
+    record_cache_generation: Option<&str>,
 ) -> Result<()> {
     #[cfg(test)]
     let _ = STATS.try_with(|s| s.borrow_mut().installations += 1);
+    if reads.iter().any(|(r, _)| r == "catalog_operations") && catalogue.is_none() {
+        return Err(contract::categorized_error(
+            contract::QuerySqlErrorCategory::UnauthorizedRelation,
+            "catalog_operations requires the serving executor catalogue",
+        ));
+    }
     let schema_started = Instant::now();
     sqlx::query(DDL).persistent(false).execute(&mut *tx).await?;
+    if reads.iter().any(|(r, _)| r == "catalog_operations") {
+        let snapshot = catalogue.ok_or_else(|| {
+            contract::categorized_error(
+                contract::QuerySqlErrorCategory::UnauthorizedRelation,
+                "catalog_operations requires the serving executor catalogue",
+            )
+        })?;
+        sqlx::query("INSERT INTO temp.catalog_operations SELECT value ->> 'executor', value ->> 'operation', value ->> 'surface', value ->> 'access', json_extract(value, '$.plan_required'), json_extract(value, '$.direct_execution_enabled'), value ->> 'contract_version', value ->> 'contract_digest', value ->> 'source_tool', value ->> 'selector_field', value ->> 'selector_value', json_extract(value, '$.advertised_directly'), json_extract(value, '$.requires_acceptance') FROM json_each(?)")
+            .bind(serde_json::to_string(snapshot.as_slice())?)
+            .execute(&mut *tx).await?;
+    }
+
     sqlx::query(&records_ddl())
         .persistent(false)
         .execute(&mut *tx)
@@ -1870,6 +3090,10 @@ async fn install_relations(
         .execute(&mut *tx)
         .await?;
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_temp_schema", elapsed_us = schema_started.elapsed().as_micros() as u64);
+    sqlx::query("INSERT INTO temp._v2_viewer_principal VALUES(?)")
+        .bind(actor)
+        .execute(&mut *tx)
+        .await?;
     let needs = |relation: &str| reads.iter().any(|(r, _)| r == relation);
     if needs("bindings") {
         // Keep main's caller-scoped portable/catalog aliases. The native
@@ -1906,6 +3130,7 @@ async fn install_relations(
         "facet_times",
         "content_events",
         "actors",
+        "viewer",
         "comment_anchors",
         "record_lifecycle_interpretations",
         "agent_activity_claims",
@@ -1917,12 +3142,63 @@ async fn install_relations(
     ]
     .iter()
     .any(|r| needs(r));
+    // Viewer-only reads need visibility checks for this principal's possible
+    // people, rather than every record in the workspace. Keep the same join
+    // precedence as the relation, including its directory/person fallback.
+    let viewer_record_ids: Option<Vec<String>> = if !reads.is_empty()
+        && reads.iter().all(|(relation, _)| relation == "viewer")
+    {
+        Some(sqlx::query_scalar("SELECT DISTINCT coalesce(d.record_id,mp.person_id) FROM main.kernel_principals p LEFT JOIN main.kernel_v1_state d ON d.section='account_directory' AND d.account_principal=p.principal_id LEFT JOIN main.kernel_message_people mp ON mp.principal_id=p.principal_id WHERE p.principal_id=? AND coalesce(d.record_id,mp.person_id) IS NOT NULL")
+            .bind(actor).fetch_all(&mut *tx).await?)
+    } else {
+        None
+    };
+    let exact_record_ids = viewer_record_ids.as_deref().or(exact_record_ids);
+    // A finite scope that accepted a closed home-ID self-join chain stages
+    // the chain's logical-placement fixpoint; otherwise it stages in full.
+    let plan = demand::current();
+    if exact_record_ids.is_some() && (plan.exact_body || plan.docs_page) {
+        demand::mark_attempt();
+    }
+    let closed_chain = match exact_record_ids {
+        Some(ids) if plan.home_chain && viewer_record_ids.is_none() => {
+            Some(Box::pin(demand::placement_closure(tx, ids)).await?)
+        }
+        _ => None,
+    };
+    let exact_record_ids = match &closed_chain {
+        Some(Some(ids)) => Some(ids.as_slice()),
+        Some(None) => None,
+        None => exact_record_ids,
+    };
+    let demand_shape = (exact_record_ids.is_some()
+        && viewer_record_ids.is_none()
+        && candidates.is_none()
+        && history_window.is_none()
+        && class_scope.is_none()
+        && record_limit.is_none()
+        && reads
+            .iter()
+            .all(|(r, _)| r == "records" || r == "facet_values"))
+    .then(|| {
+        if column("home_id") {
+            demand::Shape::DocsPage
+        } else {
+            demand::Shape::ExactBody
+        }
+    })
+    .filter(|shape| plan.allows(*shape));
+    let mut demand_candidates: Option<Vec<String>> = None;
     let needs_runs = needs("runs") || needs("run_intents") || needs("agent_activity_claims");
     let mut root_visible = false;
     if needs_records {
         // Authorize requested anchors in this same snapshot before their raw
         // structural relations can influence staging (including timing).
-        let candidate_ids = if let Some(ids) = candidate_ids {
+        let candidate_names = match candidates {
+            Some(ReadCandidates::Names(names)) => Some(names),
+            _ => None,
+        };
+        let candidate_ids = if let Some(ReadCandidates::Anchors(ids)) = candidates {
             let mut allowed = BTreeSet::new();
             for id in ids.iter().collect::<BTreeSet<_>>() {
                 let root = [crate::events::KERNEL_ROOT_ID, "native:root"].contains(&id.as_str());
@@ -1956,10 +3232,51 @@ async fn install_relations(
         tracing::debug!(target: "native_ce::read_staging", phase = "legacy_frontier", elapsed_us = frontier_started.elapsed().as_micros() as u64);
 
         let scopes_started = Instant::now();
-        let scope = kernel::visible_home_anchors_as(tx, actor).await?;
+        let scope = match (demand_shape, exact_record_ids) {
+            (Some(shape), Some(ids)) => {
+                // The logical-home cell admits placement dependencies below
+                // with this same decision, joins or not. Their authority
+                // homes and Message proof must be loaded with the demand.
+                let dependencies = if column("home_id") {
+                    Box::pin(demand::placement_dependencies(tx, ids)).await?
+                } else {
+                    Vec::new()
+                };
+                match Box::pin(kernel::demand_visibility::demand_home_anchors_as(
+                    tx,
+                    actor,
+                    ids,
+                    &dependencies,
+                    demand::root_aliases(),
+                ))
+                .await?
+                {
+                    kernel::demand_visibility::Demand::Scope(demanded) => {
+                        demand::selected(shape);
+                        demand_candidates = Some(demanded.staged);
+                        #[cfg(test)]
+                        let _ = STATS.try_with(|s| {
+                            s.borrow_mut().demand = Some(match shape {
+                                demand::Shape::ExactBody => "exact_body",
+                                demand::Shape::DocsPage => "docs_page",
+                            })
+                        });
+                        let _ = shape;
+                        demanded.homes
+                    }
+                    kernel::demand_visibility::Demand::Fallback(_reason) => {
+                        #[cfg(test)]
+                        let _ = STATS.try_with(|s| s.borrow_mut().demand = Some(_reason));
+                        Box::pin(kernel::visible_home_anchors_as(tx, actor)).await?
+                    }
+                }
+            }
+            _ => Box::pin(kernel::visible_home_anchors_as(tx, actor)).await?,
+        };
         #[cfg(test)]
         let _ = STATS.try_with(|s| {
             let mut s = s.borrow_mut();
+            s.visibility_us += scopes_started.elapsed().as_micros() as u64;
             s.home_checks = scope.homes.len();
             s.failed_homes = scope.failed_homes;
         });
@@ -2008,8 +3325,22 @@ async fn install_relations(
         // snapshot proves there are no sealed OR unsealed Message records.
         // The second probe preserves fail-closed reads of missing audience
         // state; it is intentionally independent of the public type carrier.
-        let has_messages: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.kernel_messages) OR EXISTS(SELECT 1 FROM main.kernel_records WHERE primary_type='Message') OR EXISTS(SELECT 1 FROM main.kernel_record_fields WHERE name='v1_type' AND value_json='\"Message\"')")
-            .fetch_one(&mut *tx).await?;
+        let has_messages: bool = match &demand_candidates {
+            Some(candidates) => {
+                Box::pin(demand::has_messages_for(
+                    tx,
+                    actor,
+                    candidates,
+                    "SELECT home_id AS id,policy_view AS view FROM temp._v2_scopes WHERE valid",
+                ))
+                .await?
+            }
+            None => {
+                sqlx::query_scalar(demand::HAS_MESSAGES_SQL)
+                    .fetch_one(&mut *tx)
+                    .await?
+            }
+        };
         let visibility = kernel::sql_record_visible(
             "r",
             "?1",
@@ -2020,24 +3351,91 @@ async fn install_relations(
         // not an authorization gate. Annotation windows only consume direct
         // part_of sources of requested subjects, not unrelated annotations.
         // All candidates pass the unchanged kernel
-        // visibility predicates below. Include every self-home and moved row
-        // so private filing and logical relocation remain exact.
+        // visibility predicates below. Include every self-home and any record
+        // historically moved into a requested logical parent. A later move
+        // away may overselect a candidate; the latest placement below still
+        // determines child membership. Physical destinations alone cannot
+        // identify these children: private records retain their own ACL home.
         let candidates = if exact_record_ids.is_some() {
             "r.id IN (SELECT value FROM json_each(?2))"
+        } else if candidate_names.is_some() {
+            // Nonempty logical names are coalesce(title,name,''). Either
+            // stored field can nominate a candidate, including a shadowed
+            // name; the unchanged caller predicate resolves precedence.
+            "r.id IN (SELECT f.record_id FROM main.kernel_record_fields f WHERE f.name IN ('title','name') AND json_extract(f.value_json,'$') COLLATE BINARY IN (SELECT value FROM json_each(?2)))"
         } else if candidate_ids.is_some() {
-            "r.id IN (SELECT value FROM json_each(?2) UNION SELECT id FROM main.kernel_records WHERE home_id IN (SELECT value FROM json_each(?2)) UNION SELECT id FROM main.kernel_records WHERE home_id IN (SELECT home_id FROM temp._v2_home_map WHERE record_id IN (SELECT value FROM json_each(?2))) UNION SELECT record_id FROM temp._v2_home_map UNION SELECT root_id FROM main.kernel_roots UNION SELECT id FROM main.kernel_records WHERE primary_type='Collection' UNION SELECT record_id FROM main.kernel_record_fields WHERE name='v1_type' AND value_json IN ('\"Annotation\"','\"Collection\"') AND value_json='\"Collection\"' UNION SELECT source_id FROM main.kernel_generic_links WHERE active=1 AND relationship='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT source_id FROM main.kernel_links WHERE relationship='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT source_id FROM main.kernel_link4_edges WHERE predicate='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT record_id FROM main.content_events INDEXED BY idx_kernel_record_moves WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2'))"
+            "r.id IN (SELECT value FROM json_each(?2) UNION SELECT id FROM main.kernel_records WHERE home_id IN (SELECT value FROM json_each(?2)) UNION SELECT id FROM main.kernel_records WHERE home_id IN (SELECT home_id FROM temp._v2_home_map WHERE record_id IN (SELECT value FROM json_each(?2))) UNION SELECT record_id FROM temp._v2_home_map UNION SELECT root_id FROM main.kernel_roots UNION SELECT id FROM main.kernel_records WHERE primary_type='Collection' UNION SELECT record_id FROM main.kernel_record_fields WHERE name='v1_type' AND value_json IN ('\"Annotation\"','\"Collection\"') AND value_json='\"Collection\"' UNION SELECT source_id FROM main.kernel_generic_links WHERE active=1 AND relationship='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT source_id FROM main.kernel_links WHERE relationship='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT source_id FROM main.kernel_link4_edges WHERE predicate='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT record_id FROM main.content_events INDEXED BY idx_kernel_record_logical_homes WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') AND json_extract(payload,'$.logical_home_id') IN (SELECT value FROM json_each(?2)))"
         } else if let Some(scope) = class_scope {
             &scope.predicate
         } else {
             "1"
         };
+        #[cfg(test)]
+        let candidates = if candidate_ids.is_some()
+            && exact_record_ids.is_none()
+            && ALL_MOVED_CANDIDATES.try_with(|_| ()).is_ok()
+        {
+            "r.id IN (SELECT value FROM json_each(?2) UNION SELECT id FROM main.kernel_records WHERE home_id IN (SELECT value FROM json_each(?2)) UNION SELECT id FROM main.kernel_records WHERE home_id IN (SELECT home_id FROM temp._v2_home_map WHERE record_id IN (SELECT value FROM json_each(?2))) UNION SELECT record_id FROM temp._v2_home_map UNION SELECT root_id FROM main.kernel_roots UNION SELECT id FROM main.kernel_records WHERE primary_type='Collection' UNION SELECT record_id FROM main.kernel_record_fields WHERE name='v1_type' AND value_json IN ('\"Annotation\"','\"Collection\"') AND value_json='\"Collection\"' UNION SELECT source_id FROM main.kernel_generic_links WHERE active=1 AND relationship='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT source_id FROM main.kernel_links WHERE relationship='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT source_id FROM main.kernel_link4_edges WHERE predicate='part_of' AND target_id IN (SELECT value FROM json_each(?2)) UNION SELECT record_id FROM main.content_events INDEXED BY idx_kernel_record_moves WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2'))"
+        } else {
+            candidates
+        };
         let prefix = record_limit
             .map(|n| format!(" ORDER BY r.id LIMIT {n}"))
             .unwrap_or_default();
+        #[cfg(test)]
+        let visibility = if demand_candidates.is_some() && demand::broken_admission() {
+            "1".to_owned()
+        } else {
+            visibility
+        };
         let staging = format!("INSERT INTO temp._v2_visible SELECT r.id,r.home_id,{projection},{creation} FROM main.kernel_records r WHERE ({candidates}) AND ({visibility}){prefix}");
+        #[cfg(all(test, feature = "v2-kernel-probe"))]
+        let diagnostic_input =
+            if read_diagnostics::active() && history_window.is_none() && exact_record_ids.is_none()
+            {
+                if let Some(names) = candidate_names {
+                    Some(("names", serde_json::to_string(names)?))
+                } else {
+                    candidate_ids.as_ref().map(|ids| ("moves", ids.clone()))
+                }
+            } else {
+                None
+            };
+        // Scoped entries are keyed by the person's canonical folder grant.
+        // A broader known set is narrowed before seeding a new grant entry.
+        let scoped_app = scoped_app_folders_on(tx, actor).await?;
+        // Full staging only: no candidates, exact ids, names, class scope,
+        // record limit or history window.
+        let cache = (candidates == "1"
+            && record_limit.is_none()
+            && history_window.is_none()
+            && exact_record_ids.is_none())
+        .then(visible_cache::current)
+        .flatten();
+        let cache_snapshot = match &cache {
+            Some(_) => Some(visible_cache::snapshot_on(tx).await?),
+            None => None,
+        };
+        let cache_plan = match (&cache, cache_snapshot) {
+            (Some(ctx), Some(snap)) => {
+                Some(visible_cache::plan(tx, ctx, actor, has_messages, &visibility, snap).await?)
+            }
+            _ => None,
+        };
+        let staging = match &cache_plan {
+            Some(visible_cache::Plan::Use(_)) => format!("INSERT INTO temp._v2_visible SELECT r.id,r.home_id,{projection},{creation} FROM main.kernel_records r WHERE ?1 IS NOT NULL AND r.id IN (SELECT value FROM json_each(?2))"),
+            _ => staging,
+        };
+        // Cache cost is timed from here: serialising cached ids, or the full
+        // gate plus publishing its result on a miss.
+        let cache_stage_started = Instant::now();
         let mut query = sqlx::query(&staging).bind(actor);
-        if let Some(ids) = exact_record_ids {
+        if let Some(visible_cache::Plan::Use(ids)) = &cache_plan {
+            query = query.bind(serde_json::to_string(&**ids)?);
+        } else if let Some(ids) = exact_record_ids {
             query = query.bind(serde_json::to_string(ids)?);
+        } else if let Some(names) = candidate_names {
+            query = query.bind(serde_json::to_string(names)?);
         } else if let Some(ids) = candidate_ids {
             query = query.bind(ids);
         } else if let Some(scope) = class_scope {
@@ -2053,6 +3451,43 @@ async fn install_relations(
         } else {
             query.execute(&mut *tx).await?.rows_affected()
         };
+        if let (Some(ctx), Some(snap), Some(visible_cache::Plan::Miss { publish: true })) =
+            (&cache, cache_snapshot, &cache_plan)
+        {
+            visible_cache::publish_staged(tx, ctx, actor, has_messages, snap).await?;
+        }
+        if let Some(ctx) = &cache {
+            visible_cache::record_stage(
+                ctx,
+                matches!(cache_plan, Some(visible_cache::Plan::Use(_))),
+                cache_stage_started.elapsed(),
+            );
+        }
+        #[cfg(all(test, feature = "v2-kernel-probe"))]
+        if let Some((kind, input)) = diagnostic_input {
+            read_diagnostics::on_candidates(
+                tx,
+                actor,
+                kind,
+                &input,
+                candidates,
+                &visibility,
+                &staging,
+                count,
+            )
+            .await?;
+        }
+        let currency_dependencies =
+            exact_record_ids.is_some() && (column("is_current") || column("successor_count"));
+        if currency_dependencies {
+            // Freeze the one-hop frontier while _v2_visible contains ONLY
+            // admitted requested targets. Neither placement dependencies nor
+            // newly admitted successors may expand it. This is the exact
+            // active-generic-link definition used by records' currency cells;
+            // the candidate table grants no visibility by itself.
+            sqlx::query("CREATE TEMP TABLE _v2_currency_candidates AS SELECT DISTINCT l.source_id AS id FROM temp._v2_visible target CROSS JOIN main.kernel_generic_links l ON l.target_id=target.id AND l.relationship='supersedes' AND l.active=1")
+                .execute(&mut *tx).await?;
+        }
         // The wide pulse also discloses logical placement. Admit only its
         // direct placement dependencies with the SAME kernel endpoint gate.
         // They cannot become caller rows: the original IN predicate remains.
@@ -2073,12 +3508,46 @@ async fn install_relations(
         } else {
             0
         };
-        let count = count + dependency_count;
+        let currency_count = if currency_dependencies {
+            // A successor contributes only its independently authorized
+            // existence. Its own currency and placement are not observed by
+            // the closed finite-ID query, so no recursive closure is needed.
+            sqlx::query(&format!("INSERT OR IGNORE INTO temp._v2_visible SELECT r.id,r.home_id,{projection},{creation} FROM main.kernel_records r WHERE r.id IN (SELECT id FROM temp._v2_currency_candidates) AND ({visibility})"))
+                .bind(actor).execute(&mut *tx).await?.rows_affected()
+        } else {
+            0
+        };
+        let count = count + dependency_count + currency_count;
+        // A folder-scoped app never sees Message records (audience rules,
+        // not folders) nor records deriving authority from one, even when
+        // the message is filed inside a granted folder.
+        if scoped_app {
+            sqlx::query(
+                "DELETE FROM temp._v2_visible WHERE id IN (
+                   WITH RECURSIVE excluded(id) AS (
+                     SELECT id FROM main.kernel_records WHERE primary_type='Message'
+                     UNION SELECT message_id FROM main.kernel_messages
+                     UNION SELECT record_id FROM main.kernel_record_fields
+                            WHERE name='v1_type' AND value_json='\"Message\"'
+                     UNION
+                     SELECT l.source_id FROM main.kernel_generic_links l
+                       JOIN excluded e ON e.id=l.target_id
+                      WHERE l.relationship='part_of' AND l.active=1
+                   ) SELECT id FROM excluded)",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        if demand_candidates.is_some() {
+            Box::pin(demand::recheck(tx, actor)).await?;
+        }
         tracing::debug!(target:"native_ce::read_staging",phase="visibility_gate",elapsed_us=staging_started.elapsed().as_micros() as u64,records=count);
         #[cfg(test)]
         let _ = STATS.try_with(|s| {
             let mut s = s.borrow_mut();
+            s.visibility_us += visible_started.elapsed().as_micros() as u64;
             s.staged_records = count;
+            s.staged_currency_records = currency_count;
             s.staged_metadata_records = if identity || creation != "NULL" {
                 count
             } else {
@@ -2095,8 +3564,30 @@ async fn install_relations(
                 .unwrap_or(Capability::None)
                 .allows(Capability::View);
     }
+    if needs("records") {
+        record_projection::install(
+            tx,
+            reads,
+            record_cache_generation,
+            demand_candidates.is_some(),
+        )
+        .await?;
+    }
     let relations_started = Instant::now();
     if column("home_id") {
+        // A folder-scoped app already holds its grant's folder ids. The
+        // folder record itself may sit in a home outside the grant (so it is
+        // not staged), yet it is the authorised logical home of the rows the
+        // grant admits. Its id, and nothing else about it, passes the mask.
+        let authorized = kernel::app_scope_authorized_homes_on(tx, actor).await?;
+        if !authorized.is_empty() {
+            sqlx::query(
+                "INSERT OR IGNORE INTO temp._v2_authorized_homes SELECT value FROM json_each(?)",
+            )
+            .bind(serde_json::to_string(&authorized)?)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(&logical_home_rows_sql())
             .execute(&mut *tx)
             .await?;
@@ -2114,12 +3605,26 @@ async fn install_relations(
         } else {
             FACET_ROWS.to_owned()
         };
+        // A finite admitted set drives facet lookups from its own IDs, so
+        // SQLite cannot choose a scan of every facet row.
+        let rows = if demand_shape.is_some() {
+            rows.replace(
+                "FROM main.kernel_facets f JOIN temp._v2_visible v ON v.id=f.record_id",
+                "FROM temp._v2_visible v CROSS JOIN main.kernel_facets f ON f.record_id=v.id",
+            )
+        } else {
+            rows
+        };
         sqlx::query(&rows).execute(&mut *tx).await?;
     }
     if needs("facet_observations") {
-        sqlx::query(FACET_OBSERVATION_ROWS)
-            .execute(&mut *tx)
-            .await?;
+        let ids = observation_scope::current();
+        let statement = facet_observation_rows(ids.is_some());
+        let mut query = sqlx::query(&statement).persistent(false);
+        if let Some(ids) = ids {
+            query = query.bind(ids);
+        }
+        query.execute(&mut *tx).await?;
     }
     if needs("facet_times") {
         facet_times::stage(tx).await?;
@@ -2136,10 +3641,17 @@ async fn install_relations(
             .await?;
         if let Some(window) = history_window {
             install_history_window(tx, actor, root_visible, window).await?;
-        } else {
+        } else if event_scope::stage(tx, actor).await? {
+            select_event_ids(tx, true).await?;
+            install_events(tx, actor, root_visible, false).await?;
+        } else if !event_projection::install(tx, actor, root_visible, event_cache_generation)
+            .await?
+        {
             select_event_ids(tx, false).await?;
             install_events(tx, actor, root_visible, false).await?;
         }
+        #[cfg(test)]
+        let _index_phase = event_profile::Phase::new("event_index");
         sqlx::query(
             "CREATE INDEX temp._v2_event_record_type ON _v2_event_rows(record_id,type,local_seq)",
         )
@@ -2213,7 +3725,7 @@ async fn install_relations(
             sqlx::query("INSERT INTO temp.catalog_relations VALUES(?,?,?,?,?,?,?)")
                 .bind(relation.name).bind(relation.identity).bind(relation.semantic_version as i64).bind(relation.caller_relative)
                 .bind("best_effort").bind("sqlite-local-v2")
-                .bind("v2 probe; catalog_columns lists the supported columns. Bindings expose only the caller's visible verified Person with its portable account and stored H3 catalogue aliases; email, canonical flags and provider timestamps are not represented. Bodies lazy. Home is the visible logical folder, or native home id. Currency counts visible active supersedes sources; is_current is 1 or NULL. Generic links retain ids/notes/times; provider links are symmetric with NULL note/time: an aggregate may combine directed legacy sources with different original notes and claimed timestamps; no single source is chosen. Facet value timestamps use as_of; facet_times follows v1 current typed writes and excludes observation-only writes. Native event attribution uses self/root-directory admission; legacy attribution requires self or View on the verified Person and retains v1:. Logical create/update types and retained content headers are exposed; migration receipts are omitted. channel_kind is unknown until provenance admission. Actor names/person IDs use visible verified imported Persons when available, otherwise labels may be placeholders. Anchor positions retain their source namespace without a coedit cut proof. Native runs use self/root-directory admission and NULL person/model/client fields. Imported runs/intents require self or a visible verified imported Person; known principal_person_id is retained; imported runs preserve declarations, use model_assurance imported_historical and ended_at_ms at the source close or snapshot boundary. Imported claims are historical, is_current=0 and released at the source release or snapshot boundary; they never occupy the live claims lane. Imported creation times retain source birth; native creation time stays separate; deletion times NULL.")
+                .bind("v2 probe; catalog_columns lists the supported columns. Bindings expose only the caller's visible verified Person with its portable account and stored H3 catalogue aliases; email, canonical flags and provider timestamps are not represented. Bodies lazy. Home is the visible logical folder, or native home id. Currency counts visible active supersedes sources; is_current is 1 or NULL. Generic links retain ids/notes/times; provider links retain each directed legacy source identity, note and claimed timestamp (or assertion time). Native provider assertions without legacy sources expose the symmetric pair with stable ids and assertion time. Facet value timestamps use as_of; facet_times follows v1 current typed writes and excludes observation-only writes. Native event attribution uses self/root-directory admission; legacy attribution requires self or View on the verified Person and retains v1:. Logical create/update types and retained content headers are exposed; migration receipts are omitted. channel_kind is unknown until provenance admission. Actor names/person IDs use visible verified imported Persons when available, otherwise labels may be placeholders. Anchor positions retain their source namespace without a coedit cut proof. Native runs use self/root-directory admission and NULL person/model/client fields. Imported runs/intents require self or a visible verified imported Person; known principal_person_id is retained; imported runs preserve declarations, use model_assurance imported_historical and ended_at_ms at the source close or snapshot boundary. Imported claims are historical, is_current=0 and released at the source release or snapshot boundary; they never occupy the live claims lane. Imported creation times retain source birth; native creation time stays separate; deletion times NULL.")
                 .execute(&mut *tx).await?;
             for (position, column) in supported.iter().enumerate() {
                 sqlx::query("INSERT INTO temp.catalog_columns VALUES(?,?,?)")
@@ -3413,6 +4925,9 @@ pub(crate) async fn generated_checkpoint_on(
         None,
         chrono::Utc::now().timestamp_millis(),
         false,
+        None,
+        None,
+        None,
     )
     .await?;
     registry.register(conn).await?;
@@ -3420,4 +4935,205 @@ pub(crate) async fn generated_checkpoint_on(
         .fetch_one(&mut *conn)
         .await?;
     execute_prepared(conn, prepared, head, started).await
+}
+
+// Scan has no whole-call wall-clock wrapper. Its select/enrichment snapshot
+// owns a 2 s VM guard, separate from relation staging and later successors.
+// Reserve 500 ms of that actual deadline for axes and sample enrichment; HQ
+// owner attribution can take ~695 ms, so a fixed 800 ms cap is too tight.
+const SCAN_ATTRIBUTION_RESERVE: Duration = Duration::from_millis(500);
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static TEST_SCAN_ATTRIBUTION_BUDGET: Duration;
+    pub(super) static TEST_SCAN_ATTRIBUTION_EXIT_AT: std::cell::Cell<usize>;
+    pub(super) static TEST_SNAPSHOT_BUDGET: Duration;
+}
+fn snapshot_budget() -> Duration {
+    #[cfg(test)]
+    if let Ok(budget) = TEST_SNAPSHOT_BUDGET.try_with(|b| *b) {
+        return budget;
+    }
+    Duration::from_millis(contract::QUERY_DEADLINE_MS)
+}
+
+/// Stage births and the newest authored positions first. Only unresolved
+/// records walk older authored positions, in bounded descending windows.
+/// Ordinary event admission/disclosure and the read deadline remain in force.
+pub(super) async fn scan_attribution_on(
+    conn: &mut sqlx::SqliteConnection,
+    actor: &str,
+    ids: &[String],
+    selector: Option<&str>,
+) -> Result<Option<Vec<(String, String, Option<i64>, Option<String>)>>> {
+    const AUTHORED_WINDOW: i64 = 256;
+    let started = Instant::now();
+    let deadline = SNAPSHOT_VM_DEADLINE
+        .try_with(|deadline| {
+            deadline
+                .checked_sub(SCAN_ATTRIBUTION_RESERVE)
+                .unwrap_or(started)
+        })
+        .map_err(|_| Error::engine("scan attribution requires a snapshot VM deadline"))?;
+    #[cfg(test)]
+    let deadline = TEST_SCAN_ATTRIBUTION_BUDGET
+        .try_with(|budget| deadline.min(started + *budget))
+        .unwrap_or(deadline);
+    // Check cooperatively: interrupting a TEMP-table write can roll back the
+    // entire shared SQLite transaction. Each statement retains the enclosing
+    // VM deadline; never cancel it or reset that deadline for attribution.
+    macro_rules! budget_checkpoint {
+        () => {
+            #[cfg(test)]
+            if TEST_SCAN_ATTRIBUTION_EXIT_AT
+                .try_with(|remaining| {
+                    let count = remaining.get();
+                    remaining.set(count.saturating_sub(1));
+                    count == 1
+                })
+                .unwrap_or(false)
+            {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        };
+    }
+    kernel::legacy_history::require_sql_frontier_on(conn).await?;
+    let binding: String =
+        sqlx::query_scalar("SELECT auth_binding FROM main.kernel_principals WHERE principal_id=?")
+            .bind(actor)
+            .fetch_one(&mut *conn)
+            .await?;
+    let owner = kernel::kernel_effective_capability_on(conn, actor, crate::events::KERNEL_ROOT_ID)
+        .await?
+        .allows(Capability::Manage);
+    if selector.is_some_and(|s| s != binding) && !owner {
+        return Err(Error::engine(
+            "scan: authored_by may name only the current caller",
+        ));
+    }
+    let target: String = match selector {
+        None => actor.to_owned(),
+        Some(value) => sqlx::query_scalar("SELECT principal_id FROM main.kernel_principals WHERE auth_binding=? AND kind='account'")
+            .bind(value).fetch_optional(&mut *conn).await?
+            .ok_or_else(|| Error::engine("scan: 'authored_by' must be an account token present in this file"))?,
+    };
+    let legacy_target: String = sqlx::query_scalar(
+        "SELECT 'v1:'||auth_binding FROM main.kernel_principals WHERE principal_id=?",
+    )
+    .bind(&target)
+    .fetch_one(&mut *conn)
+    .await?;
+    budget_checkpoint!();
+    sqlx::query(
+        "CREATE TEMP TABLE _scan_headers(id TEXT PRIMARY KEY,genesis INTEGER,latest INTEGER,candidate INTEGER)",
+    )
+    .execute(&mut *conn)
+    .await?;
+    budget_checkpoint!();
+    sqlx::query("CREATE TEMP TABLE _v2_history_candidates(seq INTEGER PRIMARY KEY)")
+        .execute(&mut *conn)
+        .await?;
+    budget_checkpoint!();
+    // Correlated lookups use the record/seq indexes. Imported births must
+    // prefer the source create even when that header will fail admission.
+    // Falling back after admission would credit the host import principal.
+    let imported = super::IMPORTED_EVENTS
+        .iter()
+        .map(|v| format!("'{v}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::query("INSERT INTO temp._scan_headers SELECT r.id,coalesce((SELECT min(m.seq) FROM main.kernel_legacy_sql_events m WHERE m.record_id=r.id AND m.source_stream='content_events' AND m.event_type='record.created'),r.created_seq),NULL,NULL FROM main.kernel_records r WHERE r.id IN (SELECT value FROM json_each(?1))")
+        .bind(serde_json::to_string(ids)?).execute(&mut *conn).await?;
+    budget_checkpoint!();
+    tracing::debug!(target: "native_ce::read_staging", phase="scan_headers", elapsed_us=started.elapsed().as_micros() as u64);
+    let root = kernel::kernel_effective_capability_on(conn, actor, crate::events::KERNEL_ROOT_ID)
+        .await?
+        .allows(Capability::View);
+    let native_authored = format!("e.type!='kernel.legacy_recorded.v1' AND e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT GLOB 'kernel.webhook_*' AND e.type NOT GLOB 'kernel.import_*' AND e.type NOT IN ({imported}) AND e.actor=?1");
+    let legacy_authored = "m.source_stream='content_events' AND m.actor=?2";
+    // Filter excluded types from the existing (record_id,type,seq) index
+    // before loading actor from event rows. The record/seq plan fetches every
+    // retained envelope when a record has no native authored position.
+    // Indexed newest-position lookups do not stage the target's whole
+    // history. In the common case admission settles a record immediately.
+    sqlx::query(&format!("UPDATE temp._scan_headers AS s SET candidate=max(coalesce((SELECT max(e.seq) FROM main.content_events e INDEXED BY idx_kernel_hosted_event_lookup WHERE e.record_id=s.id AND {native_authored}),0),coalesce((SELECT max(m.seq) FROM main.kernel_legacy_sql_events m WHERE m.record_id=s.id AND {legacy_authored}),0))"))
+        .bind(&target).bind(&legacy_target).execute(&mut *conn).await?;
+    budget_checkpoint!();
+    tracing::debug!(target: "native_ce::read_staging", phase="scan_newest_authored", elapsed_us=started.elapsed().as_micros() as u64);
+    let positions = sqlx::query("INSERT INTO temp._v2_history_candidates SELECT genesis FROM temp._scan_headers WHERE genesis IS NOT NULL UNION SELECT candidate FROM temp._scan_headers WHERE candidate>0")
+        .execute(&mut *conn).await?.rows_affected();
+    tracing::debug!(target: "native_ce::read_staging", phase="scan_candidates", elapsed_us=started.elapsed().as_micros() as u64,positions);
+    select_event_ids(conn, true).await?;
+    budget_checkpoint!();
+    tracing::debug!(target: "native_ce::read_staging", phase="scan_native_ids", elapsed_us=started.elapsed().as_micros() as u64);
+    install_events(conn, actor, root, true).await?;
+    budget_checkpoint!();
+    tracing::debug!(target: "native_ce::read_staging", phase="scan_admitted", elapsed_us=started.elapsed().as_micros() as u64);
+    sqlx::query("CREATE INDEX _scan_admitted_author ON _v2_event_rows(record_id,actor,local_seq)")
+        .execute(&mut *conn)
+        .await?;
+    budget_checkpoint!();
+    // An admitted birth alone cannot settle authored_latest: an admitted
+    // edit may lie between that birth and a newer unadmitted position.
+    sqlx::query("UPDATE temp._scan_headers AS s SET latest=(SELECT a.local_seq FROM temp._v2_event_rows a WHERE a.local_seq=s.candidate AND a.actor=?1)")
+        .bind(&target).execute(&mut *conn).await?;
+    budget_checkpoint!();
+    sqlx::query("CREATE INDEX _scan_pending ON _scan_headers(candidate) WHERE latest IS NULL AND candidate>0; CREATE TEMP TABLE _scan_tail(id TEXT,seq INTEGER,PRIMARY KEY(id,seq))")
+        .execute(&mut *conn).await?;
+    budget_checkpoint!();
+    while sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM temp._scan_headers WHERE latest IS NULL AND candidate>0)",
+    )
+    .fetch_one(&mut *conn)
+    .await?
+    {
+        sqlx::query("DELETE FROM temp._scan_tail; DELETE FROM temp._v2_history_candidates; DELETE FROM temp._v2_event_ids")
+            .execute(&mut *conn).await?;
+        budget_checkpoint!();
+        // Bound each pending record's next window; settled records and birth
+        // headers are never restaged. Native and legacy positions are disjoint.
+        sqlx::query(&format!("INSERT INTO temp._scan_tail SELECT s.id,j.value FROM temp._scan_headers s CROSS JOIN json_each((SELECT json_group_array(seq) FROM (SELECT seq FROM (SELECT e.seq FROM main.content_events e INDEXED BY idx_kernel_hosted_event_lookup WHERE e.record_id=s.id AND e.seq<s.candidate AND {native_authored} UNION ALL SELECT m.seq FROM main.kernel_legacy_sql_events m WHERE m.record_id=s.id AND m.seq<s.candidate AND {legacy_authored}) ORDER BY seq DESC LIMIT {AUTHORED_WINDOW}))) j WHERE s.latest IS NULL AND s.candidate>0"))
+            .bind(&target).bind(&legacy_target).execute(&mut *conn).await?;
+        budget_checkpoint!();
+        let positions = sqlx::query("INSERT INTO temp._v2_history_candidates SELECT DISTINCT t.seq FROM temp._scan_tail t WHERE NOT EXISTS(SELECT 1 FROM temp._v2_event_rows a WHERE a.local_seq=t.seq)")
+            .execute(&mut *conn).await?.rows_affected();
+        if positions > 0 {
+            select_event_ids(conn, true).await?;
+            budget_checkpoint!();
+            install_events(conn, actor, root, true).await?;
+            budget_checkpoint!();
+        }
+        // Accept the newest admitted position only if it lies in the visited
+        // prefix, or this partial/empty window proves history is exhausted.
+        // Otherwise continue older windows under the unchanged deadline;
+        // never substitute a birth or zero because an arbitrary K was reached.
+        sqlx::query(&format!("UPDATE temp._scan_headers AS s SET latest=(SELECT max(a.local_seq) FROM temp._v2_event_rows a WHERE a.record_id=s.id AND a.actor=?1 AND (a.local_seq>=(SELECT min(t.seq) FROM temp._scan_tail t WHERE t.id=s.id) OR (SELECT count(*) FROM temp._scan_tail t WHERE t.id=s.id)<{AUTHORED_WINDOW})) WHERE s.latest IS NULL AND s.candidate>0"))
+            .bind(&target).execute(&mut *conn).await?;
+        budget_checkpoint!();
+        sqlx::query(&format!("UPDATE temp._scan_headers AS s SET candidate=CASE WHEN (SELECT count(*) FROM temp._scan_tail t WHERE t.id=s.id)<{AUTHORED_WINDOW} THEN 0 ELSE (SELECT min(t.seq) FROM temp._scan_tail t WHERE t.id=s.id) END WHERE s.latest IS NULL AND s.candidate>0"))
+            .execute(&mut *conn).await?;
+        budget_checkpoint!();
+        tracing::debug!(target: "native_ce::read_staging", phase="scan_authored_window",elapsed_us=started.elapsed().as_micros() as u64,positions);
+    }
+    // A boolean run signal is all scan discloses. Neither native root-only
+    // run keys nor admitted legacy run keys leave this internal query.
+    // Retained births already carry their run signal in m. Loading their
+    // wrapped content row would read a potentially large envelope just to
+    // compute unused native-only actor/run fields.
+    let rows_started = Instant::now();
+    let rows = sqlx::query_as("SELECT s.id,CASE WHEN g.local_seq IS NULL OR (m.seq IS NULL AND birth.auth_binding=?3) THEN 'unknown' WHEN (CASE WHEN m.seq IS NOT NULL THEN m.run_key ELSE e.run_key END) IS NOT NULL THEN 'agent' WHEN g.actor=?1 THEN 'you' WHEN p.kind='account' THEN 'other_account' ELSE 'unknown' END,
+      a.local_seq,a.created_at FROM temp._scan_headers s
+      LEFT JOIN temp._v2_event_rows g ON g.local_seq=s.genesis
+      LEFT JOIN main.kernel_legacy_sql_events m ON m.seq=g.local_seq
+      LEFT JOIN main.content_events e ON e.seq=CASE WHEN m.seq IS NULL THEN g.local_seq END
+      LEFT JOIN main.kernel_principals birth ON birth.principal_id=e.actor
+      LEFT JOIN main.kernel_principals p ON p.principal_id=g.actor
+      LEFT JOIN temp._v2_event_rows a ON a.local_seq=s.latest AND a.actor=?2")
+      .bind(actor).bind(target).bind(kernel::hq::HOST_IMPORT_BINDING).fetch_all(&mut *conn).await?;
+    tracing::debug!(target: "native_ce::read_staging", phase="scan_attribution_join", elapsed_us=rows_started.elapsed().as_micros() as u64);
+    // Complete rows are already paid for: preserve them even if the last
+    // statement used the remaining attribution allowance.
+    Ok(Some(rows))
 }

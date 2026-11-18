@@ -1863,6 +1863,52 @@ mod tests {
         catalogue.close().await;
     }
 
+    // Exercise the actual plan-retention verifier as the reverse side of the
+    // Desktop app proof's shared-provider domain-substitution regression.
+    #[tokio::test]
+    async fn desktop_app_proof_cannot_substitute_for_plan_retained_key_proof() {
+        use crate::mcp::desktop_app_proof::{DesktopAppProofBinding, DesktopAppProofCore};
+        let keys: Arc<dyn HostedPlanKeyProvider> = Arc::new(SharedTestKeys::new());
+        let core = DesktopAppProofCore::new(keys.clone()).await.unwrap();
+        let proof = core
+            .issue(
+                &DesktopAppProofBinding {
+                    account_id: "account".into(),
+                    hosted_db_id: "hosted-route".into(),
+                    origin_database_id: "portable-db".into(),
+                    hosted_origin: "https://app.example".into(),
+                    app: crate::mcp::app_attribution::AppAttribution::new("notes", "1", "install")
+                        .unwrap(),
+                },
+                0,
+                60_000,
+            )
+            .await
+            .unwrap();
+        let wire: Value = serde_json::from_str(proof.expose_secret()).unwrap();
+        let key_id = wire["key_id"].as_str().unwrap();
+        let mut stored = hosted_stored_plan_envelope(&keys, key_id, &json!({"plan":"opaque"}))
+            .await
+            .unwrap();
+        verify_hosted_retained_key(
+            &keys,
+            key_id,
+            &stored.to_string(),
+            &payload_sha256(&stored).unwrap(),
+        )
+        .await
+        .unwrap();
+        stored["key_verifier"] = wire["signature"].clone();
+        assert!(verify_hosted_retained_key(
+            &keys,
+            key_id,
+            &stored.to_string(),
+            &payload_sha256(&stored).unwrap()
+        )
+        .await
+        .is_err());
+    }
+
     #[tokio::test]
     async fn hosted_retained_key_probe_rejects_missing_and_wrong_material() {
         let directory = tempfile::tempdir().unwrap();

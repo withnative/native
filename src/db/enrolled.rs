@@ -780,8 +780,9 @@ unsafe extern "C" fn authorize(
 pub(super) async fn install_read_guard(connection: &mut SqliteConnection) -> sqlx::Result<()> {
     {
         let mut locked = connection.lock_handle().await?;
+        // SAFETY: locked live handle; the policy is process-static.
         let rc = unsafe {
-            libsqlite3_sys::sqlite3_set_authorizer(
+            super::writer_contract::set_authorizer(
                 locked.as_raw_handle().as_ptr(),
                 Some(authorize),
                 (&ORDINARY as *const Role).cast_mut().cast(),
@@ -843,8 +844,10 @@ pub(super) async fn install(
                 "enrolled context registration failed: {rc}"
             )));
         }
+        // The writer contract's lease guard stays in front on writer
+        // connections; this policy decides everything it does not refuse.
         let rc = unsafe {
-            libsqlite3_sys::sqlite3_set_authorizer(
+            super::writer_contract::set_authorizer(
                 raw,
                 Some(authorize),
                 (policy as *const Role).cast_mut().cast(),
@@ -1481,3 +1484,78 @@ tokio::task_local! { pub(crate) static TEST_GATE: Arc<TestGate>; }
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Stored-visibility marking triggers (73ad275) run inside every canonical
+/// write. On enrolled storage that write is authorized statement by
+/// statement, trigger programs included, so every function and table a
+/// marking trigger touches must be admitted, or each write would fail.
+#[cfg(test)]
+mod marking_authorizer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn document_writers_admit_every_marking_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enrolled-marking.db");
+        let (db, admin) = crate::kernel::create_v2_database(
+            &format!("sqlite://{}", path.display()),
+            "account",
+            "Admin",
+            "admin",
+        )
+        .await
+        .unwrap();
+        let record = crate::kernel::create_record_as(&db, &admin, crate::events::KERNEL_ROOT_ID)
+            .await
+            .unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        crate::kernel::stored_visibility::install_on(&mut tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        db.close().await;
+
+        let c = rusqlite::Connection::open(&path).unwrap();
+        // SAFETY: the connection outlives the authorizer; the policy is static.
+        let rc = unsafe {
+            libsqlite3_sys::sqlite3_set_authorizer(
+                c.handle(),
+                Some(authorize),
+                (&DOCUMENT as *const Role).cast_mut().cast(),
+            )
+        };
+        assert_eq!(rc, libsqlite3_sys::SQLITE_OK);
+        c.execute_batch("PRAGMA foreign_keys = OFF").ok();
+        for event_type in [
+            "kernel.body_set.v1",
+            "kernel.import_home.v1",
+            "kernel.unknown.v1",
+            "kernel.hcp_read.v1",
+        ] {
+            c.execute(
+                "INSERT INTO content_events(id, record_id, type, payload, causal_envelope_version, causal_status) VALUES(?1, ?2, ?3, '{}', 1, 'complete')",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), record, event_type],
+            )
+            .unwrap_or_else(|e| panic!("{event_type}: {e}"));
+        }
+        c.execute(
+            "UPDATE kernel_records SET created_at = created_at WHERE id = ?1",
+            [&record],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO kernel_app_installs(principal, package, row_json, generation, status, executable, event_seq) VALUES(?1, 'pkg', '{}', 'g', 'active', 1, 1)",
+            [&admin],
+        )
+        .unwrap();
+        c.execute("DELETE FROM kernel_app_installs", []).unwrap();
+        let kinds: Vec<String> = c
+            .prepare("SELECT DISTINCT kind FROM main.p_dirty ORDER BY kind")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(kinds, ["anchor", "rec", "scope", "ws"]);
+    }
+}

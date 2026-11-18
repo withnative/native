@@ -1,0 +1,280 @@
+{
+  "result": "named-base8578-vs-f587 positive, without claiming raw whole-output/manifest equality",
+  "baseline_source": "f58788380de8313feb44db3adcfec62056245693",
+  "receiver_source": "8578fe3a2ec1ee1c2b3c8a315a95d6cb68bfff24",
+  "ordinary_mcp_process": [
+    {
+      "id": 1,
+      "raw_bytes_identical": false,
+      "baseline_sha256": "a08002770fb59f9463b4bec1cc240e7abe2a098dc3f400c3f94bc1146ef90cdc",
+      "receiver_sha256": "15c71df3fa333fd6c26a8005f637ad99354a34c1775e9b3cf7d33b64c157e08b",
+      "differences": [
+        {
+          "path": "/result/serverInfo/version",
+          "baseline": "0.0.0+f58788380de8",
+          "receiver": "0.0.0+8578fe3a2ec1"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "raw_bytes_identical": true,
+      "baseline_sha256": "9f59f9f9103b9ef4bcc0657fbc7bdadfb61d8495e35f06f3825c20ec1b5f40c3",
+      "receiver_sha256": "9f59f9f9103b9ef4bcc0657fbc7bdadfb61d8495e35f06f3825c20ec1b5f40c3",
+      "differences": []
+    },
+    {
+      "id": 3,
+      "raw_bytes_identical": true,
+      "baseline_sha256": "fbe32b77b0ad016fc5d5e05f6a4202dc82c840384c32fbaf8aa55021842296fa",
+      "receiver_sha256": "fbe32b77b0ad016fc5d5e05f6a4202dc82c840384c32fbaf8aa55021842296fa",
+      "differences": []
+    },
+    {
+      "id": 4,
+      "raw_bytes_identical": true,
+      "baseline_sha256": "ec5e15178cdd13204de72705c049d2c1f8ab9dff22db4131928e5f47990fa786",
+      "receiver_sha256": "ec5e15178cdd13204de72705c049d2c1f8ab9dff22db4131928e5f47990fa786",
+      "differences": []
+    },
+    {
+      "id": 5,
+      "raw_bytes_identical": true,
+      "baseline_sha256": "e160745813e95f56dc8a489eaa61b57de7fec821de7299fc4af26593abcdd67b",
+      "receiver_sha256": "e160745813e95f56dc8a489eaa61b57de7fec821de7299fc4af26593abcdd67b",
+      "differences": []
+    }
+  ],
+  "emitter_components": [
+    {
+      "name": "head.json",
+      "raw_bytes_identical": true,
+      "size": 3797,
+      "sha256": "c1372050aab37182d9ac6a8a2cbec69179c8d2f253923514270420b5c733c3df"
+    },
+    {
+      "name": "delta.json",
+      "raw_bytes_identical": true,
+      "size": 156297,
+      "sha256": "dfe8519ad1346bf77a617e1322a575f8502c25dad9c064f4bd8f969116158183"
+    },
+    {
+      "name": "full.sqlite",
+      "raw_bytes_identical": true,
+      "size": 2748416,
+      "sha256": "002107e0bf9dbc697996c464e6060e3d1ba88efc4ac5f8c7ccf725617975133f"
+    }
+  ],
+  "manifest": {
+    "raw_bytes_identical": false,
+    "baseline_sha256": "26915aaca1f972bdff7f928ee3c38c74c14b4570b988861d9ae6406331147217",
+    "receiver_sha256": "e1529907257514f7ef92458d151e1432e323892ab84df2638cb9a103bdbd89a4",
+    "exact_leaf_differences": [
+      {
+        "path": "/captured_at",
+        "baseline": "2026-11-15T01:00:03.367Z",
+        "receiver": "2026-11-15T01:42:08.034Z"
+      },
+      {
+        "path": "/snapshot_completed_at",
+        "baseline": "2026-11-15T01:00:03.497Z",
+        "receiver": "2026-11-15T01:42:08.170Z"
+      },
+      {
+        "path": "/engine/source_sha",
+        "baseline": "f58788380de8313feb44db3adcfec62056245693",
+        "receiver": "8578fe3a2ec1ee1c2b3c8a315a95d6cb68bfff24"
+      }
+    ],
+    "all_other_fields_equal": true,
+    "raw_outputs_retained": true
+  },
+  "fixture": {
+    "record_id": "0a1cc8f6-c427-410d-b694-499a9bbf37b3",
+    "seed_product_source": "f58788380de8313feb44db3adcfec62056245693",
+    "frozen_sha256": "d8d99737effdbe6287829995176e327009d3cb95522c287dc9b2c3f809514ae2",
+    "source_sha256": "ada7d024fa372505492bd6c720ab7f20d5562b4b14c251042d33fdb8704b02e9",
+    "seed_mode": "actual ordinary MCP create_record with original key; one canonical private94 fixture; later opens only on clones"
+  },
+  "requests": [
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "initialize",
+      "params": {
+        "protocolVersion": "2026-07-28",
+        "capabilities": {},
+        "clientInfo": {
+          "name": "receiver-output-comparison",
+          "version": "1"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "tools/call",
+      "params": {
+        "name": "records_read",
+        "arguments": {
+          "operation": "get_record",
+          "arguments": {
+            "ids": [
+              "0a1cc8f6-c427-410d-b694-499a9bbf37b3"
+            ]
+          },
+          "format": "json"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "method": "tools/call",
+      "params": {
+        "name": "records_read",
+        "arguments": {
+          "operation": "get_history",
+          "arguments": {
+            "record_id": "0a1cc8f6-c427-410d-b694-499a9bbf37b3"
+          },
+          "format": "json"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "method": "tools/call",
+      "params": {
+        "name": "sql_read",
+        "arguments": {
+          "operation": "query_sql",
+          "arguments": {
+            "sql": "SELECT id, name FROM records WHERE id = '0a1cc8f6-c427-410d-b694-499a9bbf37b3'"
+          },
+          "format": "json"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 5,
+      "method": "tools/call",
+      "params": {
+        "name": "records_write",
+        "arguments": {
+          "operation": "create_record",
+          "arguments": {
+            "type": "Document",
+            "kind": "note",
+            "name": "Receiver94 output fixture",
+            "body": "common94 body",
+            "reason": "Private ordinary94 output comparison",
+            "idempotency_key": "receiver-t9-seed"
+          },
+          "format": "json"
+        }
+      }
+    }
+  ],
+  "baseline_product_rlib": {
+    "product_source": "f58788380de8313feb44db3adcfec62056245693",
+    "product_sha256": "41301dbef9324945e112fd45a8a620187b612201f78530cd98bcf9af6b42cd53",
+    "product_native_ce_rlib": "/fixtures/baseline/target/debug/deps/libnative_ce-282ff4312252b035.rlib",
+    "rlib_sha256": "cf0e22d8cd88d8bdbc05955f5510ce310bbb2bdacce9025aa5df688517ca08f2",
+    "product_features": [
+      "default",
+      "experimental-agent-intents",
+      "mcp-executor-prototype",
+      "v2-kernel-probe"
+    ],
+    "probe_source_sha256": "e09c997d3a0e43fb450e25457a3130d1f2360c0a4753f63ed37959deaab9e5ff",
+    "command": [
+      "rustc",
+      "--edition=2021",
+      "--crate-name",
+      "receiver_t9_emitter",
+      "target/agent-evidence/t9-emitter-probe.rs",
+      "-o",
+      "/tmp/receiver-t9-f587/baseline-emitter",
+      "-L",
+      "dependency=/fixtures/baseline/target/debug/deps",
+      "-L",
+      "native=/fixtures/baseline/target/debug/build/libsqlite3-sys-05b2abf3937a317e/out",
+      "-L",
+      "native=/fixtures/baseline/target/debug/build/psm-9755a1dc7db614a9/out",
+      "-L",
+      "native=/fixtures/baseline/target/debug/build/rquickjs-sys-17c003c793c5b37b/out",
+      "-L",
+      "native=/fixtures/baseline/target/debug/build/ring-05e4fb86e1357301/out",
+      "--extern",
+      "native_ce=/fixtures/baseline/target/debug/deps/libnative_ce-282ff4312252b035.rlib",
+      "--extern",
+      "tokio=/fixtures/baseline/target/debug/deps/libtokio-7f3c5941f4523528.rlib",
+      "--extern",
+      "serde_json=/fixtures/baseline/target/debug/deps/libserde_json-ea7e568a31420e8b.rlib",
+      "--extern",
+      "sha2=/fixtures/baseline/target/debug/deps/libsha2-c19d6da850238667.rlib",
+      "--extern",
+      "hex=/fixtures/baseline/target/debug/deps/libhex-bdce5fbd554ae815.rlib",
+      "--extern",
+      "chrono=/fixtures/baseline/target/debug/deps/libchrono-e2ee5e5140cb8ffd.rlib"
+    ]
+  },
+  "receiver_product_rlib": {
+    "product_source": "8578fe3a2ec1ee1c2b3c8a315a95d6cb68bfff24",
+    "product_sha256": "41dd11fe40216bbc54360f84f16473630ad91548dca3698a687d0ba400440645",
+    "product_native_ce_rlib": "/fixtures/receiver/target/debug/deps/libnative_ce-282ff4312252b035.rlib",
+    "rlib_sha256": "19adee105878d5efc0cc8e2bcfbedc7006deb87f1f2651ab3280d0f2a1daf40b",
+    "product_features": [
+      "default",
+      "experimental-agent-intents",
+      "mcp-executor-prototype",
+      "v2-kernel-probe"
+    ],
+    "probe_source_sha256": "e09c997d3a0e43fb450e25457a3130d1f2360c0a4753f63ed37959deaab9e5ff",
+    "command": [
+      "rustc",
+      "--edition=2021",
+      "--crate-name",
+      "receiver_t9_emitter",
+      "target/agent-evidence/t9-emitter-probe.rs",
+      "-o",
+      "/tmp/receiver-t9-f587/a8578-emitter",
+      "-L",
+      "dependency=/fixtures/receiver/target/debug/deps",
+      "-L",
+      "native=/fixtures/receiver/target/debug/build/libsqlite3-sys-05b2abf3937a317e/out",
+      "-L",
+      "native=/fixtures/receiver/target/debug/build/psm-9755a1dc7db614a9/out",
+      "-L",
+      "native=/fixtures/receiver/target/debug/build/rquickjs-sys-17c003c793c5b37b/out",
+      "-L",
+      "native=/fixtures/receiver/target/debug/build/ring-05e4fb86e1357301/out",
+      "--extern",
+      "native_ce=/fixtures/receiver/target/debug/deps/libnative_ce-282ff4312252b035.rlib",
+      "--extern",
+      "tokio=/fixtures/receiver/target/debug/deps/libtokio-7f3c5941f4523528.rlib",
+      "--extern",
+      "serde_json=/fixtures/receiver/target/debug/deps/libserde_json-ea7e568a31420e8b.rlib",
+      "--extern",
+      "sha2=/fixtures/receiver/target/debug/deps/libsha2-c19d6da850238667.rlib",
+      "--extern",
+      "hex=/fixtures/receiver/target/debug/deps/libhex-bdce5fbd554ae815.rlib",
+      "--extern",
+      "chrono=/fixtures/receiver/target/debug/deps/libchrono-e2ee5e5140cb8ffd.rlib"
+    ]
+  },
+  "common_receiver_identity": {
+    "contract": "native.standby-consumer.v1",
+    "version": 1,
+    "platform": "linux-x86_64",
+    "source_sha": "f58788380de8313feb44db3adcfec62056245693",
+    "artifact_sha256": "41301dbef9324945e112fd45a8a620187b612201f78530cd98bcf9af6b42cd53",
+    "engine_schema_version": 94,
+    "ddl_sha256": "e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5"
+  },
+  "evidence_directory": "/tmp/receiver-t9-f587",
+  "interpretation": "RPC2=read,3=history,4=SQL,5=cached original keyedreceipt. Event payloads carried by actual delta document. Full raw SQLite snapshot bytes equal. Head/delta/FULL/manifest are product-linked emitter component evidence, separate from CLI/auth/HTTP process. Exact actual producerSHA/times retained separately; no forged common producer or broad normalization."
+}

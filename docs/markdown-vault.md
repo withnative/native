@@ -4,6 +4,43 @@ The node can publish a folder view of its authenticated account's local copy.
 This is a generated view; hosted Native remains canonical. No changes flow back
 from the vault, and no Git history or separate service is created.
 
+Run `native vault status --vault /path/to/vault` (or the identical `vault check`)
+to explain saved local edits. It reads files and the verified publication ledger
+without contacting Native, changing files, acquiring the publisher lock, or
+changing permissions. `--json` emits `native.vault-check.v1`; human output hides
+unchanged entries unless `--all` is supplied. Exit 0 means no invalid edits,
+1 means invalid edits or unsupported operations, and 2 means inspection could
+not complete. A publication changing during inspection asks you to run it again.
+
+Grammar v0 previews body changes as `merge_body` inputs, scalar `name`/`summary`
+sets, and additions to existing relationship frontmatter arrays. New relationship
+targets must identify standalone notes; fragment targets diagnose rather than
+silently linking to their parent. Frontmatter is
+the renderer's one-line JSON-valued YAML subset (plain scalars are also accepted);
+block YAML, duplicate keys, facets and other properties give diagnostics. Links
+and Comments generated sections remain read-only. New inline wikilinks are
+checked against the projected catalog but do not add relationships. Existing
+authored links are preserved. Unresolved targets are provisional warnings when
+the catalog is stale or its freshness is unknown. The report ages the STATUS
+observation to the current time and includes the underlying refresh diagnostics.
+
+These are prospective changes, not admitted writes. The original record body
+version is not available in the current projection: `base_version` is null, and
+the preview cannot be sent directly as a home merge request. `base-moved-on`
+means the publisher rendered newer output than this edit's retained base; it
+does not establish whether a home merge would succeed. An invalid edit keeps its invalid state even when its base has also moved.
+
+The publisher now retains exact successfully published Markdown in its existing
+private ledger, subject to the same revocation and crash-recovery rules as the
+projection. Older unedited files acquire a base on a successful publication;
+older edited files report `base_unavailable` rather than inventing original
+text. Artifact companions and message aggregates are read-only in grammar v0.
+Deleted or relocated managed files give a diagnostic, never an inferred archive
+or move. Unmanaged files, including files in `Inbox/`, are `local-only`; v0 does
+not infer record creation. Use Native MCP for writes and do not chmod generated
+files to bypass a refused save. This checker can be used on a private writable
+test copy to explore the grammar while the live vault remains read-only.
+
 The vault is on by default whenever `node.json` configures a `standby_config`:
 the node publishes to a `vault/` directory beside the local copy's folder
 (next to the standby `replica_root`). With no `standby_config` the vault is

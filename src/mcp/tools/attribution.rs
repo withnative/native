@@ -168,8 +168,8 @@ async fn create_attribution(db: Db, caller: Caller, arguments: Value) -> Result<
     let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.bearer_id, Capability::Edit).await?;
 
-    if let Some(attestation_id) = crate::provenance::lookup_authorized_command_attestation(
-        &db,
+    if let Some(attestation_id) = crate::provenance::lookup_authorized_command_attestation_in(
+        &mut tx,
         caller.credential(),
         TOOL,
         &accepted_arguments,

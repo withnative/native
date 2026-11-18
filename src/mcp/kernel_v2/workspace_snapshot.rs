@@ -109,6 +109,9 @@ pub(crate) async fn filtered(
         ("records", "maturity"),
         ("records", "last_activity_at"),
         ("records", "deleted_at"),
+        ("records", "is_current"),
+        ("records", "updated_at_ms"),
+        ("records", "archived"),
         ("facet_values", "id"),
         ("links", "id"),
         ("links", "source_id"),
@@ -129,7 +132,7 @@ pub(crate) async fn filtered(
     let mut facets = HashMap::new();
     let mut links = HashMap::new();
     for (relation, columns) in [
-        ("records", "id,type,kind,name,home_id,lifecycle,persistence,maturity,summary,last_activity_at,created_at,updated_at,deleted_at"),
+        ("records", "id,type,kind,name,home_id,lifecycle,persistence,maturity,summary,last_activity_at,created_at,updated_at,deleted_at,is_current,updated_at_ms,archived"),
         ("facet_values", "id,record_id,key,value,value_num,vocab_ref,created_at"),
         ("links", "id,source_id,target_id,relationship,note,created_at"),
     ] {
@@ -154,6 +157,7 @@ pub(crate) async fn filtered(
                         id:r.id,record_type:r.record_type.unwrap_or_default(),kind:r.kind,name:r.name,home_id:r.home_id,
                         lifecycle:r.lifecycle,persistence:r.persistence,maturity:r.maturity,summary:r.summary,
                         last_activity_at:r.last_activity_at,created_at:r.created_at,updated_at:r.updated_at,deleted_at:r.deleted_at,
+                        is_current:r.is_current,updated_at_ms:r.updated_at_ms,archived:r.archived,
                         owner_id:None,claimed_by_account:None,claimed_run_key:None,claimed_at:None,policy_anchor_id:None,
                     });
                 }

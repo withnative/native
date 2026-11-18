@@ -298,6 +298,13 @@ pub async fn inject_kind_projection_on(
 /// Schema authoring uses the rows themselves to calculate the prospective
 /// overlay, so returning them avoids escaping to a second pool connection and
 /// snapshot before the declaration is appended.
+pub(crate) async fn schema_config_rows_on(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<Vec<SchemaConfigRow>> {
+    let mut executor = BorrowedSqliteStatementExecutor::new(connection);
+    schema_config_rows_with_layer(&mut executor, None).await
+}
+
 pub(crate) async fn schema_config_rows_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<Vec<SchemaConfigRow>> {

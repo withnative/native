@@ -88,7 +88,7 @@ impl World {
                 payload: serde_json::to_value(KernelHomeCreatedPayload {
                     source_record_id: None,
                     parent_id: KERNEL_ROOT_ID.into(),
-                    owner_id: beneficiary.into(),
+                    owner_id: Some(beneficiary.into()),
                     entries: Some(vec![KernelHomeEntryPayload {
                         subject_id: beneficiary.into(),
                         capability: "manage".into(),

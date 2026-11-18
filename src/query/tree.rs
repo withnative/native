@@ -375,7 +375,166 @@ async fn descendants_inner(
     principal: Option<crate::authorization::Principal<'_>>,
     member: bool,
 ) -> Result<Vec<TreeNode>> {
-    let db = content_pool;
+    descendants_read(
+        Some(projection),
+        Some(authorization_pool),
+        TreeContent::Pool(content_pool),
+        root_id,
+        opts,
+        principal,
+        member,
+    )
+    .await
+}
+
+// The source choice is private. Only the sealed-session entry can select the
+// immutable native transaction; canonical callers retain their projection and
+// live authorization pools, including their original member/catalogue mode.
+enum TreeContent<'a> {
+    Pool(&'a sqlx::SqlitePool),
+    #[cfg(feature = "v2-kernel-probe")]
+    Native(&'a mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession),
+}
+enum TreeParameter {
+    Text(String),
+    Integer(i64),
+}
+impl TreeContent<'_> {
+    fn native(&self) -> bool {
+        match self {
+            Self::Pool(_) => false,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Native(_) => true,
+        }
+    }
+    async fn rows(
+        &mut self,
+        statement: &str,
+        parameters: Vec<TreeParameter>,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let mut query = sqlx::query(statement);
+        for parameter in parameters {
+            query = match parameter {
+                TreeParameter::Text(value) => query.bind(value),
+                TreeParameter::Integer(value) => query.bind(value),
+            };
+        }
+        Ok(match self {
+            Self::Pool(pool) => query.fetch_all(*pool).await?,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Native(session) => query.fetch_all(&mut **session.transaction()).await?,
+        })
+    }
+    fn parameters(&self) -> Vec<TreeParameter> {
+        if self.native() {
+            Vec::new()
+        } else {
+            vec![TreeParameter::Text(ARCHIVED_FACET_KEY.to_owned())]
+        }
+    }
+    async fn virtual_root_node(&mut self, root_id: &str) -> Result<Option<TreeNode>> {
+        let _ = root_id;
+        match self {
+            Self::Pool(_) => Ok(None),
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Native(session) => {
+                use crate::member_copy_kernel_v2::profile::virtual_root::MemberVirtualRoot;
+                if !MemberVirtualRoot::is_alias(root_id) {
+                    return Ok(None);
+                }
+                let ordinary: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM records WHERE id=?)")
+                        .bind(root_id)
+                        .fetch_one(&mut **session.transaction())
+                        .await?;
+                if ordinary {
+                    return Ok(None);
+                }
+                let Some(root) = session.virtual_root().await? else {
+                    return Ok(None);
+                };
+                Ok(Some(TreeNode {
+                    id: root_id.to_owned(),
+                    record_type: root.record_type,
+                    kind: Some(root.kind),
+                    name: root.name,
+                    home_id: root.home_id,
+                    persistence: root.persistence,
+                    last_activity_at: Some(root.last_activity_at),
+                    custody_boundary: root.custody_boundary,
+                    containment_path_visible: root.containment_path_visible,
+                    depth: 0,
+                    // Filled by the shared root-alias count query before emission.
+                    child_count: 0,
+                    archived: root.archived,
+                }))
+            }
+        }
+    }
+    async fn member_path_visible(
+        &mut self,
+        projection: Option<ProjectionRead<'_>>,
+        root_id: &str,
+    ) -> Result<bool> {
+        match self {
+            Self::Pool(_) => Ok(root_id == crate::schema::ROOT_RECORD_ID
+                || ancestors_from(projection.expect("canonical projection"), root_id)
+                    .await?
+                    .first()
+                    .is_some_and(|ancestor| ancestor.id == crate::schema::ROOT_RECORD_ID)),
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::Native(session) => {
+                if crate::member_copy_kernel_v2::profile::virtual_root::MemberVirtualRoot::is_alias(
+                    root_id,
+                ) {
+                    let ordinary: bool =
+                        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM records WHERE id=?)")
+                            .bind(root_id)
+                            .fetch_one(&mut **session.transaction())
+                            .await?;
+                    if !ordinary {
+                        return session
+                            .virtual_root()
+                            .await?
+                            .map(|root| root.containment_path_visible)
+                            .ok_or_else(crate::Error::copy_unavailable);
+                    }
+                }
+                Ok(sqlx::query_scalar("SELECT containment_path_visible FROM main.member_record_metadata WHERE record_id=?")
+                    .bind(root_id.to_owned()).fetch_one(&mut **session.transaction()).await?)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn descendants_native_member(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    root_id: &str,
+    opts: TreeOptions,
+) -> Result<Vec<TreeNode>> {
+    descendants_read(
+        None,
+        None,
+        TreeContent::Native(session),
+        root_id,
+        opts,
+        None,
+        true,
+    )
+    .await
+}
+
+async fn descendants_read(
+    projection: Option<ProjectionRead<'_>>,
+    authorization_pool: Option<&sqlx::SqlitePool>,
+    mut content: TreeContent<'_>,
+    root_id: &str,
+    opts: TreeOptions,
+    principal: Option<crate::authorization::Principal<'_>>,
+    member: bool,
+) -> Result<Vec<TreeNode>> {
+    let native = content.native();
     if opts.max_depth < 0 {
         return Err(contract_violation("tree max_depth must be >= 0"));
     }
@@ -403,12 +562,16 @@ async fn descendants_inner(
     let max_depth = opts.max_depth.min(MAX_WALK_DEPTH);
     let archived_walk_filter = if opts.include_archived {
         ""
+    } else if native {
+        "AND r.archived=0"
     } else {
         "AND NOT EXISTS (SELECT 1 FROM facet_values av \
            WHERE av.record_id = r.id AND av.key = 'archived')"
     };
     let archived_count_filter = if opts.include_archived {
         ""
+    } else if native {
+        "AND c.archived=0"
     } else {
         "AND NOT EXISTS (SELECT 1 FROM facet_values av \
            WHERE av.record_id = c.id AND av.key = 'archived')"
@@ -445,35 +608,56 @@ async fn descendants_inner(
     // trade is worth naming and not worth avoiding.
     let mut nodes: Vec<(String, TreeNode)> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let not_hidden = if member {
-        super::member_not_hidden_predicate("r")
-    } else {
-        super::not_hidden_predicate("r")
-    };
+    let not_hidden = tree_hidden_predicate("r", member, native);
 
     // The root is emitted whatever its archive state — pointing at a record is
     // asking for it, same rule `read::get_record` follows. Only the walk BELOW
     // it honours the visibility default. The same holds for `exclude_types`:
     // the root is emitted even when its own type is excluded.
-    let cols = node_columns(archived_count_filter, &type_count_filter, member);
+    let cols = node_columns(archived_count_filter, &type_count_filter, member, native);
+    // Native root admission uses its typed identity/integrity in the sealed
+    // entrypoint. An explicitly selected comment root remains a root; only
+    // descendants use the ordinary native family exclusions.
+    let root_hidden = if native { "1" } else { &not_hidden };
     let root_sql = format!(
         "SELECT {cols} FROM records r
           WHERE r.id = ? AND r.deleted_at IS NULL
-            AND {not_hidden}"
+            AND {root_hidden}"
     );
-    let Some(row) = sqlx::query(&root_sql)
-        .bind(ARCHIVED_FACET_KEY)
-        .bind(root_id)
-        .fetch_optional(db)
-        .await?
-    else {
-        return Ok(Vec::new());
+    let mut parameters = content.parameters();
+    parameters.push(TreeParameter::Text(root_id.to_owned()));
+    let virtual_root = content.virtual_root_node(root_id).await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    let has_virtual_root = virtual_root.is_some();
+    let root_alias_placement =
+        native && [crate::schema::ROOT_RECORD_ID, crate::events::KERNEL_ROOT_ID].contains(&root_id);
+    let mut root = match virtual_root {
+        Some(root) => root,
+        None => {
+            let Some(row) = content.rows(&root_sql, parameters).await?.pop() else {
+                return Ok(Vec::new());
+            };
+            node_from_row(&row, 0)?
+        }
     };
-    let mut root = node_from_row(&row, 0)?;
+    if root_alias_placement {
+        let hidden = tree_hidden_predicate("c", true, true);
+        let sql = format!("SELECT COUNT(*) AS n FROM records c WHERE c.home_id IN (?,?) AND c.deleted_at IS NULL AND {hidden} {archived_count_filter} {type_count_filter}");
+        root.child_count = content
+            .rows(
+                &sql,
+                vec![
+                    TreeParameter::Text(crate::schema::ROOT_RECORD_ID.into()),
+                    TreeParameter::Text(crate::events::KERNEL_ROOT_ID.into()),
+                ],
+            )
+            .await?[0]
+            .try_get("n")?;
+    }
     if let Some(principal) = principal {
         root.child_count = authorized_child_count(
-            projection,
-            authorization_pool,
+            projection.expect("canonical projection"),
+            authorization_pool.expect("canonical authorization"),
             &root.id,
             opts.include_archived,
             &opts.exclude_types,
@@ -481,7 +665,13 @@ async fn descendants_inner(
         )
         .await?;
         if let Some(home_id) = root.home_id.as_deref() {
-            if !can_view(authorization_pool, principal, home_id).await {
+            if !can_view(
+                authorization_pool.expect("canonical authorization"),
+                principal,
+                home_id,
+            )
+            .await
+            {
                 root.home_id = None;
             }
         }
@@ -527,29 +717,44 @@ async fn descendants_inner(
         // 14.8 ms. Wide parents are rare (12 of 5,335 containers in the
         // reference corpus exceed 200), so this path runs seldom and matters
         // enormously when it does.
-        let (wide, narrow): (Vec<&Frontier>, Vec<&Frontier>) = frontier
-            .iter()
-            .partition(|f| f.child_count > opts.max_children_per_node);
+        let (wide, narrow): (Vec<&Frontier>, Vec<&Frontier>) = frontier.iter().partition(|f| {
+            f.child_count > opts.max_children_per_node || (root_alias_placement && f.id == root_id)
+        });
 
         let mut rows = Vec::new();
         for parent in &wide {
             let limit = if principal.is_some() { "" } else { "LIMIT ?" };
+            let virtual_parent = root_alias_placement && parent.id == root_id;
+            let placement = if virtual_parent {
+                "r.home_id IN (?,?)"
+            } else {
+                "r.home_id = ?"
+            };
             let sql = format!(
                 "SELECT {cols}
                    FROM records r
-                  WHERE r.home_id = ? AND r.deleted_at IS NULL
+                  WHERE {placement} AND r.deleted_at IS NULL
                     AND {not_hidden}
                     {archived_walk_filter}
                     {type_walk_filter}
                   ORDER BY r.name, r.id {limit}"
             );
-            let query = sqlx::query(&sql).bind(ARCHIVED_FACET_KEY).bind(&parent.id);
-            let query = if principal.is_some() {
-                query
-            } else {
-                query.bind(opts.max_children_per_node)
-            };
-            rows.extend(query.fetch_all(db).await?);
+            let mut parameters = content.parameters();
+            parameters.push(TreeParameter::Text(parent.id.clone()));
+            if virtual_parent {
+                parameters.push(TreeParameter::Text(
+                    if root_id == crate::schema::ROOT_RECORD_ID {
+                        crate::events::KERNEL_ROOT_ID
+                    } else {
+                        crate::schema::ROOT_RECORD_ID
+                    }
+                    .into(),
+                ));
+            }
+            if principal.is_none() {
+                parameters.push(TreeParameter::Integer(opts.max_children_per_node));
+            }
+            rows.extend(content.rows(&sql, parameters).await?);
         }
         // Chunked because a level's parent count is bounded only by the product
         // of the cap and the levels above it, which can exceed SQLite's host
@@ -567,11 +772,13 @@ async fn descendants_inner(
                     {type_walk_filter}
                   ORDER BY r.home_id, r.name, r.id"
             );
-            let mut q = sqlx::query(&sql).bind(ARCHIVED_FACET_KEY);
-            for parent in chunk {
-                q = q.bind(&parent.id);
-            }
-            rows.extend(q.fetch_all(db).await?);
+            let mut parameters = content.parameters();
+            parameters.extend(
+                chunk
+                    .iter()
+                    .map(|parent| TreeParameter::Text(parent.id.clone())),
+            );
+            rows.extend(content.rows(&sql, parameters).await?);
         }
 
         // One preloaded authorization fold per level. Admission stays in SQL
@@ -584,14 +791,30 @@ async fn descendants_inner(
                     .iter()
                     .map(|row| row.try_get::<String, _>("id"))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                authorized_ids_in_pool(authorization_pool, principal, ids).await?
+                authorized_ids_in_pool(
+                    authorization_pool.expect("canonical authorization"),
+                    principal,
+                    ids,
+                )
+                .await?
             }
         };
 
         for row in &rows {
             let mut node = node_from_row(row, depth)?;
-            let Some(parent) = node.home_id.clone() else {
+            let Some(authored_parent) = node.home_id.clone() else {
                 continue;
+            };
+            // Root aliases select one frontier/page while preserving each
+            // child's actual source-selected home_id in the response.
+            let parent = if root_alias_placement
+                && depth == 1
+                && [crate::schema::ROOT_RECORD_ID, crate::events::KERNEL_ROOT_ID]
+                    .contains(&authored_parent.as_str())
+            {
+                root_id.to_owned()
+            } else {
+                authored_parent
             };
             if principal.is_some() && !visible.contains(&node.id) {
                 continue;
@@ -615,8 +838,8 @@ async fn descendants_inner(
             // frontier, so their counts are never read. Read-only either way.
             if let Some(principal) = principal {
                 node.child_count = authorized_child_count(
-                    projection,
-                    authorization_pool,
+                    projection.expect("canonical projection"),
+                    authorization_pool.expect("canonical authorization"),
                     &node.id,
                     opts.include_archived,
                     &opts.exclude_types,
@@ -637,35 +860,60 @@ async fn descendants_inner(
 
     nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
     let root_path_visible = if member {
-        root_id == crate::schema::ROOT_RECORD_ID
-            || ancestors_from(projection, root_id)
-                .await?
-                .first()
-                .is_some_and(|ancestor| ancestor.id == crate::schema::ROOT_RECORD_ID)
+        content.member_path_visible(projection, root_id).await?
     } else {
         match principal {
             None => true,
             Some(principal) => {
-                containment_path_visible(projection, authorization_pool, root_id, principal).await?
+                containment_path_visible(
+                    projection.expect("canonical projection"),
+                    authorization_pool.expect("canonical authorization"),
+                    root_id,
+                    principal,
+                )
+                .await?
             }
         }
     };
     for (_, node) in &mut nodes {
         if member {
-            // Never read missing policy_anchor_id or invent a served value.
-            // The typed node's placeholder is marked unavailable by MCP.
+            #[cfg(feature = "v2-kernel-probe")]
+            if let TreeContent::Native(session) = &mut content {
+                if has_virtual_root && node.id == root_id {
+                    node.containment_path_visible = root_path_visible;
+                    continue;
+                }
+                // This is an actual capture-time source fact from the same
+                // admitted generation, never a reconstructed policy anchor.
+                let boundary: i64 = sqlx::query_scalar(
+                    "SELECT custody_boundary FROM main.member_record_metadata WHERE record_id=?",
+                )
+                .bind(node.id.clone())
+                .fetch_one(&mut **session.transaction())
+                .await?;
+                node.custody_boundary = boundary != 0;
+            }
+            // v1 member copies still have no custody policy witness; their
+            // MCP caller retains its existing explicit unavailable marker.
             node.containment_path_visible = root_path_visible;
             continue;
         }
         let authored_home: Option<String> =
             sqlx::query_scalar("SELECT home_id FROM records WHERE id = ?")
                 .bind(&node.id)
-                .fetch_optional(db)
+                .fetch_optional(match &content {
+                    TreeContent::Pool(pool) => *pool,
+                    #[cfg(feature = "v2-kernel-probe")]
+                    TreeContent::Native(_) => unreachable!("native is member-only"),
+                })
                 .await?
                 .flatten();
-        node.custody_boundary =
-            custody_boundary_in_pool(authorization_pool, &node.id, authored_home.as_deref())
-                .await?;
+        node.custody_boundary = custody_boundary_in_pool(
+            authorization_pool.expect("canonical authorization"),
+            &node.id,
+            authored_home.as_deref(),
+        )
+        .await?;
         node.containment_path_visible = root_path_visible;
     }
     Ok(nodes.into_iter().map(|(_, node)| node).collect())
@@ -684,14 +932,33 @@ struct Frontier {
     child_count: i64,
 }
 
-/// The node projection, shared by the root fetch and both level strategies so
-/// they cannot drift apart in what they select. Every statement using it binds
-/// the `archived` key first.
-fn node_columns(archived_count_filter: &str, type_count_filter: &str, member: bool) -> String {
-    let not_hidden = if member {
-        super::member_not_hidden_predicate("c")
+fn tree_hidden_predicate(alias: &str, member: bool, native: bool) -> String {
+    #[cfg(feature = "v2-kernel-probe")]
+    if native {
+        return crate::mcp::kernel_v2::native_query_hidden_predicate(alias, &[]);
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let _ = native;
+    if member {
+        super::member_not_hidden_predicate(alias)
     } else {
-        super::not_hidden_predicate("c")
+        super::not_hidden_predicate(alias)
+    }
+}
+
+/// Shared projection for the root and both level strategies. Canonical/v1
+/// statements bind the archived facet key first; native uses the actual column.
+fn node_columns(
+    archived_count_filter: &str,
+    type_count_filter: &str,
+    member: bool,
+    native: bool,
+) -> String {
+    let not_hidden = tree_hidden_predicate("c", member, native);
+    let archived = if native {
+        "r.archived".to_owned()
+    } else {
+        "EXISTS (SELECT 1 FROM facet_values av WHERE av.record_id = r.id AND av.key = ?)".to_owned()
     };
     format!(
         "r.id, r.type, r.kind, r.name, r.home_id, r.persistence,
@@ -701,8 +968,7 @@ fn node_columns(archived_count_filter: &str, type_count_filter: &str, member: bo
              AND {not_hidden}
            {archived_count_filter}
            {type_count_filter}) AS child_count,
-         EXISTS (SELECT 1 FROM facet_values av
-                  WHERE av.record_id = r.id AND av.key = ?) AS archived"
+         {archived} AS archived"
     )
 }
 
@@ -806,6 +1072,60 @@ pub(crate) async fn containment_path_visible_in(
         }
     }
     Ok(true)
+}
+
+/// Query-result disclosure for one caller on one pinned transaction. Ancestor
+/// traversal and custody checks remain scalar; repeated ancestors reuse only
+/// successful capability evaluations. The memo cannot outlive this call or
+/// cross a transaction/principal boundary, and storage errors are not cached.
+pub(crate) async fn query_path_disclosures_in(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: crate::authorization::Principal<'_>,
+    subjects: &[(String, Option<String>)],
+) -> Result<Vec<(bool, bool)>> {
+    let mut permissions = HashMap::<String, bool>::new();
+    let mut output = Vec::with_capacity(subjects.len());
+    for (record_id, home_id) in subjects {
+        let custody = custody_boundary_in(transaction, record_id, home_id.as_deref()).await?;
+        let path_visible = if record_id == crate::schema::ROOT_RECORD_ID {
+            true
+        } else {
+            // Keep the original cycle/depth handling and row decoding, even
+            // when an ancestor's permission is already known.
+            let ancestors = ancestors_on(transaction, record_id).await?;
+            let mut visible = ancestors.first().map(|entry| entry.id.as_str())
+                == Some(crate::schema::ROOT_RECORD_ID);
+            if visible {
+                for ancestor in ancestors {
+                    let allowed = match permissions.get(&ancestor.id) {
+                        Some(allowed) => *allowed,
+                        None => match crate::authorization::effective_capability_on(
+                            transaction,
+                            principal,
+                            &ancestor.id,
+                        )
+                        .await
+                        {
+                            Ok(capability) => {
+                                let allowed =
+                                    capability.allows(crate::authorization::Capability::View);
+                                permissions.insert(ancestor.id, allowed);
+                                allowed
+                            }
+                            Err(_) => false,
+                        },
+                    };
+                    if !allowed {
+                        visible = false;
+                        break;
+                    }
+                }
+            }
+            visible
+        };
+        output.push((custody, path_visible));
+    }
+    Ok(output)
 }
 
 async fn can_view(
@@ -1023,7 +1343,7 @@ pub(crate) async fn subtree_ids_with_hidden_in(
         "AND {}",
         super::hidden_visibility_predicate("r", include_suggestions, include_citations, false)
     );
-    subtree_ids_with_filter_in(conn, root_id, &hidden_filter, include_archived).await
+    subtree_ids_with_filter_in(conn, root_id, &hidden_filter, include_archived, false).await
 }
 
 /// Member-copy subtree walk: the same recursive walk over the shipped
@@ -1045,7 +1365,16 @@ pub(crate) async fn member_subtree_ids_in(
     root_id: &str,
     include_archived: bool,
 ) -> Result<Vec<String>> {
-    subtree_ids_with_filter_in(conn, root_id, "AND 1", include_archived).await
+    subtree_ids_with_filter_in(conn, root_id, "AND 1", include_archived, false).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_subtree_ids_in(
+    conn: &mut SqliteConnection,
+    root_id: &str,
+    include_archived: bool,
+) -> Result<Vec<String>> {
+    subtree_ids_with_filter_in(conn, root_id, "AND 1", include_archived, true).await
 }
 
 async fn subtree_ids_with_filter_in(
@@ -1053,9 +1382,12 @@ async fn subtree_ids_with_filter_in(
     root_id: &str,
     hidden_filter: &str,
     include_archived: bool,
+    native_archive_column: bool,
 ) -> Result<Vec<String>> {
     let archived_filter = if include_archived {
         String::new()
+    } else if native_archive_column {
+        "AND r.archived=0".to_owned()
     } else {
         format!(
             "AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = r.id AND a.key = '{ARCHIVED_FACET_KEY}')"
@@ -1091,6 +1423,176 @@ async fn subtree_ids_with_filter_in(
 mod tests {
     use super::{descendants_with_lens_as, TreeOptions};
     use crate::query::lens::{self, AsOfSelector, ContentSeqSelector, ReadLens};
+
+    #[tokio::test]
+    async fn query_path_batch_matches_scalar_and_does_not_reuse_permissions_after_return() {
+        use crate::authorization::{AllowEntry, Capability, Principal};
+        use serde_json::json;
+        let db = crate::create_database(":memory:").await.unwrap();
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:policy",
+            crate::schema::ROOT_RECORD_ID,
+            vec![AllowEntry::members(Capability::View)],
+        )
+        .await
+        .unwrap();
+        let fixtures = [
+            (
+                "00000000-0000-4000-8000-000000000007",
+                crate::schema::ROOT_RECORD_ID,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000008",
+                crate::schema::ROOT_RECORD_ID,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000007",
+            ),
+            (
+                "00000000-0000-4000-8000-000000000002",
+                "00000000-0000-4000-8000-000000000008",
+            ),
+            (
+                "00000000-0000-4000-8000-000000000009",
+                crate::schema::ROOT_RECORD_ID,
+            ),
+            (
+                "00000000-0000-4000-8000-00000000000a",
+                crate::schema::ROOT_RECORD_ID,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000005",
+                crate::schema::ROOT_RECORD_ID,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000006",
+                "00000000-0000-4000-8000-000000000005",
+            ),
+            (
+                "00000000-0000-4000-8000-000000000003",
+                crate::schema::ROOT_RECORD_ID,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000004",
+                "00000000-0000-4000-8000-000000000003",
+            ),
+        ];
+        for (id, home) in fixtures {
+            crate::store::create_record(&db, json!({
+                "id":id,"type":"Collection","kind":"folder","name":"Path fixture","home_id":home,
+            })).await.unwrap();
+        }
+        for (id, account) in [
+            ("00000000-0000-4000-8000-000000000007", "acct:reader"),
+            ("00000000-0000-4000-8000-000000000008", "acct:other"),
+            ("00000000-0000-4000-8000-000000000002", "acct:reader"),
+        ] {
+            crate::authorization::replace_explicit_policy(
+                &db,
+                "test:policy",
+                id,
+                vec![AllowEntry::account(account, Capability::View)],
+            )
+            .await
+            .unwrap();
+        }
+        let mut parent = crate::schema::ROOT_RECORD_ID.to_owned();
+        for depth in 1..=super::MAX_WALK_DEPTH + 1 {
+            let id = format!("00000000-0000-4000-9000-{depth:012x}");
+            crate::store::create_record(&db, json!({
+                "id":id,"type":"Collection","kind":"folder","name":"Depth fixture","home_id":parent,
+            })).await.unwrap();
+            parent = id;
+        }
+        let mut tx = db.write_pool().begin().await.unwrap();
+        // Broken imported projections are inputs to the scalar disclosure
+        // contract too. Defer the missing-parent FK and roll this fixture back.
+        sqlx::query("PRAGMA defer_foreign_keys=ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for statement in [
+            "UPDATE records SET home_id=NULL WHERE id='00000000-0000-4000-8000-000000000009'",
+            "UPDATE records SET home_id='00000000-0000-4000-8000-00000000000b' WHERE id='00000000-0000-4000-8000-00000000000a'",
+            "UPDATE records SET home_id='00000000-0000-4000-8000-000000000006' WHERE id='00000000-0000-4000-8000-000000000005'",
+            "UPDATE records SET deleted_at='2026-01-01T00:00:00Z' WHERE id='00000000-0000-4000-8000-000000000003'",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await.unwrap();
+        }
+        let mut subjects = fixtures
+            .iter()
+            .map(|(id, home)| (id.to_string(), Some(home.to_string())))
+            .collect::<Vec<_>>();
+        subjects.extend([
+            (crate::schema::ROOT_RECORD_ID.into(), None),
+            ("00000000-0000-4000-8000-00000000000b".into(), None),
+            (
+                "00000000-0000-4000-8000-000000000001".into(),
+                Some("00000000-0000-4000-8000-000000000008".into()),
+            ),
+            ("00000000-0000-4000-8000-000000000001".into(), None),
+            (
+                format!("00000000-0000-4000-9000-{:012x}", super::MAX_WALK_DEPTH),
+                None,
+            ),
+            (
+                format!("00000000-0000-4000-9000-{:012x}", super::MAX_WALK_DEPTH + 1),
+                None,
+            ),
+        ]);
+        for account in ["acct:reader", "acct:other"] {
+            let principal = Principal::bound(account, true);
+            let mut expected = Vec::new();
+            for (id, home) in &subjects {
+                expected.push((
+                    super::custody_boundary_in(&mut tx, id, home.as_deref())
+                        .await
+                        .unwrap(),
+                    super::containment_path_visible_in(&mut tx, id, principal)
+                        .await
+                        .unwrap(),
+                ));
+            }
+            assert_eq!(
+                super::query_path_disclosures_in(&mut tx, principal, &subjects)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert!(expected[10].1); // Root is always a complete path.
+            assert!(!expected[5].1); // Missing parent.
+            assert!(!expected[6].1); // Cycle.
+            assert!(!expected[9].1); // Deleted ancestor.
+            assert!(expected[14].1); // Root exactly at the walk limit.
+            assert!(!expected[15].1); // Root beyond the walk limit.
+            assert_eq!(expected[2].1, account == "acct:reader");
+        }
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::authorization::replace_explicit_policy_on(
+            &mut tx,
+            "test:policy",
+            "00000000-0000-4000-8000-000000000007",
+            vec![],
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        let changed = super::query_path_disclosures_in(
+            &mut tx,
+            Principal::bound("acct:reader", true),
+            &subjects,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !changed[2].1,
+            "a later call must read the changed policy even on the same transaction"
+        );
+        tx.rollback().await.unwrap();
+        db.close().await;
+    }
 
     /// The batched fold keeps `include_initial_tombstone = false` like the
     /// scalar path: a live-tombstoned record stays hidden in historical walks

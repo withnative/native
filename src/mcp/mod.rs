@@ -54,6 +54,8 @@ pub mod builtin;
 pub mod counter_fence;
 pub mod database_freeze;
 pub(crate) mod deployment_read_only;
+#[cfg(feature = "mcp-executor-prototype")]
+pub mod desktop_app_proof;
 pub mod evidence;
 #[cfg(feature = "mcp-executor-prototype")]
 #[doc(hidden)]
@@ -62,6 +64,8 @@ pub mod executor_prototype;
 pub mod federated_source;
 pub mod fetch;
 pub mod guides;
+#[doc(hidden)]
+pub mod host_writer_pause;
 #[doc(hidden)]
 pub mod hosted_protocol;
 #[doc(hidden)]
@@ -76,9 +80,12 @@ pub(crate) mod member_serving;
 #[doc(hidden)]
 pub mod member_stdio;
 pub mod product_model;
+pub(crate) mod proposal_run;
 mod protocol;
 #[cfg(unix)]
 pub(crate) use protocol::is_modern_request;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use protocol::NoHeldToolCall;
 #[cfg(feature = "v2-kernel-probe")]
 pub mod kernel_v2;
 pub(crate) mod record_ref;
@@ -92,6 +99,8 @@ pub mod standby_stdio;
 pub mod status_only;
 pub mod stdio;
 mod surface;
+#[cfg(test)]
+mod tool_enumeration;
 pub mod tools;
 
 pub use authority_act::{AuthorityActDeltaRequest, AuthorityActSource, AuthorityActSourceRef};
@@ -119,6 +128,11 @@ pub use executor_prototype::{
     ExecutorTelemetryContext, ExecutorTelemetryHealth, ExecutorTelemetrySink,
     StructuredLogTelemetrySink, DEFAULT_RETENTION_DAYS,
 };
+#[cfg(all(feature = "mcp-executor-prototype", feature = "v2-kernel-probe"))]
+pub use executor_prototype::{
+    HostedPublicationAuthorityGuard, HostedPublicationContext, HostedPublicationReconcileError,
+    PublicationRoutingCurrent,
+};
 pub use guides::{GuideSource, GuideSpec, GUIDE_SPECS};
 pub use interactions::{
     AdmissionReason, AuthoritativeDisposition, AuthorizationDisposition, CustomInteractionPolicy,
@@ -133,6 +147,8 @@ pub use lens_surface::{
 };
 #[doc(hidden)]
 pub use member_stdio::{MemberServedSnapshot, MemberStdioSession};
+#[cfg(feature = "mcp-executor-prototype")]
+pub(crate) use protocol::LEGACY_SUPPORTED_PROTOCOL_VERSIONS;
 pub use protocol::{DATABASE_POOL_TIMEOUT, DATABASE_POOL_TIMEOUT_RECOVERY, PROTOCOL_VERSION};
 #[cfg(feature = "mcp-executor-prototype")]
 #[doc(hidden)]

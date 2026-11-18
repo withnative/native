@@ -141,6 +141,80 @@ impl ReqwestMemberCopyClient {
         Ok(url)
     }
 
+    fn preparation_url(&self, handle: &str) -> Result<Url> {
+        let mut url = self.start_url()?;
+        url.path_segments_mut()
+            .map_err(|_| Error::engine("member copy origin cannot be a base URL"))?
+            .extend(["preparations", handle]);
+        Ok(url)
+    }
+
+    /// Pending metadata cannot mint an authenticated member context. Only the
+    /// ordinary final outcome parser below can bind a successful manifest.
+    async fn prepared_outcome(
+        &self,
+        mut response: reqwest::Response,
+        selection: &CredentialSelection,
+    ) -> Result<MemberCopyAttempt> {
+        let began = tokio::time::Instant::now();
+        let mut handle: Option<String> = None;
+        let mut announced_minute = None;
+        loop {
+            if response.status() != StatusCode::ACCEPTED {
+                if handle.is_some() && response.status() == StatusCode::NOT_FOUND {
+                    require_api(Self::api_header(&response))?;
+                    let bytes = bounded_body(response, MAX_OUTCOME_BYTES).await?;
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Missing {
+                        api: String,
+                        error_code: String,
+                    }
+                    let body: Missing = serde_json::from_slice(&bytes).map_err(|_| {
+                        Error::engine("member preparation expiry response malformed")
+                    })?;
+                    if body.api != MEMBER_COPY_API || body.error_code != "preparation_not_found" {
+                        return Err(Error::engine("member preparation expiry contract mismatch"));
+                    }
+                    return Ok(MemberCopyAttempt {
+                        answer: MemberCopyAnswer::Restart,
+                        context: None,
+                    });
+                }
+                return self.outcome(response, selection).await;
+            }
+            require_api(Self::api_header(&response))?;
+            let pending = parse_preparing(&bounded_body(response, MAX_OUTCOME_BYTES).await?)?;
+            if handle
+                .as_ref()
+                .is_some_and(|old| old != &pending.preparation_handle)
+            {
+                return Err(Error::engine(
+                    "member preparation handle changed while polling",
+                ));
+            }
+            let minute = began.elapsed().as_secs() / 60;
+            if announced_minute != Some(minute) {
+                eprintln!(
+                    "Preparing workspace copy ({} minutes elapsed; acquisition limit 90 minutes).",
+                    minute
+                );
+                announced_minute = Some(minute);
+            }
+            handle = Some(pending.preparation_handle);
+            tokio::time::sleep(Duration::from_secs(pending.retry_after_seconds)).await;
+            response = self
+                .http
+                .get(self.preparation_url(handle.as_deref().expect("validated handle"))?)
+                .header(AUTHORIZATION, self.bearer(selection)?)
+                .send()
+                .await
+                .map_err(|error| {
+                    Error::engine(format!("member preparation poll failed: {error}"))
+                })?;
+        }
+    }
+
     fn bearer(&self, selection: &CredentialSelection) -> Result<HeaderValue> {
         let token = std::str::from_utf8(selection.bearer())
             .map_err(|_| Error::engine("member copy credential is not UTF-8"))?;
@@ -271,6 +345,31 @@ struct RefusalBody {
     kind: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparingBody {
+    api: String,
+    kind: String,
+    preparation_handle: String,
+    retry_after_seconds: u64,
+}
+fn parse_preparing(body: &[u8]) -> Result<PreparingBody> {
+    let pending: PreparingBody = serde_json::from_slice(body)
+        .map_err(|_| Error::engine("member preparation metadata malformed"))?;
+    let handle = uuid::Uuid::parse_str(&pending.preparation_handle)
+        .map_err(|_| Error::engine("member preparation handle invalid"))?;
+    if pending.api != MEMBER_COPY_API
+        || pending.kind != "preparing"
+        || handle.to_string() != pending.preparation_handle
+        || !(1..=5).contains(&pending.retry_after_seconds)
+    {
+        return Err(Error::engine(
+            "member preparation metadata contract mismatch",
+        ));
+    }
+    Ok(pending)
+}
+
 fn require_kind(body: &[u8], expected: &str) -> Result<()> {
     let refusal: RefusalBody = serde_json::from_slice(body)
         .map_err(|error| Error::engine(format!("member copy refusal is malformed: {error}")))?;
@@ -290,34 +389,54 @@ impl MemberCopyTransport for ReqwestMemberCopyClient {
     ) -> BoxFuture<'_, Result<MemberCopyAttempt>> {
         let selection = selection.clone();
         Box::pin(async move {
-            if request.db_id != self.config.route_database_id {
-                return Err(Error::engine(
-                    "member copy request route disagrees with the adapter config",
-                ));
-            }
-            if request.consumer != self.config.consumer {
-                return Err(Error::engine(
-                    "member copy request consumer disagrees with the adapter config",
-                ));
-            }
-            let body = serde_json::to_vec(&serde_json::json!({
-                "contract": MEMBER_COPY_API,
-                "version": 1,
-                "consumer": request.consumer,
-                "installed_generation_id": request.installed_generation_id,
-                "installed_scope_ref": request.installed_scope_ref,
-            }))
-            .map_err(|error| Error::engine(format!("member copy request serialises: {error}")))?;
-            let response = self
-                .http
-                .post(self.start_url()?)
-                .header(AUTHORIZATION, self.bearer(&selection)?)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|error| Error::engine(format!("member copy request failed: {error}")))?;
-            self.outcome(response, &selection).await
+            tokio::time::timeout(
+                crate::member_copy_transport::MEMBER_COPY_ACQUISITION_BUDGET,
+                async {
+                    if request.db_id != self.config.route_database_id {
+                        return Err(Error::engine(
+                            "member copy request route disagrees with the adapter config",
+                        ));
+                    }
+                    if request.consumer != self.config.consumer {
+                        return Err(Error::engine(
+                            "member copy request consumer disagrees with the adapter config",
+                        ));
+                    }
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "contract": MEMBER_COPY_API,
+                        "version": 1,
+                        "consumer": request.consumer,
+                        "installed_generation_id": request.installed_generation_id,
+                        "installed_scope_ref": request.installed_scope_ref,
+                    }))
+                    .map_err(|error| {
+                        Error::engine(format!("member copy request serialises: {error}"))
+                    })?;
+                    let response = self
+                        .http
+                        .post(self.start_url()?)
+                        .timeout(crate::member_copy_transport::MEMBER_COPY_PREPARATION_TIMEOUT)
+                        .header("x-native-member-copy-preparation", "v1")
+                        // One key per logical call. Independent concurrent starts
+                        // retain their own ordinals; resending this HTTP start
+                        // retains the same idempotency key.
+                        .header(
+                            "x-native-member-copy-preparation-id",
+                            uuid::Uuid::new_v4().to_string(),
+                        )
+                        .header(AUTHORIZATION, self.bearer(&selection)?)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            Error::engine(format!("member copy request failed: {error}"))
+                        })?;
+                    self.prepared_outcome(response, &selection).await
+                },
+            )
+            .await
+            .map_err(|_| Error::engine("member copy acquisition deadline expired"))?
         })
     }
 
@@ -590,6 +709,180 @@ impl OutcomeBody {
 mod tests {
     use super::*;
     use crate::member_copy_transport::{test_consumer, CredentialSelection};
+
+    /// Exercise the real HTTP adapter, advancing virtual time only after the
+    /// server received the POST. No production timeout is shortened for tests.
+    #[tokio::test]
+    async fn preparation_survives_short_http_timeout_but_still_has_a_deadline() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for (wait, expires) in [
+            (Duration::from_secs(61), false),
+            (Duration::from_secs(85 * 60 + 1), true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let (entered, received) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let request_bytes = socket.read(&mut bytes).await.unwrap();
+                assert!(
+                    request_bytes > 0,
+                    "client sent request bytes before the stall"
+                );
+                entered.send(()).unwrap();
+                let _ = released.await;
+                let body = r#"{"api":"native.member-copy.v1","kind":"locked"}"#;
+                let response = format!("HTTP/1.1 423 Locked\r\nx-native-member-copy-api: native.member-copy.v1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+            let client = ReqwestMemberCopyClient::new(
+                MemberCopyClientConfig::new(&origin, "route-test", test_consumer()).unwrap(),
+            )
+            .unwrap();
+            let request = tokio::spawn(async move {
+                client
+                    .request(
+                        MemberCopyRequest {
+                            db_id: "route-test".into(),
+                            consumer: test_consumer(),
+                            installed_generation_id: None,
+                            installed_scope_ref: None,
+                        },
+                        &CredentialSelection::for_test(b"bearer"),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), received)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(wait).await;
+            tokio::task::yield_now().await;
+            if !expires {
+                assert!(
+                    !request.is_finished(),
+                    "preparation must survive the ordinary 60-second HTTP limit"
+                );
+            }
+            let _ = release.send(());
+            tokio::time::resume();
+            let result = tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .unwrap()
+                .unwrap();
+            if expires {
+                assert!(result.is_err(), "preparation must remain bounded");
+            } else {
+                assert!(matches!(result.unwrap().answer, MemberCopyAnswer::Locked));
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[test]
+    fn preparing_metadata_is_strict_and_carries_no_admission_authority() {
+        let good = serde_json::json!({"api":MEMBER_COPY_API,"kind":"preparing",
+            "preparation_handle":"00000000-0000-4000-8000-000000000001","retry_after_seconds":1});
+        assert!(parse_preparing(&serde_json::to_vec(&good).unwrap()).is_ok());
+        for (key, value) in [
+            ("api", serde_json::json!("foreign")),
+            ("kind", serde_json::json!("replace")),
+            ("preparation_handle", serde_json::json!("../../foreign")),
+            ("retry_after_seconds", serde_json::json!(0)),
+            ("retry_after_seconds", serde_json::json!(6)),
+            ("manifest", serde_json::json!({})),
+            ("account_binding", serde_json::json!("forged")),
+        ] {
+            let mut invalid = good.clone();
+            invalid[key] = value;
+            assert!(
+                parse_preparing(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    /// Real HTTP requests exercise start, repeated pending polls and terminal
+    /// outcomes. The pending status never constructs a serving context.
+    #[tokio::test]
+    async fn preparation_polls_one_bound_handle_and_preserves_terminal_verdicts() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for expired in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                for i in 0..3 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    let request = String::from_utf8(bytes[..n].to_vec()).unwrap();
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-bearer"));
+                    seen.push(request.lines().next().unwrap().to_owned());
+                    let (status, body) = if i < 2 {
+                        (
+                            202,
+                            serde_json::json!({"api":MEMBER_COPY_API,"kind":"preparing",
+                            "preparation_handle":"00000000-0000-4000-8000-000000000001","retry_after_seconds":1}),
+                        )
+                    } else if expired {
+                        (
+                            404,
+                            serde_json::json!({"api":MEMBER_COPY_API,"error_code":"preparation_not_found"}),
+                        )
+                    } else {
+                        (
+                            423,
+                            serde_json::json!({"api":MEMBER_COPY_API,"kind":"locked"}),
+                        )
+                    };
+                    let body = serde_json::to_vec(&body).unwrap();
+                    let head = format!("HTTP/1.1 {status} Status\r\nx-native-member-copy-api: {MEMBER_COPY_API}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+                seen
+            });
+            let client = ReqwestMemberCopyClient::new(
+                MemberCopyClientConfig::new(&origin, "route-test", test_consumer()).unwrap(),
+            )
+            .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.request(
+                    MemberCopyRequest {
+                        db_id: "route-test".into(),
+                        consumer: test_consumer(),
+                        installed_generation_id: None,
+                        installed_scope_ref: None,
+                    },
+                    &CredentialSelection::for_test(b"test-bearer"),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.context.is_none());
+            assert!(if expired {
+                matches!(result.answer, MemberCopyAnswer::Restart)
+            } else {
+                matches!(result.answer, MemberCopyAnswer::Locked)
+            });
+            let seen = server.await.unwrap();
+            assert_eq!(
+                seen[0],
+                "POST /v1/databases/route-test/member-copy HTTP/1.1"
+            );
+            assert_eq!(seen[1],"GET /v1/databases/route-test/member-copy/preparations/00000000-0000-4000-8000-000000000001 HTTP/1.1");
+            assert_eq!(seen[1], seen[2]);
+        }
+    }
 
     /// A chunked (`Transfer-Encoding: chunked`, no `Content-Length`) 206 whose
     /// body exceeds the chunk bound must fail at the bound without buffering

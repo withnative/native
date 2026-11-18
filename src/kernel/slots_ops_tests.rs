@@ -127,7 +127,7 @@ impl HomeProvisioner for TestProvisioner {
             serde_json::to_value(KernelHomeCreatedPayload {
                 source_record_id: None,
                 parent_id: KERNEL_ROOT_ID.into(),
-                owner_id: owner,
+                owner_id: Some(owner),
                 entries: entries.map(|entries| {
                     entries
                         .into_iter()
@@ -558,7 +558,7 @@ impl AttemptHooks for UniqueBackstop {
                 payload: serde_json::to_value(KernelHomeCreatedPayload {
                     source_record_id: None,
                     parent_id: KERNEL_ROOT_ID.into(),
-                    owner_id: self.principal.clone(),
+                    owner_id: Some(self.principal.clone()),
                     entries: Some(vec![KernelHomeEntryPayload {
                         subject_id: self.principal.clone(),
                         capability: "manage".into(),

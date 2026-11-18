@@ -20,9 +20,15 @@ pub(crate) mod gate;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod generated;
 #[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod proposal;
+#[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod receipt;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod retained_facets;
+#[cfg(test)]
+pub(crate) mod software_occurrence;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod software_projection;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod source_proof;
 pub(crate) mod storage;
@@ -124,12 +130,7 @@ impl Revision {
             return Err(invalid("revision identity/version/digest mismatch"));
         }
         if self.v == 2 {
-            let definition: v2::Definition = serde_json::from_value(self.definition.clone())?;
-            if serde_json::to_value(&definition)? != self.definition {
-                return Err(invalid("non-canonical revision definition"));
-            }
-            definition.validate()?;
-            return Ok(definition.common());
+            return v2::validate_definition(&self.definition);
         }
         let definition: contract::Definition = serde_json::from_value(self.definition.clone())?;
         if serde_json::to_value(&definition)? != self.definition {
@@ -546,4 +547,14 @@ pub(crate) fn testing_v2_definition() -> serde_json::Value {
     decode::<Revision>(&event, MAX_CARRIER_BYTES)
         .unwrap()
         .definition
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn inject_global_reader_fixture(db: &crate::Db, bearer: &str) -> Pin {
+    tests::v2_tests::inject_global_reader_fixture(db, bearer).await
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn inject_global_name_reader_fixture(db: &crate::Db, bearer: &str) -> Pin {
+    tests::v2_tests::inject_global_name_reader_fixture(db, bearer).await
 }

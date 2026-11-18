@@ -3,12 +3,13 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct Entry {
     pub kind: String,
     pub subject: String,
     pub capability: String,
 }
+#[derive(Clone)]
 pub(crate) struct Snapshot {
     pub target: String,
     pub anchor: String,
@@ -27,13 +28,36 @@ pub(crate) async fn snapshot_on(
     requested: &str,
     root_operator: bool,
 ) -> Result<Snapshot> {
+    snapshot_inner_on(conn, actor, requested, root_operator, true).await
+}
+
+/// Only for an already authorized explicit target's restoration preview.
+/// This does not disclose a parent record or confer authority on that parent.
+pub(crate) async fn inherited_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    home: &str,
+) -> Result<Snapshot> {
+    snapshot_inner_on(conn, actor, home, false, false).await
+}
+
+async fn snapshot_inner_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    requested: &str,
+    root_operator: bool,
+    require_view: bool,
+) -> Result<Snapshot> {
     let requested = if requested == "native:root" {
         KERNEL_ROOT_ID
     } else {
         requested
     };
     let capability = kernel_effective_capability_on(conn, actor, requested).await?;
-    if !capability.allows(Capability::View) && !(root_operator && requested == KERNEL_ROOT_ID) {
+    if require_view
+        && !capability.allows(Capability::View)
+        && !(root_operator && requested == KERNEL_ROOT_ID)
+    {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
     let is_home: bool =
@@ -99,12 +123,14 @@ pub(crate) async fn snapshot_on(
             capability: cap.as_policy_str().unwrap_or("none").into(),
         })
         .collect();
-    let seq: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events WHERE record_id=? AND type IN ('kernel.home_created.v1','kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1','kernel.home_policy_replaced.v1')")
-        .bind(&anchor).fetch_one(&mut *conn).await?;
+    // A public opaque revision must not be a hash of a guessable global log
+    // position. Bind the policy outcome to its canonical event identity.
+    let event_id: Option<String> = sqlx::query_scalar("SELECT id FROM content_events WHERE record_id=? AND type IN ('kernel.home_created.v1','kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1','kernel.home_policy_replaced.v1') ORDER BY seq DESC LIMIT 1")
+        .bind(&anchor).fetch_optional(&mut *conn).await?;
     let mut digest = Sha256::new();
     digest.update(b"native.kernel.policy-revision.v1\0");
     digest.update(serde_json::to_vec(&serde_json::json!([
-        target, owner, mode, anchor, seq, entries
+        target, owner, mode, anchor, event_id, entries
     ]))?);
     let revision = format!("prv2:{}", hex::encode(digest.finalize()));
     Ok(Snapshot {

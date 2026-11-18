@@ -1,0 +1,319 @@
+{
+  "result": "A79af serves95 with actual95 capture age; write refused; both snapshots and pin unchanged",
+  "identity": {
+    "contract": "native.standby-consumer.v1",
+    "version": 1,
+    "platform": "linux-x86_64",
+    "source_sha": "79af50f2deaf6b9cc87b9964274f922d7079b874",
+    "artifact_sha256": "ef2c7735d1e8aee295d3583a3705a2636fe184330264b0eec77191cad7d9f2aa",
+    "engine_schema_version": 94,
+    "ddl_sha256": "e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5",
+    "runtime": "mcp-stdio",
+    "standby_required": true,
+    "accepted_shapes": {
+      "version": 1,
+      "shapes": [
+        {
+          "family": "v1",
+          "engine_schema": 94,
+          "schema_sha256": "e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5",
+          "reader_format": 1
+        },
+        {
+          "family": "v1",
+          "engine_schema": 95,
+          "schema_sha256": "a122164c9e26ac98db3e04f3769a3edcc60ce25f78ecc2305c7aa5037afdc30f",
+          "reader_format": 1
+        },
+        {
+          "family": "kernel_v2",
+          "engine_schema": 94,
+          "schema_sha256": "0295db140abe29a6c4c2dce429e325eb37d1235031a6d1068d2df561e8618da7",
+          "reader_format": 1
+        },
+        {
+          "family": "kernel_v2",
+          "engine_schema": 95,
+          "schema_sha256": "770fb261b350ed747bb12db56f6b40cccc33c39ab01baaef2b2298d9b6b3ad90",
+          "reader_format": 1
+        }
+      ]
+    }
+  },
+  "expected": {
+    "old_generation": "53a9f2f12bbada4e643f7cd2a3b683a440df3f026c92ed479882735c18aca4f2",
+    "new_generation": "7cd326f6664d35908d70fb0e1b868cc281aad3e33234ca6f90e3993c3c1216de",
+    "record_id": "70110000-0000-4000-8000-000000000095",
+    "old_snapshot_sha256": "12e021400dd7398d3025b345a4e64e48de05a89f08126b7dfc82faa4d285ab1c",
+    "new_snapshot_sha256": "34d9b98f19ace3fd13f909dbbe6433f0550ab3552e6f8671b9feb91a0b2675e6"
+  },
+  "read": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"records\":[{\"status\":\"found\",\"id\":\"70110000-0000-4000-8000-000000000095\",\"type\":\"Document\",\"kind\":\"note\",\"name\":\"Receiver downgrade baseline\",\"body\":\"Verified94 remains readable\",\"home_id\":\"native:unfiled\",\"lifecycle_interpretation\":{\"status\":\"absent\"},\"owner_id\":null,\"persistence\":\"enduring\",\"maturity\":null,\"summary\":null,\"last_activity_at\":\"2026-11-14T19:08:53.080Z\",\"created_at\":\"2026-11-14T19:08:53.080Z\",\"updated_at\":\"2026-11-14T19:08:53.080Z\",\"deleted_at\":null,\"archived\":false,\"custody_boundary\":false,\"containment_path_visible\":true,\"bears_shape\":false,\"kind_governance\":{\"type\":\"Document\",\"raw_kind\":\"note\",\"classification\":\"active_canonical\",\"canonical_kind\":\"note\",\"canonical_value_id\":\"vv:voc:kind:Document:note\",\"lifecycle_status\":\"active\",\"metadata\":{\"schema_version\":1,\"provenance_ref\":\"rec:761ffae\",\"definition\":\"An ordinary authored prose or capture document.\",\"identity\":{\"criterion\":\"Each note record is a distinct document; matching titles or content do not establish identity.\",\"dedup\":{\"mode\":\"record_id\",\"keys\":[]}},\"declared_capabilities\":[]},\"quarantined\":false},\"facets\":[],\"links_out\":[],\"links_out_count\":0,\"links_in\":[],\"links_in_count\":0,\"children\":[],\"child_count\":0,\"suggestion_count\":0,\"citation_count\":0,\"comment_count\":0,\"contribution\":{\"principal\":{\"id\":\"a750ef19-cfc4-4db6-bf75-2a7667b295d4\",\"display_name\":\"Account 1a4b9044\"},\"executor\":{\"kind\":null,\"ref\":null,\"assurance\":\"unknown_or_withheld\"},\"channel\":{\"kind\":\"unknown\",\"assurance\":\"unknown_or_withheld\"},\"revision\":{\"event_id\":\"b55a5de4-bb55-43b3-baac-7ec47da9d8e2\",\"event_type\":\"record.created\",\"produced_current_body\":true},\"created_by\":{\"event_id\":\"b55a5de4-bb55-43b3-baac-7ec47da9d8e2\",\"same_run\":true},\"context\":{},\"interpretation_limits\":[\"principal_association_does_not_establish_endorsement\",\"content_creation_does_not_establish_stance\",\"some_contribution_fields_are_unknown_or_withheld\"]},\"ancestors\":[{\"id\":\"native:root\",\"type\":\"Collection\",\"kind\":\"folder\",\"name\":\"Workspace\"},{\"id\":\"native:unfiled\",\"type\":\"Collection\",\"kind\":\"folder\",\"name\":\"Unfiled\"}],\"version\":\"rec:13\",\"has_query\":false,\"record_path_full\":\"/70110000-0000-4000-8000-000000000095\",\"record_path\":\"/7011000\",\"display_reference\":\"7011000\",\"body_digest\":\"9f5c24b4984652c88bb20ed3f09de75122d3040233b9f7a45b6b461ed5501a21\"}],\"resolve\":true,\"children_limit\":200,\"children_offset\":0,\"links_limit\":200,\"links_offset\":0,\"include_suggestions\":false,\"suggestions_limit\":100,\"suggestions_offset\":0,\"include_citations\":false,\"citations_limit\":100,\"citations_offset\":0,\"include_comments\":false,\"comments_limit\":50,\"comments_offset\":0,\"include_history_summary\":false,\"standby_context\":{\"status_scope\":\"serving_generation_freshness_only\",\"full_status_tool\":\"standby_status\",\"mode\":\"standby\",\"canonical_authority\":\"hosted\",\"read_only\":true,\"writes_supported\":false,\"serving_generation_id\":\"7cd326f6664d35908d70fb0e1b868cc281aad3e33234ca6f90e3993c3c1216de\",\"serving_head_act\":17,\"serving_materialization\":\"snapshot\",\"serving_source_history\":\"exhaustive\",\"serving_consumer_rebound_at\":\"2026-11-14T20:13:18.659787919+00:00\",\"freshness\":{\"state\":\"beyond_rpo\",\"age_seconds\":3863,\"target_rpo_seconds\":300,\"target_refresh_interval_seconds\":60,\"beyond_rpo\":true},\"freshness_degraded\":true,\"degraded_reasons\":[\"snapshot_beyond_rpo\"],\"next_safe_action\":\"restore hosted connectivity or authentication and run the supported refresh command\"},\"run_context\":{\"run_key\":null,\"intent\":null,\"notes\":[\"This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap.\"]}}"
+        }
+      ],
+      "structuredContent": {
+        "records": [
+          {
+            "status": "found",
+            "id": "70110000-0000-4000-8000-000000000095",
+            "type": "Document",
+            "kind": "note",
+            "name": "Receiver downgrade baseline",
+            "body": "Verified94 remains readable",
+            "home_id": "native:unfiled",
+            "lifecycle_interpretation": {
+              "status": "absent"
+            },
+            "owner_id": null,
+            "persistence": "enduring",
+            "maturity": null,
+            "summary": null,
+            "last_activity_at": "2026-11-14T19:08:53.080Z",
+            "created_at": "2026-11-14T19:08:53.080Z",
+            "updated_at": "2026-11-14T19:08:53.080Z",
+            "deleted_at": null,
+            "archived": false,
+            "custody_boundary": false,
+            "containment_path_visible": true,
+            "bears_shape": false,
+            "kind_governance": {
+              "type": "Document",
+              "raw_kind": "note",
+              "classification": "active_canonical",
+              "canonical_kind": "note",
+              "canonical_value_id": "vv:voc:kind:Document:note",
+              "lifecycle_status": "active",
+              "metadata": {
+                "schema_version": 1,
+                "provenance_ref": "rec:761ffae",
+                "definition": "An ordinary authored prose or capture document.",
+                "identity": {
+                  "criterion": "Each note record is a distinct document; matching titles or content do not establish identity.",
+                  "dedup": {
+                    "mode": "record_id",
+                    "keys": []
+                  }
+                },
+                "declared_capabilities": []
+              },
+              "quarantined": false
+            },
+            "facets": [],
+            "links_out": [],
+            "links_out_count": 0,
+            "links_in": [],
+            "links_in_count": 0,
+            "children": [],
+            "child_count": 0,
+            "suggestion_count": 0,
+            "citation_count": 0,
+            "comment_count": 0,
+            "contribution": {
+              "principal": {
+                "id": "a750ef19-cfc4-4db6-bf75-2a7667b295d4",
+                "display_name": "Account 1a4b9044"
+              },
+              "executor": {
+                "kind": null,
+                "ref": null,
+                "assurance": "unknown_or_withheld"
+              },
+              "channel": {
+                "kind": "unknown",
+                "assurance": "unknown_or_withheld"
+              },
+              "revision": {
+                "event_id": "b55a5de4-bb55-43b3-baac-7ec47da9d8e2",
+                "event_type": "record.created",
+                "produced_current_body": true
+              },
+              "created_by": {
+                "event_id": "b55a5de4-bb55-43b3-baac-7ec47da9d8e2",
+                "same_run": true
+              },
+              "context": {},
+              "interpretation_limits": [
+                "principal_association_does_not_establish_endorsement",
+                "content_creation_does_not_establish_stance",
+                "some_contribution_fields_are_unknown_or_withheld"
+              ]
+            },
+            "ancestors": [
+              {
+                "id": "native:root",
+                "type": "Collection",
+                "kind": "folder",
+                "name": "Workspace"
+              },
+              {
+                "id": "native:unfiled",
+                "type": "Collection",
+                "kind": "folder",
+                "name": "Unfiled"
+              }
+            ],
+            "version": "rec:13",
+            "has_query": false,
+            "record_path_full": "/70110000-0000-4000-8000-000000000095",
+            "record_path": "/7011000",
+            "display_reference": "7011000",
+            "body_digest": "9f5c24b4984652c88bb20ed3f09de75122d3040233b9f7a45b6b461ed5501a21"
+          }
+        ],
+        "resolve": true,
+        "children_limit": 200,
+        "children_offset": 0,
+        "links_limit": 200,
+        "links_offset": 0,
+        "include_suggestions": false,
+        "suggestions_limit": 100,
+        "suggestions_offset": 0,
+        "include_citations": false,
+        "citations_limit": 100,
+        "citations_offset": 0,
+        "include_comments": false,
+        "comments_limit": 50,
+        "comments_offset": 0,
+        "include_history_summary": false,
+        "standby_context": {
+          "status_scope": "serving_generation_freshness_only",
+          "full_status_tool": "standby_status",
+          "mode": "standby",
+          "canonical_authority": "hosted",
+          "read_only": true,
+          "writes_supported": false,
+          "serving_generation_id": "7cd326f6664d35908d70fb0e1b868cc281aad3e33234ca6f90e3993c3c1216de",
+          "serving_head_act": 17,
+          "serving_materialization": "snapshot",
+          "serving_source_history": "exhaustive",
+          "serving_consumer_rebound_at": "2026-11-14T20:13:18.659787919+00:00",
+          "freshness": {
+            "state": "beyond_rpo",
+            "age_seconds": 3863,
+            "target_rpo_seconds": 300,
+            "target_refresh_interval_seconds": 60,
+            "beyond_rpo": true
+          },
+          "freshness_degraded": true,
+          "degraded_reasons": [
+            "snapshot_beyond_rpo"
+          ],
+          "next_safe_action": "restore hosted connectivity or authentication and run the supported refresh command"
+        },
+        "run_context": {
+          "run_key": null,
+          "intent": null,
+          "notes": [
+            "This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap."
+          ]
+        }
+      },
+      "isError": false,
+      "_meta": {
+        "nativeExecutor": {
+          "schema": "native.mcp-executor.v1",
+          "surface": "standby-read-only",
+          "contractVersion": "native.operation-contract.v1",
+          "manifestSha256": "cf7b591fe38bf4a0ac3c3a2b7527273b26462a65eeaa20e16eeafe0b504429ad",
+          "descriptorBytes": 29882,
+          "handlerAuthority": "registered production ToolRegistry"
+        }
+      }
+    }
+  },
+  "write_refusal": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "this Native server is a read-only standby\nRun context: (none) \u00b7 intent: (none)\nRun note: This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap.\n"
+        }
+      ],
+      "structuredContent": {
+        "error": "this Native server is a read-only standby",
+        "run_context": {
+          "run_key": null,
+          "intent": null,
+          "notes": [
+            "This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap."
+          ]
+        },
+        "error_code": "STANDBY_READ_ONLY",
+        "standby_context": {
+          "status_scope": "serving_generation_freshness_only",
+          "full_status_tool": "standby_status",
+          "mode": "standby",
+          "canonical_authority": "hosted",
+          "read_only": true,
+          "writes_supported": false,
+          "serving_generation_id": "7cd326f6664d35908d70fb0e1b868cc281aad3e33234ca6f90e3993c3c1216de",
+          "serving_head_act": 17,
+          "serving_materialization": "snapshot",
+          "serving_source_history": "exhaustive",
+          "serving_consumer_rebound_at": "2026-11-14T20:13:18.659787919+00:00",
+          "freshness": {
+            "state": "beyond_rpo",
+            "age_seconds": 3863,
+            "target_rpo_seconds": 300,
+            "target_refresh_interval_seconds": 60,
+            "beyond_rpo": true
+          },
+          "freshness_degraded": true,
+          "degraded_reasons": [
+            "snapshot_beyond_rpo"
+          ],
+          "next_safe_action": "restore hosted connectivity or authentication and run the supported refresh command"
+        }
+      },
+      "isError": true,
+      "_meta": {
+        "nativeExecutor": {
+          "schema": "native.mcp-executor.v1",
+          "surface": "standby-read-only",
+          "contractVersion": "native.operation-contract.v1",
+          "manifestSha256": "cf7b591fe38bf4a0ac3c3a2b7527273b26462a65eeaa20e16eeafe0b504429ad",
+          "descriptorBytes": 29882,
+          "handlerAuthority": "registered production ToolRegistry"
+        }
+      }
+    }
+  },
+  "diagnostics": [
+    "2026-11-14T20:13:18.316103Z  INFO native_ce::standby::verification: standby startup verification started",
+    "2026-11-14T20:13:18.316175Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-lock\"",
+    "2026-11-14T20:13:18.316705Z  INFO native_ce::standby::verification: standby phase finished phase=\"startup-lock\" elapsed_ms=0 ok=true",
+    "2026-11-14T20:13:18.316720Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-cleanup\"",
+    "2026-11-14T20:13:18.320828Z  INFO native_ce::standby::verification: standby phase finished phase=\"startup-cleanup\" elapsed_ms=4 ok=true",
+    "2026-11-14T20:13:18.323633Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-generation\"",
+    "2026-11-14T20:13:18.323926Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-rebind\"",
+    "2026-11-14T20:13:18.324512Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-snapshot\"",
+    "2026-11-14T20:13:18.324519Z  INFO native_ce::standby::verification: standby phase started phase=\"byte-manifest-consumer-identity\"",
+    "2026-11-14T20:13:18.326493Z  INFO native_ce::standby::verification: standby phase finished phase=\"byte-manifest-consumer-identity\" elapsed_ms=1 ok=true",
+    "2026-11-14T20:13:18.326503Z  INFO native_ce::standby::verification: standby phase started phase=\"engine-manifest-state\"",
+    "2026-11-14T20:13:18.651131Z  INFO native_ce::standby::verification: standby phase finished phase=\"engine-manifest-state\" elapsed_ms=324 ok=true",
+    "2026-11-14T20:13:18.651158Z  INFO native_ce::standby::verification: standby phase started phase=\"sqlite-quick-check-foreign-keys\"",
+    "2026-11-14T20:13:18.659770Z  INFO native_ce::standby::verification: standby phase finished phase=\"sqlite-quick-check-foreign-keys\" elapsed_ms=8 ok=true",
+    "2026-11-14T20:13:18.659782Z  INFO native_ce::standby::verification: standby phase finished phase=\"startup-snapshot\" elapsed_ms=335 ok=true",
+    "2026-11-14T20:13:18.660698Z  INFO native_ce::standby::verification: standby phase finished phase=\"startup-rebind\" elapsed_ms=336 ok=true",
+    "2026-11-14T20:13:18.660708Z  INFO native_ce::standby::verification: standby phase finished phase=\"startup-generation\" elapsed_ms=337 ok=true",
+    "2026-11-14T20:13:18.660798Z  INFO native_ce::standby::verification: standby startup phase finished phase=\"startup-generation-verify\" generation_id=\"7cd326f6664d35908d70fb0e1b868cc281aad3e33234ca6f90e3993c3c1216de\" elapsed_ms=337 ok=true",
+    "2026-11-14T20:13:18.660924Z  INFO native_ce::standby::verification: standby startup phase finished phase=\"startup-selection\" elapsed_ms=340",
+    "2026-11-14T20:13:18.660930Z  INFO native_ce::standby::verification: standby startup phase finished phase=\"startup-prune\" elapsed_ms=0 deferred=true",
+    "2026-11-14T20:13:18.660985Z  INFO native_ce::standby::verification: standby startup verification finished elapsed_ms=344 ok=true serving=true",
+    "2026-11-14T20:13:19.183074Z  INFO native_ce::standby::verification: standby phase started phase=\"background-retention\"",
+    "2026-11-14T20:13:19.186146Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-generation\"",
+    "2026-11-14T20:13:19.186491Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-rebind\"",
+    "2026-11-14T20:13:19.187107Z  INFO native_ce::standby::verification: standby phase started phase=\"startup-snapshot\"",
+    "2026-11-14T20:13:19.187117Z  INFO native_ce::standby::verification: standby phase started phase=\"byte-manifest-consumer-identity\"",
+    "2026-11-14T20:13:19.189206Z  INFO native_ce::standby::verification: standby phase finished phase=\"byte-manifest-consumer-identity\" elapsed_ms=2 ok=true",
+    "2026-11-14T20:13:19.189215Z  INFO native_ce::standby::verification: standby phase started phase=\"engine-manifest-state\""
+  ]
+}

@@ -77,12 +77,12 @@ enum ResponseMode {
     Verbose,
 }
 
-struct PreparedRecord {
-    index: usize,
-    local_ref: Option<String>,
-    dependencies: BTreeSet<usize>,
-    arguments: Value,
-    materialized_body: Option<String>,
+pub(crate) struct PreparedRecord {
+    pub(crate) index: usize,
+    pub(crate) local_ref: Option<String>,
+    pub(crate) dependencies: BTreeSet<usize>,
+    pub(crate) arguments: Value,
+    pub(crate) materialized_body: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -240,7 +240,7 @@ async fn refuse_reused_key(db: &Db, caller: &Caller, key: &str, arguments: &Valu
 /// Bind a dependant to the ids its dependencies actually have. They differ
 /// from the ids this attempt reserved only when a dependency replayed a
 /// record an earlier attempt with the same key created.
-fn rebind_dependencies(arguments: &mut Value, rebound: &[(&str, &str)]) {
+pub(crate) fn rebind_dependencies(arguments: &mut Value, rebound: &[(&str, &str)]) {
     if rebound.is_empty() {
         return;
     }
@@ -267,7 +267,10 @@ fn rebind_dependencies(arguments: &mut Value, rebound: &[(&str, &str)]) {
     }
 }
 
-fn preflight(records: Vec<Map<String, Value>>, reason: &str) -> Result<Vec<PreparedRecord>> {
+pub(crate) fn preflight(
+    records: Vec<Map<String, Value>>,
+    reason: &str,
+) -> Result<Vec<PreparedRecord>> {
     // `body_encoding` belongs to singular create_record only: it is neither
     // advertised nor decoded here, so refuse it rather than let the singular
     // dispatch below honour a field this tool never offered.
@@ -491,7 +494,7 @@ fn substitute_body_refs(
     (output, dependencies)
 }
 
-fn topological_order(records: &[PreparedRecord]) -> Result<Vec<usize>> {
+pub(crate) fn topological_order(records: &[PreparedRecord]) -> Result<Vec<usize>> {
     let mut indegree = records
         .iter()
         .map(|record| record.dependencies.len())

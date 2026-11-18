@@ -17,7 +17,7 @@ struct Args {
     dry_run: bool,
     idempotency_key: Option<String>,
 }
-const RECEIPTS:&str="CREATE TABLE IF NOT EXISTS kernel_mcp_write_receipts (principal_id TEXT NOT NULL, operation TEXT NOT NULL, operation_key TEXT NOT NULL, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, PRIMARY KEY(principal_id,operation,operation_key))";
+const RECEIPTS: &str = crate::kernel::MCP_WRITE_RECEIPTS_DDL;
 fn error(message: impl AsRef<str>) -> Error {
     Error::engine(format!("resolve_suggestions: {}", message.as_ref()))
 }
@@ -180,11 +180,6 @@ pub(super) async fn resolve(db: &Db, actor: &str, arguments: Value) -> Result<Va
         args.idempotency_key.as_deref(),
     )?;
     match args.action.as_str() {
-        "accept" if key.is_some() => {
-            return Err(error(
-                "accept does not accept idempotency_key yet; retry without a key",
-            ))
-        }
         "reject" if args.dry_run => return Err(error("dry_run is only valid with action accept")),
         "reject" if ids.len() != 1 => return Err(error("reject takes exactly one suggestion id")),
         "accept" | "reject" => {}
@@ -193,6 +188,15 @@ pub(super) async fn resolve(db: &Db, actor: &str, arguments: Value) -> Result<Va
     // The lock precedes every predicate and ordered simulation. The kind
     // reader uses only sealed rows captured while this transaction is held.
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    if let Some(key) = key.as_deref() {
+        kernel::mcp_write_receipts::fences::refuse_key_on(
+            &mut tx,
+            actor,
+            "resolve_suggestions",
+            key,
+        )
+        .await?;
+    }
     kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     let suggestions = load(&mut tx, actor, ids).await?;
     let target = &suggestions[0].target_id;
@@ -335,13 +339,19 @@ pub(super) async fn resolve(db: &Db, actor: &str, arguments: Value) -> Result<Va
         response["app_attribution"] = attribution;
     }
     if let Some(key) = key.as_deref() {
-        sqlx::query("INSERT INTO kernel_mcp_write_receipts VALUES(?,'resolve_suggestions',?,?,?)")
-            .bind(actor)
-            .bind(key)
-            .bind(request)
-            .bind(response.to_string())
-            .execute(&mut *tx)
-            .await?;
+        kernel::mcp_write_receipts::record_on(
+            db,
+            &mut tx,
+            &mut acts,
+            kernel::mcp_write_receipts::Outcome {
+                principal: actor,
+                operation: "resolve_suggestions",
+                key,
+                request: &request,
+                receipt: &response.to_string(),
+            },
+        )
+        .await?;
     }
     db.commit_kernel_content(tx).await?;
     Ok(response)

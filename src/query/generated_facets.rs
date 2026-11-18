@@ -36,6 +36,21 @@ pub(crate) enum Selection {
     Keys(BTreeSet<String>),
     All,
 }
+/// Internal selection only. No caller-facing selector or automatic fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Profile {
+    #[default]
+    Facet1,
+    Global1,
+}
+impl Profile {
+    pub(crate) fn version(self) -> &'static str {
+        match self {
+            Self::Facet1 => "facet-1",
+            Self::Global1 => "facet-global-1",
+        }
+    }
+}
 pub(crate) struct Input<'a> {
     pub(crate) workspace: &'a str,
     pub(crate) bearer: &'a str,
@@ -50,8 +65,8 @@ pub(crate) struct Input<'a> {
     pub(crate) vocabularies: &'a [Vocabulary],
 }
 #[derive(Debug, Serialize)]
-pub(crate) struct Proposal {
-    pub(crate) manifest: v2::Manifest,
+pub(crate) struct Proposal<M = v2::Manifest> {
+    pub(crate) manifest: M,
     pub(crate) manifest_sha256: String,
     pub(crate) name: String,
     pub(crate) sql: String,
@@ -225,6 +240,45 @@ pub(crate) async fn measured_compiles<T>(work: impl std::future::Future<Output =
 }
 
 pub(crate) fn compile(input: Input<'_>, deadline: Instant) -> Result<Proposal> {
+    compile_inner(input, deadline, Profile::Facet1)
+}
+
+/// Private global-at-H compilation. Explicit profile selection never changes
+/// the existing facet-1 byte contract or public preparation fences.
+#[allow(dead_code)] // STEP2 private; no public producer selects this profile.
+pub(crate) fn compile_global(
+    input: Input<'_>,
+    deadline: Instant,
+) -> Result<Proposal<v2::GlobalManifest>> {
+    let p = compile_inner(input, deadline, Profile::Global1)?;
+    Ok(Proposal {
+        manifest: global_manifest(p.manifest),
+        manifest_sha256: p.manifest_sha256,
+        name: p.name,
+        sql: p.sql,
+        output: p.output,
+        columns: p.columns,
+        relations: p.relations,
+    })
+}
+fn global_manifest(m: v2::Manifest) -> v2::GlobalManifest {
+    v2::GlobalManifest {
+        format: "native.generated-facets.v2".into(),
+        workspace_id: m.workspace_id,
+        context: v2::GlobalContext {
+            declaration_scope: v2::GlobalScope::Global,
+            r#type: m.context.r#type,
+            kind: m.context.kind,
+            logical_home_id: m.context.logical_home_id,
+        },
+        selection: m.selection,
+        sources: m.sources,
+        slots: m.slots,
+        governance_basis: m.governance_basis,
+        vocabularies: m.vocabularies,
+    }
+}
+fn compile_inner(input: Input<'_>, deadline: Instant, profile: Profile) -> Result<Proposal> {
     #[cfg(all(test, feature = "v2-kernel-probe"))]
     let _ = COMPILE_CALLS.try_with(|n| n.set(n.get() + 1));
     check(deadline)?;
@@ -288,8 +342,39 @@ pub(crate) fn compile(input: Input<'_>, deadline: Instant) -> Result<Proposal> {
         (a.layer != "pack", &a.created_at, &a.id).cmp(&(b.layer != "pack", &b.created_at, &b.id))
     });
     let rows: Vec<_> = rows.into_iter().cloned().collect();
-    if !cascade::scope_supplies_shape(&rows, input.record_type, input.kind, input.home) {
-        return Err(CompileError::Invalid("home has no governing declaration"));
+    match profile {
+        Profile::Facet1
+            if !cascade::scope_supplies_shape(&rows, input.record_type, input.kind, input.home) =>
+        {
+            return Err(CompileError::Invalid("home has no governing declaration"))
+        }
+        Profile::Global1 => {
+            // Unlike cascade's permissive read helper, malformed applicable H
+            // declarations cannot prove absence of local governance.
+            let kind = input.kind.map(|k| format!("{}:{k}", input.record_type));
+            for row in rows
+                .iter()
+                .filter(|r| r.applies_to_collection_id.as_deref() == Some(input.home))
+            {
+                for key in [Some(input.record_type), kind.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(shape) = row.data.get("shapes").and_then(|s| s.get(key)) {
+                        if !shape.is_object() {
+                            return Err(CompileError::Invalid("shape object"));
+                        }
+                        return Err(CompileError::Unsupported(
+                            "home has applicable declaration; select facet-1",
+                        ));
+                    }
+                }
+            }
+            if input.source_identity != input.home {
+                return Err(CompileError::Invalid("global source identity"));
+            }
+        }
+        _ => {}
     }
     let effective =
         cascade::facets_for_record_context(&rows, input.record_type, input.kind, Some(input.home));
@@ -517,8 +602,12 @@ pub(crate) fn compile(input: Input<'_>, deadline: Instant) -> Result<Proposal> {
             }
             let vocab = found[0];
             let mapping = vocabulary_map(vocab)?;
+            // Each field admits its own declaration spelling plus the bound
+            // ID and rec:<actual-ID>. An ID binding therefore never gains the
+            // row's unrelated name, while a name binding admits exactly the
+            // three frozen spellings.
             let refs = BTreeSet::from([
-                vocab.reference.clone(),
+                reference.to_owned(),
                 vocab.id.clone(),
                 format!("rec:{}", vocab.id),
             ]);
@@ -677,10 +766,24 @@ pub(crate) fn compile(input: Input<'_>, deadline: Instant) -> Result<Proposal> {
         governance_basis,
         vocabularies: selected_vocabularies,
     };
-    manifest
-        .validate()
-        .map_err(|_| CompileError::Invalid("closed manifest"))?;
-    let selector = selector(&manifest);
+    let (manifest_value, selector) = if profile == Profile::Global1 {
+        let global = global_manifest(manifest.clone());
+        // The reader's exact closed structural rules, not a permissive format.
+        global
+            .validate()
+            .map_err(|_| CompileError::Invalid("closed manifest"))?;
+        let selector = String::from_utf8(canonical(
+            &json!({"context":global.context,"selection":global.selection}),
+        ))
+        .expect("canonical UTF-8");
+        (serde_json::to_value(global), selector)
+    } else {
+        manifest
+            .validate()
+            .map_err(|_| CompileError::Invalid("closed manifest"))?;
+        (serde_json::to_value(&manifest), selector(&manifest))
+    };
+    let manifest_value = manifest_value.map_err(|_| CompileError::Invalid("manifest"))?;
     let name = crate::named_views::contract::generated_name(
         input.workspace,
         GENERATOR,
@@ -715,9 +818,7 @@ pub(crate) fn compile(input: Input<'_>, deadline: Instant) -> Result<Proposal> {
         })
         .collect();
     let proposal = Proposal {
-        manifest_sha256: digest(
-            &serde_json::to_value(&manifest).map_err(|_| CompileError::Invalid("manifest"))?,
-        ),
+        manifest_sha256: digest(&manifest_value),
         manifest,
         name,
         sql,

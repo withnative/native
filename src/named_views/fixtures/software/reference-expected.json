@@ -1,0 +1,1883 @@
+{
+ "provenance": {
+  "reference_file": "longmemeval-v2/armc/observed_software.py",
+  "reference_sha256": "f4eee3b4428d860e45621a1c11df35909d8e80f61becd9e236cf2806655fd808",
+  "reference_version": "native.software-observations/0.1",
+  "generator": "src/named_views/fixtures/software/generate_reference_expected.py",
+  "flag_mapping": "reference property value True (bare key) or 'True' -> true; 'False' -> false; absent or any other value -> null",
+  "offset_unit": "unicode_codepoint",
+  "data": "synthetic fixtures only; no corpus, gold or accuracy data"
+ },
+ "positive": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"Priority\" required\n\toption \"High\" selected=True\n\toption \"Low\"\ncombobox \"Area\"\n",
+  "tree_sha256": "ece1c6b6e257e54f5669dc1da21cfca72959f1406cc9a6f2cd650b3ba277569a",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "Priority",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 28,
+    "exact": "combobox \"Priority\" required"
+   },
+   {
+    "role": "option",
+    "label": "High",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": true,
+    "disabled": null,
+    "line": 2,
+    "char_start": 29,
+    "char_end": 57,
+    "exact": "\toption \"High\" selected=True"
+   },
+   {
+    "role": "option",
+    "label": "Low",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 58,
+    "char_end": 71,
+    "exact": "\toption \"Low\""
+   },
+   {
+    "role": "combobox",
+    "label": "Area",
+    "source_order": 3,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 72,
+    "char_end": 87,
+    "exact": "combobox \"Area\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     2
+    ],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 3,
+    "options": [],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [],
+   "parsed_nodes": 4
+  }
+ },
+ "zero_option": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"Area\"\n",
+  "tree_sha256": "fe3ffbecd88affa20bd9b8eafaaaf12d350222ef9acad859d18b00fb443589b8",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "Area",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 15,
+    "exact": "combobox \"Area\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [],
+   "parsed_nodes": 1
+  }
+ },
+ "tricky": {
+  "schema": "native.software-observations/0.1",
+  "tree": "[a] combobox \"Dup\"\n[a] combobox \"Dup\"\n\tmenuitem \"Action\"\noption \"Orphan\"\n\tcombobox \"Nested\"\n\t\toption \"Inner\" selected=False\n\t\toption \"Unterminated\n  badindent\n",
+  "tree_sha256": "42fa7f9266dc614f8e2775e6e6a31f0cef6dd52ab4f6656fecab8a6d590ca797",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "Dup",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": "a",
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 18,
+    "exact": "[a] combobox \"Dup\""
+   },
+   {
+    "role": "combobox",
+    "label": "Dup",
+    "source_order": 1,
+    "parent": null,
+    "depth": 0,
+    "bid": "a",
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 19,
+    "char_end": 37,
+    "exact": "[a] combobox \"Dup\""
+   },
+   {
+    "role": "menuitem",
+    "label": "Action",
+    "source_order": 2,
+    "parent": 1,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 38,
+    "char_end": 56,
+    "exact": "\tmenuitem \"Action\""
+   },
+   {
+    "role": "option",
+    "label": "Orphan",
+    "source_order": 3,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 57,
+    "char_end": 72,
+    "exact": "option \"Orphan\""
+   },
+   {
+    "role": "combobox",
+    "label": "Nested",
+    "source_order": 4,
+    "parent": 3,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 73,
+    "char_end": 91,
+    "exact": "\tcombobox \"Nested\""
+   },
+   {
+    "role": "option",
+    "label": "Inner",
+    "source_order": 5,
+    "parent": 4,
+    "depth": 2,
+    "bid": null,
+    "selected": false,
+    "disabled": null,
+    "line": 6,
+    "char_start": 92,
+    "char_end": 123,
+    "exact": "\t\toption \"Inner\" selected=False"
+   },
+   {
+    "role": "option",
+    "label": "",
+    "source_order": 6,
+    "parent": 4,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 7,
+    "char_start": 124,
+    "char_end": 146,
+    "exact": "\t\toption \"Unterminated"
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 1,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 4,
+    "options": [
+     5,
+     6
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [
+    8
+   ],
+   "structural_warnings": [
+    {
+     "line": 7,
+     "issue": "unterminated_quote"
+    }
+   ],
+   "parsed_nodes": 7
+  }
+ },
+ "lex_unquoted_word": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox Priority required\n\toption High selected=True\n",
+  "tree_sha256": "405e1fd47650700681441dda1711c03c8e452aee8e25700f02f9ed0e28fde8b1",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 26,
+    "exact": "combobox Priority required"
+   },
+   {
+    "role": "option",
+    "label": "",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 27,
+    "char_end": 53,
+    "exact": "\toption High selected=True"
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [
+    {
+     "line": 1,
+     "issue": "unrecognized_property_span"
+    },
+    {
+     "line": 2,
+     "issue": "unrecognized_property_span"
+    }
+   ],
+   "parsed_nodes": 2
+  }
+ },
+ "lex_role_quote_no_separator": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox\"Priority\"\n\toption \"High\"\ncombobox,\"Comma\"\n",
+  "tree_sha256": "c90dfef936a8def0f1c2f6359554591e5b96632630cfaff87e0631d8b6ecf331",
+  "nodes": [
+   {
+    "role": "option",
+    "label": "High",
+    "source_order": 0,
+    "parent": null,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 19,
+    "char_end": 33,
+    "exact": "\toption \"High\""
+   },
+   {
+    "role": "combobox",
+    "label": "Comma",
+    "source_order": 1,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 34,
+    "char_end": 50,
+    "exact": "combobox,\"Comma\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 1,
+    "options": [],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [
+    1
+   ],
+   "structural_warnings": [
+    {
+     "line": 2,
+     "issue": "indentation_gap"
+    }
+   ],
+   "parsed_nodes": 2
+  }
+ },
+ "lex_bid_forms": {
+  "schema": "native.software-observations/0.1",
+  "tree": "[ab_1] combobox \"One\"\n[a-b] combobox \"Dash\"\n[] combobox \"Empty\"\n[ab]combobox \"NoSpace\"\n[caf\u00e9] combobox \"Uni\"\n[ab] \t combobox \"Tabbed\"\n[x]\n",
+  "tree_sha256": "6d43066080ed08d41eeb7787990851612cba23477af530654c1ca2f86672e2d1",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "One",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": "ab_1",
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 21,
+    "exact": "[ab_1] combobox \"One\""
+   },
+   {
+    "role": "combobox",
+    "label": "Uni",
+    "source_order": 1,
+    "parent": null,
+    "depth": 0,
+    "bid": "caf\u00e9",
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 87,
+    "char_end": 108,
+    "exact": "[caf\u00e9] combobox \"Uni\""
+   },
+   {
+    "role": "combobox",
+    "label": "Tabbed",
+    "source_order": 2,
+    "parent": null,
+    "depth": 0,
+    "bid": "ab",
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 109,
+    "char_end": 133,
+    "exact": "[ab] \t combobox \"Tabbed\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 1,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 2,
+    "options": [],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [
+    2,
+    3,
+    4,
+    7
+   ],
+   "structural_warnings": [],
+   "parsed_nodes": 3
+  }
+ },
+ "lex_property_tokens": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"C\" a,,b\n\toption \"O\" selected = True\n\toption \"P\" , selected=True\n\toption \"Q\" selected=True,\n\toption \"R\" selected=\n\toption \"S\" selected=\"False\"\n\toption \"T\" disabled=True,disabled=False\n\toption \"U\" selected= True\n\toption \"V\" selected=T\"rue\n\toption \"W\" selected=\"True\"x\n\toption \"X\" selected=\"True\n\toption \"Y\" key='a,b',selected=False\n\toption \"Z\" 9bad,ok\n",
+  "tree_sha256": "6141a7143efd25ffb81d84395aa248435202b318affe12a6f95b4f690fe7e451",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "C",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 17,
+    "exact": "combobox \"C\" a,,b"
+   },
+   {
+    "role": "option",
+    "label": "O",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 18,
+    "char_end": 45,
+    "exact": "\toption \"O\" selected = True"
+   },
+   {
+    "role": "option",
+    "label": "P",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": true,
+    "disabled": null,
+    "line": 3,
+    "char_start": 46,
+    "char_end": 73,
+    "exact": "\toption \"P\" , selected=True"
+   },
+   {
+    "role": "option",
+    "label": "Q",
+    "source_order": 3,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": true,
+    "disabled": null,
+    "line": 4,
+    "char_start": 74,
+    "char_end": 100,
+    "exact": "\toption \"Q\" selected=True,"
+   },
+   {
+    "role": "option",
+    "label": "R",
+    "source_order": 4,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 101,
+    "char_end": 122,
+    "exact": "\toption \"R\" selected="
+   },
+   {
+    "role": "option",
+    "label": "S",
+    "source_order": 5,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": false,
+    "disabled": null,
+    "line": 6,
+    "char_start": 123,
+    "char_end": 151,
+    "exact": "\toption \"S\" selected=\"False\""
+   },
+   {
+    "role": "option",
+    "label": "T",
+    "source_order": 6,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": false,
+    "line": 7,
+    "char_start": 152,
+    "char_end": 192,
+    "exact": "\toption \"T\" disabled=True,disabled=False"
+   },
+   {
+    "role": "option",
+    "label": "U",
+    "source_order": 7,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 8,
+    "char_start": 193,
+    "char_end": 219,
+    "exact": "\toption \"U\" selected= True"
+   },
+   {
+    "role": "option",
+    "label": "V",
+    "source_order": 8,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 9,
+    "char_start": 220,
+    "char_end": 246,
+    "exact": "\toption \"V\" selected=T\"rue"
+   },
+   {
+    "role": "option",
+    "label": "W",
+    "source_order": 9,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 10,
+    "char_start": 247,
+    "char_end": 275,
+    "exact": "\toption \"W\" selected=\"True\"x"
+   },
+   {
+    "role": "option",
+    "label": "X",
+    "source_order": 10,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 11,
+    "char_start": 276,
+    "char_end": 302,
+    "exact": "\toption \"X\" selected=\"True"
+   },
+   {
+    "role": "option",
+    "label": "Y",
+    "source_order": 11,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": false,
+    "disabled": null,
+    "line": 12,
+    "char_start": 303,
+    "char_end": 339,
+    "exact": "\toption \"Y\" key='a,b',selected=False"
+   },
+   {
+    "role": "option",
+    "label": "Z",
+    "source_order": 12,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 13,
+    "char_start": 340,
+    "char_end": 359,
+    "exact": "\toption \"Z\" 9bad,ok"
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     12
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [
+    {
+     "line": 1,
+     "issue": "unrecognized_property_span"
+    },
+    {
+     "line": 2,
+     "issue": "unrecognized_property_span"
+    },
+    {
+     "line": 4,
+     "issue": "unrecognized_property_span"
+    },
+    {
+     "line": 5,
+     "issue": "malformed_property_value"
+    },
+    {
+     "line": 7,
+     "issue": "duplicate_property"
+    },
+    {
+     "line": 9,
+     "issue": "unterminated_property_quote"
+    },
+    {
+     "line": 9,
+     "issue": "malformed_property_value"
+    },
+    {
+     "line": 10,
+     "issue": "unconsumed_property_suffix"
+    },
+    {
+     "line": 11,
+     "issue": "unterminated_property_quote"
+    },
+    {
+     "line": 11,
+     "issue": "unterminated_quote"
+    },
+    {
+     "line": 13,
+     "issue": "unrecognized_property_span"
+    }
+   ],
+   "parsed_nodes": 13
+  }
+ },
+ "lex_label_forms": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"Label\"suffix\ncombobox \"Label\" , selected=True\ncombobox\ncombobox \ncombobox  \"Spaced\"\ncombobox \"Unterminated\ncombobox 'single' disabled\ncombobox \"a\\\"b\"\n",
+  "tree_sha256": "671ab16a65b67f200039c52d5f8190699d42a77b4c87a46e7aafe80e5531a387",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 22,
+    "exact": "combobox \"Label\"suffix"
+   },
+   {
+    "role": "combobox",
+    "label": "Label",
+    "source_order": 1,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": true,
+    "disabled": null,
+    "line": 2,
+    "char_start": 23,
+    "char_end": 55,
+    "exact": "combobox \"Label\" , selected=True"
+   },
+   {
+    "role": "combobox",
+    "label": "",
+    "source_order": 2,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 56,
+    "char_end": 64,
+    "exact": "combobox"
+   },
+   {
+    "role": "combobox",
+    "label": "",
+    "source_order": 3,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 65,
+    "char_end": 74,
+    "exact": "combobox "
+   },
+   {
+    "role": "combobox",
+    "label": "Spaced",
+    "source_order": 4,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 75,
+    "char_end": 93,
+    "exact": "combobox  \"Spaced\""
+   },
+   {
+    "role": "combobox",
+    "label": "",
+    "source_order": 5,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 94,
+    "char_end": 116,
+    "exact": "combobox \"Unterminated"
+   },
+   {
+    "role": "combobox",
+    "label": "single",
+    "source_order": 6,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": true,
+    "line": 7,
+    "char_start": 117,
+    "char_end": 143,
+    "exact": "combobox 'single' disabled"
+   },
+   {
+    "role": "combobox",
+    "label": "a\"b",
+    "source_order": 7,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 8,
+    "char_start": 144,
+    "char_end": 159,
+    "exact": "combobox \"a\\\"b\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 1,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 2,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 3,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 4,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 5,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 6,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 7,
+    "options": [],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [
+    {
+     "line": 1,
+     "issue": "unconsumed_label_suffix"
+    },
+    {
+     "line": 6,
+     "issue": "unterminated_quote"
+    }
+   ],
+   "parsed_nodes": 8
+  }
+ },
+ "lex_indent_gaps": {
+  "schema": "native.software-observations/0.1",
+  "tree": "\tcombobox \"IndentedFirst\"\n\t\toption \"Deep\"\ncombobox \"Root\"\n\t\toption \"Gap\"\n\toption \"Ok\"\n\t\t\toption \"Gap2\"\n\t\toption \"Back\"\n",
+  "tree_sha256": "2a872feedbc8d461e3db90f971e47b1ebbe21bd37c94db5ee87119988a4969c7",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "IndentedFirst",
+    "source_order": 0,
+    "parent": null,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 25,
+    "exact": "\tcombobox \"IndentedFirst\""
+   },
+   {
+    "role": "option",
+    "label": "Deep",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 26,
+    "char_end": 41,
+    "exact": "\t\toption \"Deep\""
+   },
+   {
+    "role": "combobox",
+    "label": "Root",
+    "source_order": 2,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 42,
+    "char_end": 57,
+    "exact": "combobox \"Root\""
+   },
+   {
+    "role": "option",
+    "label": "Gap",
+    "source_order": 3,
+    "parent": 2,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 58,
+    "char_end": 72,
+    "exact": "\t\toption \"Gap\""
+   },
+   {
+    "role": "option",
+    "label": "Ok",
+    "source_order": 4,
+    "parent": 2,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 73,
+    "char_end": 85,
+    "exact": "\toption \"Ok\""
+   },
+   {
+    "role": "option",
+    "label": "Gap2",
+    "source_order": 5,
+    "parent": 4,
+    "depth": 3,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 86,
+    "char_end": 102,
+    "exact": "\t\t\toption \"Gap2\""
+   },
+   {
+    "role": "option",
+    "label": "Back",
+    "source_order": 6,
+    "parent": 4,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 7,
+    "char_start": 103,
+    "char_end": 118,
+    "exact": "\t\toption \"Back\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1
+    ],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 2,
+    "options": [
+     3,
+     4,
+     5,
+     6
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [
+    {
+     "line": 1,
+     "issue": "indentation_gap"
+    },
+    {
+     "line": 4,
+     "issue": "indentation_gap"
+    },
+    {
+     "line": 6,
+     "issue": "indentation_gap"
+    }
+   ],
+   "parsed_nodes": 7
+  }
+ },
+ "lex_blank_and_markers": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"A\"\n\n   \n...\n\u2026 more\n[truncated] x\ntruncated\nTRUNCATED \"T\"\n<truncated>\n\toption \"B\"\n",
+  "tree_sha256": "c9250377f388affab76c446f3d5701130f6a4f31c18f2c83ef35da8c80a5b498",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "A",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 12,
+    "exact": "combobox \"A\""
+   },
+   {
+    "role": "x",
+    "label": "",
+    "source_order": 1,
+    "parent": null,
+    "depth": 0,
+    "bid": "truncated",
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 29,
+    "char_end": 42,
+    "exact": "[truncated] x"
+   },
+   {
+    "role": "truncated",
+    "label": "",
+    "source_order": 2,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 7,
+    "char_start": 43,
+    "char_end": 52,
+    "exact": "truncated"
+   },
+   {
+    "role": "TRUNCATED",
+    "label": "T",
+    "source_order": 3,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 8,
+    "char_start": 53,
+    "char_end": 66,
+    "exact": "TRUNCATED \"T\""
+   },
+   {
+    "role": "option",
+    "label": "B",
+    "source_order": 4,
+    "parent": 3,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 10,
+    "char_start": 79,
+    "char_end": 90,
+    "exact": "\toption \"B\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [
+    4,
+    5,
+    9
+   ],
+   "structural_warnings": [
+    {
+     "line": 4,
+     "issue": "source_truncation_marker"
+    },
+    {
+     "line": 5,
+     "issue": "source_truncation_marker"
+    },
+    {
+     "line": 6,
+     "issue": "source_truncation_marker"
+    },
+    {
+     "line": 7,
+     "issue": "source_truncation_marker"
+    },
+    {
+     "line": 8,
+     "issue": "source_truncation_marker"
+    },
+    {
+     "line": 9,
+     "issue": "source_truncation_marker"
+    }
+   ],
+   "parsed_nodes": 5
+  }
+ },
+ "escapes": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"A\\u0041\\x42\\n\\/\"\n\toption \"\\ud83d\\ude00\"\n\toption \"\\ud83d\"\n\toption \"\\ude00\"\n\toption \"\\q\\u12\"\n\toption \"\\ud83dx\"\n\toption \"trail\\\\\"\n\toption \"\\\\u0041\"\n\toption \"\\ud83d\\u0041\"\n\toption \"\\xZZ\"\n",
+  "tree_sha256": "3be0d9608a83ff5d025dadb76be9f498b33de8003121700649add3e225bef6ae",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "AAB\n/",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 26,
+    "exact": "combobox \"A\\u0041\\x42\\n\\/\""
+   },
+   {
+    "role": "option",
+    "label": "\ud83d\ude00",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 27,
+    "char_end": 49,
+    "exact": "\toption \"\\ud83d\\ude00\""
+   },
+   {
+    "role": "option",
+    "label": "\\ud83d",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 50,
+    "char_end": 66,
+    "exact": "\toption \"\\ud83d\""
+   },
+   {
+    "role": "option",
+    "label": "\\ude00",
+    "source_order": 3,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 67,
+    "char_end": 83,
+    "exact": "\toption \"\\ude00\""
+   },
+   {
+    "role": "option",
+    "label": "\\q\\u12",
+    "source_order": 4,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 84,
+    "char_end": 100,
+    "exact": "\toption \"\\q\\u12\""
+   },
+   {
+    "role": "option",
+    "label": "\\ud83dx",
+    "source_order": 5,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 101,
+    "char_end": 118,
+    "exact": "\toption \"\\ud83dx\""
+   },
+   {
+    "role": "option",
+    "label": "trail\\",
+    "source_order": 6,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 7,
+    "char_start": 119,
+    "char_end": 136,
+    "exact": "\toption \"trail\\\\\""
+   },
+   {
+    "role": "option",
+    "label": "\\u0041",
+    "source_order": 7,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 8,
+    "char_start": 137,
+    "char_end": 154,
+    "exact": "\toption \"\\\\u0041\""
+   },
+   {
+    "role": "option",
+    "label": "\\ud83dA",
+    "source_order": 8,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 9,
+    "char_start": 155,
+    "char_end": 177,
+    "exact": "\toption \"\\ud83d\\u0041\""
+   },
+   {
+    "role": "option",
+    "label": "\\xZZ",
+    "source_order": 9,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 10,
+    "char_start": 178,
+    "char_end": 192,
+    "exact": "\toption \"\\xZZ\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8,
+     9
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [
+    {
+     "line": 3,
+     "issue": "unpaired_surrogate"
+    },
+    {
+     "line": 4,
+     "issue": "unpaired_surrogate"
+    },
+    {
+     "line": 5,
+     "issue": "unsupported_escape"
+    },
+    {
+     "line": 5,
+     "issue": "unsupported_escape"
+    },
+    {
+     "line": 6,
+     "issue": "unpaired_surrogate"
+    },
+    {
+     "line": 9,
+     "issue": "unpaired_surrogate"
+    },
+    {
+     "line": 10,
+     "issue": "unsupported_escape"
+    }
+   ],
+   "parsed_nodes": 10
+  }
+ },
+ "crlf_offsets": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"A\"\r\n\toption \"B\u00e9\"\r\n\r\ncombobox \"C\"\r\n\toption \"D\"",
+  "tree_sha256": "ab0aac55cf77ba2930ebd87b3e9e93659559da1ffa03d3b0b59a9732aee6814b",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "A",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 12,
+    "exact": "combobox \"A\""
+   },
+   {
+    "role": "option",
+    "label": "B\u00e9",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 14,
+    "char_end": 26,
+    "exact": "\toption \"B\u00e9\""
+   },
+   {
+    "role": "combobox",
+    "label": "C",
+    "source_order": 2,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 30,
+    "char_end": 42,
+    "exact": "combobox \"C\""
+   },
+   {
+    "role": "option",
+    "label": "D",
+    "source_order": 3,
+    "parent": 2,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 44,
+    "char_end": 55,
+    "exact": "\toption \"D\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1
+    ],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 2,
+    "options": [
+     3
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [],
+   "parsed_nodes": 4
+  }
+ },
+ "bare_cr_and_exotic_breaks": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"A\"\r\toption \"B\"\u000b\toption \"C\"\f\toption \"D\"\u001c\toption \"E\"\u0085\toption \"F\"\u2028\toption \"G\"\u2029combobox \"H\"\n",
+  "tree_sha256": "06e03deddf5c607e0310c5dc104b1ed5507e715eac318c928ee2890c4407722c",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "A",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 12,
+    "exact": "combobox \"A\""
+   },
+   {
+    "role": "option",
+    "label": "B",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 13,
+    "char_end": 25,
+    "exact": "\toption \"B\"\u000b"
+   },
+   {
+    "role": "option",
+    "label": "C",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 25,
+    "char_end": 37,
+    "exact": "\toption \"C\"\f"
+   },
+   {
+    "role": "option",
+    "label": "D",
+    "source_order": 3,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 37,
+    "char_end": 49,
+    "exact": "\toption \"D\"\u001c"
+   },
+   {
+    "role": "option",
+    "label": "E",
+    "source_order": 4,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 49,
+    "char_end": 61,
+    "exact": "\toption \"E\"\u0085"
+   },
+   {
+    "role": "option",
+    "label": "F",
+    "source_order": 5,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 61,
+    "char_end": 73,
+    "exact": "\toption \"F\"\u2028"
+   },
+   {
+    "role": "option",
+    "label": "G",
+    "source_order": 6,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 7,
+    "char_start": 73,
+    "char_end": 85,
+    "exact": "\toption \"G\"\u2029"
+   },
+   {
+    "role": "combobox",
+    "label": "H",
+    "source_order": 7,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 8,
+    "char_start": 85,
+    "char_end": 97,
+    "exact": "combobox \"H\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 7,
+    "options": [],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [],
+   "parsed_nodes": 8
+  }
+ },
+ "unicode_offsets": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"caf\u00e9 \u4e2d\u6587 \ud83d\ude00\"\n\toption \"\u00e9\"\n\u00e9bad\n\toption \"\u00fcber\"\n",
+  "tree_sha256": "0ceb6ed5b939df45ff5a3115b87ede3143e37e45c402dd67dfc61c2dae8fa524",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "caf\u00e9 \u4e2d\u6587 \ud83d\ude00",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 20,
+    "exact": "combobox \"caf\u00e9 \u4e2d\u6587 \ud83d\ude00\""
+   },
+   {
+    "role": "option",
+    "label": "\u00e9",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 21,
+    "char_end": 32,
+    "exact": "\toption \"\u00e9\""
+   },
+   {
+    "role": "option",
+    "label": "\u00fcber",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 38,
+    "char_end": 52,
+    "exact": "\toption \"\u00fcber\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     2
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [
+    3
+   ],
+   "structural_warnings": [],
+   "parsed_nodes": 3
+  }
+ },
+ "groups": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"Top\"\n\toption \"A\"\n\tgroup \"G\"\n\t\toption \"B\"\n\t\tlistbox \"Nested\"\n\t\t\toption \"C\"\n\t\toption \"D\"\ncombobox \"Empty\"\nlistbox \"Tail\"\n\toption \"Z\"\n",
+  "tree_sha256": "fb6ed9361a1ebf51ee08594dbdb984cda13bc7e58301d1b755351610b72632c0",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "Top",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 14,
+    "exact": "combobox \"Top\""
+   },
+   {
+    "role": "option",
+    "label": "A",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 15,
+    "char_end": 26,
+    "exact": "\toption \"A\""
+   },
+   {
+    "role": "group",
+    "label": "G",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 27,
+    "char_end": 37,
+    "exact": "\tgroup \"G\""
+   },
+   {
+    "role": "option",
+    "label": "B",
+    "source_order": 3,
+    "parent": 2,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 4,
+    "char_start": 38,
+    "char_end": 50,
+    "exact": "\t\toption \"B\""
+   },
+   {
+    "role": "listbox",
+    "label": "Nested",
+    "source_order": 4,
+    "parent": 2,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 5,
+    "char_start": 51,
+    "char_end": 69,
+    "exact": "\t\tlistbox \"Nested\""
+   },
+   {
+    "role": "option",
+    "label": "C",
+    "source_order": 5,
+    "parent": 4,
+    "depth": 3,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 6,
+    "char_start": 70,
+    "char_end": 83,
+    "exact": "\t\t\toption \"C\""
+   },
+   {
+    "role": "option",
+    "label": "D",
+    "source_order": 6,
+    "parent": 2,
+    "depth": 2,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 7,
+    "char_start": 84,
+    "char_end": 96,
+    "exact": "\t\toption \"D\""
+   },
+   {
+    "role": "combobox",
+    "label": "Empty",
+    "source_order": 7,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 8,
+    "char_start": 97,
+    "char_end": 113,
+    "exact": "combobox \"Empty\""
+   },
+   {
+    "role": "listbox",
+    "label": "Tail",
+    "source_order": 8,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 9,
+    "char_start": 114,
+    "char_end": 128,
+    "exact": "listbox \"Tail\""
+   },
+   {
+    "role": "option",
+    "label": "Z",
+    "source_order": 9,
+    "parent": 8,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 10,
+    "char_start": 129,
+    "char_end": 140,
+    "exact": "\toption \"Z\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     3,
+     6
+    ],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 4,
+    "options": [
+     5
+    ],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 7,
+    "options": [],
+    "boundary": "following_sibling_or_ancestor"
+   },
+   {
+    "control": 8,
+    "options": [
+     9
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [],
+   "parsed_nodes": 10
+  }
+ },
+ "groups_end_of_source": {
+  "schema": "native.software-observations/0.1",
+  "tree": "combobox \"OnlyTree\"\n\toption \"A\"\n\toption \"B\"",
+  "tree_sha256": "494b540f7b142ddd9dd8a01f0a0d55bedd52141ecd7db2154f55de09c8ee28f2",
+  "nodes": [
+   {
+    "role": "combobox",
+    "label": "OnlyTree",
+    "source_order": 0,
+    "parent": null,
+    "depth": 0,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 1,
+    "char_start": 0,
+    "char_end": 19,
+    "exact": "combobox \"OnlyTree\""
+   },
+   {
+    "role": "option",
+    "label": "A",
+    "source_order": 1,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 2,
+    "char_start": 20,
+    "char_end": 31,
+    "exact": "\toption \"A\""
+   },
+   {
+    "role": "option",
+    "label": "B",
+    "source_order": 2,
+    "parent": 0,
+    "depth": 1,
+    "bid": null,
+    "selected": null,
+    "disabled": null,
+    "line": 3,
+    "char_start": 32,
+    "char_end": 43,
+    "exact": "\toption \"B\""
+   }
+  ],
+  "groups": [
+   {
+    "control": 0,
+    "options": [
+     1,
+     2
+    ],
+    "boundary": "end_of_captured_source"
+   }
+  ],
+  "coverage": {
+   "unparsed_nonempty_lines": [],
+   "structural_warnings": [],
+   "parsed_nodes": 3
+  }
+ }
+}

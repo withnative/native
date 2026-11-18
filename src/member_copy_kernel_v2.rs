@@ -44,6 +44,11 @@ pub struct NativeMemberCut {
 }
 
 impl NativeMemberCut {
+    /// Server-only equality token; never include this in member responses.
+    pub fn delivery_fence(&self) -> &str {
+        &self.authorization_fence
+    }
+
     /// Declare only this captured account's native identity. The hosting
     /// producer obtains this cut from its authenticated read snapshot; neither
     /// an account override nor a candidate file is an input. The private

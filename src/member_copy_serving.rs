@@ -58,6 +58,9 @@ use crate::standby_snapshot::StandbyConsumerIdentity;
 /// root file, so a full barrier / scope / account purge deletes it and a
 /// same-scope superseded replace keeps it until the new metadata overwrites
 /// it. This is the **single** durable binding: no second binding file exists.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod native;
+
 pub const ADMISSION_FILENAME: &str = "admission.json";
 
 const ADMISSION_CONTRACT: &str = "native.member-copy-admission.v3";
@@ -79,6 +82,34 @@ struct PersistedBinding {
     scope_ref: String,
     consumer: StandbyConsumerIdentity,
     credential_fingerprint: String,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+impl PersistedBinding {
+    /// Receipt binding only: no credential is reconstructed or used for HTTP.
+    fn file_context(&self) -> MemberCopyContext {
+        MemberCopyContext::new(
+            self.account_binding.clone(),
+            self.server_origin.clone(),
+            self.route_database_id.clone(),
+            self.origin_database_id.clone(),
+            self.consumer.clone(),
+            self.scope_ref.clone(),
+            CredentialSelection::from_bearer(zeroize::Zeroizing::new(Vec::new())),
+        )
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn is_native(json: &[u8]) -> bool {
+    serde_json::from_slice::<crate::replica_generation::ReplicaGenerationManifest>(json).is_ok_and(
+        |m| {
+            matches!(
+                m.profile,
+                crate::replica_generation::ReplicaProfile::MemberReadKernelV2 { .. }
+            )
+        },
+    )
 }
 
 /// Persisted, validated admission metadata. The manifest text is stored
@@ -247,7 +278,9 @@ fn managed_generations_present(root: &Path) -> bool {
 /// One admitted, servable generation plus its immutable read-only `Db`.
 struct ActiveServing {
     admitted: AdmittedGeneration,
-    db: Db,
+    db: Option<Db>,
+    #[cfg(feature = "v2-kernel-probe")]
+    native: Option<Arc<Mutex<crate::member_copy_kernel_v2::profile::AdmittedMemberFile>>>,
 }
 
 /// Outcome of [`MemberCopyServing::bind_scope`]. `Bound` is a first binding,
@@ -527,7 +560,8 @@ impl MemberCopyServing {
     }
 
     /// Grounds or checks the portable origin from a sealed authenticated
-    /// context. The **only** origin mutator: a configured pin is a constraint
+    /// context. Apart from current-credential native receipt recovery above,
+    /// this is the only origin mutator: a configured pin is a constraint
     /// (must equal the authenticated origin), never identity proof, and the
     /// authenticated manifest origin is the first-pin source.
     pub fn ground_origin(&mut self, context: &MemberCopyContext) -> Result<()> {
@@ -597,6 +631,123 @@ impl MemberCopyServing {
             CopyStatus::Ready { .. } | CopyStatus::Locked { .. } | CopyStatus::Refreshing { .. }
         );
         servable.then_some((facts.generation_id, scope))
+    }
+
+    /// An unpinned native restart needs the retained credential selection before
+    /// receipt metadata can supply its previously authenticated origin. A new
+    /// setup (no receipt), v1 copy, and explicit origin pin keep their old paths.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn needs_native_receipt_metadata(&self) -> bool {
+        self.origin_database_id.is_none()
+            && self
+                .persisted
+                .as_ref()
+                .is_some_and(|receipt| is_native(receipt.manifest_json.as_bytes()))
+    }
+
+    /// Restore coordinates only, never activation, from a current-selection
+    /// authenticated v3 native receipt. No durable state is changed on either
+    /// success or refusal. The ordinary lifecycle/read/pointer activation gate
+    /// must still run afterwards, including its independent file verification.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn restore_native_receipt_metadata(
+        &mut self,
+        current: &CredentialSelection,
+    ) -> bool {
+        let Some(receipt) = self.persisted.as_ref() else {
+            return false;
+        };
+        let binding = &receipt.binding;
+        // Check the guarded current selection before accepting receipt identity.
+        if binding.credential_fingerprint.is_empty()
+            || current.fingerprint_sha256() != binding.credential_fingerprint
+            || receipt.contract != ADMISSION_CONTRACT
+            || receipt.version != ADMISSION_VERSION
+            || self.scope_needs_rebind
+            || self
+                .origin_database_id
+                .as_ref()
+                .is_some_and(|pin| pin != &binding.origin_database_id)
+        {
+            return false;
+        }
+        let Ok(facts) = validate_manifest(receipt.manifest_json.as_bytes()) else {
+            return false;
+        };
+        let Ok(manifest) = serde_json::from_str::<
+            crate::replica_generation::ReplicaGenerationManifest,
+        >(&receipt.manifest_json) else {
+            return false;
+        };
+        let crate::replica_generation::ReplicaProfile::MemberReadKernelV2 { identity, .. } =
+            &manifest.profile
+        else {
+            return false;
+        };
+        if identity.account_binding != binding.account_binding
+            || facts.origin_database_id != binding.origin_database_id
+            || facts.consumer != binding.consumer
+        {
+            return false;
+        }
+        let Some(scope) = restored_scope(
+            &self.persisted,
+            self.account_token().as_deref(),
+            Some(&binding.origin_database_id),
+            &self.server_origin,
+            &self.route_database_id,
+            &self.consumer,
+        ) else {
+            return false;
+        };
+        if self
+            .scope_bound
+            .as_ref()
+            .is_some_and(|bound| bound != &scope)
+        {
+            return false;
+        }
+        {
+            let Ok(lifecycle) = self.lifecycle.lock() else {
+                return false;
+            };
+            if lifecycle.current_generation_id().ok().flatten().as_deref()
+                != Some(facts.generation_id.as_str())
+                || !lifecycle
+                    .activatable_generations()
+                    .is_ok_and(|ids| ids.contains(&facts.generation_id))
+            {
+                return false;
+            }
+        }
+        let Ok(installed) = receipt.installed_facts() else {
+            return false;
+        };
+        let expected = ExpectedFooting {
+            origin_database_id: binding.origin_database_id.clone(),
+            scope_ref: scope.clone(),
+            consumer: self.consumer.clone(),
+        };
+        let path = self
+            .root
+            .join("generations")
+            .join(&installed.generation_id)
+            .join(SNAPSHOT_FILENAME);
+        if crate::member_copy_admission::native::verify(
+            &self.root,
+            &path,
+            receipt.manifest_json.as_bytes(),
+            &binding.file_context(),
+            Some(&installed),
+            &expected,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        self.origin_database_id = Some(binding.origin_database_id.clone());
+        self.scope_bound = Some(scope);
+        true
     }
 
     /// Whether the held copy may be served under `current`. Pure, no network.
@@ -749,13 +900,42 @@ impl MemberCopyServing {
             }
         }
         let expected = self.expected_footing()?;
+        #[cfg(feature = "v2-kernel-probe")]
+        if is_native(persisted.manifest_json.as_bytes()) {
+            let context = persisted.binding.file_context();
+            let facts = persisted.installed_facts().ok()?;
+            let path = self
+                .root
+                .join("generations")
+                .join(&facts.generation_id)
+                .join(SNAPSHOT_FILENAME);
+            let (admitted, native) = crate::member_copy_admission::native::verify(
+                &self.root,
+                &path,
+                persisted.manifest_json.as_bytes(),
+                &context,
+                Some(&facts),
+                &expected,
+            )
+            .ok()?;
+            return Some(ActiveServing {
+                admitted,
+                db: None,
+                native: Some(Arc::new(Mutex::new(native))),
+            });
+        }
         let admitted =
             revalidate_installed(&self.root, persisted.manifest_json.as_bytes(), &expected).ok()?;
         let snapshot = admitted.generation_dir.join(SNAPSHOT_FILENAME);
         let db = open_member_database_read_only(snapshot.to_str()?)
             .await
             .ok()?;
-        Some(ActiveServing { admitted, db })
+        Some(ActiveServing {
+            admitted,
+            db: Some(db),
+            #[cfg(feature = "v2-kernel-probe")]
+            native: None,
+        })
     }
 
     /// Whether a validated generation is currently served.
@@ -792,7 +972,7 @@ impl MemberCopyServing {
     /// The shared read-only `Db` for the active generation, if any. The
     /// composition hands this to the transport; a quiesce closes it.
     pub fn database(&self) -> Option<Db> {
-        self.active.as_ref().map(|active| active.db.clone())
+        self.active.as_ref().and_then(|active| active.db.clone())
     }
 
     /// Takes one read lease for a whole dispatch. Refuses while inactive or
@@ -811,7 +991,9 @@ impl MemberCopyServing {
         self.leases.deactivate();
         self.leases.drain().await;
         if let Some(active) = self.active.take() {
-            active.db.close().await;
+            if let Some(db) = active.db {
+                db.close().await;
+            }
         }
     }
 
@@ -830,6 +1012,9 @@ impl MemberCopyServing {
         else {
             return false;
         };
+        let Some(db) = &active.db else {
+            return false;
+        };
         let admitted = &active.admitted;
         let gate = MemberCopyGate::with_leases(
             self.lifecycle.clone(),
@@ -839,7 +1024,7 @@ impl MemberCopyServing {
             self.leases.clone(),
         )
         .with_generation_id(admitted.generation_id.clone())
-        .with_admission_binding(active.db.handle_id(), account_token);
+        .with_admission_binding(db.handle_id(), account_token);
         registry.set_member_copy_gate_instance(gate);
         true
     }
@@ -980,14 +1165,38 @@ impl MemberCopyServing {
                 .lifecycle
                 .lock()
                 .expect("member copy lifecycle lock is never poisoned");
-            admit_member_copy(
-                &self.root,
-                staged,
-                manifest_json,
-                installed.as_ref(),
-                &expected,
-                &mut lifecycle,
-            )?
+            #[cfg(feature = "v2-kernel-probe")]
+            if is_native(manifest_json) {
+                crate::member_copy_admission::native::admit(
+                    &self.root,
+                    staged,
+                    manifest_json,
+                    context,
+                    installed.as_ref(),
+                    &expected,
+                    &mut lifecycle,
+                )?
+            } else {
+                admit_member_copy(
+                    &self.root,
+                    staged,
+                    manifest_json,
+                    installed.as_ref(),
+                    &expected,
+                    &mut lifecycle,
+                )?
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            {
+                admit_member_copy(
+                    &self.root,
+                    staged,
+                    manifest_json,
+                    installed.as_ref(),
+                    &expected,
+                    &mut lifecycle,
+                )?
+            }
         };
         // Persist the trusted binding with the validated manifest AFTER a
         // successful admission and BEFORE any activation, so a crash between
@@ -1006,17 +1215,12 @@ impl MemberCopyServing {
         write_persisted(&self.root, &persisted).map_err(|e| AdmissionError::Io {
             detail: e.to_string(),
         })?;
-        let snapshot = admitted.generation_dir.join(SNAPSHOT_FILENAME);
-        let db = open_member_database_read_only(snapshot.to_str().unwrap_or_default())
+        self.persisted = Some(persisted.clone());
+        let active = self
+            .validate_active(&persisted)
             .await
-            .map_err(|e| AdmissionError::Io {
-                detail: e.to_string(),
-            })?;
-        self.active = Some(ActiveServing {
-            admitted: admitted.clone(),
-            db,
-        });
-        self.persisted = Some(persisted);
+            .ok_or(AdmissionError::NotAdmitted)?;
+        self.active = Some(active);
         self.leases = MemberCopyLeaseGate::new(true);
         Ok(admitted)
     }
@@ -1108,6 +1312,7 @@ mod tests {
 
     fn consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,

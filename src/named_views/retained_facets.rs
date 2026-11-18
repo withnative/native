@@ -9,8 +9,8 @@ use sqlx::SqliteConnection;
 use std::{collections::BTreeSet, time::Instant};
 
 #[allow(dead_code)] // Private checkpoint; public v2 resolution still refuses.
-pub(super) struct Checked {
-    pub definition: v2::Definition,
+pub(super) struct Checked<M = v2::Manifest> {
+    pub definition: v2::Definition<M>,
     pub drift: Drift,
     pub unknown_reason: Option<source_proof::ComparisonReason>,
     pub work: source_proof::Work,
@@ -89,6 +89,128 @@ async fn inspect_inner(
     deadline: Instant,
     limits: source_proof::ScanLimits,
 ) -> Result<Checked> {
+    let rev = load_retained_on(conn, actor, pin, deadline).await?;
+    let bearer = pin
+        .view_id
+        .strip_prefix("native.named-view:")
+        .ok_or_else(|| Error::engine(MISSING))?;
+    let definition: v2::Definition = serde_json::from_value(rev.definition)?;
+    inspect_definition_on(conn, actor, workspace, bearer, definition, deadline, limits).await
+}
+
+/// Common-input projection for global serving/retention only. Never a
+/// facet-1 carrier, compiler input, or public adapter conversion.
+pub(super) fn global_inputs(definition: &v2::Definition<v2::GlobalManifest>) -> v2::Definition {
+    let common = definition.common();
+    v2::Definition {
+        query: common.query,
+        origin: common.origin,
+        description: common.description,
+        scope: common.scope,
+        columns: common.columns,
+        source_pins: common.source_pins,
+        generated: definition.generated.inputs(),
+    }
+}
+
+/// Shared-snapshot global comparison for closure certification. Bearer View
+/// was already checked by the caller; mandatory checks run before comparison.
+#[allow(clippy::too_many_arguments)] // One snapshot/cap shared by a bounded closure.
+pub(super) async fn inspect_global_definition_shared_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    workspace: &str,
+    bearer: &str,
+    definition: v2::Definition<v2::GlobalManifest>,
+    deadline: Instant,
+    limits: source_proof::ScanLimits,
+    snapshot: &mut ComparisonSnapshot,
+) -> Result<Checked<v2::GlobalManifest>> {
+    definition.validate_global()?;
+    let inputs = global_inputs(&definition);
+    let (head, work) = mandatory_on(conn, actor, workspace, bearer, &inputs, deadline).await?;
+    let result =
+        compare_profile_on(conn, inputs, head, work, deadline, limits, snapshot, true).await?;
+    Ok(Checked {
+        definition,
+        drift: result.drift,
+        unknown_reason: result.unknown_reason,
+        work: result.work,
+    })
+}
+
+/// Global metadata diagnostic without advisory scans. Caller owns context.
+pub(super) async fn compare_global_metadata_on(
+    conn: &mut SqliteConnection,
+    definition: v2::Definition<v2::GlobalManifest>,
+    context: (i64, source_proof::Work),
+    deadline: Instant,
+) -> Result<Checked<v2::GlobalManifest>> {
+    let inputs = global_inputs(&definition);
+    let result = compare_profile_on(
+        conn,
+        inputs,
+        context.0,
+        context.1,
+        deadline,
+        source_proof::ScanLimits::default(),
+        &mut ComparisonSnapshot::default(),
+        true,
+    )
+    .await?;
+    Ok(Checked {
+        definition,
+        drift: result.drift,
+        unknown_reason: result.unknown_reason,
+        work: result.work,
+    })
+}
+/// Private persisted global-profile comparison. Public resolution retains its
+/// STEP1 fence; neither this checker nor its result grants serving/admission.
+#[allow(dead_code)]
+pub(super) async fn inspect_global_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    workspace: &str,
+    pin: &Pin,
+    deadline: Instant,
+    snapshot: &mut ComparisonSnapshot,
+) -> Result<Checked<v2::GlobalManifest>> {
+    let rev = load_retained_on(conn, actor, pin, deadline).await?;
+    let definition: v2::Definition<v2::GlobalManifest> = serde_json::from_value(rev.definition)?;
+    definition.validate_global()?;
+    let bearer = pin
+        .view_id
+        .strip_prefix("native.named-view:")
+        .ok_or_else(|| Error::engine(MISSING))?;
+    // Explicit common-input projection, never passed to the facet-1 compiler or
+    // public serving adapter. Global structural/profile validation precedes it.
+    let inputs = global_inputs(&definition);
+    let (head, work) = mandatory_on(conn, actor, workspace, bearer, &inputs, deadline).await?;
+    let result = compare_profile_on(
+        conn,
+        inputs,
+        head,
+        work,
+        deadline,
+        source_proof::ScanLimits::default(),
+        snapshot,
+        true,
+    )
+    .await?;
+    Ok(Checked {
+        definition,
+        drift: result.drift,
+        unknown_reason: result.unknown_reason,
+        work: result.work,
+    })
+}
+async fn load_retained_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    pin: &Pin,
+    deadline: Instant,
+) -> Result<Revision> {
     check(deadline)?;
     {
         let mut handle = conn.lock_handle().await?;
@@ -162,8 +284,7 @@ async fn inspect_inner(
     {
         return Err(super::invalid("view_revision_unavailable"));
     }
-    let definition: v2::Definition = serde_json::from_value(rev.definition)?;
-    inspect_definition_on(conn, actor, workspace, bearer, definition, deadline, limits).await
+    Ok(rev)
 }
 
 /// Shared retained interpretation on an already validated immutable carrier.
@@ -234,6 +355,22 @@ async fn compare_at_on(
     limits: source_proof::ScanLimits,
     snapshot: &mut ComparisonSnapshot,
 ) -> Result<Checked> {
+    compare_profile_on(
+        conn, definition, head, work, deadline, limits, snapshot, false,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn compare_profile_on(
+    conn: &mut SqliteConnection,
+    definition: v2::Definition,
+    head: i64,
+    work: source_proof::Work,
+    deadline: Instant,
+    limits: source_proof::ScanLimits,
+    snapshot: &mut ComparisonSnapshot,
+    global: bool,
+) -> Result<Checked> {
     if snapshot.head.is_some_and(|old| old != head) {
         return Err(Error::conflict("retained comparison snapshot changed"));
     }
@@ -283,7 +420,7 @@ async fn compare_at_on(
                     && s.origin == old.origin
             });
         }
-        drifted |= compare(manifest, &resolved, deadline)?;
+        drifted |= compare(manifest, &resolved, deadline, global)?;
         Ok(if drifted {
             Drift::Changed
         } else {
@@ -314,12 +451,49 @@ fn compare(
     m: &v2::Manifest,
     current: &facet_resolver::ResolvedSources<'_>,
     deadline: Instant,
+    global: bool,
 ) -> source_proof::ComparisonResult<bool> {
+    if global {
+        // A new applicable H shape is sufficient positive drift evidence. Do
+        // NOT run proposal eligibility or let a new empty/unsupported shape
+        // turn this fact into Unknown merely because fresh generation refuses.
+        let kind = m
+            .context
+            .kind
+            .as_ref()
+            .map(|k| format!("{}:{k}", m.context.r#type));
+        for row in current.rows.iter().filter(|r| {
+            r.applies_to_collection_id.as_deref() == Some(m.context.logical_home_id.as_str())
+        }) {
+            if row.data.get("shapes").is_some_and(|s| !s.is_object()) {
+                return Err(source_proof::ComparisonFailure::unsupported(Error::engine(
+                    "unsupported current home shapes",
+                )));
+            }
+            for key in [Some(m.context.r#type.as_str()), kind.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(shape) = row.data.get("shapes").and_then(|s| s.get(key)) {
+                    if shape.is_object() {
+                        return Ok(true);
+                    }
+                    return Err(source_proof::ComparisonFailure::unsupported(Error::engine(
+                        "unsupported current home shape",
+                    )));
+                }
+            }
+        }
+    }
     let effective = crate::query::cascade::facets_for_record_context(
         &current.rows,
         &m.context.r#type,
         m.context.kind.as_deref(),
-        Some(&m.context.logical_home_id),
+        if global {
+            None
+        } else {
+            Some(&m.context.logical_home_id)
+        },
     );
     let old_keys: BTreeSet<_> = m
         .slots
@@ -347,6 +521,9 @@ fn compare(
     let mut governance = Vec::new();
     for (index, slot) in m.slots.iter().enumerate() {
         check(deadline)?;
+        if global && index >= 4 {
+            continue;
+        }
         let home = if slot.scope == v2::Scope::Home {
             Some(m.context.logical_home_id.as_str())
         } else {
@@ -480,6 +657,54 @@ fn compare(
             .collect();
         expected.sort_by_key(Value::to_string);
         drift |= actual != expected;
+    }
+    if global {
+        // Advisory name/ID candidate membership for the admitted binding.
+        // The binding resolved exactly one snapshot row at prepare time;
+        // today's candidate set must be that same retained row. A rename, a
+        // new competing row, or an emptied set is Changed, never silent
+        // retargeting and never a new proof of uniqueness. Exhaustion of the
+        // bounded scan is Unknown (budget), never absence.
+        let mut scanned_vocabularies = 0usize;
+        for vocab in &m.vocabularies {
+            check(deadline)?;
+            let id = m.sources[vocab.source].row_id.as_str();
+            // The winning declaration is the LAST fragment for the field
+            // across slots: user slots follow pack slots, kind follows type.
+            // A first-match lookup would pin superseded pack spellings and
+            // both falsely change on unrelated renames and miss collisions
+            // that are only relevant to the winner.
+            let reference = m
+                .slots
+                .iter()
+                .flat_map(|s| s.fragments.iter())
+                .rfind(|f| f.key == vocab.field)
+                .and_then(|f| f.decl.vocab_ref.as_ref().or(f.decl.vocab.as_ref()));
+            let Some(reference) = reference else {
+                continue;
+            };
+            let stripped = crate::meta::vocabulary::resolve_vocab_ref(reference);
+            let mut candidates = BTreeSet::new();
+            for (s, row) in &current.raw {
+                check(deadline)?;
+                if s.section != "vocabularies" {
+                    continue;
+                }
+                scanned_vocabularies += 1;
+                if scanned_vocabularies > 1024 {
+                    return Err(source_proof::ComparisonFailure::budget(budget()));
+                }
+                let Some(row_id) = row["id"].as_str() else {
+                    continue;
+                };
+                if row_id == stripped
+                    || row.get("name").and_then(|n| n.as_str()) == Some(reference.as_str())
+                {
+                    candidates.insert(row_id.to_owned());
+                }
+            }
+            drift |= candidates.len() != 1 || !candidates.contains(id);
+        }
     }
     Ok(drift)
 }

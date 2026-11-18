@@ -1,0 +1,14 @@
+{
+  "source": "03b1bbb3f4204591b69e0e80a2d14788bf0535ef",
+  "artifact_sha256": "96ace0b09190066037ea52efa47b82229740b966bb5434c5a49076c6bcc7c21f",
+  "engine_schema_version": 94,
+  "ddl_sha256": "e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5",
+  "platform": "linux-x86_64",
+  "runtime": "mcp-stdio",
+  "accepted_shapes_present": false,
+  "build": "NATIVE_CE_GIT_SHA=03b1bbb3f4204591b69e0e80a2d14788bf0535ef cargo build -p native-ce --features v2-kernel-probe --bin mcp-stdio",
+  "build_duration": "6m19s",
+  "workspace": "wks_ddfee52e75504ada",
+  "purpose": "Authentic pre-A installed-v7 ingress; this artifact receipt alone does not prove ingress or drain.",
+  "copy_downgrade_artifact": "pre-a-downgrade-receipt.json remains pinned to actual3be9, unchanged"
+}

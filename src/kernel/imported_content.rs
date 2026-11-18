@@ -4,6 +4,9 @@
 use super::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+mod preinspection;
+use preinspection::observe;
+pub use preinspection::{preinspect, reuse_probe, Preinspection};
 
 pub struct Plan {
     artifacts: Vec<artifact_closures::VerifiedArtifactClosure>,
@@ -32,19 +35,88 @@ pub async unsafe fn inspect_on(
     report_digest: String,
     members: &std::collections::BTreeSet<String>,
 ) -> Result<Plan> {
+    inspect_on_with_progress(
+        conn,
+        source,
+        source_head,
+        report_digest,
+        members,
+        &mut |_, _, _| {},
+    )
+    .await
+}
+
+/// Same guarded preflight, with content-free progress for the local operator.
+/// # Safety
+/// The caller must satisfy the same guards as [`inspect_on`].
+pub async unsafe fn inspect_on_with_progress(
+    conn: &mut SqliteConnection,
+    source: &std::path::Path,
+    source_head: Value,
+    report_digest: String,
+    members: &std::collections::BTreeSet<String>,
+    progress: &mut (dyn FnMut(&'static str, usize, usize) + Send),
+) -> Result<Plan> {
+    inspect_on_with_preinspection(
+        conn,
+        source,
+        source_head,
+        report_digest,
+        members,
+        None,
+        None,
+        progress,
+    )
+    .await
+}
+
+/// Reuse only v1 observations whose complete conservative dependency key still
+/// matches. Kernel closure/custody checks and whole-batch parity are unchanged.
+/// # Safety
+/// Same guards as [`inspect_on`]; evidence must be computed from this frozen source.
+#[allow(clippy::too_many_arguments)]
+pub async unsafe fn inspect_on_with_preinspection(
+    conn: &mut SqliteConnection,
+    source: &std::path::Path,
+    source_head: Value,
+    report_digest: String,
+    members: &std::collections::BTreeSet<String>,
+    receipt: Option<&Preinspection>,
+    evidence: Option<&crate::v1_import::cutover::SnapshotEvidence>,
+    progress: &mut (dyn FnMut(&'static str, usize, usize) + Send),
+) -> Result<Plan> {
+    progress("source_open", 0, 1);
     let v1 = crate::db::open_current_database_read_only_at(source).await?;
-    let result = inspect_inner(conn, &v1, source_head, report_digest, members).await;
+    progress("source_open", 1, 1);
+    let result = inspect_inner(
+        conn,
+        &v1,
+        source_head,
+        report_digest,
+        members,
+        receipt,
+        evidence,
+        progress,
+    )
+    .await;
     v1.close().await;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn inspect_inner(
     conn: &mut SqliteConnection,
     v1: &Db,
     head: Value,
     digest: String,
     members: &std::collections::BTreeSet<String>,
+    receipt: Option<&Preinspection>,
+    evidence: Option<&crate::v1_import::cutover::SnapshotEvidence>,
+    progress: &mut (dyn FnMut(&'static str, usize, usize) + Send),
 ) -> Result<Plan> {
+    let mut reused = 0;
+    let mut inspected = 0;
+    let mut slowest = Vec::new();
     let mut plan = Plan {
         artifacts: Vec::new(),
         exclusions: Vec::new(),
@@ -54,67 +126,39 @@ async fn inspect_inner(
         expected: Vec::new(),
     };
     let sources = crate::mcp::tools::artifacts::frozen_artifact_sources(v1).await?;
-    for (id, runtime) in sources {
+    let total = sources.len();
+    progress("artifacts", 0, total);
+    for (index, (id, runtime)) in sources.into_iter().enumerate() {
         let class = match runtime.as_deref() {
             Some("native.html.v1") => "html",
             Some("native.board.v1") => "board",
             Some("native.mdx.v2") => "mdx",
             _ => "other_runtime",
         };
+        let started = std::time::Instant::now();
+        let cached = match (receipt, evidence) {
+            (Some(receipt), Some(evidence)) => {
+                receipt
+                    .observation(v1, &id, runtime.as_deref(), members, evidence)
+                    .await?
+            }
+            _ => None,
+        };
+        let observation = if let Some(observation) = cached {
+            reused += 1;
+            observation.clone()
+        } else {
+            inspected += 1;
+            observe(v1, &id, members).await?
+        };
+        slowest.push((started.elapsed().as_secs_f64(), id.clone()));
         let mut served = false;
-        let mut non_string_failure = false;
+        let non_string_failure = observation.non_string_failure;
         let mut expected = Vec::new();
         let mut outcomes = std::collections::BTreeSet::<String>::new();
         let mut diagnostics = BTreeMap::new();
-        for member in members {
-            let caller =
-                crate::mcp::Caller::authenticated(member).with_suppressed_request_persistence();
-            // Permission failures are expected for private artifacts. Other
-            // failures must not be silently treated as v1 render refusals.
-            let visible = crate::authorization::effective_capability(
-                v1,
-                crate::authorization::Principal::bound(member, true),
-                &id,
-            )
-            .await?
-            .allows(Capability::View);
-            if !visible {
-                continue;
-            }
-            let result = match crate::mcp::tools::artifacts::frozen_render_outcome(v1, &caller, &id)
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    // v1 preserves SQLx's refusal for numeric body cells, which
-                    // has no structured diagnostic. Only that known source-cell
-                    // incompatibility becomes an unsupported exclusion. Storage
-                    // and unrelated decoder failures still abort.
-                    let body_decode = matches!(&error, Error::Sqlx(sqlx::Error::ColumnDecode { index, .. }) if index.trim_matches('"') == "body");
-                    if !body_decode {
-                        return Err(error);
-                    }
-                    let source = crate::record_body::live_artifact::latest_present_source_on(
-                        v1.pool(),
-                        &id,
-                        None,
-                    )
-                    .await?
-                    .ok_or_else(|| refusal("served_source_missing", 1))?;
-                    let event: String = source.try_get("id")?;
-                    let kind: Option<String> = sqlx::query_scalar(
-                        "SELECT json_type(payload,'$.body') FROM content_events WHERE id=?",
-                    )
-                    .bind(event)
-                    .fetch_one(v1.pool())
-                    .await?;
-                    if !matches!(kind.as_deref(), Some("integer" | "real" | "true" | "false")) {
-                        return Err(error);
-                    }
-                    non_string_failure = true;
-                    artifact_closures::unsupported_outcome(&id)
-                }
-            };
+        for (member, result) in &observation.outcomes {
+            let Some(result) = result else { continue };
             let actor: String = sqlx::query_scalar(
                 "SELECT principal_id FROM kernel_principals WHERE auth_binding=?",
             )
@@ -146,6 +190,7 @@ async fn inspect_inner(
                 &mut plan.summary["exclusions"],
                 "outside_imported_view_scope",
             );
+            progress("artifacts", index + 1, total);
             continue;
         }
         // Retain expected refusals as well as successes. Every visible member's
@@ -202,10 +247,13 @@ async fn inspect_inner(
             }
         }
         plan.expected.extend(expected);
+        progress("artifacts", index + 1, total);
     }
     let canvases: Vec<String> = sqlx::query_scalar("SELECT id FROM records WHERE type='Document' AND kind='canvas' AND deleted_at IS NULL ORDER BY id")
         .fetch_all(v1.pool()).await?;
-    for id in canvases {
+    let total = canvases.len();
+    progress("canvases", 0, total);
+    for (index, id) in canvases.into_iter().enumerate() {
         let seq: i64 =
             sqlx::query_scalar("SELECT event_seq FROM kernel_app_state WHERE record_id=?")
                 .bind(&id)
@@ -229,7 +277,15 @@ async fn inspect_inner(
         }
         plan.already_active &= already;
         plan.canvases.push(proof);
+        progress("canvases", index + 1, total);
     }
+    slowest.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    plan.summary["v1_observations"] = json!({"reused":reused,"inspected":inspected});
+    plan.summary["slowest_v1_artifacts"] = json!(slowest
+        .into_iter()
+        .take(10)
+        .map(|(seconds, id)| json!({"artifact_id":id,"seconds":seconds}))
+        .collect::<Vec<_>>());
     Ok(plan)
 }
 
@@ -237,8 +293,19 @@ async fn inspect_inner(
 /// totals cannot hide a swapped success/refusal or a diagnostic disagreement.
 /// This executes only on an operator-owned disposable native target copy.
 pub async fn verify_parity_as(db: &Db, plan: &Plan) -> Result<()> {
+    verify_parity_as_with_progress(db, plan, &mut |_, _, _| {}).await
+}
+
+/// Per authorized artifact/member comparison progress, without identifiers.
+pub async fn verify_parity_as_with_progress(
+    db: &Db,
+    plan: &Plan,
+    progress: &mut (dyn FnMut(&'static str, usize, usize) + Send),
+) -> Result<()> {
     let mut mismatches = 0;
-    for (id, member, expected) in &plan.expected {
+    let total = plan.expected.len();
+    progress("artifact_members", 0, total);
+    for (index, (id, member, expected)) in plan.expected.iter().enumerate() {
         let actor = resolve_principal_by_binding(db, member)
             .await?
             .ok_or_else(|| refusal("parity_identity_missing", 1))?
@@ -246,17 +313,32 @@ pub async fn verify_parity_as(db: &Db, plan: &Plan) -> Result<()> {
         let caller =
             crate::mcp::Caller::authenticated(member).with_suppressed_request_persistence();
         let args = json!({"id":id});
-        let actual = match crate::mcp::kernel_v2::artifacts::html_board::try_render_for_cutover(
-            db, &caller, &actor, &args,
-        )
-        .await?
-        {
-            Some(value) => value,
-            None => {
-                crate::mcp::kernel_v2::artifacts::render_with_database(db, &actor, None, args)
-                    .await?
-            }
-        };
+        // This closed semantic probe only reads its disposable database: no
+        // dispatch, delivery URL or writer runs here. Unlike live render_artifact,
+        // parity opts into the capability cache already used by get/query/search/
+        // history serving. This is safe with no parity writes: each lookup checks
+        // the actor, database file and content/meta event heads, within this render.
+        // Keep the renderer behind one allocation before nesting task-local
+        // scopes. Otherwise debug builds copy its large future into each scope
+        // and overflow the operator's main-thread stack during parity checks.
+        let actual = read_cache::scope_request(hosted_identity::scope_request(
+            read_cache::with_capabilities(Box::pin(async {
+                match crate::mcp::kernel_v2::artifacts::html_board::try_render_for_cutover(
+                    db, &caller, &actor, &args,
+                )
+                .await?
+                {
+                    Some(value) => Ok(value),
+                    None => {
+                        crate::mcp::kernel_v2::artifacts::render_with_database(
+                            db, &actor, None, args,
+                        )
+                        .await
+                    }
+                }
+            })),
+        ))
+        .await?;
         let equal = match expected {
             None => actual["status"] == "rendered",
             Some(code) => actual["status"] != "rendered" && actual["diagnostic"]["code"] == *code,
@@ -264,6 +346,7 @@ pub async fn verify_parity_as(db: &Db, plan: &Plan) -> Result<()> {
         if !equal {
             mismatches += 1;
         }
+        progress("artifact_members", index + 1, total);
     }
     if mismatches != 0 {
         return Err(refusal("artifact_outcome_parity", mismatches));
@@ -279,17 +362,34 @@ pub async fn activate_as(
     apps: &app_installs::VerifiedFrozenApps,
     plan: &Plan,
 ) -> Result<()> {
+    activate_as_with_progress(db, host, apps, plan, &mut |_, _, _| {}).await
+}
+
+/// Atomic activation with bounded content-free operator progress.
+pub async fn activate_as_with_progress(
+    db: &Db,
+    host: &str,
+    apps: &app_installs::VerifiedFrozenApps,
+    plan: &Plan,
+    progress: &mut (dyn FnMut(&'static str, usize, usize) + Send),
+) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
     hq::require_import(&mut tx, host).await?;
     app_installs::activate_on(db, &mut tx, host, apps).await?;
-    for proof in &plan.artifacts {
+    progress("activate_artifacts", 0, plan.artifacts.len());
+    for (index, proof) in plan.artifacts.iter().enumerate() {
         artifact_closures::activate_on(db, &mut tx, host, proof).await?;
+        progress("activate_artifacts", index + 1, plan.artifacts.len());
     }
-    for proof in &plan.exclusions {
+    progress("activate_exclusions", 0, plan.exclusions.len());
+    for (index, proof) in plan.exclusions.iter().enumerate() {
         artifact_closures::exclude_on(db, &mut tx, host, proof).await?;
+        progress("activate_exclusions", index + 1, plan.exclusions.len());
     }
-    for proof in &plan.canvases {
+    progress("activate_canvases", 0, plan.canvases.len());
+    for (index, proof) in plan.canvases.iter().enumerate() {
         canvas_v2::activate_on(db, &mut tx, host, proof).await?;
+        progress("activate_canvases", index + 1, plan.canvases.len());
     }
     db.commit_kernel_content(tx).await?;
     Ok(())
@@ -329,6 +429,13 @@ fn refusal_class(code: &str) -> &str {
 }
 
 impl Plan {
+    /// Synthetic parity fault injection; absent from the production feature closure.
+    #[cfg(feature = "body-read-test-support")]
+    #[doc(hidden)]
+    pub fn expected_outcomes_mut_for_test(&mut self) -> &mut Vec<(String, String, Option<String>)> {
+        &mut self.expected
+    }
+
     pub fn is_empty(&self) -> bool {
         self.artifacts.is_empty() && self.exclusions.is_empty() && self.canvases.is_empty()
     }

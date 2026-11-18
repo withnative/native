@@ -238,6 +238,13 @@ pub(crate) async fn prepare_commit(
     let deadline = Instant::now() + Duration::from_secs(2);
     let fingerprint = intent_fingerprint("manage_named_views", args.clone(), Value::Null)?;
     let mut tx = db.pool().begin().await?;
+    kernel::mcp_write_receipts::fences::refuse_key_on(
+        &mut tx,
+        actor,
+        &format!("manage_named_views.{}", text(args, "action")?),
+        text(args, "idempotency_key")?.trim(),
+    )
+    .await?;
     kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     kernel::kernel_require(
         &mut tx,
@@ -367,10 +374,10 @@ async fn validate_on(
                         "view_validation_changed: generated request changed",
                     ));
                 }
-                serde_json::from_value::<views::v2::Definition>(
-                    candidate.revision().definition.clone(),
-                )?
-                .common()
+                // The trusted candidate may be facet-1 or facet-global-1.
+                // Dispatch the closed typed profile and return its common
+                // definition; the guarded preflight proof is unchanged.
+                views::v2::validate_definition(&candidate.revision().definition)?
             } else {
                 serde_json::from_value(args["definition"].clone())?
             };
@@ -723,6 +730,13 @@ pub(super) async fn execute(
     }
     let mut tx = writer.into_transaction();
     let work = async {
+        kernel::mcp_write_receipts::fences::refuse_key_on(
+            &mut tx,
+            actor,
+            &format!("manage_named_views.{action}"),
+            key,
+        )
+        .await?;
         kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
         let id = record_id(&args)?;
         // Recheck current access before a prior success; replay creates no publication effect.
@@ -737,7 +751,8 @@ pub(super) async fn execute(
             },
         )
         .await?;
-        // The established adapter ledger is optional and normalized out of coordinates.
+        // Legacy files may create the ledger lazily; successful outcomes now
+        // enter the canonical receipt stream before this transaction commits.
         sqlx::query(RECEIPTS).execute(&mut *tx).await?;
         let fingerprint = dispatched_fingerprint("manage_named_views", args.clone())?;
         let old:Option<(String,String)>=sqlx::query_as("SELECT request_json,receipt_json FROM kernel_mcp_write_receipts WHERE principal_id=? AND operation=? AND operation_key=?").bind(actor).bind(format!("manage_named_views.{action}")).bind(key).fetch_optional(&mut *tx).await?;
@@ -814,14 +829,19 @@ pub(super) async fn execute(
             {
                 receipt["app_attribution"] = app;
             }
-            sqlx::query("INSERT INTO kernel_mcp_write_receipts VALUES(?,?,?,?,?)")
-                .bind(actor)
-                .bind(format!("manage_named_views.{action}"))
-                .bind(key)
-                .bind(fingerprint)
-                .bind(serde_json::to_string(&receipt)?)
-                .execute(&mut *tx)
-                .await?;
+            kernel::mcp_write_receipts::record_on(
+                db,
+                &mut tx,
+                &mut acts,
+                kernel::mcp_write_receipts::Outcome {
+                    principal: actor,
+                    operation: &format!("manage_named_views.{action}"),
+                    key,
+                    request: &fingerprint,
+                    receipt: &serde_json::to_string(&receipt)?,
+                },
+            )
+            .await?;
             views::storage::check_deadline(deadline)?;
             db.commit_kernel_content(tx).await?;
             return Ok(receipt);
@@ -872,14 +892,19 @@ pub(super) async fn execute(
             )
             .await?;
         }
-        sqlx::query("INSERT INTO kernel_mcp_write_receipts VALUES(?,?,?,?,?)")
-            .bind(actor)
-            .bind(format!("manage_named_views.{action}"))
-            .bind(key)
-            .bind(fingerprint)
-            .bind(serde_json::to_string(&receipt)?)
-            .execute(&mut *tx)
-            .await?;
+        kernel::mcp_write_receipts::record_on(
+            db,
+            &mut tx,
+            &mut acts,
+            kernel::mcp_write_receipts::Outcome {
+                principal: actor,
+                operation: &format!("manage_named_views.{action}"),
+                key,
+                request: &fingerprint,
+                receipt: &serde_json::to_string(&receipt)?,
+            },
+        )
+        .await?;
         views::storage::check_deadline(deadline)?;
         db.commit_kernel_content(tx).await?;
         Ok(receipt)
@@ -898,6 +923,13 @@ pub(crate) async fn authorize_retry(
 ) -> Result<()> {
     gate::require()?;
     let mut tx = db.pool().begin().await?;
+    kernel::mcp_write_receipts::fences::refuse_key_on(
+        &mut tx,
+        actor,
+        &format!("manage_named_views.{}", text(args, "action")?),
+        text(args, "idempotency_key")?.trim(),
+    )
+    .await?;
     kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     kernel::kernel_require(&mut tx, actor, record_id(args)?, Capability::View).await?;
     if args["action"] == "activate_view" {
@@ -911,6 +943,27 @@ pub(crate) async fn authorize_retry(
     }
     tx.rollback().await?;
     Ok(())
+}
+
+/// Isolate the commit-time fence from the separately tested preflight proof.
+/// No certificate is fabricated: this empty carry never reaches validation or
+/// a domain write because the serialized writer must first refuse its fence.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(super) fn fence_commit_for_settlement_test(
+    db: &Db,
+    actor: &str,
+    args: &Value,
+) -> Result<PreparedCommit> {
+    Ok(PreparedCommit {
+        database: db.clone(),
+        actor: actor.into(),
+        certificates: Vec::new(),
+        fingerprint: intent_fingerprint("manage_named_views", args.clone(), Value::Null)?,
+        evidence: None,
+        generated: None,
+        referenced: None,
+        deadline: Instant::now() + Duration::from_secs(10),
+    })
 }
 
 #[cfg(test)]

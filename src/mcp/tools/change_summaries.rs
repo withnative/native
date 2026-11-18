@@ -91,9 +91,13 @@ fn live_gate(
     // Hosted ingress only constructs Caller after a live catalog membership
     // check. Stdio selects one in-file account. Change-summary workflows have
     // an exact single-account audience, so every other account fails closed.
+    // The live answer folds the caller's catalog footing: a guest resolves
+    // without the `native:members` baseline, so a revoked account grant is
+    // not masked by member visibility.
     let account = caller.credential().to_owned();
+    let is_member = caller.is_host_member();
     RequestRevisionApplicabilityGate::new(
-        move |candidate: &str| (candidate == account).then_some(true),
+        move |candidate: &str| (candidate == account).then_some(is_member),
         ChangeSummaryCurrentBasis,
     )
 }
@@ -632,6 +636,19 @@ mod tests {
         assert!(schema.contains("^[0-9a-f]{64}$"));
         assert!(!schema.contains("head_event_seq"));
         assert!(!schema.contains("confirmation_id"));
+    }
+
+    #[test]
+    fn live_gate_folds_caller_footing_for_guests() {
+        let member = Caller::authenticated(ALICE).with_hosting_member(true);
+        let guest = Caller::authenticated(BOB).with_hosting_member(false);
+        assert_eq!(live_gate(&member).live_answer(ALICE), Some(true));
+        assert_eq!(live_gate(&member).live_answer(BOB), None);
+        // A guest resolves without the `native:members` baseline: the live
+        // answer for its own account is `Some(false)`, so a revoked account
+        // grant is not masked by member visibility.
+        assert_eq!(live_gate(&guest).live_answer(BOB), Some(false));
+        assert_eq!(live_gate(&guest).live_answer(ALICE), None);
     }
 
     #[tokio::test]

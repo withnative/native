@@ -688,3 +688,232 @@ fn facet_compiler_boolean_unknowns_and_deprecated_alias_chains_are_explicit() {
         ]
     );
 }
+
+#[test]
+fn facet_global_hq_compiler_is_deterministic_and_profile_separated() {
+    assert_eq!(Profile::default(), Profile::Facet1);
+    assert_eq!(Profile::Global1.version(), "facet-global-1");
+    let (mut rows, mut vocabs) = global_fixture();
+    let p = global_run(&rows, &vocabs, &["area", "strategy_lane"]).unwrap();
+    rows.reverse();
+    vocabs.reverse();
+    for v in &mut vocabs {
+        v.values.reverse();
+    }
+    let q = global_run(&rows, &vocabs, &["strategy_lane", "area"]).unwrap();
+    assert_eq!(
+        serde_json::to_value(&p).unwrap(),
+        serde_json::to_value(&q).unwrap()
+    );
+    assert_eq!(p.manifest.format, "native.generated-facets.v2");
+    assert!(p.manifest.governance_basis.is_empty());
+    assert!(p.manifest.slots[4..].iter().all(|s| s.fragments.is_empty()));
+    assert!(p.manifest.sources.iter().all(|s| s.anchor.is_none()));
+    assert!(p.sql.contains("r.home_id = 'H'"));
+    assert!(p.sql.contains("'workspace-ops'"));
+    assert!(p.sql.contains("'research'"));
+    assert_eq!(p.output["row_identity"], json!(["id"]));
+    let selector = String::from_utf8(canonical(
+        &json!({"context":p.manifest.context,"selection":p.manifest.selection}),
+    ))
+    .unwrap();
+    assert!(selector.starts_with("{\"context\":{\"declaration_scope\":\"global\""));
+    assert_eq!(
+        p.name,
+        crate::named_views::contract::generated_name("workspace", GENERATOR, "H", &selector)
+    );
+    let lowered = p.manifest.inputs();
+    assert_ne!(
+        p.name,
+        crate::named_views::contract::generated_name(
+            "workspace",
+            GENERATOR,
+            "H",
+            &super::selector(&lowered)
+        )
+    );
+    assert_eq!(
+        p.manifest_sha256,
+        digest(&serde_json::to_value(&p.manifest).unwrap())
+    );
+    assert!(matches!(
+        global_run(&rows, &vocabs, &["priority"]),
+        Err(CompileError::MissingDeclaration(_))
+    ));
+    // Existing explicit profile stays exact: no automatic fallback.
+    assert_eq!(
+        compile(input(&rows, &vocabs, &["area"]), soon()).unwrap_err(),
+        CompileError::Invalid("home has no governing declaration")
+    );
+}
+
+#[test]
+fn facet_global_compiler_refuses_local_governance_and_malformed_absence() {
+    let (rows, vocabs) = global_fixture();
+    for shape in [
+        json!({}),
+        json!({"facets":{}}),
+        json!({"facets":null}),
+        json!({"facets":{"area":null}}),
+        Value::Null,
+        json!([]),
+    ] {
+        let mut rows = rows.clone();
+        rows.push(row(
+            "local",
+            "user",
+            Some("H"),
+            json!({"shapes":{"WorkItem:task":shape}}),
+        ));
+        assert!(global_run(&rows, &vocabs, &["area"]).is_err());
+    }
+    let mut rows = rows;
+    rows.push(row(
+        "last",
+        "user",
+        None,
+        json!({"shapes":{"WorkItem:task":{"facets":{"area":null}}}}),
+    ));
+    assert_eq!(
+        global_run(&rows, &vocabs, &["area"]).unwrap_err(),
+        CompileError::Invalid("explicit declaration must be object")
+    );
+    rows.pop();
+    rows.push(row(
+        "unrelated",
+        "pack",
+        Some("H"),
+        json!({"shapes":{"Document":{"facets":{}}}}),
+    ));
+    assert!(global_run(&rows, &vocabs, &["area"]).is_ok());
+    let mut i = input(&rows, &vocabs, &["area"]);
+    i.source_identity = "wrong";
+    assert_eq!(
+        compile_global(i, soon()).unwrap_err(),
+        CompileError::Invalid("global source identity")
+    );
+}
+
+#[test]
+fn facet_global_frozen_sql_admits_exact_name_and_id_spellings() {
+    let (rows, vocabs) = global_fixture();
+    let p = global_run(&rows, &vocabs, &["area"]).unwrap();
+    // Name binding area -> voc:area: exactly these three cell spellings.
+    assert!(p.sql.contains("IN ('area', 'rec:voc:area', 'voc:area')"));
+    // Literal rec:<name> never guesses a canonical name in frozen SQL.
+    assert!(!p.sql.contains("'rec:area'"));
+    // ID binding admits only the exact ID and rec:<actual-ID>.
+    let mut id_rows = rows.clone();
+    id_rows[0].data["shapes"]["WorkItem"]["facets"]["area"]["vocab_ref"] = json!("voc:area");
+    let mut id_vocabs = vocabs.clone();
+    for v in &mut id_vocabs {
+        if v.id == "voc:area" {
+            // Mirror resolver output for a "voc:area" declaration: the
+            // reference is the original declaration spelling, so the bare
+            // name is not admitted for this ID-bound view.
+            v.reference = "voc:area".into();
+        }
+    }
+    let q = global_run(&id_rows, &id_vocabs, &["area"]).unwrap();
+    assert!(q.sql.contains("IN ('rec:voc:area', 'voc:area')"));
+    assert!(!q.sql.contains("IN ('area', 'rec:voc:area', 'voc:area')"));
+}
+
+#[test]
+fn facet_global_shared_vocabulary_binds_once_with_exact_field_guards() {
+    let (mut rows, mut vocabs) = global_fixture();
+    // Three fields share voc:area through mixed spellings; the resolver
+    // would emit one vocabulary with the bare-name reference.
+    assert_eq!(vocabs.len(), 2);
+    vocabs.retain(|v| v.id == "voc:area");
+    assert_eq!(vocabs.len(), 1);
+    rows[0].data["shapes"]["WorkItem:task"]["facets"] = json!({
+        "area_bare": {"vocab_ref": "area"},
+        "area_id": {"vocab_ref": "voc:area"},
+        "area_rec": {"vocab_ref": "rec:voc:area"},
+    });
+    let p = global_run(&rows, &vocabs, &["area_bare", "area_id", "area_rec"]).unwrap();
+    // One vocabulary source for all three fields.
+    let row_ids: BTreeSet<_> = p
+        .manifest
+        .vocabularies
+        .iter()
+        .map(|v| p.manifest.sources[v.source].row_id.clone())
+        .collect();
+    assert_eq!(row_ids, BTreeSet::from(["voc:area".to_string()]));
+    assert_eq!(p.manifest.vocabularies.len(), 3);
+    // Each field admits exactly its own spelling plus ID and rec:ID.
+    // (Each guard shape occurs three times in the frozen SQL: the value
+    // CASE, the status NOT-guard, and the usable CASE it embeds.)
+    assert_eq!(
+        p.sql
+            .matches("IN ('area', 'rec:voc:area', 'voc:area')")
+            .count(),
+        3
+    );
+    assert_eq!(p.sql.matches("IN ('rec:voc:area', 'voc:area')").count(), 6);
+    assert!(!p.sql.contains("'rec:area'"));
+}
+fn soon() -> Instant {
+    Instant::now() + Duration::from_secs(2)
+}
+fn global_run(
+    rows: &[SchemaConfigRow],
+    vocabs: &[Vocabulary],
+    keys: &[&str],
+) -> Result<Proposal<v2::GlobalManifest>> {
+    let mut i = input(rows, vocabs, keys);
+    i.source_identity = "H";
+    compile_global(i, soon())
+}
+fn global_fixture() -> (Vec<SchemaConfigRow>, Vec<Vocabulary>) {
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/hq-global.json")).unwrap();
+    let rows: Vec<_> = fixture["schema"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| SchemaConfigRow {
+            id: v["id"].as_str().unwrap().into(),
+            layer: v["layer"].as_str().unwrap().into(),
+            name: None,
+            data: serde_json::from_str(v["data"].as_str().unwrap()).unwrap(),
+            applies_to_collection_id: None,
+            version_lineage: v["version_lineage"].as_str().map(str::to_owned),
+            created_at: v["created_at"].as_str().unwrap().into(),
+        })
+        .collect();
+    let vocabs = fixture["vocabularies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let id = v["id"].as_str().unwrap();
+            Vocabulary {
+                id: id.into(),
+                // Mirrors resolver output: the original declaration spelling.
+                // In this faithful fixture the bare declarations coincide
+                // with the vocabulary names; divergent spellings (custom IDs,
+                // rec: forms) are covered by inline cases below.
+                reference: v["name"].as_str().unwrap().into(),
+                source: source(v2::Section::Vocabularies, id, None),
+                values: fixture["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| v["vocabulary_id"] == id)
+                    .map(|v| {
+                        let id = v["id"].as_str().unwrap();
+                        VocabularyValue {
+                            source: source(v2::Section::VocabularyValues, id, None),
+                            id: id.into(),
+                            value: v["value"].as_str().unwrap().into(),
+                            status: v["status"].as_str().unwrap().into(),
+                            alias_of: v["alias_of"].as_str().map(str::to_owned),
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    (rows, vocabs)
+}

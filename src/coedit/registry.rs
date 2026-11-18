@@ -1430,6 +1430,18 @@ impl SessionRegistry {
         }
     }
 
+    /// Accepted bytes and epoch from one immutable registry/session borrow.
+    /// No cut snapshot, attribution collection or activity mutation occurs.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn acknowledged_body(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(String, u64), Refused> {
+        let epoch = self.mutation_epoch(session_id)?;
+        let body = self.live_body(session_id)?;
+        Ok((body, epoch))
+    }
+
     /// Current state vector of the live doc (encoded v1).
     pub fn state_vector(&self, session_id: &SessionId) -> Result<Vec<u8>, Refused> {
         let session = self.find_session(session_id).ok_or_else(|| {

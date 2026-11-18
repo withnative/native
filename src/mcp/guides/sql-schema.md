@@ -8,9 +8,9 @@ This is native-ce's exact ordered SQLite DDL contract for a fresh database. It i
 
 ## Contract identity
 
-- Engine schema version: `93`
-- Ordered DDL statements: `402`
-- Frozen DDL SHA-256: `4a818a9dd255d32f8f5c57fd49e9cfca7a2231d76a94f0bc7dbe24d192c00581`
+- Engine schema version: `94`
+- Ordered DDL statements: `406`
+- Frozen DDL SHA-256: `e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5`
 
 The fingerprint is SHA-256 over the canonical statement sequence joined by `\n;\n`. Generation fails before writing if the compiled sequence and frozen pin disagree.
 
@@ -3046,5 +3046,28 @@ CREATE TRIGGER content_event_heads_frontier_delete AFTER DELETE ON content_event
             AND NOT EXISTS (SELECT 1 FROM content_event_causal_frontier WHERE parent_event_id = OLD.parent_event_id);
        END
 ;
-PRAGMA user_version = 93;
+CREATE TABLE provenance_local_command_cancellations (
+     event_id TEXT PRIMARY KEY REFERENCES control_events(id),
+     origin_db_id TEXT NOT NULL,
+     principal TEXT NOT NULL,
+     operation TEXT NOT NULL CHECK (operation IN ('create_record','update_record')),
+     command_identity_digest TEXT NOT NULL CHECK (length(command_identity_digest)=64),
+     action_digest TEXT NOT NULL CHECK (length(action_digest)=64),
+     intent_digest TEXT CHECK (intent_digest IS NULL OR length(intent_digest)=64),
+     app_context_digest TEXT NOT NULL CHECK (length(app_context_digest)=64),
+     UNIQUE(principal,operation,command_identity_digest)
+   )
+;
+CREATE TRIGGER provenance_local_command_cancellations_no_update
+       BEFORE UPDATE ON provenance_local_command_cancellations
+       BEGIN SELECT RAISE(ABORT, 'provenance_local_command_cancellations is append-only'); END
+;
+CREATE TRIGGER provenance_local_command_cancellations_no_delete
+       BEFORE DELETE ON provenance_local_command_cancellations
+       BEGIN SELECT RAISE(ABORT, 'provenance_local_command_cancellations is append-only'); END
+;
+CREATE INDEX idx_local_command_cancellations_event
+       ON provenance_local_command_cancellations(event_id)
+;
+PRAGMA user_version = 94;
 ```

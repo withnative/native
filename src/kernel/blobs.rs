@@ -64,7 +64,7 @@ pub(crate) async fn put(conn: &mut SqliteConnection, bytes: &[u8], meta: &BlobMe
 
 pub(crate) async fn bind(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     actor: &str,
     id: &str,

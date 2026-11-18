@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
+use tracing::Instrument as _;
 
 use crate::error::{Error, Result};
 use crate::standby_snapshot::{
@@ -39,12 +40,15 @@ use super::act_materialise::apply_authority_act_delta_and_finalize_head;
 use super::authority_probe::read_authority_act_head_from_path;
 use super::delta_transport::{AuthorityActTransport, MAINTENANCE_SNAPSHOT_ERROR};
 use super::generation_store::DeltaDeferral;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+use super::phase_timings::PhaseTimings;
 use super::{GenerationStore, InstalledGeneration, StandbyRuntimeConfig};
 
 mod binary;
 
 mod binary_resume;
 mod binary_work;
+mod shape_transition;
 mod transfer_progress;
 mod transfer_repr;
 pub use transfer_progress::{
@@ -64,11 +68,33 @@ const MANUAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // and never splice a timed-out transfer into a new export.
 // Allow the server's thirty-minute initial capture plus download and local
 // verification. Subsequent refreshes still coalesce under the same controller.
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+pub(crate) const FOLLOW_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_FULL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_FULL_REFRESH_REPAIR_RETRY: Duration = Duration::from_secs(30 * 60);
 const NETWORK_RECOVERY_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const WAKE_DETECTION_SLOP: Duration = Duration::from_secs(5);
+/// First retry after a busy hosted delta export: hosted asks for one second
+/// via `Retry-After`; without it wait a few seconds. Consecutive busy
+/// failures double toward the cap while the export plausibly still runs.
+const EXPORT_BUSY_BASE_BACKOFF: Duration = Duration::from_secs(5);
+const EXPORT_BUSY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Fixed receipt details for the two "hosted may still be exporting" signals:
+/// a refused start while the account's export lease is held, and a poll this
+/// node gave up on.
+const EXPORT_BUSY_DETAIL: &str = "export_in_progress";
+const EXPORT_CAPTURE_TIMEOUT_DETAIL: &str = "capture_timed_out";
+/// Tracing target for the follow-loop scheduler's own observability: skipped
+/// ticks, coalesced acquisitions, the per-deadline alive trace and the stall
+/// WARN. Separate from the transport target so journal readers can isolate
+/// scheduler health from attempt outcomes.
+const FOLLOW_LOG_TARGET: &str = "native_ce::standby::follow";
+/// A follow loop that starts no attempt for this many of its own cadences
+/// while a scheduled deadline sits overdue owes a stall WARN. Five is far
+/// outside healthy jitter (a tick is ~1 s, an attempt re-anchors the deadline
+/// on completion) and far inside the incident window this was built for.
+const STALL_WARN_INTERVAL_MULTIPLE: u32 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,9 +121,68 @@ pub struct StandbyRefreshConfig {
     /// falling back to its start if the failure end is unavailable.
     #[serde(default)]
     pub full_refresh_repair_retry_seconds: Option<u64>,
+    /// Apply SMALL kernel-v2 deltas in place, in one WAL transaction on the
+    /// serving database, instead of copying and republishing the whole file
+    /// (epic c15a932). Off by default. Large deltas, gaps, identity or schema
+    /// changes, periodic re-checkpoints and any copy not served by this build
+    /// keep the staged path. Older builds refuse a config naming this field.
+    #[serde(default)]
+    pub kernel_in_place_deltas: bool,
+    /// Seconds between required audits of a copy advanced in place (design
+    /// record 5065900 §5, "N"); default 21,600 (six hours), bounds 60 to 86,400. Applies only
+    /// while `kernel_in_place_deltas` is on. Online local reads are forwarded
+    /// to hosted once the last successful audit is older than twice this.
+    /// Older builds refuse a config naming this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_audit_interval_seconds: Option<u64>,
+    /// Seconds between deltas that carry the full projection proof; default
+    /// 1800, bounds 60 to 86,400. A host that offers wire version 3 cuts
+    /// deltas WITHOUT that proof (it is most of a cut's cost), so at this
+    /// interval, on the first follow after start, and right after any apply
+    /// anomaly, the node asks for a delta with the proof instead and checks it
+    /// the ordinary way. A divergence found that way takes the existing
+    /// whole-snapshot repair. Reads are never held for it. Older builds refuse
+    /// a config naming this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_proof_interval_seconds: Option<u64>,
 }
 
+/// Bounds on [`StandbyRefreshConfig::projection_proof_interval_seconds`].
+pub const MIN_PROJECTION_PROOF_INTERVAL_SECONDS: u64 = 60;
+pub const MAX_PROJECTION_PROOF_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_PROJECTION_PROOF_INTERVAL_SECONDS: u64 = 30 * 60;
+
+/// Bounds on [`StandbyRefreshConfig::kernel_audit_interval_seconds`].
+pub const MIN_KERNEL_AUDIT_INTERVAL_SECONDS: u64 = 60;
+pub const MAX_KERNEL_AUDIT_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+
 impl StandbyRefreshConfig {
+    /// Seconds between required audits, or `None` when none is required (the
+    /// in-place flag is off).
+    pub fn audit_interval(&self) -> Option<Duration> {
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        {
+            self.kernel_in_place_deltas.then(|| {
+                Duration::from_secs(self.kernel_audit_interval_seconds.unwrap_or(
+                    super::generation_store::kernel_in_place::audit::DEFAULT_AUDIT_INTERVAL_SECONDS,
+                ))
+            })
+        }
+        #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+        {
+            None
+        }
+    }
+
+    /// How long a proof-less (wire version 3) stretch may run before the next
+    /// delta must carry the projection proof.
+    pub fn projection_proof_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.projection_proof_interval_seconds
+                .unwrap_or(DEFAULT_PROJECTION_PROOF_INTERVAL_SECONDS),
+        )
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let config: Self = serde_json::from_slice(bytes)
             .map_err(|_| Error::engine("invalid standby refresh config"))?;
@@ -110,6 +195,25 @@ impl StandbyRefreshConfig {
             return Err(Error::engine("invalid standby refresh config contract"));
         }
         validate_exact_origin(&self.hosted_origin)?;
+        if self.kernel_audit_interval_seconds.is_some_and(|seconds| {
+            !(MIN_KERNEL_AUDIT_INTERVAL_SECONDS..=MAX_KERNEL_AUDIT_INTERVAL_SECONDS)
+                .contains(&seconds)
+        }) {
+            return Err(Error::engine(
+                "standby kernel_audit_interval_seconds must be between 60 and 86400",
+            ));
+        }
+        if self
+            .projection_proof_interval_seconds
+            .is_some_and(|seconds| {
+                !(MIN_PROJECTION_PROOF_INTERVAL_SECONDS..=MAX_PROJECTION_PROOF_INTERVAL_SECONDS)
+                    .contains(&seconds)
+            })
+        {
+            return Err(Error::engine(
+                "standby projection_proof_interval_seconds must be between 60 and 86400",
+            ));
+        }
         if self.refresh_interval_seconds == Some(0) {
             return Err(Error::engine(
                 "standby refresh_interval_seconds must be positive",
@@ -495,12 +599,173 @@ struct PendingTriggers {
     causes: Vec<RefreshCause>,
 }
 
+/// No synchronous flock on the single-thread refresh runtime may wait forever.
+fn lock_exclusive_bounded(lock: &File, budget: Duration) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= budget {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "standby refresh lock wait timed out",
+                    )
+                    .into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// In-memory hold while hosted plausibly still runs a delta export for this
+/// account: a busy refusal, or a poll the node gave up on. Never persisted —
+/// a rolled-back binary simply retries on its normal cadence — so it only
+/// ever delays attempts, never correctness or read availability.
+#[derive(Default)]
+struct BusyExportBackoff {
+    until: Option<tokio::time::Instant>,
+    consecutive: u32,
+}
+
+/// In-memory liveness heartbeat for the follow loop: the loop stamps every
+/// `poll.tick()`, and an independent watchdog warns while the stamps stop.
+/// Monotonic and never persisted, so older builds keep parsing state strictly.
+/// `u64::MAX` marks "never": before the loop's first tick there is no quiet
+/// history to judge, so the watchdog stays silent through slow startup.
+#[derive(Debug)]
+pub(crate) struct FollowHeartbeat {
+    base: tokio::time::Instant,
+    last_tick_ms: std::sync::atomic::AtomicU64,
+    attempt_started_ms: std::sync::atomic::AtomicU64,
+    warned: std::sync::atomic::AtomicBool,
+    expired: tokio::sync::Notify,
+}
+
+impl FollowHeartbeat {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last_tick_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
+            attempt_started_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
+            warned: std::sync::atomic::AtomicBool::new(false),
+            expired: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Stamp the latest scheduler tick. Called once per `poll.tick()`.
+    fn note_tick(&self) {
+        self.last_tick_ms.store(
+            self.millis_since_base(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Stamp the start of a refresh attempt; cleared by [`Self::note_attempt_end`].
+    fn note_attempt_start(&self) {
+        self.attempt_started_ms.store(
+            self.millis_since_base(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Clear the in-flight attempt stamp on completion.
+    fn note_attempt_end(&self) {
+        self.attempt_started_ms
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+    }
+
+    fn millis_since_base(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// How long since the last stamped tick, or zero before the first tick.
+    fn tick_age(&self, now: tokio::time::Instant) -> Duration {
+        let last_ms = self.last_tick_ms.load(std::sync::atomic::Ordering::Acquire);
+        if last_ms == u64::MAX {
+            return Duration::ZERO;
+        }
+        let last = self.base + Duration::from_millis(last_ms);
+        now.saturating_duration_since(last)
+    }
+
+    /// How long the current attempt has held the loop, or `None` between attempts.
+    fn attempt_age(&self, now: tokio::time::Instant) -> Option<Duration> {
+        let started_ms = self
+            .attempt_started_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if started_ms == u64::MAX {
+            return None;
+        }
+        let started = self.base + Duration::from_millis(started_ms);
+        Some(now.saturating_duration_since(started))
+    }
+}
+
+/// Warn once while the follow loop's ticks stop arriving, and re-arm when
+/// they resume. Runs on a thread independent of the loop's own runtime, so a
+/// parked loop cannot park its watcher. Nothing here is persisted.
+async fn run_follow_watchdog(
+    heartbeat: &FollowHeartbeat,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut probe = tokio::time::interval(interval);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+            _ = probe.tick() => {
+                let now = tokio::time::Instant::now();
+                let idle = heartbeat.tick_age(now);
+                if heartbeat.attempt_age(now).is_some_and(|age| age >= ATTEMPT_TIMEOUT) {
+                    heartbeat.expired.notify_waiters();
+                }
+                if idle > stall_warn_after(interval) {
+                    if !heartbeat
+                        .warned
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        match heartbeat.attempt_age(now) {
+                            Some(running) => tracing::warn!(
+                                target: FOLLOW_LOG_TARGET,
+                                attempt_secs = running.as_secs(),
+                                tick_idle_secs = idle.as_secs(),
+                                "standby follow loop has an attempt running for {}s; ticks are parked while it runs",
+                                running.as_secs()
+                            ),
+                            None => tracing::warn!(
+                                target: FOLLOW_LOG_TARGET,
+                                tick_idle_secs = idle.as_secs(),
+                                "standby follow loop scheduler parked between attempts for {}s; hosted may be ahead",
+                                idle.as_secs()
+                            ),
+                        }
+                    }
+                } else {
+                    heartbeat
+                        .warned
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AttemptError {
     class: RefreshFailureClass,
     safe_message: &'static str,
     detail: &'static str,
     source: Box<Error>,
+    /// Hosted's `retry-after` hint for a busy export refusal, if it carried a
+    /// parseable one. Consumed once by the daemon's busy backoff; never
+    /// persisted or disclosed.
+    retry_after: Option<Duration>,
     delta_fallback: Option<DeltaFallbackDiagnostic>,
     /// Allowlisted fence/check identifier naming the refusing stage (e.g.
     /// `install-fence:successor`). `None` means no specific fence claimed.
@@ -542,6 +807,9 @@ enum DeltaAttempt {
         reason: &'static str,
     },
     FallBackToSnapshot(DeltaFallbackDiagnostic),
+    /// This attempt observed an exact, directed registry transition. A saved
+    /// retry-budget receipt alone never authorizes the cooldown exception.
+    ShapeTransition(DeltaFallbackDiagnostic),
     /// Hosted authors an unreadable interchange revision: pause following
     /// instead of falling back to a whole snapshot that could never admit.
     Paused(InstalledGeneration, &'static str),
@@ -601,6 +869,7 @@ impl AttemptError {
             safe_message,
             detail: "unclassified",
             source: Box::new(source),
+            retry_after: None,
             delta_fallback: None,
             check: None,
         }
@@ -652,6 +921,8 @@ pub fn sanitize_retained_detail(raw: Option<&str>) -> &'static str {
         // Return the canonical `&'static` token, never the state-file string.
         Some(UNCLASSIFIED_CHECK) => UNCLASSIFIED_CHECK,
         Some(INSTALL_VERIFY_CHECK) => INSTALL_VERIFY_CHECK,
+        Some("attempt_timeout") => "attempt_timeout",
+        Some("lock_wait_timeout") => "lock_wait_timeout",
         Some(value) => ADMISSION_CHECKS
             .iter()
             .map(|check| check.token())
@@ -755,6 +1026,8 @@ pub struct RefreshAttemptFailure {
 
 // This marker lives outside the timed future and survives its cancellation.
 struct AttemptProgress {
+    resume_observation: Option<(binary_resume::ResumeBinding, binary::BinaryExport)>,
+    transition: bool,
     receipt: RefreshFailureReceipt,
     diagnosed: bool,
     full_started_at: Option<String>,
@@ -764,6 +1037,8 @@ struct AttemptProgress {
 impl AttemptProgress {
     fn new(cause: RefreshCause) -> Self {
         Self {
+            resume_observation: None,
+            transition: false,
             receipt: RefreshFailureReceipt {
                 attempt_id: uuid::Uuid::new_v4(),
                 cause,
@@ -779,6 +1054,21 @@ impl AttemptProgress {
             full_eligible_at: None,
         }
     }
+    fn diagnose_boundary(&mut self, source: &Error) {
+        if self.diagnosed {
+            return;
+        }
+        if matches!(source, Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut) {
+            self.receipt.class = RefreshFailureClass::Timeout;
+            self.receipt.safe_message =
+                "standby refresh coordination lock wait exceeded its time bound";
+            self.receipt.detail = "lock_wait_timeout";
+            self.receipt.check = "lock_wait_timeout";
+        }
+        self.receipt.emit();
+        self.diagnosed = true;
+    }
+
     fn diagnose(&mut self, error: &AttemptError) {
         self.receipt.class = error.class;
         self.receipt.safe_message = error.safe_message;
@@ -798,7 +1088,9 @@ trait SnapshotPageClient: Send + Sync {
 }
 
 struct HttpSnapshotPageClient {
+    compatibility: crate::client_compatibility::Monitor,
     client: reqwest::Client,
+    install_key: Option<crate::node_credential::InstallKey>,
 }
 
 impl HttpSnapshotPageClient {
@@ -811,17 +1103,53 @@ impl HttpSnapshotPageClient {
             .map_err(|error| {
                 Error::engine(format!("cannot build standby refresh client: {error}"))
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            compatibility: Default::default(),
+            install_key: None,
+        })
     }
 }
 
 impl SnapshotPageClient for HttpSnapshotPageClient {
     fn page(&self, endpoint: String, bearer: String, request: SnapshotPageRequest) -> PageFuture {
         let client = self.client.clone();
+        let compatibility = self.compatibility.clone();
+        let install_key = self.install_key.clone();
         Box::pin(async move {
-            let body = modern_export_call(&request);
-            let response = client
+            let mut body = modern_export_call(&request);
+            let endpoint = if install_key.is_some() {
+                let mut url = reqwest::Url::parse(&endpoint).map_err(|_| {
+                    AttemptError::new(
+                        RefreshFailureClass::Network,
+                        "invalid installed snapshot URL",
+                        Error::engine("invalid installed snapshot URL"),
+                    )
+                })?;
+                let Some(database) = url.path().strip_prefix("/mcp/") else {
+                    return Err(AttemptError::new(
+                        RefreshFailureClass::Protocol,
+                        "invalid installed snapshot route",
+                        Error::engine("invalid installed snapshot route"),
+                    ));
+                };
+                url.set_path(&format!("/internal/node/databases/{database}/mcp"));
+                body["params"]["name"] = json!("call_executor");
+                body["params"]["arguments"]["executor"] = json!(EXPORT_EXECUTOR);
+                url.to_string()
+            } else {
+                endpoint
+            };
+            let builder = client
                 .post(endpoint)
+                .header(
+                    super::shapes::ACCEPTED_SHAPES_HEADER,
+                    super::shapes::advertisement(),
+                )
+                .header(
+                    crate::client_compatibility::HEADER,
+                    crate::client_compatibility::advertisement(),
+                )
                 .bearer_auth(bearer)
                 .header(
                     reqwest::header::ACCEPT,
@@ -831,16 +1159,21 @@ impl SnapshotPageClient for HttpSnapshotPageClient {
                 .header("MCP-Protocol-Version", PROTOCOL_VERSION)
                 .header("Mcp-Method", "tools/call")
                 .header("Mcp-Name", EXPORT_EXECUTOR)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|_| {
-                    AttemptError::new(
-                        RefreshFailureClass::Network,
-                        "hosted snapshot request failed",
-                        Error::engine("hosted snapshot request failed"),
-                    )
-                })?;
+                .json(&body);
+            let response =
+                crate::node_credential::send_request(&client, builder, install_key.as_ref())
+                    .await
+                    .map_err(|_| {
+                        AttemptError::new(
+                            RefreshFailureClass::Network,
+                            "hosted snapshot request failed",
+                            Error::engine("hosted snapshot request failed"),
+                        )
+                    })?;
+            let response =
+                crate::client_compatibility::inspect(response, &compatibility, "snapshot", "page")
+                    .await
+                    .map_err(classify_delta_transport_error)?;
             if matches!(response.status().as_u16(), 401 | 403) {
                 return Err(AttemptError::new(
                     RefreshFailureClass::Authentication,
@@ -875,6 +1208,10 @@ impl SnapshotPageClient for HttpSnapshotPageClient {
                     Error::engine("hosted snapshot response too large"),
                 ));
             }
+            let selected_shape = super::delta_transport::selected_header(response.headers())
+                .map_err(|error| {
+                    integrity("hosted snapshot selected an unsupported shape", error)
+                })?;
             let mut response = response;
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| {
@@ -892,6 +1229,21 @@ impl SnapshotPageClient for HttpSnapshotPageClient {
                     ));
                 }
                 bytes.extend_from_slice(&chunk);
+            }
+            let refusal: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                integrity("hosted snapshot returned invalid JSON", error.into())
+            })?;
+            if refusal.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
+                && refusal
+                    .pointer("/result/structuredContent/error_code")
+                    .and_then(Value::as_str)
+                    == Some(super::shapes::UPDATE_REQUIRED)
+            {
+                return Err(AttemptError::new(
+                    RefreshFailureClass::Compatibility,
+                    "update this receiver to refresh",
+                    Error::engine(super::shapes::UPDATE_REQUIRED),
+                ));
             }
             let envelope: RpcEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
                 AttemptError::new(
@@ -936,13 +1288,15 @@ impl SnapshotPageClient for HttpSnapshotPageClient {
                     Error::engine("hosted snapshot tool failure"),
                 ));
             }
-            result.structured_content.ok_or_else(|| {
+            let mut page = result.structured_content.ok_or_else(|| {
                 AttemptError::new(
                     RefreshFailureClass::Protocol,
                     "hosted snapshot omitted structured content",
                     Error::engine("hosted snapshot missing structured content"),
                 )
-            })
+            })?;
+            page.selected_shape = selected_shape;
+            Ok(page)
         })
     }
 }
@@ -955,7 +1309,130 @@ pub struct BackgroundRefresh {
     shutdown: watch::Sender<bool>,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
     hints: RefreshHints,
+}
+
+/// Process-local, nonblocking handoff of the original transport witness after
+/// its accepted commit. Implementations must only enqueue, never do owner work.
+pub(crate) trait AcceptedDeltaObserver: Send + Sync {
+    fn begin(&self) {}
+    fn finish(&self) {}
+    fn committed(
+        &self,
+        generation: String,
+        delta: super::act_materialise::TrustedAuthorityActDelta,
+    );
+}
+
+pub(crate) struct AcceptedDeltaNotice(Option<Arc<dyn AcceptedDeltaObserver>>);
+impl AcceptedDeltaNotice {
+    pub(crate) fn committed(
+        mut self,
+        generation: String,
+        delta: super::act_materialise::TrustedAuthorityActDelta,
+    ) {
+        if let Some(observer) = self.0.take() {
+            observer.committed(generation, delta);
+        }
+    }
+}
+impl Drop for AcceptedDeltaNotice {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer.finish();
+        }
+    }
+}
+
+/// Actual kernel-v2 accepted publication, minted only by this refresh owner
+/// AFTER native accepted commit/publication. This is not a v1 authority delta,
+/// a receipt/head claim, or a constructor-granted verdict capability.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) struct AcceptedKernelDelta {
+    source: String,
+    destination: String,
+    before: super::kernel_v2::KernelGeneration,
+    delta: super::kernel_v2_delta::TrustedKernelDelta,
+}
+#[cfg(feature = "v2-kernel-probe")]
+impl AcceptedKernelDelta {
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+    pub(crate) fn destination(&self) -> &str {
+        &self.destination
+    }
+    pub(crate) fn before(&self) -> &super::kernel_v2::KernelGeneration {
+        &self.before
+    }
+    pub(crate) fn delta(&self) -> &super::kernel_v2_delta::TrustedKernelDelta {
+        &self.delta
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_materialized(
+        source: String,
+        destination: String,
+        before: super::kernel_v2::KernelGeneration,
+        delta: super::kernel_v2_delta::TrustedKernelDelta,
+    ) -> Result<Self> {
+        if source.is_empty()
+            || destination.is_empty()
+            || before.head_act != delta.delta().from_exclusive_act
+            || before.genesis_event_id != delta.delta().head.genesis_event_id
+        {
+            return Err(Error::engine(
+                "fixture kernel publication coordinates differ",
+            ));
+        }
+        Ok(Self {
+            source,
+            destination,
+            before,
+            delta,
+        })
+    }
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) trait AcceptedKernelDeltaObserver: Send + Sync {
+    fn begin(&self) {}
+    fn no_publication(&self) {}
+    fn finish(&self) {}
+    fn committed(&self, accepted: AcceptedKernelDelta);
+}
+#[cfg(feature = "v2-kernel-probe")]
+struct AcceptedKernelNotice(Option<Arc<dyn AcceptedKernelDeltaObserver>>);
+#[cfg(feature = "v2-kernel-probe")]
+impl AcceptedKernelNotice {
+    fn no_publication(mut self) {
+        if let Some(observer) = self.0.take() {
+            observer.no_publication();
+        }
+    }
+    fn committed(
+        mut self,
+        source: String,
+        destination: String,
+        before: super::kernel_v2::KernelGeneration,
+        delta: super::kernel_v2_delta::TrustedKernelDelta,
+    ) {
+        if let Some(observer) = self.0.take() {
+            observer.committed(AcceptedKernelDelta {
+                source,
+                destination,
+                before,
+                delta,
+            });
+        }
+    }
+}
+#[cfg(feature = "v2-kernel-probe")]
+impl Drop for AcceptedKernelNotice {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer.finish();
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -963,11 +1440,55 @@ pub(crate) struct RefreshHints(Arc<RefreshHintsInner>);
 
 #[derive(Default)]
 struct RefreshHintsInner {
+    compatibility: crate::client_compatibility::Monitor,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_observer: std::sync::Mutex<Option<Arc<dyn AcceptedKernelDeltaObserver>>>,
+    observer: std::sync::Mutex<Option<Arc<dyn AcceptedDeltaObserver>>>,
     pending: std::sync::atomic::AtomicU8,
     ready: tokio::sync::Notify,
 }
 
 impl RefreshHints {
+    pub(crate) fn compatibility(&self) -> crate::client_compatibility::Monitor {
+        self.0.compatibility.clone()
+    }
+
+    pub(crate) fn observe_accepted_deltas(&self, observer: Arc<dyn AcceptedDeltaObserver>) {
+        *self.0.observer.lock().unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+    pub(crate) fn begin_accepted(&self) -> Option<AcceptedDeltaNotice> {
+        let observer = self
+            .0
+            .observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        observer.begin();
+        Some(AcceptedDeltaNotice(Some(observer)))
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn observe_accepted_kernel_deltas(
+        &self,
+        observer: Arc<dyn AcceptedKernelDeltaObserver>,
+    ) {
+        *self
+            .0
+            .kernel_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    fn begin_kernel_accepted(&self) -> Option<AcceptedKernelNotice> {
+        let observer = self
+            .0
+            .kernel_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        observer.begin();
+        Some(AcceptedKernelNotice(Some(observer)))
+    }
     /// Payload-free, coalesced notification only: no filesystem or network work
     /// runs on an agent request or health-probe task.
     pub(crate) fn request(&self, cause: RefreshCause) {
@@ -1007,6 +1528,9 @@ impl BackgroundRefresh {
         if let Some(worker) = self.worker.take() {
             let _ = tokio::task::spawn_blocking(move || worker.join()).await;
         }
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = tokio::task::spawn_blocking(move || watchdog.join()).await;
+        }
     }
 
     fn cancel(&self) {
@@ -1044,7 +1568,14 @@ pub fn start_background_refresh_with_store(
     refresh_config_path: impl AsRef<Path>,
     store: GenerationStore,
 ) -> Result<BackgroundRefresh> {
-    start_background_refresh_inner(runtime, observed, refresh_config_path.as_ref(), None, store)
+    start_background_refresh_inner(
+        runtime,
+        observed,
+        refresh_config_path.as_ref(),
+        None,
+        store,
+        None,
+    )
 }
 
 /// Node refresh waits for its supervisor's cold recovery before acquiring any
@@ -1056,6 +1587,7 @@ pub(crate) fn start_background_refresh_after_startup(
     refresh_config_path: &Path,
     startup_ready: tokio::sync::oneshot::Receiver<()>,
     store: GenerationStore,
+    install_key: Option<crate::node_credential::InstallKey>,
 ) -> Result<BackgroundRefresh> {
     start_background_refresh_inner(
         runtime,
@@ -1063,6 +1595,7 @@ pub(crate) fn start_background_refresh_after_startup(
         refresh_config_path,
         Some(startup_ready),
         store,
+        install_key,
     )
 }
 
@@ -1072,18 +1605,27 @@ fn start_background_refresh_inner(
     refresh_config_path: &Path,
     startup_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     store: GenerationStore,
+    install_key: Option<crate::node_credential::InstallKey>,
 ) -> Result<BackgroundRefresh> {
     let refresh_config = StandbyRefreshConfig::from_json(&fs::read(refresh_config_path)?)?;
-    let controller = Arc::new(StandbyRefreshController::new(
+    let controller = StandbyRefreshController::new_with_install_key(
         runtime.clone(),
         refresh_config,
         store,
         observed.clone(),
-    )?);
+        install_key,
+    )?;
+    let hints = controller.pending_observer.clone();
+    let controller = Arc::new(controller);
     let guard = controller.try_acquire_daemon()?;
+    // The watchdog's handle and the daemon question are settled before the
+    // refresher worker takes the controller: the watchdog below must only
+    // run for a live daemon loop, never for a process that lost the lock.
+    let watchdog_heartbeat = controller.follow_heartbeat.clone();
+    let daemon_owned = guard.is_some();
+    let follow_interval = refresh_cadence(&controller.config);
     let (started, readiness) = std::sync::mpsc::sync_channel(1);
     let (shutdown, mut receiver) = watch::channel(false);
-    let hints = RefreshHints::default();
     let worker_hints = hints.clone();
     let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
@@ -1135,6 +1677,8 @@ fn start_background_refresh_inner(
     match readiness.recv() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
+            // The watchdog is only spawned below, so a failed start joins
+            // just the worker — which already exited after reporting.
             let _ = worker.join();
             return Err(error.into());
         }
@@ -1143,28 +1687,96 @@ fn start_background_refresh_inner(
             return Err(Error::engine("standby refresh runtime startup failed"));
         }
     }
+    // The watchdog watches the follow loop's heartbeat from its own thread
+    // and runtime: a parked loop must not park its watcher. It starts only
+    // once the refresher runtime is up, and only for a process that owns
+    // the daemon — without a guard no follow loop runs, so there is nothing
+    // to watch. The bootstrap has no handle to the caller's runtime, so a
+    // sibling thread — the same shape as the refresher worker — is the
+    // independent home.
+    let watchdog = if daemon_owned {
+        let watchdog_shutdown = shutdown.subscribe();
+        Some(
+            std::thread::Builder::new()
+                .name("standby-follow-watchdog".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            eprintln!(
+                                "native-standby-refresh: follow watchdog runtime failed: {error}"
+                            );
+                            return;
+                        }
+                    };
+                    runtime.block_on(run_follow_watchdog(
+                        &watchdog_heartbeat,
+                        follow_interval,
+                        watchdog_shutdown,
+                    ));
+                })?,
+        )
+    } else {
+        None
+    };
     Ok(BackgroundRefresh {
         shutdown,
         cancellation,
         worker: Some(worker),
+        watchdog,
         hints,
     })
 }
 
 pub struct StandbyRefreshController {
+    install_key: Option<crate::node_credential::InstallKey>,
+    #[cfg(test)]
+    attempt_timeout: Option<Duration>,
+    pending_observer: RefreshHints,
     #[cfg(test)]
     kernel_available_space: Option<u64>,
+    #[cfg(test)]
+    kernel_in_place_crash: Option<super::generation_store::kernel_in_place::InPlaceCrash>,
     runtime: StandbyRuntimeConfig,
     config: StandbyRefreshConfig,
     store: GenerationStore,
     observed: ObservedInstalledConsumerIdentity,
+    // Only a successful authority probe selects non-legacy reader coordinates.
+    route_kernel_v2: std::sync::atomic::AtomicBool,
     refresh_dir: PathBuf,
+    /// In-memory hold while hosted plausibly still runs a delta export (see
+    /// [`BusyExportBackoff`]). Guarded inline: reads never block an attempt.
+    busy_backoff: std::sync::Mutex<BusyExportBackoff>,
+    /// In-memory liveness heartbeat for the follow loop, watched from an
+    /// independent thread. Never persisted.
+    follow_heartbeat: Arc<FollowHeartbeat>,
+    /// In memory only, by design: after a restart the first follow is an
+    /// audit, so nothing needs persisting (and no older binary has to
+    /// tolerate a new file).
+    #[cfg_attr(not(any(test, feature = "v2-kernel-probe")), allow(dead_code))]
+    proof_audit: std::sync::Mutex<ProofAudit>,
     client: Arc<dyn SnapshotPageClient>,
     binary_client: Arc<dyn binary::BinarySnapshotClient>,
     binary_snapshot_enabled: bool,
     delta_enabled: bool,
     #[cfg(test)]
     transfer_pause: std::sync::Mutex<Option<transfer_progress::TransferPause>>,
+}
+
+/// When the last delta that carried the full projection proof was applied, and
+/// whether something since looked wrong. Wire-version-3 deltas carry no proof,
+/// so this decides when the next follow must ask for one.
+#[derive(Debug, Default)]
+#[cfg_attr(not(any(test, feature = "v2-kernel-probe")), allow(dead_code))]
+struct ProofAudit {
+    /// `None` until a proof-carrying delta applies (so the first follow after
+    /// a start audits).
+    last: Option<std::time::Instant>,
+    /// An apply anomaly or refusal: audit on the next follow, not on schedule.
+    trouble: bool,
 }
 
 /// Authenticated whole-copy acquisition, NOT an admitted/serving generation.
@@ -1202,27 +1814,103 @@ impl Drop for StandbySnapshotDownload {
     }
 }
 
+/// The shortest rest after a failed or large v2 replay.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+const KERNEL_REPLAY_FLOOR: Duration = Duration::from_secs(60);
+
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 struct KernelReplayCooldown<'a> {
     controller: &'a StandbyRefreshController,
     started: std::time::Instant,
+    timings: PhaseTimings,
+    /// How this attempt ended; anything but a completed small delta keeps
+    /// the one-minute floor.
+    outcome: KernelReplayOutcome,
+    /// `staged` or `in_place`, and why a small delta was not applied in place.
+    path: &'static str,
+    in_place_skip: Option<&'static str>,
+}
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelReplayOutcome {
+    /// Dropped without a verdict: an error or refusal part-way through.
+    Failed,
+    /// A delta over the small-delta cap completed.
+    CompletedLarge,
+    /// A delta within the small-delta cap completed.
+    CompletedSmall,
+}
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+impl KernelReplayOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::CompletedLarge => "completed_large",
+            Self::CompletedSmall => "completed_small",
+        }
+    }
 }
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 impl<'a> KernelReplayCooldown<'a> {
-    fn start(controller: &'a StandbyRefreshController) -> Result<Self> {
+    fn start(controller: &'a StandbyRefreshController, timings: PhaseTimings) -> Result<Self> {
+        // The attempt marks itself resting before it begins, so a crash
+        // part-way through still leaves the floor in place.
         controller.defer_kernel_replay(Duration::ZERO)?;
         Ok(Self {
             controller,
             started: std::time::Instant::now(),
+            timings,
+            outcome: KernelReplayOutcome::Failed,
+            path: "staged",
+            in_place_skip: None,
         })
+    }
+
+    fn complete(&mut self, small: bool) {
+        self.outcome = if small {
+            KernelReplayOutcome::CompletedSmall
+        } else {
+            KernelReplayOutcome::CompletedLarge
+        };
     }
 }
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 impl Drop for KernelReplayCooldown<'_> {
     fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        let floor = if self.outcome == KernelReplayOutcome::CompletedSmall {
+            Duration::ZERO
+        } else {
+            KERNEL_REPLAY_FLOOR
+        };
+        // Display-only: a staged attempt with no recorded skip reason means
+        // the flag is off, so name it for counting. Recorded state keeps
+        // `in_place_skip` as `None` there; only this log line carries the
+        // `in_place_disabled` reason.
+        let logged_skip = self.in_place_skip.unwrap_or(if self.path == "staged" {
+            "in_place_disabled"
+        } else {
+            ""
+        });
+        tracing::info!(
+            target: "native_ce::standby::kernel_delta",
+            outcome = self.outcome.label(),
+            path = self.path,
+            in_place_skip = logged_skip,
+            replay_ms = elapsed.as_millis() as u64,
+            phases = %self.timings.to_json(),
+            "kernel-v2 delta attempt finished"
+        );
         if self
             .controller
-            .defer_kernel_replay(self.started.elapsed())
+            .write_kernel_replay(
+                elapsed,
+                floor,
+                self.outcome.label(),
+                self.path,
+                self.in_place_skip,
+                &self.timings,
+            )
             .is_err()
         {
             tracing::warn!("kernel replay cooldown persistence failed");
@@ -1231,6 +1919,11 @@ impl Drop for KernelReplayCooldown<'_> {
 }
 
 impl StandbyRefreshController {
+    #[cfg(test)]
+    pub(crate) fn set_pending_observer_for_test(&mut self, hints: RefreshHints) {
+        self.pending_observer = hints;
+    }
+
     /// Deliberately acquire ONE full snapshot without delta fallback, admission
     /// or pruning. Network acquisition retains its existing bounded transport,
     /// credential rotation, manifest binding and digest checks. Expensive
@@ -1283,6 +1976,8 @@ impl StandbyRefreshController {
     /// [`StandbyDeltaOutcome::FullRefreshRequired`]. Network and authentication
     /// failures are errors, not reasons to take a whole snapshot.
     pub async fn refresh_delta_only(&self) -> Result<StandbyDeltaOutcome> {
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        self.apply_audit_policy();
         let _verification_retry = self.store.retry_verification_after_refresh(&self.observed);
         // Never overlap the built-in refresh daemon or another attempt.
         let controller_lock = open_private_lock(&self.refresh_dir.join("controller.lock"))?;
@@ -1353,7 +2048,8 @@ impl StandbyRefreshController {
                 head_act,
             },
             DeltaAttempt::Deferred { reason, .. } => StandbyDeltaOutcome::Deferred { reason },
-            DeltaAttempt::FallBackToSnapshot(diagnostic) => {
+            DeltaAttempt::FallBackToSnapshot(diagnostic)
+            | DeltaAttempt::ShapeTransition(diagnostic) => {
                 StandbyDeltaOutcome::FullRefreshRequired {
                     reason: diagnostic.class,
                 }
@@ -1370,24 +2066,53 @@ impl StandbyRefreshController {
         store: GenerationStore,
         observed: ObservedInstalledConsumerIdentity,
     ) -> Result<Self> {
+        Self::new_with_install_key(runtime, config, store, observed, None)
+    }
+
+    fn new_with_install_key(
+        runtime: StandbyRuntimeConfig,
+        config: StandbyRefreshConfig,
+        store: GenerationStore,
+        observed: ObservedInstalledConsumerIdentity,
+        install_key: Option<crate::node_credential::InstallKey>,
+    ) -> Result<Self> {
         runtime.validate()?;
         config.validate()?;
         let refresh_dir = runtime.replica_root.join("refresh");
         create_private_directory(&refresh_dir)?;
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        store.set_audit_interval(config.audit_interval());
+        let pending_observer = RefreshHints::default();
+        let mut client = HttpSnapshotPageClient::new()?;
+        client.compatibility = pending_observer.compatibility();
+        client.install_key = install_key.clone();
+        let mut binary_client = binary::HttpBinarySnapshotClient::new()?;
+        binary_client.compatibility = pending_observer.compatibility();
+        binary_client.install_key = install_key.clone();
         Ok(Self {
+            install_key,
+            #[cfg(test)]
+            attempt_timeout: None,
+            pending_observer,
             runtime,
             config,
             store,
             observed,
+            route_kernel_v2: std::sync::atomic::AtomicBool::new(false),
             refresh_dir,
-            client: Arc::new(HttpSnapshotPageClient::new()?),
-            binary_client: Arc::new(binary::HttpBinarySnapshotClient::new()?),
+            busy_backoff: std::sync::Mutex::new(BusyExportBackoff::default()),
+            follow_heartbeat: Arc::new(FollowHeartbeat::new()),
+            proof_audit: std::sync::Mutex::new(ProofAudit::default()),
+            client: Arc::new(client),
+            binary_client: Arc::new(binary_client),
             binary_snapshot_enabled: true,
             delta_enabled: true,
             #[cfg(test)]
             transfer_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             kernel_available_space: None,
+            #[cfg(test)]
+            kernel_in_place_crash: None,
         })
     }
 
@@ -1431,11 +2156,58 @@ impl StandbyRefreshController {
         self.request_refresh(RefreshCause::Manual)
     }
 
+    /// Whether the daemon must skip starting attempts: hosted plausibly still
+    /// runs a delta export for this account, so a fresh start would only hit
+    /// the same busy lease. The durable triggers stay in place and fire once
+    /// the hold lapses.
+    fn busy_backoff_active(&self) -> bool {
+        self.busy_backoff.lock().is_ok_and(|backoff| {
+            backoff
+                .until
+                .is_some_and(|until| tokio::time::Instant::now() < until)
+        })
+    }
+
+    /// Hold fresh starts for a short bounded backoff: hosted's `retry-after`
+    /// hint when it sent one, else a few seconds, doubling toward the cap on
+    /// consecutive busy failures. Never persisted and never a read block —
+    /// the node keeps serving its last copy throughout.
+    fn note_busy_export(&self, retry_after: Option<Duration>) {
+        let base = retry_after.unwrap_or(EXPORT_BUSY_BASE_BACKOFF);
+        let Ok(mut backoff) = self.busy_backoff.lock() else {
+            return;
+        };
+        let shift = backoff.consecutive.min(5);
+        let delay = base
+            .saturating_mul(1 << shift)
+            .min(EXPORT_BUSY_MAX_BACKOFF)
+            .max(Duration::from_secs(1));
+        backoff.consecutive = backoff.consecutive.saturating_add(1);
+        backoff.until = Some(tokio::time::Instant::now() + delay);
+    }
+
+    /// A non-busy outcome means hosted answered: drop any busy hold.
+    fn clear_busy_export(&self) {
+        if let Ok(mut backoff) = self.busy_backoff.lock() {
+            *backoff = BusyExportBackoff::default();
+        }
+    }
+
+    /// How long the busy-export hold still has to run, if armed. Lock-only:
+    /// no filesystem or clock work beyond reading the deadline.
+    fn busy_backoff_remaining(&self) -> Option<Duration> {
+        self.busy_backoff.lock().ok().and_then(|backoff| {
+            backoff
+                .until
+                .map(|until| until.saturating_duration_since(tokio::time::Instant::now()))
+        })
+    }
+
     /// Durable, payload-free trigger seam for wake/network recovery and the
     /// future admitted-write hook. All causes coalesce while one attempt runs.
     pub fn request_refresh(&self, cause: RefreshCause) -> Result<bool> {
         let lock = open_private_lock(&self.refresh_dir.join("trigger.lock"))?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, LOCK_WAIT_TIMEOUT)?;
         let mut pending = self.read_pending_triggers().unwrap_or_default();
         let inserted = !pending.causes.contains(&cause);
         if inserted {
@@ -1492,8 +2264,11 @@ impl StandbyRefreshController {
         &self,
         cause: RefreshCause,
     ) -> std::result::Result<StandbyRefreshOutcome, RefreshAttemptFailure> {
-        self.refresh_once_receipt_with_timeout(cause, ATTEMPT_TIMEOUT)
-            .await
+        #[cfg(test)]
+        let timeout = self.attempt_timeout.unwrap_or(ATTEMPT_TIMEOUT);
+        #[cfg(not(test))]
+        let timeout = ATTEMPT_TIMEOUT;
+        self.refresh_once_receipt_with_timeout(cause, timeout).await
     }
 
     /// One-shot CLI scheduling boundary: daemon-lock/recovery and trigger
@@ -1503,20 +2278,27 @@ impl StandbyRefreshController {
         cause: RefreshCause,
     ) -> std::result::Result<StandbyRefreshOutcome, RefreshAttemptFailure> {
         let mut progress = AttemptProgress::new(cause);
+        let span = tracing::info_span!(target: "native_ce::standby::transport",
+            "standby_refresh", attempt_id = %progress.receipt.attempt_id, cause = ?cause);
         let result = async {
             if let Some(_guard) = self.try_acquire_daemon()? {
                 self.refresh_once_inner(cause, ATTEMPT_TIMEOUT, &mut progress)
                     .await
             } else {
                 let coalesced = !self.request_refresh(cause)?;
+                tracing::info!(
+                    target: FOLLOW_LOG_TARGET,
+                    cause = ?cause,
+                    coalesced,
+                    "standby refresh coalesced: the daemon holds the acquisition, so this caller is represented by its attempt"
+                );
                 Ok(StandbyRefreshOutcome::Accepted { coalesced })
             }
         }
+        .instrument(span)
         .await;
         result.map_err(|source| {
-            if !progress.diagnosed {
-                progress.receipt.emit();
-            }
+            progress.diagnose_boundary(&source);
             RefreshAttemptFailure {
                 receipt: Box::new(progress.receipt),
                 source,
@@ -1530,12 +2312,13 @@ impl StandbyRefreshController {
         timeout: Duration,
     ) -> std::result::Result<StandbyRefreshOutcome, RefreshAttemptFailure> {
         let mut progress = AttemptProgress::new(cause);
+        let span = tracing::info_span!(target: "native_ce::standby::transport",
+            "standby_refresh", attempt_id = %progress.receipt.attempt_id, cause = ?cause);
         self.refresh_once_inner(cause, timeout, &mut progress)
+            .instrument(span)
             .await
             .map_err(|source| {
-                if !progress.diagnosed {
-                    progress.receipt.emit();
-                }
+                progress.diagnose_boundary(&source);
                 RefreshAttemptFailure {
                     receipt: Box::new(progress.receipt),
                     source,
@@ -1556,6 +2339,12 @@ impl StandbyRefreshController {
                 return Err(error.into());
             }
             let coalesced = !self.request_refresh(cause)?;
+            tracing::info!(
+                target: FOLLOW_LOG_TARGET,
+                cause = ?cause,
+                coalesced,
+                "standby refresh coalesced: another holder owns the attempt, so this caller is represented by its acquisition"
+            );
             return Ok(StandbyRefreshOutcome::Accepted { coalesced });
         }
 
@@ -1589,22 +2378,29 @@ impl StandbyRefreshController {
         self.write_state(&state)?;
 
         let _activity = transfer_progress::AttemptActivity::new(self, progress.receipt.attempt_id);
+        let _pending = crate::async_diagnostics::Pending::new("refresh.attempt");
 
         // The attempt includes snapshot import and delta verification. Keep its
         // state on the heap instead of enlarging every refresh/daemon caller.
-        let outcome = match tokio::time::timeout(
-            timeout,
-            Box::pin(self.run_attempt(cause, progress)),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => {
+        let result = {
+            let attempt =
+                tokio::time::timeout(timeout, Box::pin(self.run_attempt(cause, progress)));
+            tokio::pin!(attempt);
+            tokio::select! {
+                result = &mut attempt => result.ok(),
+                _ = self.follow_heartbeat.expired.notified() => None,
+            }
+        };
+        let outcome = match result {
+            Some(outcome) => outcome,
+            None => {
                 let error = AttemptError::new(
                     RefreshFailureClass::Timeout,
                     "standby refresh attempt exceeded its time bound",
                     Error::engine("standby refresh attempt timed out"),
-                );
+                )
+                .with_detail("attempt_timeout")
+                .with_check("attempt_timeout");
                 Err(error)
             }
         };
@@ -1653,6 +2449,7 @@ impl StandbyRefreshController {
                 // Best effort: a missed marker only delays the next repair.
                 let _ = self.record_full_outcome(true);
                 state.consecutive_failure_count = 0;
+                self.clear_busy_export();
                 state.last_failure_class = None;
                 state.last_failure = None;
                 set_delta_fallback(&mut state, delta_fallback);
@@ -1673,6 +2470,7 @@ impl StandbyRefreshController {
                     Some(generation.manifest.snapshot_completed_at.clone());
                 state.frontier = Some(generation.manifest.frontier.clone());
                 state.consecutive_failure_count = 0;
+                self.clear_busy_export();
                 state.last_failure_class = None;
                 state.last_failure = None;
                 set_delta_fallback(&mut state, None);
@@ -1689,6 +2487,7 @@ impl StandbyRefreshController {
             }) => {
                 state.last_deferral = Some(reason.into());
                 state.next_full_refresh_eligible_at = progress.full_eligible_at.clone();
+                self.clear_busy_export();
                 set_delta_fallback(&mut state, delta_fallback);
                 self.write_state(&state)?;
                 Ok(StandbyRefreshOutcome::Deferred {
@@ -1704,6 +2503,7 @@ impl StandbyRefreshController {
                     Some(generation.manifest.snapshot_completed_at.clone());
                 state.frontier = Some(generation.manifest.frontier.clone());
                 state.consecutive_failure_count = 0;
+                self.clear_busy_export();
                 state.last_failure_class = None;
                 state.last_failure = None;
                 set_delta_fallback(&mut state, None);
@@ -1713,7 +2513,26 @@ impl StandbyRefreshController {
                 })
             }
             Err(error) => {
-                state.consecutive_failure_count = state.consecutive_failure_count.saturating_add(1);
+                // A busy hosted export is routine scheduling, not a fault:
+                // keep the trigger and back off, and leave the failure count
+                // alone so status never reads it as an outage. A poll this
+                // node gave up on while hosted may still run it still counts:
+                // a five-minute patience expiring is genuinely ambiguous.
+                if error.class == RefreshFailureClass::Throttled
+                    && error.detail == EXPORT_BUSY_DETAIL
+                {
+                    self.note_busy_export(error.retry_after);
+                    let _ = self.request_refresh(cause);
+                } else {
+                    state.consecutive_failure_count =
+                        state.consecutive_failure_count.saturating_add(1);
+                    if error.detail == EXPORT_CAPTURE_TIMEOUT_DETAIL {
+                        self.note_busy_export(None);
+                        let _ = self.request_refresh(cause);
+                    } else {
+                        self.clear_busy_export();
+                    }
+                }
                 state.last_failure_class = Some(error.class);
                 state.last_failure = Some(error.safe_message.into());
                 set_delta_fallback(&mut state, error.delta_fallback);
@@ -1750,28 +2569,46 @@ impl StandbyRefreshController {
     /// attempt produces one immediate follow-up, never a catch-up burst.
     pub async fn run_daemon_after_startup(
         &self,
+        guard: StandbyRefreshDaemonGuard,
+        shutdown: watch::Receiver<bool>,
+    ) {
+        // The required audit is its own schedule, on the same tick source: an
+        // attempt that sits in a download, a delta, a disk-space deferral or a
+        // cooldown never delays it, and it never delays an attempt.
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        let audit = crate::async_diagnostics::track(
+            "refresh.audit_loop",
+            self.run_audit_loop(shutdown.clone()),
+        );
+        #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+        let audit = async {};
+        tokio::join!(self.run_follow_loop(guard, shutdown), audit);
+    }
+
+    async fn run_follow_loop(
+        &self,
         _guard: StandbyRefreshDaemonGuard,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let mut poll = tokio::time::interval(MANUAL_POLL_INTERVAL);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let interval = Duration::from_secs(
-            self.config
-                .refresh_interval_seconds
-                .unwrap_or(super::status::STANDBY_REFRESH_INTERVAL_SECONDS),
-        );
+        let interval = refresh_cadence(&self.config);
         let mut scheduled = tokio::time::Instant::now() + interval;
         let mut startup_pending = true;
         let mut last_monotonic = tokio::time::Instant::now();
         let mut last_wall = SystemTime::now();
         let mut network_probe_at = None;
+        // Scheduler-health bookkeeping only: loop-local Instants and a latch,
+        // never persisted, so older builds keep parsing state strictly.
+        let mut last_attempt_start: Option<tokio::time::Instant> = None;
+        let mut stall_warned = false;
+        let mut last_busy_skip_log: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { break; }
                 }
                 _ = poll.tick() => {
-                    let pending = self.take_pending_triggers().unwrap_or_default();
                     let now = tokio::time::Instant::now();
                     let wall = SystemTime::now();
                     let monotonic_elapsed = now.saturating_duration_since(last_monotonic);
@@ -1779,8 +2616,45 @@ impl StandbyRefreshController {
                     let woke = elapsed_indicates_wake(wall_elapsed, monotonic_elapsed);
                     last_monotonic = now;
                     last_wall = wall;
+                    // The loop is alive on this tick even when it starts
+                    // nothing: stamp first so the watchdog only fires on a
+                    // genuinely parked scheduler.
+                    self.follow_heartbeat.note_tick();
+                    if self.busy_backoff_active() {
+                        // Hosted plausibly still runs an export for this
+                        // account: leave the durable triggers in place and
+                        // retry after the backoff instead of firing a fresh
+                        // start into the same busy lease.
+                        if busy_skip_log_due(now, last_busy_skip_log, interval) {
+                            last_busy_skip_log = Some(now);
+                            tracing::info!(
+                                target: FOLLOW_LOG_TARGET,
+                                hold_remaining_secs =
+                                    self.busy_backoff_remaining().map(|left| left.as_secs()),
+                                "standby follow loop skipping tick while the busy-export hold is active; durable triggers stay queued"
+                            );
+                        }
+                        continue;
+                    }
+                    if !stall_warned {
+                        if let Some(stall) =
+                            follow_loop_stall_report(now, last_attempt_start, scheduled, interval)
+                        {
+                            stall_warned = true;
+                            tracing::warn!(
+                                target: FOLLOW_LOG_TARGET,
+                                idle_secs = stall.idle.as_secs(),
+                                scheduled_overdue_secs = stall.scheduled_overdue.as_secs(),
+                                "standby follow loop resumed after {}s without starting an attempt; scheduled deadline {}s overdue, hosted may be ahead",
+                                stall.idle.as_secs(),
+                                stall.scheduled_overdue.as_secs()
+                            );
+                        }
+                    }
+                    let pending = self.take_pending_triggers().unwrap_or_default();
 
-                    let network_failed = self.state().ok().is_some_and(|state| {
+                    let state_snapshot = self.state().ok();
+                    let network_failed = state_snapshot.as_ref().is_some_and(|state| {
                         state.last_failure_class == Some(RefreshFailureClass::Network)
                     });
                     if network_failed {
@@ -1805,7 +2679,19 @@ impl StandbyRefreshController {
                     if let Some(cause) = cause {
                         // Extra causes in the same set are intentionally
                         // represented by this one acquisition.
-                        let attempt = self.refresh_once(cause);
+                        last_attempt_start = Some(now);
+                        stall_warned = false;
+                        self.follow_heartbeat.note_attempt_start();
+                        tracing::info!(
+                            target: FOLLOW_LOG_TARGET,
+                            cause = ?cause,
+                            previous_attempt_at = state_snapshot
+                                .as_ref()
+                                .and_then(|state| state.last_attempt_at.as_deref())
+                                .unwrap_or("never"),
+                            "standby follow loop starting refresh attempt"
+                        );
+                        let attempt = crate::async_diagnostics::track("refresh.scheduled_attempt", self.refresh_once(cause));
                         tokio::pin!(attempt);
                         tokio::select! {
                             _ = &mut attempt => {}
@@ -1818,6 +2704,36 @@ impl StandbyRefreshController {
                         let completed = tokio::time::Instant::now();
                         scheduled =
                             next_scheduled_deadline(scheduled, now, completed, cause, interval);
+                        let attempt_took = completed.saturating_duration_since(now);
+                        if cause == RefreshCause::Scheduled {
+                            let attempt_started_at =
+                                chrono::DateTime::<chrono::Utc>::from(wall)
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                            tracing::info!(
+                                target: FOLLOW_LOG_TARGET,
+                                last_attempt_at = %attempt_started_at,
+                                next_deadline_in_secs =
+                                    scheduled.saturating_duration_since(completed).as_secs(),
+                                attempt_secs = attempt_took.as_secs(),
+                                "standby follow loop scheduler alive: scheduled attempt finished, next deadline anchored"
+                            );
+                        } else {
+                            tracing::info!(
+                                target: FOLLOW_LOG_TARGET,
+                                cause = ?cause,
+                                attempt_secs = attempt_took.as_secs(),
+                                "standby follow loop finished refresh attempt"
+                            );
+                        }
+                        if attempt_took > stall_warn_after(interval) {
+                            tracing::warn!(
+                                target: FOLLOW_LOG_TARGET,
+                                cause = ?cause,
+                                attempt_secs = attempt_took.as_secs(),
+                                "standby follow loop attempt ran well over its cadence; ticks were parked while it ran"
+                            );
+                        }
+                        self.follow_heartbeat.note_attempt_end();
                         if cause == RefreshCause::NetworkRecovery {
                             network_probe_at = Some(
                                 tokio::time::Instant::now() + NETWORK_RECOVERY_PROBE_INTERVAL,
@@ -1829,10 +2745,162 @@ impl StandbyRefreshController {
         }
     }
 
+    /// Make the store agree with this config about whether audits are
+    /// required: the status provider that gates serving reads the store.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn apply_audit_policy(&self) {
+        self.store.set_audit_interval(self.config.audit_interval());
+    }
+
+    /// Run the required audit of the current generation once, now. `Ok(None)`
+    /// when none is required or the copy needs none (a staged or immutable
+    /// generation); an infrastructure error is returned and recorded nowhere.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn audit_once(
+        &self,
+    ) -> Result<Option<super::generation_store::kernel_in_place::audit::AuditResult>> {
+        use super::generation_store::kernel_in_place::audit::AuditResult;
+        self.apply_audit_policy();
+        if self.config.audit_interval().is_none() {
+            return Ok(None);
+        }
+        let Some(current) = self.store.current_for_head_probe()? else {
+            return Ok(None);
+        };
+        Ok(
+            match self
+                .store
+                .run_required_audit(&current, &self.observed)
+                .await?
+            {
+                AuditResult::NotApplicable => None,
+                other => Some(other),
+            },
+        )
+    }
+
+    /// How long until the current generation's next audit is due: the last
+    /// verdict's snapshot time plus the interval, floored at one second.
+    ///
+    /// Zero (due now) when this process has observed no audit success for the
+    /// current generation (a restart, or a new generation), when no at-rest
+    /// record exists yet, or when a passed at-rest record was written under a
+    /// different receipts DDL than the database now carries (an upgrade
+    /// rewrote the chain). The wall-clock record is never used to seed the
+    /// in-memory observation. A copy whose latest verdict is a failure keeps
+    /// the ordinary schedule: it is waiting for a whole snapshot, not for
+    /// another audit.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn next_audit_delay(&self, interval: Duration) -> Duration {
+        let Some(current) = self.store.current_for_head_probe().ok().flatten() else {
+            return interval;
+        };
+        let advanced = current.manifest.kernel_v2.is_some()
+            && self
+                .store
+                .generation_head(&current.id)
+                .ok()
+                .flatten()
+                .is_some_and(|head| head.advanced_in_place());
+        if !advanced {
+            return interval;
+        }
+        let audit = self.store.generation_audit(&current.id);
+        let at_rest = self.store.generation_at_rest(&current.id);
+        let failed = audit.as_ref().is_some_and(|record| !record.passed())
+            || at_rest.as_ref().is_some_and(|record| !record.passed());
+        if !failed {
+            let unobserved = self.store.audit_last_success(&current.id).is_none();
+            let ddl_changed = match &at_rest {
+                None => true,
+                Some(record) => self
+                    .store
+                    .database_receipts_ddl(&current)
+                    .await
+                    .is_some_and(|ddl| ddl.label() != record.receipts_ddl),
+            };
+            if unobserved || ddl_changed {
+                return Duration::ZERO;
+            }
+        }
+        let delay = match audit {
+            None => Duration::ZERO,
+            Some(record) => {
+                let age = record.acquired().map_or(u64::MAX, |at| {
+                    u64::try_from(chrono::Utc::now().signed_duration_since(at).num_seconds())
+                        .unwrap_or(0)
+                });
+                interval.saturating_sub(Duration::from_secs(age))
+            }
+        };
+        delay.max(Duration::from_secs(1))
+    }
+
+    /// Audit every N minutes until shutdown, and at once after a start or a
+    /// receipts-DDL change. After an infrastructure error it retries with
+    /// backoff (10 s doubling, capped at five minutes and at the interval); the
+    /// deadline keeps running meanwhile, because only a success moves the
+    /// record. An "at once" audit that leaves the copy still due at once (the
+    /// record could not advance) is not repeated back to back.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    async fn run_audit_loop(&self, mut shutdown: watch::Receiver<bool>) {
+        let mut failures = 0_u32;
+        let mut last_was_immediate = false;
+        loop {
+            self.apply_audit_policy();
+            let Some(interval) = self.config.audit_interval() else {
+                // Audits are not required: nothing to schedule.
+                let _ = shutdown.changed().await;
+                return;
+            };
+            let mut immediate = false;
+            let delay = if failures == 0 {
+                let due = self.next_audit_delay(interval).await;
+                immediate = due.is_zero();
+                if immediate && last_was_immediate {
+                    Duration::from_secs(60).min(interval)
+                } else {
+                    due
+                }
+            } else {
+                Duration::from_secs(10)
+                    .saturating_mul(1 << failures.saturating_sub(1).min(5))
+                    .min(Duration::from_secs(300))
+                    .min(interval)
+            };
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            match self.audit_once().await {
+                Ok(_) => {
+                    failures = 0;
+                    last_was_immediate = immediate;
+                }
+                Err(_) => {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(
+                        target: "native_ce::standby::audit",
+                        failures,
+                        "required audit hit an infrastructure error; retrying with backoff"
+                    );
+                }
+            }
+        }
+    }
+
     fn record_full_start(
         &self,
         progress: &mut AttemptProgress,
     ) -> std::result::Result<(), AttemptError> {
+        if progress.transition {
+            self.consume_transition_attempt().map_err(local_io)?;
+        }
         progress.full_started_at = Some(now());
         let mut state = self.state().map_err(local_io)?;
         state.last_full_refresh_at = progress.full_started_at.clone();
@@ -1859,7 +2927,23 @@ impl StandbyRefreshController {
         let probe_base = self.store.current_for_head_probe().ok().flatten();
         if self.delta_enabled {
             if let Some(current) = probe_base.clone() {
-                match self.try_delta_attempt(&bearer, current).await? {
+                match tokio::time::timeout(
+                    FOLLOW_ATTEMPT_TIMEOUT,
+                    crate::async_diagnostics::track(
+                        "refresh.follow_delta",
+                        self.try_delta_attempt(&bearer, current),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    AttemptError::new(
+                        RefreshFailureClass::Timeout,
+                        "standby following attempt exceeded its time bound",
+                        Error::engine("standby following attempt timed out"),
+                    )
+                    .with_detail("attempt_timeout")
+                    .with_check("attempt_timeout")
+                })?? {
                     DeltaAttempt::Advanced {
                         generation,
                         head_act,
@@ -1881,6 +2965,10 @@ impl StandbyRefreshController {
                     }
                     DeltaAttempt::FallBackToSnapshot(diagnostic) => {
                         delta_fallback = Some(diagnostic)
+                    }
+                    DeltaAttempt::ShapeTransition(diagnostic) => {
+                        progress.transition = true;
+                        delta_fallback = Some(diagnostic);
                     }
                     DeltaAttempt::Paused(generation, reason) => {
                         return Ok(AttemptSuccess::Deferred {
@@ -1943,8 +3031,12 @@ impl StandbyRefreshController {
         // without consuming capture budget; a gone handle was already
         // cleared, so the ordinary gate decides between deferral and one
         // fresh export. Other poll failures return through existing paths.
+        progress.resume_observation = None;
         let resume_live = match self.probe_binary_resume().await {
-            Ok(binary::ResumeProbe::Live) => true,
+            Ok(binary::ResumeProbe::Live(observation)) => {
+                progress.resume_observation = Some(*observation);
+                true
+            }
             Ok(binary::ResumeProbe::Absent) | Ok(binary::ResumeProbe::Gone) => false,
             Err(error) => return Err(error),
         };
@@ -1954,6 +3046,25 @@ impl StandbyRefreshController {
         // A first install is never held back, but its start is recorded too.
         // Compute new-capture eligibility independently of handle liveness.
         let capture_allowed = {
+            // Only this attempt's observed edge grants the exception. Retain
+            // the durable budget receipt through a hosted reversion so head
+            // churn cannot refill the cap; the receipt grants no exception.
+            if progress.transition {
+                if let Some(current) = probe_base.as_ref() {
+                    if let Some(eligible) = self.transition_eligible(current).map_err(local_io)? {
+                        if eligible > chrono::Utc::now().timestamp_millis() && !resume_live {
+                            progress.full_eligible_at =
+                                chrono::DateTime::from_timestamp_millis(eligible)
+                                    .map(|date| date.to_rfc3339());
+                            return Ok(AttemptSuccess::Deferred {
+                                generation: current.clone(),
+                                reason: "shape_transition_backoff",
+                                delta_fallback,
+                            });
+                        }
+                    }
+                }
+            }
             let state = self.state().map_err(local_io)?;
             let repair = delta_fallback.is_some_and(|diagnostic| {
                 matches!(
@@ -1961,7 +3072,9 @@ impl StandbyRefreshController {
                     DeltaFallbackClass::AuditFailed | DeltaFallbackClass::ConsumerChanged
                 )
             });
-            let bypass = cause == RefreshCause::Manual || (repair && !self.last_full_failed());
+            let bypass = cause == RefreshCause::Manual
+                || progress.transition
+                || (repair && !self.last_full_failed());
             let ordinary_minimum = self
                 .config
                 .full_refresh_min_interval_seconds
@@ -2061,6 +3174,9 @@ impl StandbyRefreshController {
                 None => error,
             })?,
         };
+        if self.complete_transition(&generation).is_err() {
+            tracing::warn!(target: "native_ce::standby::refresh", "receiver transition cleanup deferred");
+        }
         Ok(AttemptSuccess::Installed {
             generation,
             retention_warnings,
@@ -2076,17 +3192,30 @@ impl StandbyRefreshController {
         &self,
         bearer: &str,
     ) -> std::result::Result<Option<&'static str>, AttemptError> {
-        let transport = AuthorityActTransport::new(
+        let transport = AuthorityActTransport::new_with_install_key(
             &self.config.hosted_origin,
             &self.runtime.hosted_route_database_id,
             &self.runtime.origin_database_id,
             bearer,
+            self.pending_observer.compatibility(),
+            self.install_key.clone(),
         )
         .map_err(classify_delta_transport_error)?;
-        match transport.head().await {
-            Ok(head) => Ok(head.refresh_pause_reason()),
+        match crate::async_diagnostics::track("refresh.hosted_head", transport.head()).await {
+            Ok(head) => {
+                self.route_kernel_v2.store(
+                    head.head().is_kernel_v2(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(head.refresh_pause_reason())
+            }
             Err(error) if crate::standby::is_revision_unsupported(&error) => {
                 Ok(Some(DEFERRED_REVISION_UNSUPPORTED))
+            }
+            Err(Error::Engine(detail))
+                if detail == crate::client_compatibility::UPDATE_REQUIRED =>
+            {
+                Err(classify_delta_transport_error(Error::Engine(detail)))
             }
             Err(error) if self.delta_enabled => Err(classify_delta_transport_error(error)),
             Err(_) => Ok(None),
@@ -2101,22 +3230,35 @@ impl StandbyRefreshController {
         // Conservative freshness boundary: sampled before the hosted probe.
         let synced_at = now();
         // Observe hosted compatibility before any local fallback can request FULL.
-        let transport = AuthorityActTransport::new(
+        let transport = AuthorityActTransport::new_with_install_key(
             &self.config.hosted_origin,
             &self.runtime.hosted_route_database_id,
             &self.runtime.origin_database_id,
             bearer,
+            self.pending_observer.compatibility(),
+            self.install_key.clone(),
         )
         .map_err(classify_delta_transport_error)?;
-        let remote_head = match transport.head().await {
-            Ok(head) => head,
-            // An unreadable interchange revision pauses following here: it
-            // must never become a HeadCompatibility whole-snapshot fallback.
-            Err(error) if crate::standby::is_revision_unsupported(&error) => {
-                return Ok(DeltaAttempt::Paused(current, DEFERRED_REVISION_UNSUPPORTED))
-            }
-            Err(error) => return Err(classify_delta_transport_error(error)),
-        };
+        let remote_head =
+            match crate::async_diagnostics::track("refresh.hosted_head", transport.head()).await {
+                Ok(head) => head,
+                Err(Error::Engine(reason)) if reason == super::shapes::UNSUPPORTED => {
+                    return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                        class: DeltaFallbackClass::HeadCompatibility,
+                        message: "hosted receiver shape is unknown; a whole snapshot is required",
+                    }));
+                }
+                // An unreadable interchange revision pauses following here: it
+                // must never become a HeadCompatibility whole-snapshot fallback.
+                Err(error) if crate::standby::is_revision_unsupported(&error) => {
+                    return Ok(DeltaAttempt::Paused(current, DEFERRED_REVISION_UNSUPPORTED))
+                }
+                Err(error) => return Err(classify_delta_transport_error(error)),
+            };
+        self.route_kernel_v2.store(
+            remote_head.head().is_kernel_v2(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(reason) = remote_head.refresh_pause_reason() {
             return Ok(DeltaAttempt::Paused(current, reason));
         }
@@ -2126,11 +3268,73 @@ impl StandbyRefreshController {
                 message: "upstream engine changed; a fresh generation is required",
             }));
         }
+        if let super::delta_transport::AuthorityHead::KernelV2(remote) = remote_head.head() {
+            if current.manifest.kernel_v2.as_ref().is_some_and(|local| {
+                local.schema_sha256 != remote.generation.schema_sha256
+                    || local.reader_format != remote.generation.reader_format
+            }) {
+                if let (Some(from), Some(to)) = (
+                    super::shapes::manifest(&current.manifest),
+                    super::shapes::v2(
+                        remote.generation.reader_format,
+                        &remote.generation.schema_sha256,
+                    ),
+                ) {
+                    if super::shapes::follows(from, to) {
+                        self.observe_transition(from, to).map_err(local_io)?;
+                        return Ok(DeltaAttempt::ShapeTransition(DeltaFallbackDiagnostic {
+                            class: DeltaFallbackClass::HeadCompatibility,
+                            message: "receiver shape changed; a staged whole snapshot is required",
+                        }));
+                    }
+                }
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::HeadCompatibility,
+                    message: "receiver shape changed; a staged whole snapshot is required",
+                }));
+            }
+        }
+        if let Some(selected) = transport.selected_shapes().0 {
+            if let (Some(from), Some(to)) = (
+                super::shapes::manifest(&current.manifest),
+                super::shapes::lookup(&selected),
+            ) {
+                if from.shape() != to.shape() {
+                    if super::shapes::follows(from, to) {
+                        self.observe_transition(from, to).map_err(local_io)?;
+                        return Ok(DeltaAttempt::ShapeTransition(DeltaFallbackDiagnostic {
+                            class: DeltaFallbackClass::HeadCompatibility,
+                            message: "receiver shape changed; a staged whole snapshot is required",
+                        }));
+                    }
+                    return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                        class: DeltaFallbackClass::HeadCompatibility,
+                        message: "receiver shape changed; a staged whole snapshot is required",
+                    }));
+                }
+            }
+        }
+        // New v1 dialects require an explicit authenticated selection even for
+        // an equal-head probe. A missing signal cannot refresh a95 copy's age
+        // or become a legacy94 fallback merely because no rows changed.
+        if current.manifest.kernel_v2.is_none()
+            && super::shapes::manifest(&current.manifest).is_some_and(|entry| {
+                entry.observation_envelope
+                    && transport.selected_shapes().0.as_ref() != Some(&entry.shape())
+            })
+        {
+            return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::HeadCompatibility,
+                message: "receiver dialect requires explicit shape selection; a whole snapshot is required",
+            }));
+        }
         // A same-format replacement can re-verify and bind the existing copy
         // locally. Any format/evidence failure keeps the consumer_changed FULL.
+        // The serving copy is re-bound without a whole-file pass when it
+        // qualifies for trust at rest; anything else runs every check.
         if let Err(error) = self
             .store
-            .ensure_consumer_binding(&current.id, &self.observed)
+            .ensure_consumer_binding_depth(&current.id, &self.observed, true)
             .await
         {
             if super::generation_store::audit_infrastructure_error(&error) {
@@ -2176,7 +3380,7 @@ impl StandbyRefreshController {
         {
             // An interrupted delta left its rollback journal. Opening the
             // writer rolls it back before the read-only head probe below.
-            match self.store.open_head_writer(&current).await {
+            match crate::async_diagnostics::track("refresh.open_writer", self.store.open_head_writer(&current)).await {
                 Ok(Some(writer)) => writer.close().await,
                 _ => {
                     return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
@@ -2189,9 +3393,15 @@ impl StandbyRefreshController {
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         if let super::delta_transport::AuthorityHead::KernelV2(remote) = remote_head.head() {
-            return self
+            let attempt = self
                 .try_kernel_delta(&transport, current, remote, &synced_at)
                 .await;
+            // A copy that could not take its delta is trouble: the next follow
+            // carries the projection proof (a whole snapshot is on its way).
+            if matches!(attempt, Ok(DeltaAttempt::FallBackToSnapshot(_))) {
+                self.proof_audit.lock().expect("proof audit").trouble = true;
+            }
+            return attempt;
         }
         let local_head = match read_authority_act_head_from_path(&current.snapshot_path).await {
             Ok(head) => head,
@@ -2244,7 +3454,7 @@ impl StandbyRefreshController {
         // origin binding. Any exact-cut refusal from here is a typed request
         // to take the whole-snapshot path (oversize, incompatible pins,
         // identity movement, or an unrepresentable gap).
-        let delta = match transport.delta(local_head.head_act).await {
+        let delta = match crate::async_diagnostics::track("refresh.fetch_delta", transport.delta(local_head.head_act)).await {
             Ok(delta) => delta,
             Err(Error::Auth(message)) => {
                 return Err(AttemptError::new(
@@ -2262,11 +3472,19 @@ impl StandbyRefreshController {
                 }))
             }
             Err(error) => {
-                let classified = classify_delta_transport_error(error);
+                let mut classified = classify_delta_transport_error(error);
+                if classified.class == RefreshFailureClass::Throttled {
+                    // Only a busy export classifies as Throttled here: fail
+                    // the attempt for a bounded retry, never a whole snapshot.
+                    classified.retry_after = transport.take_busy_retry_after();
+                }
                 if matches!(
                     classified.class,
-                    RefreshFailureClass::Authentication | RefreshFailureClass::Network
-                ) {
+                    RefreshFailureClass::Authentication
+                        | RefreshFailureClass::Network
+                        | RefreshFailureClass::Throttled
+                ) || matches!(classified.source.as_ref(), Error::Engine(detail)
+                    if detail == crate::client_compatibility::UPDATE_REQUIRED) {
                     return Err(classified);
                 }
                 let rpc_refusal = classified.source.to_string().contains("RPC error")
@@ -2286,12 +3504,43 @@ impl StandbyRefreshController {
             }
         };
 
+        // Format proof is a pre-writer gate. Missing wire identity is a
+        // bounded legacy-94 dialect, never evidence of a remote schema.
+        let dialect = async {
+            let entry = super::shapes::manifest(&current.manifest)
+                .filter(|e| e.family == super::shapes::Family::V1)
+                .ok_or_else(|| Error::engine("unsupported v1 receiver shape"))?;
+            let (head, cut) = transport.selected_shapes();
+            match (head, cut) {
+                (Some(head), Some(cut)) if head == cut && cut == entry.shape() => {}
+                (None, None) if entry.engine_schema == 94 => {}
+                _ => {
+                    return Err(Error::engine(
+                        "delta shape is missing, incompatible, or changed after the head",
+                    ))
+                }
+            }
+            super::shapes::check_v1_cut(delta.act_cut(), entry).await
+        }
+        .await;
+        if dialect.is_err() {
+            return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::HeadCompatibility,
+                message: "delta does not match the selected exact receiver dialect; a whole snapshot is required",
+            }));
+        }
+
         // Apply in place. The materialiser checks contiguity (the delta starts
         // exactly at this copy's head), origin and pins, destination schema,
         // and its exact postconditions inside one write transaction; any
         // refusal rolls the whole transaction back.
         let writer =
-            match self.store.open_head_writer(&current).await {
+            match crate::async_diagnostics::track(
+                "refresh.open_writer",
+                self.store.open_head_writer(&current),
+            )
+            .await
+            {
                 Ok(Some(writer)) => writer,
                 Ok(None) => {
                     return Ok(DeltaAttempt::Deferred {
@@ -2309,6 +3558,7 @@ impl StandbyRefreshController {
         writer.close().await;
         match applied {
             Ok(_) => {
+                let notice = self.pending_observer.begin_accepted();
                 let head_act = delta.to_inclusive_act();
                 self.store
                     .record_synced(&current, head_act, &synced_at)
@@ -2322,6 +3572,12 @@ impl StandbyRefreshController {
                 );
                 self.store
                     .note_deferral(&current.id, DeltaDeferral::DatabaseBusy, false);
+                // Accepted publication is complete before any private undo or
+                // replay. Cancellation drops the notice and releases the fence;
+                // the owner then detects a missing handoff and fully rebuilds.
+                if let Some(notice) = notice {
+                    notice.committed(current.id.clone(), delta);
+                }
                 Ok(DeltaAttempt::Advanced {
                     generation: current,
                     head_act,
@@ -2360,6 +3616,7 @@ impl StandbyRefreshController {
                 message,
             })
         };
+        let timings = PhaseTimings::default();
         let before = match super::kernel_v2::verify_path(&current.snapshot_path).await {
             Ok(value) => value,
             Err(_) => {
@@ -2368,10 +3625,68 @@ impl StandbyRefreshController {
                 ))
             }
         };
+        timings.lap("verify_base");
+        if before.schema_sha256 != remote.generation.schema_sha256
+            || before.reader_format != remote.generation.reader_format
+        {
+            return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::HeadCompatibility,
+                message: "receiver shape changed; a staged whole snapshot is required",
+            }));
+        }
+        // A copy advanced in place is judged by the receipts inside its own
+        // database, on every tick and whether or not the flag is still on. A
+        // copy that cannot be shown to continue them is never served onward:
+        // it is replaced by a whole snapshot.
+        let state = match self
+            .store
+            .check_in_place_integrity(
+                &current,
+                super::generation_store::kernel_in_place::IntegrityDepth::Light,
+            )
+            .await
+        {
+            Ok(state) => state,
+            Err(error) if super::generation_store::audit_infrastructure_error(&error) => {
+                return Err(local_io(error));
+            }
+            Err(_) => {
+                let _ = self.store.require_full_refresh(&current);
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message:
+                        "in-place copy failed its apply-receipt check; a whole snapshot is required",
+                }));
+            }
+        };
+        if let super::generation_store::kernel_in_place::InPlaceState::Sound {
+            db_head_act, ..
+        } = state
+        {
+            // The head sidecar is a cache of the database; repair a lag.
+            let _ = self.store.heal_head_from_database(&current.id, db_head_act);
+        }
+        // Count and age limits are evaluated here, so a copy that has gone on
+        // long enough is re-checkpointed even when no new delta has arrived.
+        let recheckpoint = self.store.kernel_recheckpoint_due(&current, state);
         let verified = self
             .store
             .verified_refresh_base(&current.id, &self.observed);
-        if before == remote.generation {
+        // A due audit must not wait for the next write: with the head
+        // unchanged, ask for a zero-act delta that carries the projection
+        // proof, which compares the projection at the current head. Only the
+        // cheap in-place path does this: the staged path copies the whole
+        // database for every delta, so there an audit rides on the next real
+        // one.
+        let idle_audit = before == remote.generation
+            && recheckpoint.is_none()
+            && self.config.kernel_in_place_deltas
+            && self.proof_due()
+            && self
+                .store
+                .kernel_in_place_ineligible(&current, &self.observed, state)
+                .is_none();
+        if before == remote.generation && recheckpoint.is_none() && !idle_audit {
             self.store
                 .record_synced(&current, before.head_act, synced_at)
                 .map_err(local_io)?;
@@ -2388,6 +3703,25 @@ impl StandbyRefreshController {
             || before.head_act > remote.generation.head_act
         {
             return Ok(fallback("kernel-v2 hosted history changed or regressed"));
+        }
+        // The head record is written only after the database commit, so it
+        // can lag the database but never lead it. A head ahead of the file
+        // means the file was replaced or rolled back under us.
+        match self.store.generation_head(&current.id) {
+            Ok(Some(head)) if head.head_act > before.head_act => {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message:
+                        "local head record is ahead of its database; a whole snapshot is required",
+                }));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message: "local copy head record was unreadable; a whole snapshot is required",
+                }))
+            }
         }
         if self.kernel_replay_cooling_down().map_err(local_io)? {
             return Ok(DeltaAttempt::Deferred {
@@ -2410,14 +3744,30 @@ impl StandbyRefreshController {
         let inventory = super::kernel_v2::blob_inventory_path(&current.snapshot_path)
             .await
             .map_err(local_io)?;
-        let delta = match transport.kernel_delta(before.head_act, &inventory).await {
+        timings.lap("blob_inventory");
+        let want_proof = self.proof_due();
+        let delta = match crate::async_diagnostics::track(
+            "refresh.fetch_kernel_delta",
+            transport.kernel_delta_with_proof(before.head_act, &inventory, want_proof),
+        )
+        .await
+        {
             Ok(delta) => delta,
             Err(error) => {
-                let classified = classify_delta_transport_error(error);
+                let mut classified = classify_delta_transport_error(error);
+                if classified.class == RefreshFailureClass::Throttled {
+                    // Only a busy export classifies as Throttled here: fail
+                    // the attempt for a bounded retry, never a whole snapshot.
+                    classified.retry_after = transport.take_busy_retry_after();
+                }
                 if matches!(
                     classified.class,
-                    RefreshFailureClass::Authentication | RefreshFailureClass::Network
-                ) {
+                    RefreshFailureClass::Authentication
+                        | RefreshFailureClass::Network
+                        | RefreshFailureClass::Throttled
+                ) || matches!(classified.source.as_ref(), Error::Engine(detail)
+                    if detail == crate::client_compatibility::UPDATE_REQUIRED)
+                {
                     return Err(classified);
                 }
                 return Ok(fallback(
@@ -2425,11 +3775,159 @@ impl StandbyRefreshController {
                 ));
             }
         };
-        let _cooldown = KernelReplayCooldown::start(self).map_err(local_io)?;
-        let prepared = match self
-            .store
-            .prepare_kernel_delta(&current, &delta, synced_at)
-            .await
+        timings.lap("fetch_delta");
+        // Preparation alone cannot change the accepted base. Arm only at the
+        // actual in-place apply or staged publication boundary.
+        #[cfg(feature = "v2-kernel-probe")]
+        let mut kernel_notice = None;
+
+        let size = delta.delta().size();
+        let mut cooldown = KernelReplayCooldown::start(self, timings.clone()).map_err(local_io)?;
+        if self.config.kernel_in_place_deltas {
+            if !size.is_small() {
+                cooldown.in_place_skip = Some("delta_not_small");
+            } else {
+                match self
+                    .store
+                    .kernel_in_place_ineligible(&current, &self.observed, state)
+                {
+                    None => {
+                        cooldown.path = "in_place";
+                        #[cfg(test)]
+                        let crash = self.kernel_in_place_crash;
+                        #[cfg(not(test))]
+                        let crash = None;
+                        #[cfg(feature = "v2-kernel-probe")]
+                        if delta.delta().head.generation != before {
+                            kernel_notice = self.pending_observer.begin_kernel_accepted();
+                        }
+                        match crate::async_diagnostics::track("refresh.apply_kernel_delta", self.store.apply_kernel_delta_in_place(&current, &delta, synced_at, &timings, crash)).await
+                        {
+                            Ok(super::generation_store::kernel_in_place::InPlaceApplied::Applied) => {
+                                let head_act = delta.delta().head.head_act;
+                                self.store.complete_validated_refresh(
+                                    &current.id,
+                                    &self.observed,
+                                    verified,
+                                    head_act,
+                                    true,
+                                );
+                                self.store.note_deferral(
+                                    &current.id,
+                                    DeltaDeferral::DatabaseBusy,
+                                    false,
+                                );
+                                timings.lap("in_place_finish");
+                                self.note_proof_outcome(&delta, &timings);
+                                cooldown.complete(true);
+                                // The delta carries no hosted creation/acceptance
+                                // time for its newest act (coordinates only),
+                                // so visibility is just the local commit time
+                                // and the act it reached.
+                                tracing::info!(
+                                    target: "native_ce::standby::kernel_delta",
+                                    to_act = head_act,
+                                    applied_at = now(),
+                                    "kernel-v2 delta applied"
+                                );
+                                if idle_audit {
+                                    // Nothing advanced: this was only the audit.
+                                    return Ok(DeltaAttempt::Unchanged(current));
+                                }
+                                #[cfg(feature="v2-kernel-probe")]
+        if let Some(notice)=kernel_notice {notice.committed(current.id.clone(),current.id.clone(),before,delta);}
+                                return Ok(DeltaAttempt::Advanced {
+                                    generation: current,
+                                    head_act,
+                                });
+                            }
+                            Ok(super::generation_store::kernel_in_place::InPlaceApplied::CheckpointVerifying) => {
+                                #[cfg(feature = "v2-kernel-probe")]
+                                if let Some(notice) = kernel_notice.take() { notice.no_publication(); }
+                                return Ok(DeltaAttempt::Deferred {
+                                    generation: current,
+                                    reason: DEFERRED_CHECKPOINT_VERIFYING,
+                                });
+                            }
+                            // The commit happened; only a sidecar write failed
+                            // or a fault was injected. Do not also publish a
+                            // staged copy: the next tick heals the sidecars
+                            // from the database's own head.
+                            Err(super::generation_store::kernel_in_place::InPlaceError::AfterCommit(error)) => {
+                                return Err(local_io(error));
+                            }
+                            Err(super::generation_store::kernel_in_place::InPlaceError::BeforeCommit(error)) => {
+                                // Rolled back: the serving database is unchanged.
+                                if matches!(&error, Error::Engine(message) if message == super::generation_store::kernel_in_place::RECEIPTS_INCONSISTENT)
+                                {
+                                    let _ = self.store.require_full_refresh(&current);
+                                    return Ok(DeltaAttempt::FallBackToSnapshot(
+                                        DeltaFallbackDiagnostic {
+                                            class: DeltaFallbackClass::UntrustedLocalBase,
+                                            message: "in-place copy failed its apply-receipt check; a whole snapshot is required",
+                                        },
+                                    ));
+                                }
+                                if is_sqlite_busy_or_locked(&error) {
+                                #[cfg(feature = "v2-kernel-probe")]
+                                if let Some(notice) = kernel_notice.take() { notice.no_publication(); }
+                                    self.store.note_deferral(
+                                        &current.id,
+                                        DeltaDeferral::DatabaseBusy,
+                                        true,
+                                    );
+                                    return Ok(DeltaAttempt::Deferred {
+                                        generation: current,
+                                        reason: DEFERRED_DATABASE_BUSY,
+                                    });
+                                }
+                                if super::generation_store::is_kernel_disk_refusal(&error) {
+                                #[cfg(feature = "v2-kernel-probe")]
+                                if let Some(notice) = kernel_notice.take() { notice.no_publication(); }
+                                    return Ok(DeltaAttempt::Deferred {
+                                        generation: current,
+                                        reason: super::generation_store::INSUFFICIENT_DISK,
+                                    });
+                                }
+                                if matches!(&error, Error::Engine(message) if message == "kernel_v2_projection_divergence")
+                                {
+                                    // The staged path would replay the same delta
+                                    // over the same bytes to the same verdict.
+                                    return Ok(DeltaAttempt::FallBackToSnapshot(
+                                        DeltaFallbackDiagnostic {
+                                            class: DeltaFallbackClass::ProjectionDivergence,
+                                            message: "kernel_v2_projection_divergence; a whole snapshot is required",
+                                        },
+                                    ));
+                                }
+                                #[cfg(test)]
+                                if matches!(&error, Error::Engine(message) if message == super::generation_store::kernel_in_place::INJECTED_CRASH)
+                                {
+                                    return Err(local_io(error));
+                                }
+                                tracing::warn!(
+                                    target: "native_ce::standby::kernel_delta",
+                                    "in-place kernel-v2 delta refused; using the staged path"
+                                );
+                                cooldown.in_place_skip = Some("in_place_refused");
+                                // Whatever the staged path does next, the copy
+                                // met trouble: audit until a proof checks out.
+                                self.proof_audit.lock().expect("proof audit").trouble = true;
+                            }
+                        }
+                    }
+                    Some(reason) => cooldown.in_place_skip = Some(reason),
+                }
+            }
+        } else if let Some(reason) = recheckpoint {
+            cooldown.in_place_skip = Some(reason);
+        }
+        let prepared = match crate::async_diagnostics::track(
+            "refresh.prepare_kernel_delta",
+            self.store
+                .prepare_kernel_delta_timed(&current, &delta, synced_at, &timings),
+        )
+        .await
         {
             Ok(prepared) => prepared,
             Err(error) if super::generation_store::is_kernel_disk_refusal(&error) => {
@@ -2437,6 +3935,14 @@ impl StandbyRefreshController {
                     generation: current,
                     reason: super::generation_store::INSUFFICIENT_DISK,
                 });
+            }
+            Err(Error::Engine(message))
+                if message == super::generation_store::kernel_in_place::BASE_UNPROVED =>
+            {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::UntrustedLocalBase,
+                    message: "in-place copy could not be proved; a whole snapshot is required",
+                }));
             }
             Err(Error::Engine(message)) if message == "kernel_v2_projection_divergence" => {
                 return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
@@ -2450,11 +3956,17 @@ impl StandbyRefreshController {
                 ))
             }
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        if kernel_notice.is_none() && delta.delta().head.generation != before {
+            kernel_notice = self.pending_observer.begin_kernel_accepted();
+        }
         let generation =
-            match self
-                .store
-                .publish_kernel_delta(prepared, &self.observed)
-                .await
+            match crate::async_diagnostics::track(
+                "refresh.publish_kernel_delta",
+                self.store
+                    .publish_kernel_delta_timed(prepared, &self.observed, &timings),
+            )
+            .await
             {
                 Ok(generation) => generation,
                 Err(error) if super::generation_store::is_kernel_disk_refusal(&error) => {
@@ -2471,11 +3983,71 @@ impl StandbyRefreshController {
         self.store
             .record_synced(&generation, head_act, synced_at)
             .map_err(local_io)?;
+        timings.lap("record_synced");
+        self.note_proof_outcome(&delta, &timings);
         self.store.schedule_maintenance(&self.observed);
+        cooldown.complete(size.is_small());
+        // As above: no hosted per-act time in the delta, so log the local
+        // commit time and the act reached.
+        tracing::info!(
+            target: "native_ce::standby::kernel_delta",
+            to_act = head_act,
+            applied_at = now(),
+            "kernel-v2 delta applied"
+        );
+        #[cfg(feature = "v2-kernel-probe")]
+        if let Some(notice) = kernel_notice {
+            notice.committed(current.id.clone(), generation.id.clone(), before, delta);
+        }
         Ok(DeltaAttempt::Advanced {
             generation,
             head_act,
         })
+    }
+
+    /// Whether the next delta must carry the projection proof: on the first
+    /// follow after a start, at the configured interval, and straight after
+    /// any trouble. Never blocks anything; it only chooses which wire version
+    /// to ask for.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn proof_due(&self) -> bool {
+        let audit = self.proof_audit.lock().expect("proof audit");
+        audit.trouble
+            || audit
+                .last
+                .is_none_or(|at| at.elapsed() >= self.config.projection_proof_interval())
+    }
+
+    /// Record what an applied delta did for the audit schedule. A delta that
+    /// carried the proof was checked against it, so it restarts the interval
+    /// and clears any trouble. A proof-less one that hit a set-path anomaly or
+    /// a reseed is trouble: the next follow audits.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn note_proof_outcome(
+        &self,
+        delta: &super::kernel_v2_delta::TrustedKernelDelta,
+        timings: &PhaseTimings,
+    ) {
+        let mut audit = self.proof_audit.lock().expect("proof audit");
+        if delta.delta().version != super::kernel_v2_delta::WIRE_VERSION_3 {
+            audit.last = Some(std::time::Instant::now());
+            audit.trouble = false;
+            return;
+        }
+        // Anything that made the cache or the capture unreliable is trouble;
+        // so is every reseed the node did not plan. (A first-DDL copy's
+        // `skipped:no_accumulator` and a version-1 delta's `skipped:v1_delta`
+        // are ordinary.)
+        let path = timings.set_path_json();
+        let label = path["last_set_path"].as_str().unwrap_or("");
+        if ["anomaly", "mismatch_reseeded", "divergence"]
+            .iter()
+            .any(|prefix| label.starts_with(prefix))
+            || label == "skipped:accumulator_invalid"
+            || label == "skipped:suppressed"
+        {
+            audit.trouble = true;
+        }
     }
 
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -2505,13 +4077,50 @@ impl StandbyRefreshController {
 
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     fn defer_kernel_replay(&self, elapsed: Duration) -> Result<()> {
-        // Rest at least as long as replay took (and at least one minute).
-        // The attempt lock covers copy, replay, verification and publication.
-        let seconds = elapsed.as_secs().max(60);
-        let until =
-            chrono::Utc::now() + chrono::Duration::seconds(seconds.min(i64::MAX as u64) as i64);
+        self.write_kernel_replay(
+            elapsed,
+            KERNEL_REPLAY_FLOOR,
+            "in_progress",
+            "staged",
+            None,
+            &PhaseTimings::default(),
+        )
+    }
+
+    /// Persist the rest after a replay: at least as long as the replay took
+    /// (so replay never takes more than half the wall clock) and at least
+    /// `floor`. The attempt lock covers copy, replay, verification and
+    /// publication. `phases` is the per-phase wall time of the attempt.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn write_kernel_replay(
+        &self,
+        elapsed: Duration,
+        floor: Duration,
+        outcome: &str,
+        path: &str,
+        in_place_skip: Option<&str>,
+        timings: &PhaseTimings,
+    ) -> Result<()> {
+        let rest = elapsed.max(floor);
+        let until = chrono::Utc::now()
+            + chrono::Duration::milliseconds(rest.as_millis().min(i64::MAX as u128) as i64);
         let mut temp = tempfile::NamedTempFile::new_in(&self.refresh_dir)?;
-        temp.write_all(&serde_jcs::to_vec(&serde_json::json!({"not_before": until.to_rfc3339(), "last_wall_millis": elapsed.as_millis()}))?)?;
+        temp.write_all(&serde_jcs::to_vec(&serde_json::json!({
+            "not_before": until.to_rfc3339(),
+            "last_wall_millis": elapsed.as_millis(),
+            "last_outcome": outcome,
+            "last_path": path,
+            "last_in_place_skip": in_place_skip,
+            "last_rest_millis": rest.as_millis(),
+            "last_phases": timings.to_json(),
+            "last_digest_tables": timings.tables_json(),
+            // What the set-digest path did: `fast`, `anomaly:<reason>`,
+            // `mismatch_reseeded:<table>`, `divergence`, or `skipped:<cause>`
+            // when a full scan proved the apply without attempting it; the
+            // generation's counters; and the capture's sizes.
+            "last_set_path": timings.set_path_json()["last_set_path"].clone(),
+            "set_path": timings.set_path_json(),
+        }))?)?;
         temp.as_file().sync_all()?;
         temp.persist(self.refresh_dir.join("kernel-replay.json"))
             .map_err(|e| e.error)?;
@@ -2533,8 +4142,12 @@ impl StandbyRefreshController {
         let mut expected_size = None;
         let mut expected_sha = None;
         let mut manifest: Option<StandbySnapshotManifest> = None;
+        let mut selected_transfer: Option<Option<super::shapes::Shape>> = None;
+        let mut disk_budget = None;
 
         loop {
+            self.check_transition_transfer_budget(disk_budget.as_ref(), offset)
+                .map_err(local_io)?;
             let request = SnapshotPageRequest {
                 export_id: export_id.clone(),
                 offset,
@@ -2544,6 +4157,40 @@ impl StandbyRefreshController {
             let page = self
                 .fetch_page_with_retry(endpoint, &bearer, request)
                 .await?;
+            if selected_transfer
+                .as_ref()
+                .is_some_and(|shape| shape != &page.selected_shape)
+            {
+                return Err(integrity(
+                    "snapshot selected shape changed between pages",
+                    Error::engine("snapshot selected shape changed"),
+                ));
+            }
+            selected_transfer = Some(page.selected_shape.clone());
+            if let Some(entry) = page
+                .manifest
+                .as_ref()
+                .or(manifest.as_ref())
+                .and_then(super::shapes::manifest)
+            {
+                super::shapes::check_selection(page.selected_shape.as_ref(), entry).map_err(
+                    |error| integrity("snapshot shape signal is missing or conflicting", error),
+                )?;
+            }
+            if let Some(selected) = &page.selected_shape {
+                let described = page
+                    .manifest
+                    .as_ref()
+                    .or(manifest.as_ref())
+                    .and_then(super::shapes::manifest)
+                    .map(super::shapes::Entry::shape);
+                if described.as_ref() != Some(selected) {
+                    return Err(integrity(
+                        "snapshot selected shape disagrees with its manifest",
+                        Error::engine("snapshot shape mismatch"),
+                    ));
+                }
+            }
             validate_page(
                 &page,
                 export_id.as_deref(),
@@ -2552,6 +4199,15 @@ impl StandbyRefreshController {
                 expected_sha.as_deref(),
                 manifest.as_ref(),
             )?;
+            if offset == 0 {
+                if let Some(manifest) = &page.manifest {
+                    // The legacy route combines metadata with one bounded
+                    // first page. Gate before writing it or requesting more.
+                    disk_budget = self
+                        .transition_transfer_budget(manifest, page.size_bytes)
+                        .map_err(local_io)?;
+                }
+            }
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&page.data_base64)
                 .map_err(|_| {
@@ -2702,6 +4358,7 @@ impl StandbyRefreshController {
 
     fn declared_consumer(&self) -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: self.observed.kernel_v2_reader.clone(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: self.observed.platform,
@@ -2710,6 +4367,10 @@ impl StandbyRefreshController {
             engine_schema_version: self.observed.engine_schema_version,
             ddl_sha256: self.observed.ddl_sha256.clone(),
         }
+        .for_engine(
+            self.route_kernel_v2
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn state_path(&self) -> PathBuf {
@@ -2749,7 +4410,7 @@ impl StandbyRefreshController {
 
     fn take_pending_triggers(&self) -> Result<Vec<RefreshCause>> {
         let lock = open_private_lock(&self.refresh_dir.join("trigger.lock"))?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, LOCK_WAIT_TIMEOUT)?;
         let pending = self.read_pending_triggers().unwrap_or_default();
         match fs::remove_file(self.pending_marker_path()) {
             Ok(()) => {
@@ -2765,7 +4426,7 @@ impl StandbyRefreshController {
 
     fn write_state(&self, state: &StandbyRefreshState) -> Result<()> {
         let lock = open_private_lock(&self.refresh_dir.join("trigger.lock"))?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, LOCK_WAIT_TIMEOUT)?;
         let mut state = state.clone();
         state.manual_refresh_pending = self
             .read_pending_triggers()?
@@ -2888,7 +4549,7 @@ impl StandbyRefreshController {
 
     fn reset_invalid_pending_triggers(&self) -> Result<()> {
         let lock = open_private_lock(&self.refresh_dir.join("trigger.lock"))?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, LOCK_WAIT_TIMEOUT)?;
         if self.read_pending_triggers().is_err() {
             match fs::remove_file(self.pending_marker_path()) {
                 Ok(()) => File::open(&self.refresh_dir)?.sync_all()?,
@@ -2974,6 +4635,8 @@ struct SnapshotPageRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotPage {
+    #[serde(skip)]
+    selected_shape: Option<super::shapes::Shape>,
     export_id: String,
     file_name: String,
     media_type: String,
@@ -3372,7 +5035,19 @@ fn delta_transport_failure_detail(source: &Error) -> &'static str {
     let Error::Engine(message) = source else {
         return "unclassified";
     };
-    if let Some(status) = message.strip_prefix("hosted authority act HTTP status ") {
+    if let Some(detail) = super::delta_transport::diagnostics::failure_detail(message) {
+        return detail;
+    }
+    if message == super::delta_transport::DELTA_EXPORT_BUSY_MESSAGE {
+        return EXPORT_BUSY_DETAIL;
+    }
+    if message == "hosted authority act delta export request failed: capture unavailable" {
+        return "capture_unavailable";
+    }
+    if let Some(status) = message
+        .strip_prefix("hosted authority act HTTP status ")
+        .or_else(|| message.strip_prefix("hosted authority act delta export HTTP status "))
+    {
         return status
             .split_whitespace()
             .next()
@@ -3389,6 +5064,8 @@ fn delta_transport_failure_detail(source: &Error) -> &'static str {
         "response_too_large"
     } else if message.starts_with("hosted authority act returned an invalid protocol response:") {
         "decode"
+    } else if message == super::delta_transport::DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE {
+        EXPORT_CAPTURE_TIMEOUT_DETAIL
     } else {
         "unclassified"
     }
@@ -3396,6 +5073,15 @@ fn delta_transport_failure_detail(source: &Error) -> &'static str {
 
 fn classify_delta_transport_error(source: Error) -> AttemptError {
     let (class, message) = match &source {
+        Error::Engine(detail)
+            if detail == super::shapes::UPDATE_REQUIRED
+                || detail == crate::client_compatibility::UPDATE_REQUIRED =>
+        {
+            (
+                RefreshFailureClass::Compatibility,
+                "update this receiver to refresh",
+            )
+        }
         Error::Auth(_) => (
             RefreshFailureClass::Authentication,
             "hosted delta authentication was refused",
@@ -3403,6 +5089,15 @@ fn classify_delta_transport_error(source: Error) -> AttemptError {
         Error::Io(_) => (
             RefreshFailureClass::LocalIo,
             "local standby delta preparation failed",
+        ),
+        // Hosted runs one delta export per account and database: a busy
+        // refusal is scheduling, not an outage. Throttled keeps the
+        // trigger for a bounded retry and never schedules network-recovery
+        // probes or a network-failure disclosure — and, below, never buys a
+        // whole snapshot for a momentarily busy host.
+        Error::Engine(detail) if detail == super::delta_transport::DELTA_EXPORT_BUSY_MESSAGE => (
+            RefreshFailureClass::Throttled,
+            "hosted delta export is already in progress",
         ),
         Error::Engine(detail)
             if detail == MAINTENANCE_SNAPSHOT_ERROR
@@ -3501,6 +5196,75 @@ fn elapsed_indicates_wake(wall: Duration, monotonic: Duration) -> bool {
     wall > monotonic.saturating_add(WAKE_DETECTION_SLOP)
 }
 
+/// The follow loop's own cadence: the configured refresh interval, defaulting
+/// to the 60 s backstop. Shared by the loop and its watchdog so the two can
+/// never disagree about what "overdue" means.
+fn refresh_cadence(config: &StandbyRefreshConfig) -> Duration {
+    Duration::from_secs(
+        config
+            .refresh_interval_seconds
+            .unwrap_or(super::status::STANDBY_REFRESH_INTERVAL_SECONDS),
+    )
+}
+
+/// How long the follow loop may stay quiet before it owes a stall WARN:
+/// well over its own cadence, floored so sub-second test intervals still
+/// produce a meaningful bound.
+fn stall_warn_after(interval: Duration) -> Duration {
+    interval
+        .saturating_mul(STALL_WARN_INTERVAL_MULTIPLE)
+        .max(Duration::from_secs(1))
+}
+
+/// The scheduler-health evidence carried by a stall WARN: how long since the
+/// loop last started an attempt, and by how much the scheduled deadline it
+/// should have followed sits overdue. Both are loop-local; nothing here is
+/// persisted, so older builds keep parsing state strictly.
+struct FollowLoopStall {
+    idle: Duration,
+    scheduled_overdue: Duration,
+}
+
+/// Whether the follow loop owes a stall WARN on this tick: it has started no
+/// attempt for well over its cadence while the scheduled deadline sits
+/// overdue by the same bound. Either half alone is healthy — a fresh start
+/// with a future deadline, or a just-completed long attempt whose completion
+/// re-anchored the deadline — so both are required. A tick that fires this is
+/// itself the recovery evidence: the loop is running again, and the very next
+/// selection starts the overdue Scheduled probe that learns whether hosted is
+/// ahead.
+fn follow_loop_stall_report(
+    now: tokio::time::Instant,
+    last_attempt_start: Option<tokio::time::Instant>,
+    scheduled: tokio::time::Instant,
+    interval: Duration,
+) -> Option<FollowLoopStall> {
+    let threshold = stall_warn_after(interval);
+    let started = last_attempt_start?;
+    let idle = now.saturating_duration_since(started);
+    let scheduled_overdue = now.saturating_duration_since(scheduled);
+    if idle > threshold && scheduled_overdue > threshold {
+        Some(FollowLoopStall {
+            idle,
+            scheduled_overdue,
+        })
+    } else {
+        None
+    }
+}
+
+/// Whether a busy-backoff skip earns a log line: the first skip of an episode
+/// always does; further skips log at most once per cadence. A second episode
+/// starting within the same cadence window stays silent — a deliberate blind
+/// spot that keeps a flapping hold from flooding the journal.
+fn busy_skip_log_due(
+    now: tokio::time::Instant,
+    last_log: Option<tokio::time::Instant>,
+    interval: Duration,
+) -> bool {
+    last_log.is_none_or(|logged| now.saturating_duration_since(logged) >= interval)
+}
+
 fn next_scheduled_deadline(
     scheduled: tokio::time::Instant,
     attempt_started: tokio::time::Instant,
@@ -3523,6 +5287,14 @@ fn next_scheduled_deadline(
         scheduled
     }
 }
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) use tests::kernel_v2_in_place::trust::audited_and_recorded;
+/// Test-only reuse of the kernel-v2 in-place setup from the generation-store
+/// churn tests: the setup lives under `tests` but is re-exported here so the
+/// churn tests can drive a real delta without duplicating the fixture.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) use tests::kernel_v2_in_place::Setup;
 
 #[cfg(test)]
 mod tests {
@@ -3556,8 +5328,11 @@ mod tests {
     mod gzip_http;
     mod gzip_recovery;
     #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) mod kernel_v2_in_place;
+    #[cfg(feature = "v2-kernel-probe")]
     mod kernel_v2_refresh;
     mod progress;
+    mod receiver_shapes;
 
     /// Reader locks stand in for serving processes that outlive the test.
     static READER_LOCKS: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec::new());
@@ -3678,6 +5453,7 @@ mod tests {
 
     fn observed() -> ObservedInstalledConsumerIdentity {
         ObservedInstalledConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             platform: StandbyConsumerPlatform::LinuxX8664,
             source_sha: "1".repeat(40),
             artifact_sha256: "2".repeat(64),
@@ -3689,6 +5465,7 @@ mod tests {
     fn consumer() -> StandbyConsumerIdentity {
         let observed = observed();
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: observed.platform,
@@ -3697,6 +5474,64 @@ mod tests {
             engine_schema_version: observed.engine_schema_version,
             ddl_sha256: observed.ddl_sha256,
         }
+    }
+
+    #[tokio::test]
+    async fn v1_full_request_and_manifest_ignore_a_v2_reader_bump() {
+        struct V1Client(ScriptedClient);
+        impl SnapshotPageClient for V1Client {
+            fn page(
+                &self,
+                endpoint: String,
+                bearer: String,
+                request: SnapshotPageRequest,
+            ) -> PageFuture {
+                if let Some(consumer) = &request.standby_consumer {
+                    assert!(serde_json::to_value(consumer)
+                        .unwrap()
+                        .get("kernel_v2_reader")
+                        .is_none());
+                }
+                self.0.page(endpoint, bearer, request)
+            }
+        }
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(V1Client(ScriptedClient::new(paged_replies(
+                "v1-reader",
+                &bytes,
+                &manifest,
+            )))),
+        );
+        controller.observed.kernel_v2_reader.reader_format += 1;
+        controller.delta_enabled = true;
+        let (port, server) = serve_authority_act_calls(db.clone(), 1).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        let StandbyRefreshOutcome::Installed { generation, .. } = controller
+            .refresh_once(RefreshCause::Scheduled)
+            .await
+            .unwrap()
+        else {
+            panic!("a v2-only reader bump must not change v1 FULL admission")
+        };
+        assert!(
+            serde_json::to_value(&generation.manifest).unwrap()["consumer"]
+                .get("kernel_v2_reader")
+                .is_none()
+        );
+        assert!(controller
+            .store
+            .consumer_rebind(&generation.id, &controller.observed)
+            .unwrap()
+            .is_none());
+        server.await.unwrap();
+        controller.store.maintenance_idle().await;
+        db.close().await;
     }
 
     async fn snapshot_fixture(db: &crate::Db) -> (Vec<u8>, StandbySnapshotManifest) {
@@ -3734,6 +5569,7 @@ mod tests {
                 let page_offset = *offset;
                 *offset += chunk.len() as u64;
                 Some(ScriptedReply::Page(Box::new(SnapshotPage {
+                    selected_shape: None,
                     export_id: export_id.into(),
                     file_name: "native-ce-export.db".into(),
                     media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
@@ -3773,6 +5609,9 @@ mod tests {
             refresh_interval_seconds: None,
             full_refresh_min_interval_seconds: None,
             full_refresh_repair_retry_seconds: None,
+            kernel_in_place_deltas: false,
+            kernel_audit_interval_seconds: None,
+            projection_proof_interval_seconds: None,
         };
         let store = GenerationStore::open(&replica_root, "route-1", Some(origin)).unwrap();
         StandbyRefreshController::new_with_client(runtime, config, store, observed(), client)
@@ -3806,6 +5645,10 @@ mod tests {
         ShortBody,
         StartContract,
         StartStructured404,
+        WrongPollSelection,
+        MatchingPollSelection,
+        WrongReadySelection,
+        WrongRangeSelection,
     }
 
     #[derive(Clone)]
@@ -3824,6 +5667,21 @@ mod tests {
     }
 
     const BINARY_TEST_HANDLE: &str = "0dc9aadc-46b9-438d-8fca-5f719a8d6dc7";
+
+    fn assert_receiver_advertisement(headers: &HeaderMap) {
+        assert_eq!(
+            headers[crate::client_compatibility::HEADER],
+            crate::client_compatibility::advertisement()
+        );
+        assert_eq!(
+            headers
+                .get(super::super::shapes::ACCEPTED_SHAPES_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            super::super::shapes::advertisement()
+        );
+    }
 
     fn binary_json(
         transfer: transfer_repr::SnapshotTransfer,
@@ -3844,6 +5702,7 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        assert_receiver_advertisement(&headers);
         assert_eq!(database, "route-1");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         assert_eq!(body["contract"], fixture.transfer.route_api());
@@ -3877,16 +5736,39 @@ mod tests {
         HttpPath((database, handle)): HttpPath<(String, String)>,
         headers: HeaderMap,
     ) -> Response {
+        assert_receiver_advertisement(&headers);
         assert_eq!(database, "route-1");
         assert_eq!(handle, BINARY_TEST_HANDLE);
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         if fixture.polls.fetch_add(1, Ordering::SeqCst) == 0 {
-            return binary_json(
+            let mut response = binary_json(
                 fixture.transfer,
                 StatusCode::OK,
                 json!({"api":fixture.transfer.route_api(),"export_handle":BINARY_TEST_HANDLE,
                        "status":"pending","expires_at":"2026-09-29T21:00:00Z"}),
             );
+            if matches!(
+                fixture.fault,
+                BinaryWireFault::WrongPollSelection | BinaryWireFault::MatchingPollSelection
+            ) {
+                response.headers_mut().insert(
+                    super::super::shapes::SELECTED_SHAPE_HEADER,
+                    HeaderValue::from_str(
+                        &serde_json::to_string(
+                            &if matches!(fixture.fault, BinaryWireFault::MatchingPollSelection) {
+                                super::super::shapes::v1(94, super::super::shapes::V1_94)
+                            } else {
+                                super::super::shapes::v1(95, super::super::shapes::V1_95)
+                            }
+                            .unwrap()
+                            .shape(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+            return response;
         }
         if matches!(fixture.fault, BinaryWireFault::InvalidPollJson) {
             return binary_json(fixture.transfer, StatusCode::OK, json!("not a poll object"));
@@ -3929,7 +5811,22 @@ mod tests {
             }
             _ => {}
         }
-        binary_json(fixture.transfer, StatusCode::OK, ready)
+        let mut response = binary_json(fixture.transfer, StatusCode::OK, ready);
+        if matches!(fixture.fault, BinaryWireFault::WrongReadySelection) {
+            response.headers_mut().insert(
+                super::super::shapes::SELECTED_SHAPE_HEADER,
+                HeaderValue::from_str(
+                    &serde_json::to_string(
+                        &super::super::shapes::v1(95, super::super::shapes::V1_95)
+                            .unwrap()
+                            .shape(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        response
     }
 
     async fn binary_bytes_fixture(
@@ -3937,6 +5834,7 @@ mod tests {
         HttpPath((database, handle)): HttpPath<(String, String)>,
         headers: HeaderMap,
     ) -> Response {
+        assert_receiver_advertisement(&headers);
         assert_eq!(database, "route-1");
         assert_eq!(handle, BINARY_TEST_HANDLE);
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
@@ -4011,6 +5909,20 @@ mod tests {
         let mut response = Response::new(body);
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         let headers = response.headers_mut();
+        if matches!(fixture.fault, BinaryWireFault::WrongRangeSelection) {
+            headers.insert(
+                super::super::shapes::SELECTED_SHAPE_HEADER,
+                HeaderValue::from_str(
+                    &serde_json::to_string(
+                        &super::super::shapes::v1(95, super::super::shapes::V1_95)
+                            .unwrap()
+                            .shape(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
         headers.insert(
             "x-native-export-api",
             HeaderValue::from_static(
@@ -4080,6 +5992,7 @@ mod tests {
         HttpPath((database, handle)): HttpPath<(String, String)>,
         headers: HeaderMap,
     ) -> Response {
+        assert_receiver_advertisement(&headers);
         assert_eq!(database, "route-1");
         assert_eq!(handle, BINARY_TEST_HANDLE);
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
@@ -4097,10 +6010,13 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        assert_receiver_advertisement(&headers);
         assert_eq!(database, "route-1");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         fixture.mcp_calls.fetch_add(1, Ordering::SeqCst);
-        if matches!(fixture.fault, BinaryWireFault::HeadProbeUnavailable) {
+        if fixture.authority.is_none()
+            || matches!(fixture.fault, BinaryWireFault::HeadProbeUnavailable)
+        {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error":"head unavailable"})),
@@ -4214,6 +6130,7 @@ mod tests {
                 fs::write(&self.credential, "after-capture-ready").unwrap();
                 *self.expected.lock().unwrap() = "after-capture-ready".into();
                 let reply = binary::BinaryPoll::Ready {
+                    selected: None,
                     manifest: Box::new(self.manifest.clone()),
                     size: self.bytes.len() as u64,
                     sha256: self.manifest.snapshot.sha256.clone(),
@@ -4302,6 +6219,7 @@ mod tests {
         polls: AtomicUsize,
         reads: AtomicUsize,
         cancels: AtomicUsize,
+        poll_selection_once: Mutex<Option<super::super::shapes::Shape>>,
         poll_bearers: Mutex<Vec<String>>,
         start_bearers: Mutex<Vec<String>>,
         read_bearers: Mutex<Vec<String>>,
@@ -4327,6 +6245,7 @@ mod tests {
                 polls: AtomicUsize::new(0),
                 reads: AtomicUsize::new(0),
                 cancels: AtomicUsize::new(0),
+                poll_selection_once: Mutex::new(None),
                 poll_bearers: Mutex::new(Vec::new()),
                 start_bearers: Mutex::new(Vec::new()),
                 read_bearers: Mutex::new(Vec::new()),
@@ -4385,6 +6304,9 @@ mod tests {
             }
             let index = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             let handle = binary::BinaryExport {
+                selected: None,
+                actual_shape: None,
+                poll_selection: None,
                 handle: Self::handle_for(index),
                 transfer: *self.transfer.lock().unwrap(),
             };
@@ -4403,8 +6325,13 @@ mod tests {
             if index == self.gone_on_poll.load(Ordering::SeqCst) {
                 return Box::pin(async { Err(Self::gone_error()) });
             }
+            if let Some(selected) = self.poll_selection_once.lock().unwrap().take() {
+                return Box::pin(async move { Ok(binary::BinaryPoll::Pending(Some(selected))) });
+            }
             match *self.poll_mode.lock().unwrap() {
-                ResumePollMode::Pending => Box::pin(async { Ok(binary::BinaryPoll::Pending) }),
+                ResumePollMode::Pending => {
+                    Box::pin(async { Ok(binary::BinaryPoll::Pending(None)) })
+                }
                 ResumePollMode::Gone => Box::pin(async { Err(Self::gone_error()) }),
                 ResumePollMode::Auth => Box::pin(async { Err(Self::auth_error()) }),
                 ResumePollMode::Refused(class) => Box::pin(async move {
@@ -4428,6 +6355,7 @@ mod tests {
                         manifest.validate().unwrap();
                     }
                     let reply = binary::BinaryPoll::Ready {
+                        selected: None,
                         size: manifest.snapshot.size_bytes,
                         sha256: manifest.snapshot.sha256.clone(),
                         manifest: Box::new(manifest),
@@ -5025,11 +6953,21 @@ mod tests {
                 controller.store.maintenance_idle().await;
                 let locks = ["attempt.lock", "binary-work.lock"]
                     .map(|name| open_private_lock(&controller.refresh_dir.join(name)).unwrap());
-                let idle = locks.iter().all(|lock| match lock.try_lock_exclusive() {
-                    Ok(()) => true,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-                    Err(error) => panic!("refresh worker quiescence failed: {error}"),
-                });
+                let acquired = locks
+                    .each_ref()
+                    .map(|lock| match lock.try_lock_exclusive() {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                        Err(error) => panic!("refresh worker quiescence failed: {error}"),
+                    });
+                let idle = acquired.iter().all(|acquired| *acquired);
+                for (lock, acquired) in locks.iter().zip(acquired) {
+                    if acquired {
+                        // Explicit unlock also releases an inherited open-file
+                        // description if another test forks during this probe.
+                        fs2::FileExt::unlock(lock).unwrap();
+                    }
+                }
                 drop(locks);
                 if idle {
                     return;
@@ -5263,6 +7201,20 @@ mod tests {
             // The retained export survives: no server DELETE fired.
             assert_eq!(fake.cancels.load(Ordering::SeqCst), 0);
             let refresh_dir = directory.path().join("replica/refresh");
+            // Aborting the waiter does not stop its blocking worker, which keeps
+            // `binary-work.lock` until it finishes. Wait (bounded) for that
+            // worker to go quiet instead of racing it with a fixed delay.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let lock = open_private_lock(&refresh_dir.join("binary-work.lock")).unwrap();
+                    if lock.try_lock_exclusive().is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the aborted transfer worker must release its lock");
             assert!(refresh_dir.join("binary-resume.json").exists());
             assert!(refresh_dir.join("binary-resume.partial.db").exists());
             // A new controller resumes the same handle to a complete transfer.
@@ -5321,6 +7273,11 @@ mod tests {
             };
             state.last_full_refresh_at = Some(previous.clone());
             controller.write_state(&state).unwrap();
+            *fake.poll_selection_once.lock().unwrap() = Some(
+                super::super::shapes::v1(95, super::super::shapes::V1_95)
+                    .unwrap()
+                    .shape(),
+            );
             // The liveness probe succeeds; the immediately following poll loses
             // the retained handle. Only the replacement's polls are live again.
             fake.gone_on_poll
@@ -6005,6 +7962,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receiver_fresh_poll_selections_bind_to_ready_manifest_before_transfer() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        for retained in [false, true] {
+            for fault in [
+                BinaryWireFault::None,
+                BinaryWireFault::MatchingPollSelection,
+                BinaryWireFault::WrongPollSelection,
+                BinaryWireFault::WrongReadySelection,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let fixture = BinaryHttpFixture {
+                    bytes: Arc::new(bytes.clone()),
+                    manifest: manifest.clone(),
+                    authority: None,
+                    transfer: transfer_repr::SnapshotTransfer::IdentityV1,
+                    legacy_starts: Arc::default(),
+                    fault,
+                    starts: Arc::default(),
+                    ranges: Arc::default(),
+                    polls: Arc::default(),
+                    mcp_calls: Arc::default(),
+                    cancels: Arc::default(),
+                };
+                let (port, server) = serve_binary_fixture(fixture.clone()).await;
+                let mut controller = controller_for_origin(
+                    &directory,
+                    origin.clone(),
+                    Arc::new(AlwaysFailClient {
+                        class: RefreshFailureClass::Protocol,
+                        calls: AtomicUsize::new(0),
+                    }),
+                );
+                controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+                controller.binary_snapshot_enabled = true;
+                let mut previous_full = None;
+                if retained {
+                    let pending = binary_resume::pending_capture(
+                        &controller.resume_binding(),
+                        BINARY_TEST_HANDLE.into(),
+                        now(),
+                    );
+                    binary_resume::save_pending_capture(&controller.refresh_dir, &pending).unwrap();
+                    previous_full = Some(now());
+                    let mut state = controller.state().unwrap();
+                    state.last_full_refresh_at = previous_full.clone();
+                    controller.write_state(&state).unwrap();
+                }
+                let result = controller.refresh_once(RefreshCause::Startup).await;
+                assert_eq!(
+                    fixture.starts.load(Ordering::SeqCst),
+                    if retained { 0 } else { 1 }
+                );
+                if retained {
+                    assert_eq!(
+                        controller.state().unwrap().last_full_refresh_at,
+                        previous_full,
+                        "resuming must not spend another capture or cooldown start"
+                    );
+                }
+                if matches!(
+                    fault,
+                    BinaryWireFault::None | BinaryWireFault::MatchingPollSelection
+                ) {
+                    assert!(matches!(
+                        result.unwrap(),
+                        StandbyRefreshOutcome::Installed { .. }
+                    ));
+                    assert!(!fixture.ranges.lock().unwrap().is_empty());
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "a contradictory poll selection must refuse"
+                    );
+                    assert_eq!(
+                        controller.state().unwrap().last_failure_class,
+                        Some(RefreshFailureClass::Protocol)
+                    );
+                    assert!(
+                        fixture.ranges.lock().unwrap().is_empty(),
+                        "refuse before GET"
+                    );
+                    assert!(controller.store.current_for_head_probe().unwrap().is_none());
+                    assert_eq!(
+                        fs::read_dir(controller.store.staging_dir())
+                            .unwrap()
+                            .count(),
+                        0
+                    );
+                }
+                controller.store.maintenance_idle().await;
+                server.abort();
+            }
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn binary_first_install_rejects_invalid_wire_without_promotion() {
         let db = crate::create_database(":memory:").await.unwrap();
         let origin = crate::identity::database_id(&db).await.unwrap();
@@ -6175,6 +8231,8 @@ mod tests {
 
     /// How a fixture authority misbehaves on its delta response.
     #[derive(Clone, Copy)]
+    // The version-2 variants are used by the in-place tests (v2-kernel-probe).
+    #[cfg_attr(not(feature = "v2-kernel-probe"), allow(dead_code))]
     enum AuthorityFault {
         None,
         /// Cut from one act after the requested lower bound: a gap.
@@ -6182,6 +8240,20 @@ mod tests {
         /// A correctly re-signed delta whose carried storage-policy pin no
         /// longer matches the local copy, so only the apply step refuses it.
         PolicyDrift,
+        /// A hosted whose deployment flag for version-2 deltas is on: the head
+        /// advertises it and a request carrying `kernel_delta_version: 2` is cut
+        /// at version 2.
+        AdvertiseV2,
+        /// A mixed fleet: the head advertises version 2, but the replica that
+        /// answers the delta request cannot read the field and refuses it.
+        MixedFleet,
+        /// A hosted that advertises wire version 3 (the set digest alone) and
+        /// cuts at whatever version the request names.
+        AdvertiseV3,
+        /// The head advertises versions 2 and 3, but the replica that answers
+        /// cannot read version 3 (it knows only 1 and 2) and refuses that
+        /// request; version 2 is served.
+        RefuseV3,
     }
 
     fn drift_delta_policy(mut structured: Value) -> Value {
@@ -6230,9 +8302,30 @@ mod tests {
                 let operation = body["params"]["arguments"]["operation"].as_str().unwrap();
                 let result = match operation {
                     super::super::delta_transport::AUTHORITY_ACT_HEAD_OPERATION => {
-                        super::super::delta_transport::observe_authority_act_head(&db, "route-1")
-                            .await
-                            .map(|value| serde_json::to_value(value).unwrap())
+                        super::super::delta_transport::observe_authority_act_head_advertising(
+                            &db,
+                            "route-1",
+                            matches!(
+                                fault,
+                                AuthorityFault::AdvertiseV2
+                                    | AuthorityFault::MixedFleet
+                                    | AuthorityFault::AdvertiseV3
+                                    | AuthorityFault::RefuseV3
+                            ),
+                        )
+                        .await
+                        .map(|value| serde_json::to_value(value).unwrap())
+                        .map(|mut value| {
+                            // Hosted advertises [1, 2] at most; a version-3 host
+                            // is scripted by adding 3 to the advertised list.
+                            if matches!(
+                                fault,
+                                AuthorityFault::AdvertiseV3 | AuthorityFault::RefuseV3
+                            ) {
+                                value["kernel_delta_versions"] = json!([1, 2, 3]);
+                            }
+                            value
+                        })
                     }
                     super::super::delta_transport::AUTHORITY_ACT_DELTA_OPERATION => {
                         let from = body["params"]["arguments"]["arguments"]["from_exclusive_act"]
@@ -6246,11 +8339,40 @@ mod tests {
                             body["params"]["arguments"]["arguments"]["blob_inventory"].clone(),
                         )
                         .unwrap();
-                        super::super::delta_transport::observe_authority_act_delta_with_inventory(
+                        let refused = (matches!(fault, AuthorityFault::MixedFleet)
+                            && body["params"]["arguments"]["arguments"]["kernel_delta_version"]
+                                .is_number())
+                            || (matches!(fault, AuthorityFault::RefuseV3)
+                                && body["params"]["arguments"]["arguments"]
+                                    ["kernel_delta_version"]
+                                    == 3);
+                        if refused {
+                            let envelope = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "error": {"code": -32602, "message": "unknown field kernel_delta_version"}
+                            });
+                            write_json_response(&mut stream, "200 OK", &envelope).await;
+                            continue;
+                        }
+                        let version = if matches!(
+                            fault,
+                            AuthorityFault::AdvertiseV2
+                                | AuthorityFault::AdvertiseV3
+                                | AuthorityFault::RefuseV3
+                        ) {
+                            body["params"]["arguments"]["arguments"]["kernel_delta_version"]
+                                .as_u64()
+                                .unwrap_or(1) as u32
+                        } else {
+                            1
+                        };
+                        super::super::delta_transport::observe_authority_act_delta_versioned(
                             &db,
                             "route-1",
                             from,
                             inventory.as_deref(),
+                            version,
                         )
                         .await
                         .map(|value| serde_json::to_value(value).unwrap())
@@ -6412,6 +8534,9 @@ mod tests {
             refresh_interval_seconds: None,
             full_refresh_min_interval_seconds: None,
             full_refresh_repair_retry_seconds: None,
+            kernel_in_place_deltas: false,
+            kernel_audit_interval_seconds: None,
+            projection_proof_interval_seconds: None,
         };
         let store = GenerationStore::open(
             &replica_root,
@@ -6420,6 +8545,7 @@ mod tests {
         )
         .unwrap();
         let observed = ObservedInstalledConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,
             source_sha: "1".repeat(40),
             artifact_sha256: "2".repeat(64),
@@ -7303,10 +9429,11 @@ mod tests {
         else {
             panic!("install")
         };
-        // Installation schedules maintenance, whose unknown-current check also
-        // takes attempt.lock. Settle it before changing verification inputs so
-        // this refresh exercises rebind refusal rather than Accepted/coalescing.
-        controller.store.maintenance_idle().await;
+        // This proof needs an actual refresh attempt, not busy/coalescing.
+        // Wait for maintenance AND independently held attempt/transfer leases
+        // before changing verification inputs. Worker completion alone does
+        // not establish that every open lock description has been released.
+        refresh_workers_idle(&controller).await;
         controller.observed.artifact_sha256 = "9".repeat(64);
         enable_deltas(&mut controller);
         if fault == "io" {
@@ -8098,18 +10225,35 @@ mod tests {
     #[tokio::test]
     async fn maintenance_head_preserves_freshness_without_full_and_recovers() {
         for header in [false, true] {
-            assert_maintenance_preserves_copy_and_recovers(false, header).await;
+            assert_maintenance_preserves_copy_and_recovers(false, header, false, false).await;
         }
     }
 
     #[tokio::test]
     async fn maintenance_delta_preserves_freshness_without_full_and_recovers() {
         for header in [false, true] {
-            assert_maintenance_preserves_copy_and_recovers(true, header).await;
+            assert_maintenance_preserves_copy_and_recovers(true, header, false, false).await;
         }
     }
 
-    async fn assert_maintenance_preserves_copy_and_recovers(delta: bool, header: bool) {
+    #[tokio::test]
+    async fn update_required_head_and_delta_preserve_generation_without_full_then_recover() {
+        for delta in [false, true] {
+            assert_maintenance_preserves_copy_and_recovers(delta, false, true, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_shape_update_required_delta_retains_existing_full_fallback() {
+        assert_maintenance_preserves_copy_and_recovers(true, false, false, true).await;
+    }
+
+    async fn assert_maintenance_preserves_copy_and_recovers(
+        delta: bool,
+        header: bool,
+        update: bool,
+        receiver_shape_update: bool,
+    ) {
         let authority = crate::db::create_database(":memory:").await.unwrap();
         let origin = crate::identity::database_id(&authority).await.unwrap();
         let base_act = read_authority_act_head(&authority).await.unwrap().head_act;
@@ -8182,6 +10326,20 @@ mod tests {
                     break (stream, request);
                 };
                 assert_eq!(request["params"]["arguments"]["operation"], operation);
+                if maintenance && receiver_shape_update {
+                    write_json_response(&mut stream,"200 OK",&json!({"jsonrpc":"2.0","id":1,"result":{
+                        "content":[],"isError":true,"structuredContent":{"error_code":super::super::shapes::UPDATE_REQUIRED},
+                        "resultType":"complete","_meta":{}
+                    }})).await;
+                    continue;
+                }
+                if maintenance && update {
+                    write_json_response(&mut stream, "426 Upgrade Required", &json!({
+                        "error_code":"client_update_required","outcome":"refused","applied":false
+                    })).await;
+                    continue;
+                }
+
                 let structured = if operation == AUTHORITY_ACT_HEAD_OPERATION {
                     serde_json::to_value(observe_authority_act_head(&db, "route-1").await.unwrap())
                         .unwrap()
@@ -8227,8 +10385,42 @@ mod tests {
             .refresh_once_with_receipt(RefreshCause::Manual)
             .await
             .unwrap_err();
-        assert_eq!(failure.receipt.class, RefreshFailureClass::Network);
-        assert_eq!(failure.receipt.detail, "maintenance");
+        if receiver_shape_update {
+            assert_eq!(failure.receipt.class, RefreshFailureClass::Protocol);
+            assert_eq!(failure.receipt.phase, RefreshAttemptPhase::Full);
+            assert!(failure.receipt.delta_fallback.is_some());
+            assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fs::read(&generation.snapshot_path).unwrap(), before_bytes);
+            assert_eq!(
+                controller
+                    .store
+                    .current_for_head_probe()
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                generation.id
+            );
+            server.abort();
+            controller.store.maintenance_idle().await;
+            authority.close().await;
+            return;
+        }
+        assert_eq!(
+            failure.receipt.class,
+            if update {
+                RefreshFailureClass::Compatibility
+            } else {
+                RefreshFailureClass::Network
+            }
+        );
+        if update {
+            assert_eq!(
+                controller.pending_observer.compatibility().status()["status"],
+                "demand_recorded"
+            );
+        } else {
+            assert_eq!(failure.receipt.detail, "maintenance");
+        }
         assert_eq!(failure.receipt.phase, RefreshAttemptPhase::Following);
         assert_eq!(failure.receipt.delta_fallback, None);
         let state = controller.state().unwrap();
@@ -8549,6 +10741,34 @@ mod tests {
                 "unrecognized error with https://secret.invalid/token",
                 "unclassified",
             ),
+            (
+                "hosted authority act request failed: request_timeout",
+                "request_timeout",
+            ),
+            (
+                "hosted authority act response was interrupted: connection_reset",
+                "connection_reset",
+            ),
+            (
+                "hosted authority act request failed: secret-body",
+                "unclassified",
+            ),
+            (
+                "hosted authority act delta export request failed: export_in_progress",
+                "export_in_progress",
+            ),
+            (
+                "hosted authority act delta export request failed: capture unavailable",
+                "capture_unavailable",
+            ),
+            (
+                "hosted authority act delta export request failed: capture timed out",
+                "capture_timed_out",
+            ),
+            (
+                "hosted authority act delta export HTTP status 503 (capacity_exhausted)",
+                "http_5xx",
+            ),
             ("payload mentions HTTP status 409", "unclassified"),
         ] {
             let error = classify_delta_transport_error(Error::engine(message));
@@ -8563,6 +10783,24 @@ mod tests {
             delta_transport_failure_detail(&Error::auth("secret")),
             "unclassified"
         );
+        // A busy export is scheduling, not an outage: it must never read as
+        // a network failure (which would schedule network-recovery probes
+        // into the same busy lease). A poll this node gave up on keeps the
+        // network class — hosted may still be running that export.
+        let busy = classify_delta_transport_error(Error::engine(
+            super::super::delta_transport::DELTA_EXPORT_BUSY_MESSAGE,
+        ));
+        assert_eq!(busy.class, RefreshFailureClass::Throttled);
+        assert_eq!(busy.detail, EXPORT_BUSY_DETAIL);
+        assert_eq!(
+            busy.safe_message,
+            "hosted delta export is already in progress"
+        );
+        let timed_out = classify_delta_transport_error(Error::engine(
+            super::super::delta_transport::DELTA_EXPORT_CAPTURE_TIMEOUT_MESSAGE,
+        ));
+        assert_eq!(timed_out.class, RefreshFailureClass::Network);
+        assert_eq!(timed_out.detail, EXPORT_CAPTURE_TIMEOUT_DETAIL);
     }
 
     #[test]
@@ -8676,6 +10914,668 @@ mod tests {
         assert!(!raw.manual_refresh_pending);
     }
 
+    #[tokio::test]
+    async fn a_burst_of_hints_leaves_one_durable_pending_cause() {
+        let client = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Authentication,
+            calls: AtomicUsize::new(0),
+        });
+        let (_directory, controller) = controller_with_client(client);
+        let hints = RefreshHints::default();
+        // A hosted-change burst: many hints before the controller drains any.
+        for _ in 0..200 {
+            hints.request(RefreshCause::AfterAdmittedWrite);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(300), hints.persist(&controller)).await;
+        assert_eq!(
+            controller.take_pending_triggers().unwrap(),
+            vec![RefreshCause::AfterAdmittedWrite]
+        );
+        // Hints that arrive while that one acquisition runs become exactly one
+        // follow-up, not a queue.
+        for _ in 0..200 {
+            hints.request(RefreshCause::AfterAdmittedWrite);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(300), hints.persist(&controller)).await;
+        assert_eq!(controller.take_pending_triggers().unwrap().len(), 1);
+    }
+
+    /// Hosted answers chunked delta starts with 409 `export_in_progress`
+    /// (plus `Retry-After: 1`) while it runs an export for this account.
+    /// Serve the MCP head for real and refuse every start, counting them.
+    async fn serve_busy_delta_starts(
+        authority: crate::Db,
+        starts: Arc<AtomicUsize>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                if headers.starts_with("POST /v1/databases/") {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    let body = serde_json::to_vec(&json!({
+                        "api": super::super::delta_transport::AUTHORITY_ACT_DELTA_EXPORT_CONTRACT,
+                        "error_code": "export_in_progress",
+                    }))
+                    .unwrap();
+                    let head = format!(
+                        "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 1\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    continue;
+                }
+                let operation = body["params"]["arguments"]["operation"].as_str().unwrap();
+                assert_eq!(
+                    operation,
+                    super::super::delta_transport::AUTHORITY_ACT_HEAD_OPERATION
+                );
+                let structured =
+                    super::super::delta_transport::observe_authority_act_head_advertising(
+                        &authority, "route-1", false,
+                    )
+                    .await
+                    .map(|value| serde_json::to_value(value).unwrap())
+                    .unwrap();
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [],
+                            "structuredContent": structured,
+                            "isError": false,
+                            "resultType": "complete",
+                            "_meta": {}
+                        }
+                    }),
+                )
+                .await;
+            }
+        });
+        (port, task)
+    }
+
+    /// Install a delta-eligible copy, move the hosted head past it, and point
+    /// the controller at a hosted fixture. Returns the controller, the busy
+    /// fixture's start counter, and a snapshot client that counts any whole
+    /// snapshot fallback.
+    async fn busy_delta_setup() -> (
+        tempfile::TempDir,
+        StandbyRefreshController,
+        Arc<AtomicUsize>,
+        Arc<AlwaysFailClient>,
+        crate::Db,
+    ) {
+        let authority = crate::db::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&authority).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(ScriptedClient::new(paged_replies(
+                "busy-base",
+                &bytes,
+                &manifest,
+            ))),
+        );
+        controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        enable_deltas(&mut controller);
+        controller.store.maintenance_idle().await;
+        crate::store::append(
+            &authority,
+            crate::store::AppendSpec {
+                record_id: "1a7e4000-0000-4000-8000-00000000d240".into(),
+                event_type: "record.created".into(),
+                payload: json!({"type":"Document","kind":"note","name":"busy head"}),
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+        // A whole snapshot fallback would go through this client.
+        let downloads = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        controller.client = downloads.clone();
+        let starts = Arc::new(AtomicUsize::new(0));
+        (directory, controller, starts, downloads, authority)
+    }
+
+    #[tokio::test]
+    async fn busy_delta_failure_keeps_trigger_and_backs_off_without_network_class() {
+        let (_directory, mut controller, starts, downloads, authority) = busy_delta_setup().await;
+        let (port, server) = serve_busy_delta_starts(authority.clone(), starts.clone()).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        let before = tokio::time::Instant::now();
+        let error = controller
+            .refresh_once(RefreshCause::AfterAdmittedWrite)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("export_in_progress"),
+            "{error:?}"
+        );
+        // One follow-up, not a snapshot, a probe, or a verdict of outage.
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            downloads.calls.load(Ordering::SeqCst),
+            0,
+            "a busy export must never buy a whole snapshot"
+        );
+        let state = controller.state().unwrap();
+        assert_eq!(
+            state.last_failure_class,
+            Some(RefreshFailureClass::Throttled),
+            "busy must not read as a network failure: that schedules recovery probes"
+        );
+        assert_eq!(
+            state.consecutive_failure_count, 0,
+            "a busy export is scheduling and must not count as a failure"
+        );
+        assert_eq!(
+            controller.take_pending_triggers().unwrap(),
+            vec![RefreshCause::AfterAdmittedWrite]
+        );
+        // Hosted asked for one second via Retry-After: the hold is armed
+        // for one second from the failure. Read the deadline itself: the
+        // wall clock may pass the one-second hold before this assert runs
+        // under parallel load.
+        {
+            let backoff = controller.busy_backoff.lock().unwrap();
+            assert!(
+                backoff
+                    .until
+                    .is_some_and(|until| until >= before + Duration::from_secs(1)),
+                "Retry-After: 1 must arm a one-second hold"
+            );
+            assert_eq!(backoff.consecutive, 1);
+        }
+        server.abort();
+        controller.store.maintenance_idle().await;
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn burst_hints_become_one_busy_attempt_plus_one_follow_up() {
+        let (_directory, mut controller, starts, _downloads, authority) = busy_delta_setup().await;
+        let (port, server) = serve_busy_delta_starts(authority.clone(), starts.clone()).await;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        // Hold the attempt lock so the whole burst coalesces before any
+        // attempt can run: an SSE burst is one acquisition, never a queue.
+        let lock = open_private_lock(&controller.refresh_dir.join("attempt.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        for _ in 0..8 {
+            let outcome = controller
+                .refresh_or_request_with_receipt(RefreshCause::AfterAdmittedWrite)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, StandbyRefreshOutcome::Accepted { .. }),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.take_pending_triggers().unwrap(),
+            vec![RefreshCause::AfterAdmittedWrite]
+        );
+        drop(lock);
+        // The one follow-up runs, hits the same busy lease, and re-arms.
+        let error = controller
+            .refresh_once(RefreshCause::AfterAdmittedWrite)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("export_in_progress"),
+            "{error:?}"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controller.take_pending_triggers().unwrap(),
+            vec![RefreshCause::AfterAdmittedWrite]
+        );
+        assert!(
+            controller.busy_backoff.lock().unwrap().until.is_some(),
+            "the follow-up failure must re-arm the busy hold"
+        );
+        server.abort();
+        controller.store.maintenance_idle().await;
+        authority.close().await;
+    }
+
+    #[tokio::test]
+    async fn daemon_skips_attempts_while_the_busy_backoff_holds() {
+        let client = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        let (_directory, controller) = controller_with_client(client.clone());
+        controller
+            .request_refresh(RefreshCause::AfterAdmittedWrite)
+            .unwrap();
+        // Pretend a busy failure just armed the hold; the busy-failure test
+        // above covers the real path that sets it.
+        controller.note_busy_export(Some(Duration::from_secs(30)));
+        // Consecutive busy failures push the hold further out, toward the cap.
+        let first = controller
+            .busy_backoff
+            .lock()
+            .unwrap()
+            .until
+            .expect("busy hold must be armed");
+        controller.note_busy_export(Some(Duration::from_secs(30)));
+        let second = controller
+            .busy_backoff
+            .lock()
+            .unwrap()
+            .until
+            .expect("busy hold must still be armed");
+        assert!(second > first);
+        let guard = controller.try_acquire_daemon().unwrap().unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::time::timeout(
+            Duration::from_millis(1200),
+            controller.run_daemon_after_startup(guard, shutdown_rx),
+        )
+        .await
+        .expect_err("the daemon must still be running");
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            0,
+            "no attempt may start while the busy backoff holds"
+        );
+        assert_eq!(
+            controller.take_pending_triggers().unwrap(),
+            vec![RefreshCause::AfterAdmittedWrite],
+            "the trigger stays durable for the retry"
+        );
+        // Once the hold lapses the daemon runs the pending trigger: the
+        // first tick fires immediately, the next only after the 1 s poll.
+        controller.clear_busy_export();
+        let guard = controller.try_acquire_daemon().unwrap().unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::time::timeout(
+            Duration::from_millis(900),
+            controller.run_daemon_after_startup(guard, shutdown_rx),
+        )
+        .await
+        .expect_err("the daemon must still be running");
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            1,
+            "the pending trigger retries after the backoff"
+        );
+        controller.store.maintenance_idle().await;
+    }
+
+    #[test]
+    fn follow_loop_stall_report_fires_only_when_idle_and_overdue() {
+        let interval = Duration::from_secs(60);
+        assert_eq!(
+            stall_warn_after(interval),
+            Duration::from_secs(300),
+            "well over the cadence means a multiple of it"
+        );
+        // A future base keeps every offset below clear of underflow.
+        let now = tokio::time::Instant::now() + Duration::from_secs(7200);
+        // Healthy: an attempt just started and the deadline lies ahead.
+        assert!(follow_loop_stall_report(now, Some(now), now + interval, interval).is_none());
+        // Healthy: a long attempt completed 40 minutes after it started and
+        // its completion re-anchored the deadline into the future.
+        assert!(follow_loop_stall_report(
+            now,
+            Some(now - Duration::from_secs(2400)),
+            now + interval,
+            interval
+        )
+        .is_none());
+        // Healthy: the deadline is overdue but an attempt just started — the
+        // overdue probe is already running.
+        assert!(
+            follow_loop_stall_report(now, Some(now), now - Duration::from_secs(600), interval)
+                .is_none()
+        );
+        // Stalled: no attempt for 35 minutes while the scheduled deadline
+        // sits 17 minutes overdue — the incident's recovery-tick shape.
+        let stall = follow_loop_stall_report(
+            now,
+            Some(now - Duration::from_secs(2100)),
+            now - Duration::from_secs(1020),
+            interval,
+        )
+        .expect("the recovery tick after a 35-minute stall must warn");
+        assert_eq!(stall.idle, Duration::from_secs(2100));
+        assert_eq!(stall.scheduled_overdue, Duration::from_secs(1020));
+        // Never started: the first tick always runs Startup, so there is no
+        // quiet history to judge yet.
+        assert!(
+            follow_loop_stall_report(now, None, now - Duration::from_secs(3600), interval)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn busy_skip_log_rate_limits_repeated_skips() {
+        let interval = Duration::from_secs(60);
+        let now = tokio::time::Instant::now();
+        assert!(
+            busy_skip_log_due(now, None, interval),
+            "the first skip of an episode always logs"
+        );
+        assert!(!busy_skip_log_due(now, Some(now), interval));
+        assert!(!busy_skip_log_due(
+            now + Duration::from_secs(59),
+            Some(now),
+            interval
+        ));
+        assert!(busy_skip_log_due(now + interval, Some(now), interval));
+    }
+
+    #[tokio::test]
+    async fn busy_backoff_remaining_tracks_the_armed_hold() {
+        // Freeze the clock: arming a 30 s hold must report exactly 30 s back.
+        tokio::time::pause();
+        let client = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        let (_directory, controller) = controller_with_client(client);
+        assert_eq!(controller.busy_backoff_remaining(), None);
+        controller.note_busy_export(Some(Duration::from_secs(30)));
+        assert_eq!(
+            controller.busy_backoff_remaining(),
+            Some(Duration::from_secs(30))
+        );
+        controller.clear_busy_export();
+        assert_eq!(controller.busy_backoff_remaining(), None);
+    }
+
+    /// Log capture for the follow-loop scheduler target, mirroring the
+    /// verification capture in `generation_store::test_diagnostics`: scoped to
+    /// the awaiting task with a second live dispatcher so parallel tests
+    /// cannot cache the callsite as disabled.
+    #[derive(Clone, Default)]
+    struct FollowLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for FollowLogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl FollowLogCapture {
+        fn subscriber(&self) -> tracing::Dispatch {
+            use tracing_subscriber::prelude::*;
+            let writer = self.clone();
+            tracing::Dispatch::new(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .without_time()
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone())
+                        .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                            metadata.target() == FOLLOW_LOG_TARGET
+                        })),
+                ),
+            )
+        }
+
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_coalescing_is_logged() {
+        use tracing::instrument::WithSubscriber as _;
+        let _capture_guard = crate::standby::generation_store::test_diagnostics::LOG_CAPTURE_LOCK
+            .lock()
+            .await;
+        let client = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Protocol,
+            calls: AtomicUsize::new(0),
+        });
+        let (_directory, controller) = controller_with_client(client);
+        // The test holds the daemon lock, so the one-shot scheduling
+        // boundary must coalesce instead of acquiring.
+        let _guard = controller
+            .try_acquire_daemon()
+            .unwrap()
+            .expect("test holds the daemon lock");
+        let logs = FollowLogCapture::default();
+        let _keepalive = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        let outcome = controller
+            .refresh_or_request_with_receipt(RefreshCause::AfterAdmittedWrite)
+            .with_subscriber(logs.subscriber())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, StandbyRefreshOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.output().contains("coalesced"),
+            "the coalesced acquisition must leave a scheduler log line"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn follow_watchdog_warns_once_until_ticks_resume() {
+        use tracing::instrument::WithSubscriber as _;
+        let _capture_guard = crate::standby::generation_store::test_diagnostics::LOG_CAPTURE_LOCK
+            .lock()
+            .await;
+        let heartbeat = std::sync::Arc::new(FollowHeartbeat::new());
+        let interval = Duration::from_secs(2);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let logs = FollowLogCapture::default();
+        let _keepalive = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        // Drive the watchdog future directly. Advancing the clock fires its
+        // probe timers, but a fired probe is only observed when this task
+        // polls the future again — so each phase advances the clock, then
+        // drives the future once with a yield race it cannot lose except by
+        // exiting (which only shutdown may cause).
+        let watchdog = run_follow_watchdog(&heartbeat, interval, shutdown_rx)
+            .with_subscriber(logs.subscriber());
+        tokio::pin!(watchdog);
+        macro_rules! drive_once {
+            () => {
+                tokio::select! {
+                    _ = &mut watchdog => {
+                        panic!("the watchdog must not exit before shutdown")
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+            };
+        }
+        // The loop has not ticked yet (slow startup): no quiet history to
+        // judge, so no warning is owed no matter how far the clock runs.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        drive_once!();
+        assert!(
+            !heartbeat.warned.load(std::sync::atomic::Ordering::SeqCst)
+                && !logs.output().contains("parked between attempts")
+                && !logs.output().contains("attempt running for"),
+            "the watchdog must stay silent before the loop's first tick"
+        );
+        // The loop ticks once and then parks between attempts: the probe
+        // sees a 30 s idle heartbeat and warns once (threshold is 5 x 2 s).
+        heartbeat.note_tick();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        drive_once!();
+        assert!(
+            heartbeat.warned.load(std::sync::atomic::Ordering::SeqCst),
+            "the watchdog must observe the 30 s idle heartbeat"
+        );
+        assert_eq!(
+            logs.output().matches("parked between attempts").count(),
+            1,
+            "a parked scheduler must warn while the stall is happening"
+        );
+        // Still parked: the latch holds, so no second line.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_once!();
+        assert_eq!(
+            logs.output().matches("parked between attempts").count(),
+            1,
+            "the watchdog must not repeat itself while nothing recovers"
+        );
+        // A tick resumes the loop: the next probe re-arms the latch without
+        // a new warning.
+        heartbeat.note_tick();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drive_once!();
+        assert_eq!(
+            logs.output().matches("parked between attempts").count(),
+            1,
+            "a fresh tick must re-arm the watchdog without a new warning"
+        );
+        // An attempt starts and then holds the loop: ticks stop while it
+        // runs, so the next warning names the running attempt instead.
+        heartbeat.note_attempt_start();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_once!();
+        assert_eq!(
+            logs.output().matches("attempt running for").count(),
+            1,
+            "a stalled attempt must warn while it is still running"
+        );
+        heartbeat.note_attempt_end();
+        drop(shutdown_tx);
+        watchdog.await;
+    }
+
+    fn lifecycle_harness() -> (
+        tempfile::TempDir,
+        StandbyRuntimeConfig,
+        ObservedInstalledConsumerIdentity,
+        std::path::PathBuf,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let replica_root = directory.path().join("replica");
+        let credential = directory.path().join("credential");
+        std::fs::write(&credential, b"secret\n").unwrap();
+        set_mode(&credential, 0o600).unwrap();
+        let runtime = StandbyRuntimeConfig {
+            replica_root: replica_root.clone(),
+            hosted_route_database_id: "route-1".into(),
+            origin_database_id: "ndb_0123456789abcdef0123456789abcdef".into(),
+        };
+        let observed = ObservedInstalledConsumerIdentity {
+            kernel_v2_reader: Default::default(),
+            platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,
+            source_sha: "1".repeat(40),
+            artifact_sha256: "2".repeat(64),
+            engine_schema_version: crate::CURRENT_ENGINE_SCHEMA_VERSION,
+            ddl_sha256: crate::schema::FROZEN_DDL_SHA256.into(),
+        };
+        let config_path = directory.path().join("refresh.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "contract": CONFIG_CONTRACT,
+                "version": 1,
+                "hosted_origin": "http://localhost",
+                "credential_file": credential,
+                "refresh_interval_seconds": 2,
+                "full_refresh_min_interval_seconds": 0,
+                "full_refresh_repair_retry_seconds": 60,
+                "kernel_in_place_deltas": false,
+                "kernel_audit_interval_seconds": null,
+                "projection_proof_interval_seconds": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (directory, runtime, observed, config_path)
+    }
+
+    #[tokio::test]
+    async fn background_refresh_stop_joins_worker_and_watchdog() {
+        let (_directory, runtime, observed, config_path) = lifecycle_harness();
+        let store = GenerationStore::open(
+            &runtime.replica_root,
+            &runtime.hosted_route_database_id,
+            Some(runtime.origin_database_id.clone()),
+        )
+        .unwrap();
+        // Startup already failed elsewhere: the worker exits at once, and
+        // stop must still join both threads instead of hanging.
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        drop(startup_tx);
+        let refresh = start_background_refresh_inner(
+            &runtime,
+            &observed,
+            &config_path,
+            Some(startup_rx),
+            store,
+            None,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), refresh.stop())
+            .await
+            .expect("stop must join the worker and watchdog threads");
+    }
+
+    #[tokio::test]
+    async fn background_refresh_without_daemon_guard_spawns_no_watchdog() {
+        let (_directory, runtime, observed, config_path) = lifecycle_harness();
+        // Hold the daemon lock before startup: this process loses the
+        // acquisition, runs no follow loop, and must spawn no watchdog.
+        // Owner-only modes are set explicitly: create_dir_all would inherit
+        // the process umask (0755 under CI's 022), which the store refuses.
+        create_private_directory(&runtime.replica_root).unwrap();
+        create_private_directory(&runtime.replica_root.join("refresh")).unwrap();
+        let held = open_private_lock(&runtime.replica_root.join("refresh").join("controller.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let store = GenerationStore::open(
+            &runtime.replica_root,
+            &runtime.hosted_route_database_id,
+            Some(runtime.origin_database_id.clone()),
+        )
+        .unwrap();
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        drop(startup_tx);
+        let refresh = start_background_refresh_inner(
+            &runtime,
+            &observed,
+            &config_path,
+            Some(startup_rx),
+            store,
+            None,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), refresh.stop())
+            .await
+            .expect("stop must return without a watchdog thread");
+        drop(held);
+    }
+
     #[test]
     fn wake_and_cadence_helpers_coalesce_without_catch_up_bursts() {
         assert!(elapsed_indicates_wake(
@@ -8748,6 +11648,9 @@ mod tests {
             refresh_interval_seconds: None,
             full_refresh_min_interval_seconds: None,
             full_refresh_repair_retry_seconds: None,
+            kernel_in_place_deltas: false,
+            kernel_audit_interval_seconds: None,
+            projection_proof_interval_seconds: None,
         };
         let store = GenerationStore::open(
             &replica_root,
@@ -8986,6 +11889,11 @@ mod tests {
                 assert!(lower.contains("mcp-protocol-version: 2026-07-28\r\n"));
                 assert!(lower.contains("mcp-method: tools/call\r\n"));
                 assert!(lower.contains("mcp-name: export\r\n"));
+                assert!(lower.contains(&format!(
+                    "{}: {}\r\n",
+                    super::super::shapes::ACCEPTED_SHAPES_HEADER,
+                    super::super::shapes::advertisement()
+                )));
                 assert_eq!(body["jsonrpc"], "2.0");
                 assert_eq!(body["id"], 1);
                 assert_eq!(body["method"], "tools/call");
@@ -9134,6 +12042,7 @@ mod tests {
             "snapshot":{"media_type":STANDBY_SNAPSHOT_MEDIA_TYPE,"size_bytes":2,"sha256":"a".repeat(64)}
         })).unwrap();
         let page = SnapshotPage {
+            selected_shape: None,
             export_id: "export".into(),
             file_name: "native-ce-export.db".into(),
             media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
@@ -9956,6 +12865,135 @@ mod tests {
         authority.close().await;
     }
 
+    #[tokio::test]
+    async fn hung_hosted_connection_times_out_and_daemon_resumes_without_restart() {
+        let authority = crate::db::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&authority).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&authority).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(ScriptedClient::new(paged_replies(
+                "base", &bytes, &manifest,
+            ))),
+        );
+        controller
+            .refresh_once(RefreshCause::Startup)
+            .await
+            .unwrap();
+        controller.store.maintenance_idle().await;
+        enable_deltas(&mut controller);
+        controller.config.refresh_interval_seconds = Some(1);
+        controller.attempt_timeout = Some(Duration::from_millis(500));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        controller.config.hosted_origin = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let db = authority.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/mcp/{route}",
+                    post(move || {
+                        let calls = server_calls.clone();
+                        let db = db.clone();
+                        let release = server_release.clone();
+                        async move {
+                            // Hosted accepts the request but sends no headers or bytes.
+                            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                release.notified().await;
+                            }
+                            let head = super::super::delta_transport::observe_authority_act_head(
+                                &db, "route-1",
+                            )
+                            .await
+                            .unwrap();
+                            Json(json!({"jsonrpc":"2.0","id":1,"result":{
+                        "structuredContent":head,"content":[],"isError":false}}))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let controller = Arc::new(controller);
+        let guard = controller.try_acquire_daemon().unwrap().unwrap();
+        let (shutdown, receiver) = watch::channel(false);
+        let daemon = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.run_daemon_after_startup(guard, receiver).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let state = controller.state().unwrap();
+                if state.last_failure_class == Some(RefreshFailureClass::Timeout) {
+                    assert!(!state.refresh_active);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            loop {
+                let state = controller.state().unwrap();
+                if calls.load(Ordering::SeqCst) >= 2
+                    && state.last_failure_class.is_none()
+                    && state.consecutive_failure_count == 0
+                    && !state.refresh_active
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the same daemon must follow again without a restart");
+        shutdown.send(true).unwrap();
+        daemon.await.unwrap();
+        release.notify_waiters();
+        server.abort();
+        controller.store.maintenance_idle().await;
+        authority.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_wakes_the_expired_attempt_boundary() {
+        let heartbeat = Arc::new(FollowHeartbeat::new());
+        heartbeat.note_tick();
+        heartbeat.note_attempt_start();
+        let expired = heartbeat.expired.notified();
+        tokio::pin!(expired);
+        expired.as_mut().enable();
+        let (shutdown, receiver) = watch::channel(false);
+        let watcher = tokio::spawn({
+            let heartbeat = heartbeat.clone();
+            async move { run_follow_watchdog(&heartbeat, Duration::from_secs(1), receiver).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(ATTEMPT_TIMEOUT + Duration::from_secs(1)).await;
+        expired.await;
+        shutdown.send(true).unwrap();
+        watcher.await.unwrap();
+        heartbeat.note_attempt_end();
+        assert!(heartbeat.attempt_age(tokio::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn held_refresh_lock_has_a_deadline_and_can_be_acquired_after_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("held.lock");
+        let holder = open_private_lock(&path).unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let waiter = open_private_lock(&path).unwrap();
+        let error = lock_exclusive_bounded(&waiter, Duration::from_millis(20)).unwrap_err();
+        assert!(matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut));
+        drop(holder);
+        lock_exclusive_bounded(&waiter, Duration::from_millis(20)).unwrap();
+    }
+
     #[test]
     fn fence_diagnostics_use_typed_sites_and_ignore_body_words() {
         use crate::error::StandbyAdmissionCheck as Check;
@@ -10131,5 +13169,33 @@ mod tests {
             v1.close().await;
             v2.close().await;
         }
+    }
+    #[tokio::test]
+    async fn full_mcp_page_records_update_before_generic_http_refusal() {
+        let app = Router::new().fallback(axum::routing::any(|headers:HeaderMap| async move {
+            assert_eq!(headers[crate::client_compatibility::HEADER],crate::client_compatibility::advertisement());
+            (StatusCode::UPGRADE_REQUIRED,Json(json!({"error_code":"client_update_required","outcome":"refused","applied":false})))
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp/db", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpSnapshotPageClient::new().unwrap();
+        let error = client
+            .page(
+                endpoint,
+                "secret".into(),
+                SnapshotPageRequest {
+                    export_id: None,
+                    offset: 0,
+                    length: 1,
+                    standby_consumer: Some(consumer()),
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.class, RefreshFailureClass::Compatibility);
+        assert_eq!(client.compatibility.status()["status"], "demand_recorded");
+        server.abort();
     }
 }

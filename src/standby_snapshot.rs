@@ -47,6 +47,11 @@ fn lowercase_hex(value: &str, length: usize) -> bool {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandbyConsumerIdentity {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::standby::kernel_v2::KernelV2Reader::is_initial"
+    )]
+    pub kernel_v2_reader: crate::standby::kernel_v2::KernelV2Reader,
     pub contract: String,
     pub version: u32,
     pub platform: StandbyConsumerPlatform,
@@ -72,6 +77,11 @@ pub enum StandbyConsumerPlatform {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedInstalledConsumerIdentity {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::standby::kernel_v2::KernelV2Reader::is_initial"
+    )]
+    pub kernel_v2_reader: crate::standby::kernel_v2::KernelV2Reader,
     pub platform: StandbyConsumerPlatform,
     pub source_sha: String,
     pub artifact_sha256: String,
@@ -90,6 +100,8 @@ impl StandbyConsumerIdentity {
             ));
         }
         if !lowercase_hex(&self.artifact_sha256, 64)
+            || !lowercase_hex(&self.kernel_v2_reader.schema_sha256, 64)
+            || self.kernel_v2_reader.reader_format == 0
             || !lowercase_hex(&self.ddl_sha256, 64)
             || self.engine_schema_version <= 0
         {
@@ -98,13 +110,31 @@ impl StandbyConsumerIdentity {
         Ok(())
     }
 
+    /// Keep v2-only coordinates out of v1 requests and manifests.
+    pub fn for_engine(mut self, kernel_v2: bool) -> Self {
+        if !kernel_v2 {
+            self.kernel_v2_reader = Default::default();
+        }
+        self
+    }
+
     pub fn validate_observed_installed(
         &self,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Result<()> {
+        self.validate_observed_for_engine(observed, true)
+    }
+
+    fn validate_observed_for_engine(
+        &self,
+        observed: &ObservedInstalledConsumerIdentity,
+        kernel_v2: bool,
+    ) -> Result<()> {
         self.validate_declaration()?;
         if !lowercase_hex(&observed.source_sha, 40)
             || !lowercase_hex(&observed.artifact_sha256, 64)
+            || !lowercase_hex(&observed.kernel_v2_reader.schema_sha256, 64)
+            || observed.kernel_v2_reader.reader_format == 0
             || !lowercase_hex(&observed.ddl_sha256, 64)
             || observed.engine_schema_version <= 0
         {
@@ -113,6 +143,7 @@ impl StandbyConsumerIdentity {
             ));
         }
         if self.platform != observed.platform
+            || (kernel_v2 && self.kernel_v2_reader != observed.kernel_v2_reader)
             || self.source_sha != observed.source_sha
             || self.artifact_sha256 != observed.artifact_sha256
             || self.engine_schema_version != observed.engine_schema_version
@@ -290,6 +321,10 @@ impl StandbySnapshotManifest {
             && self.version == 1
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_reader(true)
+    }
+
+    fn validate_for_reader(&self, require_current_reader: bool) -> Result<()> {
         if !self.has_supported_contract() {
             return Err(Error::engine("unknown standby snapshot manifest contract"));
         }
@@ -312,7 +347,11 @@ impl StandbySnapshotManifest {
         }
         let kernel_v2 = self.kernel_v2.as_ref();
         if let Some(kernel) = kernel_v2 {
-            kernel.validate()?;
+            if require_current_reader {
+                kernel.validate()?;
+            } else {
+                kernel.validate_shape()?;
+            }
             if self.contract != crate::standby::kernel_v2::MANIFEST
                 || self.engine.name != crate::standby::kernel_v2::ENGINE
                 || !lowercase_hex(&self.engine.source_sha, 40)
@@ -331,20 +370,23 @@ impl StandbySnapshotManifest {
         if kernel_v2.is_none()
             && (self.engine.name != crate::ENGINE_NAME
                 || !lowercase_hex(&self.engine.source_sha, 40)
-                || self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
-                || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256)
+                || crate::standby::shapes::v1(self.engine.schema_version, &self.engine.ddl_sha256)
+                    .is_none())
         {
             return Err(Error::engine("standby snapshot engine identity is invalid"));
         }
         self.consumer.validate_declaration()?;
-        if kernel_v2.is_none()
-            && (self.consumer.engine_schema_version != self.engine.schema_version
-                || self.consumer.ddl_sha256 != self.engine.ddl_sha256)
-        {
-            return Err(Error::engine(
-                "standby consumer is not exactly schema-compatible with the snapshot",
-            ));
+        // Historical copies can predate the initial reader schema declaration.
+        // Refuse serving them, but let a verified FULL replace their bounded floor.
+        if let Some(kernel) = kernel_v2.filter(|_| require_current_reader) {
+            if crate::standby::shapes::v2(kernel.reader_format, &kernel.schema_sha256).is_none() {
+                return Err(Error::engine(
+                    "kernel-v2 consumer reader format or schema mismatch",
+                ));
+            }
         }
+        // Consumer fields identify the executable's primary format. Actual
+        // snapshot compatibility is independently pinned to the local registry.
         self.frontier.validate()?;
         if self.head_act.is_some_and(|head| head < 0) {
             return Err(Error::engine(
@@ -365,20 +407,29 @@ impl StandbySnapshotManifest {
         Ok(())
     }
 
-    /// Whether an earlier engine revision wrote this manifest: its engine
-    /// schema or DDL differ from this build's, so [`Self::validate`] refuses
-    /// it by design. Such a generation cannot be served or compared with
-    /// current rows, but it may still be replaced by a whole snapshot.
-    pub fn is_other_engine_revision(&self) -> bool {
-        self.kernel_v2.is_none()
-            && (self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
-                || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256)
+    /// Reader coordinates belong only to v2; v1 still binds the executable,
+    /// platform and v1 schema/DDL without depending on a v2 reader release.
+    pub fn validate_observed_installed(
+        &self,
+        observed: &ObservedInstalledConsumerIdentity,
+    ) -> Result<()> {
+        self.consumer
+            .validate_observed_for_engine(observed, self.kernel_v2.is_some())
     }
 
-    /// What a replacement needs to trust about a manifest that
-    /// [`Self::is_other_engine_revision`]: its contract, database identity
-    /// and times, never its engine identity.
+    /// Whether this manifest's actual shape is outside the receiver registry.
+    /// Unreadable coordinates may be replaced by FULL, but never grant access
+    /// to rows or bypass parity for another registered shape.
+    pub fn is_other_engine_revision(&self) -> bool {
+        crate::standby::shapes::manifest(self).is_none()
+    }
+
+    /// Evidence needed to replace another format: contract, database identity,
+    /// times and (for v2) consistent kernel coordinates, never readable rows.
     pub fn validate_other_revision_for_replacement(&self) -> Result<()> {
+        if self.kernel_v2.is_some() {
+            return self.validate_for_reader(false);
+        }
         if !self.has_supported_contract() {
             return Err(Error::engine("unknown standby snapshot manifest contract"));
         }
@@ -409,11 +460,21 @@ impl StandbySnapshotManifest {
         {
             return Ok(false);
         }
+        if let (Some(before), Some(after)) = (
+            crate::standby::shapes::manifest(current),
+            crate::standby::shapes::manifest(self),
+        ) {
+            // Cross-family v1-to-v2 keeps its explicit boundary below.
+            if before.family == after.family && !crate::standby::shapes::follows(before, after) {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
         match (&current.kernel_v2, &self.kernel_v2) {
             (None, Some(_)) => Ok(true),
             (Some(_), None) => Ok(false),
             (Some(a), Some(b)) => Ok(a.genesis_event_id == b.genesis_event_id
-                && a.schema_sha256 == b.schema_sha256
                 && b.head_act >= a.head_act
                 && b.content_event_seq >= a.content_event_seq
                 && b.meta_event_seq >= a.meta_event_seq
@@ -466,11 +527,6 @@ pub struct HostedStandbyManifestContext {
 }
 
 impl HostedStandbyManifestContext {
-    pub fn with_expected_kernel_v2(mut self, expected: bool) -> Self {
-        self.expected_kernel_v2 = Some(expected);
-        self
-    }
-
     pub fn new(
         hosted_route_database_id: String,
         consumer: StandbyConsumerIdentity,
@@ -488,13 +544,33 @@ impl HostedStandbyManifestContext {
         consumer: StandbyConsumerIdentity,
         producer: ProducerBuildIdentity,
     ) -> Result<Self> {
+        let mut context =
+            Self::for_engine_with_producer(hosted_route_database_id, consumer, producer, false)?;
+        context.expected_kernel_v2 = None;
+        Ok(context)
+    }
+
+    /// Select compatibility using the authorized route's catalog engine.
+    /// The completed file must still agree with that engine and declaration.
+    pub fn for_engine_with_producer(
+        hosted_route_database_id: String,
+        consumer: StandbyConsumerIdentity,
+        producer: ProducerBuildIdentity,
+        kernel_v2: bool,
+    ) -> Result<Self> {
         if hosted_route_database_id.trim().is_empty() || hosted_route_database_id.len() > 256 {
             return Err(Error::engine(
                 "standby snapshot hosted route database id is invalid",
             ));
         }
         consumer.validate_declaration()?;
-        if consumer.engine_schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
+        if kernel_v2 {
+            if consumer.kernel_v2_reader != crate::standby::kernel_v2::KernelV2Reader::compiled() {
+                return Err(Error::engine(
+                    "kernel-v2 consumer reader format or schema mismatch",
+                ));
+            }
+        } else if consumer.engine_schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
             || consumer.ddl_sha256 != producer.ddl_sha256
         {
             return Err(Error::engine(
@@ -502,15 +578,20 @@ impl HostedStandbyManifestContext {
             ));
         }
         Ok(Self {
-            expected_kernel_v2: None,
+            expected_kernel_v2: Some(kernel_v2),
             hosted_route_database_id,
-            consumer,
+            consumer: consumer.for_engine(kernel_v2),
             producer,
         })
     }
 }
 
-pub(crate) async fn manifest_from_completed_export(
+/// Derive the manifest for a completed, owned snapshot file. Public only for
+/// qualification harnesses (C6, plan 5b21bd7) that must describe a file
+/// built outside the export coordinator; everything is computed from the
+/// file itself.
+#[doc(hidden)]
+pub async fn manifest_from_completed_export(
     path: &Path,
     size_bytes: u64,
     sha256: String,
@@ -549,6 +630,16 @@ pub(crate) async fn manifest_from_completed_export(
         .await;
     }
     crate::db::refuse_v2_database(&mut connection).await?;
+    // Deliberate v1 backstop: validate the completed export even if a caller
+    // changed its public context after construction or selected the legacy API.
+    if context.consumer.engine_schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
+        || context.consumer.ddl_sha256 != context.producer.ddl_sha256
+    {
+        return Err(Error::engine(
+            "standby consumer is not exactly schema-compatible with the producer",
+        ));
+    }
+    crate::provenance::verify_keyed_receipt_anchor_coverage_on(&mut connection).await?;
     let row = sqlx::query(
         "SELECT
          (SELECT origin_db_id FROM database_identity WHERE singleton=1) origin_database_id,
@@ -583,7 +674,7 @@ pub(crate) async fn manifest_from_completed_export(
             schema_version,
             ddl_sha256: context.producer.ddl_sha256,
         },
-        consumer: context.consumer,
+        consumer: context.consumer.for_engine(false),
         frontier: CanonicalFrontierV1 {
             contract: STANDBY_FRONTIER_CONTRACT.into(),
             version: 1,
@@ -783,6 +874,7 @@ mod tests {
                 ddl_sha256: crate::schema::FROZEN_DDL_SHA256.into(),
             },
             consumer: StandbyConsumerIdentity {
+                kernel_v2_reader: Default::default(),
                 contract: STANDBY_CONSUMER_CONTRACT.into(),
                 version: 1,
                 platform: StandbyConsumerPlatform::LinuxX8664,
@@ -860,6 +952,7 @@ mod tests {
     #[test]
     fn installed_consumer_validation_is_exact() {
         let declaration = StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -869,6 +962,7 @@ mod tests {
             ddl_sha256: "c".repeat(64),
         };
         let mut observed = ObservedInstalledConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             platform: StandbyConsumerPlatform::LinuxX8664,
             source_sha: "a".repeat(40),
             artifact_sha256: "b".repeat(64),
@@ -904,6 +998,7 @@ mod tests {
     #[test]
     fn observed_platform_mismatch_is_refused_but_matching_macos_passes() {
         let declaration = StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::MacosArm64,
@@ -913,6 +1008,7 @@ mod tests {
             ddl_sha256: "c".repeat(64),
         };
         let matching = ObservedInstalledConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             platform: StandbyConsumerPlatform::MacosArm64,
             source_sha: "a".repeat(40),
             artifact_sha256: "b".repeat(64),

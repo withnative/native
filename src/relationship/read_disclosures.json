@@ -1,0 +1,33 @@
+{
+  "note": "Interim read-disclosure entries for relationships not yet governed (b788408). Each entry is exactly the future RelationshipTypeDefinition read_disclosure shape; the follow-up migration moves these into full definitions without behavior change. relates_to: none, by absence.",
+  "disclosures": [
+    {
+      "relationship": "supersedes",
+      "read_disclosure": {
+        "direction": "inverse",
+        "kind": "claim",
+        "max_items": 3,
+        "summary_template": "superseded by {list}"
+      }
+    },
+    {
+      "relationship": "draws_from",
+      "read_disclosure": {
+        "direction": "inverse",
+        "kind": "fact",
+        "newer_than_target": true,
+        "max_items": 3,
+        "summary_template": "newer work builds on this: {list}"
+      }
+    },
+    {
+      "relationship": "part_of",
+      "read_disclosure": {
+        "direction": "forward",
+        "kind": "claim",
+        "max_items": 3,
+        "summary_template": "part of {list}"
+      }
+    }
+  ]
+}

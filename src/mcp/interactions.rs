@@ -59,6 +59,7 @@ pub enum ToolKind {
     GetRecord,
     ResolveMany,
     UpdateRecord,
+    MergeBody,
     ClaimUnownedRecord,
     CorrectRecordType,
     DeleteRecord,
@@ -70,6 +71,7 @@ pub enum ToolKind {
     ManageBindings,
     ManageRecordPolicy,
     ManageAccountConfig,
+    ManageSavedTabs,
     ResolveExternal,
     ObserveExternal,
     GetRunActivity,
@@ -80,6 +82,7 @@ pub enum ToolKind {
     ManageParticipants,
     ManageInterventions,
     ManageNamedViews,
+    ManagePublication,
     InstantiateArtifact,
     ManageRendererBinding,
     ManageMdxModules,
@@ -106,6 +109,7 @@ pub enum ToolKind {
     AttachText,
     AttachFromUrl,
     ReadAttachment,
+    ReadAppBundle,
     ManageAttachments,
     StartWork,
     ResolveSuggestions,
@@ -396,7 +400,7 @@ pub enum AuthorizationDisposition {
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 92] = [
+    pub const ALL: [ToolKind; 96] = [
         ToolKind::Ping,
         ToolKind::EngineInfo,
         ToolKind::StandbyStatus,
@@ -419,6 +423,7 @@ impl ToolKind {
         ToolKind::GetRecord,
         ToolKind::ResolveMany,
         ToolKind::UpdateRecord,
+        ToolKind::MergeBody,
         ToolKind::ClaimUnownedRecord,
         ToolKind::CorrectRecordType,
         ToolKind::DeleteRecord,
@@ -430,6 +435,7 @@ impl ToolKind {
         ToolKind::ManageBindings,
         ToolKind::ManageRecordPolicy,
         ToolKind::ManageAccountConfig,
+        ToolKind::ManageSavedTabs,
         ToolKind::ResolveExternal,
         ToolKind::ObserveExternal,
         ToolKind::GetRunActivity,
@@ -440,6 +446,7 @@ impl ToolKind {
         ToolKind::ManageParticipants,
         ToolKind::ManageInterventions,
         ToolKind::ManageNamedViews,
+        ToolKind::ManagePublication,
         ToolKind::InstantiateArtifact,
         ToolKind::ManageRendererBinding,
         ToolKind::ManageMdxModules,
@@ -466,6 +473,7 @@ impl ToolKind {
         ToolKind::AttachText,
         ToolKind::AttachFromUrl,
         ToolKind::ReadAttachment,
+        ToolKind::ReadAppBundle,
         ToolKind::ManageAttachments,
         ToolKind::StartWork,
         ToolKind::ResolveSuggestions,
@@ -516,6 +524,7 @@ impl ToolKind {
             ToolKind::GetRecord => "get_record",
             ToolKind::ResolveMany => "resolve_many",
             ToolKind::UpdateRecord => "update_record",
+            ToolKind::MergeBody => "merge_body",
             ToolKind::ClaimUnownedRecord => "claim_unowned_record",
             ToolKind::CorrectRecordType => "correct_record_type",
             ToolKind::DeleteRecord => "delete_record",
@@ -527,6 +536,7 @@ impl ToolKind {
             ToolKind::ManageBindings => "manage_bindings",
             ToolKind::ManageRecordPolicy => "manage_record_policy",
             ToolKind::ManageAccountConfig => "manage_account_config",
+            ToolKind::ManageSavedTabs => "manage_saved_tabs",
             ToolKind::ResolveExternal => "resolve_external",
             ToolKind::ObserveExternal => "observe_external",
             ToolKind::GetRunActivity => "get_run_activity",
@@ -537,6 +547,7 @@ impl ToolKind {
             ToolKind::ManageParticipants => "manage_participants",
             ToolKind::ManageInterventions => "manage_interventions",
             ToolKind::ManageNamedViews => "manage_named_views",
+            ToolKind::ManagePublication => "manage_publication",
             ToolKind::InstantiateArtifact => "instantiate_artifact",
             ToolKind::ManageRendererBinding => "manage_renderer_binding",
             ToolKind::ManageMdxModules => "manage_mdx_modules",
@@ -563,6 +574,7 @@ impl ToolKind {
             ToolKind::AttachText => "attach_text",
             ToolKind::AttachFromUrl => "attach_from_url",
             ToolKind::ReadAttachment => "read_attachment",
+            ToolKind::ReadAppBundle => "read_app_bundle",
             ToolKind::ManageAttachments => "manage_attachments",
             ToolKind::ResolveSuggestions => "resolve_suggestions",
             ToolKind::RenderSuggestionReview => "render_suggestion_review",
@@ -644,6 +656,7 @@ impl ToolKind {
             | Self::Search
             | Self::QuerySql
             | Self::Scan
+            | Self::ReadAppBundle
             | Self::ReadAttachment
             | Self::RenderSuggestionReview
             | Self::ResolveCitation
@@ -657,6 +670,7 @@ impl ToolKind {
             Self::ManageBindings => Actions(&["list", "observations"]),
             Self::ManageRecordPolicy => Actions(&["inspect", "list"]),
             Self::ManageAccountConfig => Actions(&["inspect"]),
+            Self::ManageSavedTabs => Actions(&["get", "list"]),
             Self::ManageLinks => Actions(&["list"]),
             Self::ManageRelationships => Actions(&["read", "why", "find"]),
             Self::ManageParticipants => Actions(&["list"]),
@@ -672,12 +686,16 @@ impl ToolKind {
                 "get_attention",
             ]),
             Self::ManageInterventions => Actions(&["get", "query"]),
-            Self::ManageNamedViews => Actions(&["get_view_revision", "list_view_revisions"]),
+            Self::ManagePublication => Actions(&["inspect", "preview"]),
+            Self::ManageNamedViews => {
+                Actions(&["get_view_revision", "list_view_revisions", "propose_view"])
+            }
             Self::ManageRendererBinding
             | Self::ManageArtifactInputs
             | Self::ManageArtifactModuleGrants => Actions(&["read"]),
             Self::ManageSurfaceBindings => Actions(&["list", "get"]),
             Self::ManageAlphaTabs => Actions(&[
+                "install_link",
                 "list",
                 "inspect",
                 "prepare_install",
@@ -707,6 +725,7 @@ impl ToolKind {
             | Self::BatchWrite
             | Self::SaveAccount
             | Self::UpdateRecord
+            | Self::MergeBody
             | Self::ClaimUnownedRecord
             | Self::CorrectRecordType
             | Self::DeleteRecord
@@ -730,7 +749,7 @@ impl ToolKind {
 
     /// Compatibility spelling for the immutable-standby consumer.
     pub const fn standby_disposition(self) -> AuthoritativeDisposition {
-        if matches!(self, Self::ManageAccountConfig) {
+        if matches!(self, Self::ManageAccountConfig | Self::ManageSavedTabs) {
             AuthoritativeDisposition::Mutation
         } else {
             self.authoritative_disposition()
@@ -763,7 +782,7 @@ impl ToolKind {
         use HoldingClassification as Class;
         use HoldingSensitivity::{Bounded, Refuses, Unaffected};
         match self {
-            Self::ManageNamedViews => Class::reads(Refuses),
+            Self::ManageNamedViews | Self::ManagePublication => Class::reads(Refuses),
             // Answered from the projection alone, and accept no `as_of`.
             Self::GetDashboard
             | Self::DescribeSchema
@@ -778,6 +797,7 @@ impl ToolKind {
             | Self::Search
             | Self::QuerySql
             | Self::Scan
+            | Self::ReadAppBundle
             | Self::ReadAttachment
             | Self::RenderSuggestionReview
             | Self::ResolveCitation
@@ -786,6 +806,7 @@ impl ToolKind {
             | Self::ManageBindings
             | Self::ManageRecordPolicy
             | Self::ManageAccountConfig
+            | Self::ManageSavedTabs
             | Self::ManageLinks
             | Self::ManageRelationships
             | Self::ManageParticipants
@@ -867,6 +888,7 @@ impl ToolKind {
             | Self::BatchWrite
             | Self::SaveAccount
             | Self::UpdateRecord
+            | Self::MergeBody
             | Self::ClaimUnownedRecord
             | Self::CorrectRecordType
             | Self::DeleteRecord
@@ -938,6 +960,7 @@ impl ToolKind {
             ToolKind::GetRecord => ToolExposure::new(Records, true, Discoverability),
             ToolKind::ResolveMany => ToolExposure::new(Query, false, BoundedContextOrCalls),
             ToolKind::UpdateRecord => ToolExposure::new(Records, true, Atomicity),
+            ToolKind::MergeBody => ToolExposure::new(Records, false, Atomicity),
             ToolKind::ClaimUnownedRecord => ToolExposure::new(Records, false, Atomicity),
             ToolKind::CorrectRecordType => ToolExposure::new(Records, false, Atomicity),
             ToolKind::DeleteRecord => ToolExposure::new(Records, true, Atomicity),
@@ -951,6 +974,7 @@ impl ToolKind {
             }
             ToolKind::ManageRecordPolicy => ToolExposure::new(Records, false, Atomicity),
             ToolKind::ManageAccountConfig => ToolExposure::new(Records, false, Atomicity),
+            ToolKind::ManageSavedTabs => ToolExposure::new(Records, false, Atomicity),
             ToolKind::ResolveExternal => {
                 ToolExposure::new(Identity, false, CorrectnessUnderIgnorance)
             }
@@ -968,7 +992,9 @@ impl ToolKind {
             ToolKind::ManageMessages => ToolExposure::new(Messaging, true, Atomicity),
             ToolKind::ManageParticipants => ToolExposure::new(Messaging, false, Atomicity),
             ToolKind::ManageInterventions => ToolExposure::new(Messaging, false, Atomicity),
-            ToolKind::ManageNamedViews => ToolExposure::new(Records, false, Atomicity),
+            ToolKind::ManageNamedViews | ToolKind::ManagePublication => {
+                ToolExposure::new(Records, false, Atomicity)
+            }
             ToolKind::InstantiateArtifact => ToolExposure::new(Artifacts, false, Atomicity),
             ToolKind::ManageRendererBinding => {
                 ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
@@ -1016,6 +1042,7 @@ impl ToolKind {
             ToolKind::AttachFromUrl => {
                 ToolExposure::new(Attachments, true, CorrectnessUnderIgnorance)
             }
+            ToolKind::ReadAppBundle => ToolExposure::new(Artifacts, false, BoundedContextOrCalls),
             ToolKind::ReadAttachment => ToolExposure::new(Attachments, true, BoundedContextOrCalls),
             ToolKind::ManageAttachments => ToolExposure::new(Attachments, true, Atomicity),
             ToolKind::StartWork => ToolExposure::new(Work, true, Atomicity),
@@ -1118,12 +1145,14 @@ impl ToolKind {
             | ToolKind::GetReuseContext
             | ToolKind::GetEventContext
             | ToolKind::UpdateRecord
+            | ToolKind::MergeBody
             | ToolKind::GetHistory
             | ToolKind::ReadHcpAudit
             | ToolKind::GetRunActivity
             | ToolKind::ManageBindings
             | ToolKind::ManageRecordPolicy
             | ToolKind::ManageAccountConfig
+            | ToolKind::ManageSavedTabs
             | ToolKind::ResolveExternal
             | ToolKind::ObserveExternal
             | ToolKind::ManageLinks
@@ -1132,6 +1161,7 @@ impl ToolKind {
             | ToolKind::ManageParticipants
             | ToolKind::ManageInterventions
             | ToolKind::ManageNamedViews
+            | ToolKind::ManagePublication
             | ToolKind::InstantiateArtifact
             | ToolKind::ManageRendererBinding
             | ToolKind::ManageMdxModules
@@ -1149,6 +1179,7 @@ impl ToolKind {
             | ToolKind::ManageSchemaConfig
             | ToolKind::ManageAttachments
             | ToolKind::StartWork
+            | ToolKind::ReadAppBundle
             | ToolKind::ReadAttachment
             | ToolKind::ResolveCitation
             | ToolKind::ResolveSuggestions
@@ -1530,6 +1561,15 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                 extraction.count(1);
             }
         }
+        ToolKind::MergeBody => {
+            // Only a merge that appended an event (it echoes its
+            // `write_receipt`) touched the record; an unchanged or clash-only
+            // merge reads it.
+            if result.get("write_receipt").is_some() {
+                extraction.mutated(string_at(result, "record_id"));
+            }
+            extraction.count(1);
+        }
         ToolKind::ClaimUnownedRecord => {
             extraction.mutated(string_at(result, "id"));
             extraction.count(1);
@@ -1663,6 +1703,21 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                 extraction.opened(string_at(result, "from_record_id"));
             }
             extraction.count(1);
+        }
+        ToolKind::ManageSavedTabs => {
+            if let Some(tabs) = result.get("tabs").and_then(Value::as_array) {
+                for tab in tabs {
+                    extraction.surfaced(string_at(tab, "record_id"));
+                }
+                extraction.count(tabs.len());
+            } else if let Some(tab) = result.get("tab") {
+                if result.get("changed").and_then(Value::as_bool) == Some(true) {
+                    extraction.mutated(string_at(tab, "record_id"));
+                } else {
+                    extraction.opened(string_at(tab, "record_id"));
+                }
+                extraction.count(1);
+            }
         }
         ToolKind::ManageAccountConfig => {
             let id = string_at(result, "record_id");
@@ -1821,12 +1876,22 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             }
             extraction.count(1);
         }
+        ToolKind::ManagePublication => {
+            if matches!(string_at(arguments, "action"), Some("inspect" | "preview")) {
+                extraction.opened(string_at(arguments, "id"));
+            } else {
+                extraction.mutated(string_at(arguments, "id"));
+            }
+            extraction.count(1);
+        }
         ToolKind::ManageNamedViews => {
             if matches!(
                 string_at(arguments, "action"),
                 Some("record_view_revision" | "activate_view" | "unpublish_view")
             ) {
                 extraction.mutated(string_at(result, "id"));
+            } else if string_at(arguments, "action") == Some("propose_view") {
+                extraction.opened(string_at(arguments, "id"));
             } else if let Some(view) =
                 string_at(arguments, "view_id").and_then(|v| v.strip_prefix("native.named-view:"))
             {
@@ -1969,6 +2034,23 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                         extraction.surfaced(string_at(item, "artifact_id"));
                     }
                     extraction.count(array_at(result, "installs").len());
+                }
+                Some("shelf_add") => {
+                    extraction.mutated(
+                        result
+                            .get("entry")
+                            .and_then(|entry| string_at(entry, "artifact_id")),
+                    );
+                    extraction.count(1);
+                }
+                Some("shelf_remove") => extraction.count(1),
+                Some("materialize_catalog_update") => {
+                    extraction.mutated(string_at(result, "artifact_id"));
+                    extraction.count(1);
+                }
+                Some("publish_catalog_update") => {
+                    extraction.mutated(string_at(arguments, "artifact_id"));
+                    extraction.count(1);
                 }
                 Some("prepare_install") => {
                     extraction.surfaced(string_at(arguments, "artifact_id"));
@@ -2185,6 +2267,10 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             extraction.mutated(string_at(result, "attachment_id"));
             extraction.count(1);
         }
+        ToolKind::ReadAppBundle => {
+            extraction.opened(string_at(result, "artifact_id"));
+            extraction.count(1);
+        }
         ToolKind::ReadAttachment => {
             extraction.opened(string_at(result, "attachment_id"));
             extraction.count(1);
@@ -2309,7 +2395,7 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             extraction.count(usize::from(string_at(result, "consent_url").is_some()))
         }
         ToolKind::ManageChangeSummaries => {
-            if string_at(arguments, "action") == Some("inspect") {
+            if matches!(string_at(arguments, "action"), Some("inspect" | "preview")) {
                 extraction.opened(string_at(result, "carrier_id"));
             } else {
                 extraction.mutated(string_at(result, "carrier_id"));
@@ -2342,6 +2428,7 @@ pub(crate) fn error_kind(error: &Error) -> &'static str {
         Error::StandbyAdmission { source, .. } => error_kind(source),
         Error::Engine(_) => "engine",
         Error::Conflict(_) => "conflict",
+        Error::OriginalConflict(_) => "original_conflict",
         Error::NotHeld(_) => "not_held",
         Error::Auth(_) => "auth",
         Error::UnavailableOffline { .. } => "unavailable_offline",
@@ -3535,8 +3622,18 @@ mod tests {
                 "{}",
                 kind.name()
             );
-            if kind == ToolKind::ManageAccountConfig {
-                assert_eq!(disposition, AuthoritativeDisposition::Actions(&["inspect"]));
+            if matches!(
+                kind,
+                ToolKind::ManageAccountConfig | ToolKind::ManageSavedTabs
+            ) {
+                assert_eq!(
+                    disposition,
+                    if kind == ToolKind::ManageSavedTabs {
+                        AuthoritativeDisposition::Actions(&["get", "list"])
+                    } else {
+                        AuthoritativeDisposition::Actions(&["inspect"])
+                    }
+                );
                 assert_eq!(
                     kind.standby_disposition(),
                     AuthoritativeDisposition::Mutation
@@ -4028,6 +4125,22 @@ mod tests {
                 result_count: Some(1),
             },
             Case {
+                name: "merge_body mutates its record only when it wrote a version",
+                kind: ToolKind::MergeBody,
+                arguments: json!({ "record_id": "merged", "idempotency_key": "k" }),
+                result: json!({ "outcome": "merged", "record_id": "merged", "write_receipt": {"kind": "kernel_content_event"} }),
+                touches: vec![mutated("merged")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "merge_body with nothing written touches no record",
+                kind: ToolKind::MergeBody,
+                arguments: json!({ "record_id": "merged", "idempotency_key": "k" }),
+                result: json!({ "outcome": "merged_with_clashes", "record_id": "merged" }),
+                touches: vec![],
+                result_count: Some(1),
+            },
+            Case {
                 name: "claim_unowned_record mutates its claimed target",
                 kind: ToolKind::ClaimUnownedRecord,
                 arguments: json!({ "record_id": "claimed", "reason": "Recovery" }),
@@ -4499,6 +4612,14 @@ mod tests {
                 result_count: Some(1),
             },
             Case {
+                name: "read_app_bundle opens its admitted source artifact",
+                kind: ToolKind::ReadAppBundle,
+                arguments: json!({"package":"test.bundle"}),
+                result: json!({"artifact_id":"artifact","content":"encoded-page"}),
+                touches: vec![opened("artifact")],
+                result_count: Some(1),
+            },
+            Case {
                 name: "read_attachment opens the attachment record",
                 kind: ToolKind::ReadAttachment,
                 arguments: json!({ "attachment_id": "attachment" }),
@@ -4798,6 +4919,22 @@ mod tests {
                 result_count: Some(2),
             },
             Case {
+                name: "manage_alpha_tabs catalog materialization mutates only the returned personal target",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({"action":"materialize_catalog_update","predecessor_artifact_id":"old"}),
+                result: json!({"artifact_id":"personal"}),
+                touches: vec![mutated("personal")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "manage_alpha_tabs catalog publication mutates the existing source artifact",
+                kind: ToolKind::ManageAlphaTabs,
+                arguments: json!({"action":"publish_catalog_update","artifact_id":"a1"}),
+                result: json!({"artifact_id":"a1","source_revision":"published"}),
+                touches: vec![mutated("a1")],
+                result_count: Some(1),
+            },
+            Case {
                 name: "manage_alpha_tabs install surfaces the pinned artifact without mutating it",
                 kind: ToolKind::ManageAlphaTabs,
                 arguments: json!({ "action": "install" }),
@@ -4964,6 +5101,22 @@ mod tests {
                 result_count: Some(1),
             },
             Case {
+                name: "saved tab committed mutation touches its nested record",
+                kind: ToolKind::ManageSavedTabs,
+                arguments: json!({"action":"rename"}),
+                result: json!({"outcome":"updated","changed":true,"tab":{"record_id":"saved-tab"}}),
+                touches: vec![mutated("saved-tab")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "saved tab replay opens the canonical current record",
+                kind: ToolKind::ManageSavedTabs,
+                arguments: json!({"action":"rename"}),
+                result: json!({"outcome":"replayed","changed":false,"tab":{"record_id":"saved-tab"}}),
+                touches: vec![opened("saved-tab")],
+                result_count: Some(1),
+            },
+            Case {
                 name: "canonical healthy hit opens the current winner",
                 kind: ToolKind::ManageAccountConfig,
                 arguments: json!({"action":"ensure"}),
@@ -5123,6 +5276,26 @@ mod tests {
             },
         ]);
 
+        for action in ["inspect", "preview"] {
+            cases.push(Case {
+                name: "publication reads open only the target",
+                kind: ToolKind::ManagePublication,
+                arguments: json!({"action":action,"id":"rec-bearer"}),
+                result: json!({"id":"rec-bearer"}),
+                touches: vec![opened("rec-bearer")],
+                result_count: Some(1),
+            });
+        }
+        for action in ["publish", "unpublish"] {
+            cases.push(Case {
+                name: "publication writes mutate only the target",
+                kind: ToolKind::ManagePublication,
+                arguments: json!({"action":action,"id":"rec-bearer"}),
+                result: json!({"id":"rec-bearer"}),
+                touches: vec![mutated("rec-bearer")],
+                result_count: Some(1),
+            });
+        }
         for action in ["record_view_revision", "activate_view", "unpublish_view"] {
             cases.push(Case {
                 name: "named-view writes mutate only the receipt bearer",
@@ -5143,6 +5316,14 @@ mod tests {
                 result_count: Some(1),
             });
         }
+        cases.push(Case {
+            name: "proposal opens its bearer without mutating or surfacing provenance ids",
+            kind: ToolKind::ManageNamedViews,
+            arguments: json!({"action":"propose_view","id":"rec-bearer"}),
+            result: json!({"definition":{"generated":{"sources":["source-event"],"required_anchors":["other-record"]}}}),
+            touches: vec![opened("rec-bearer")],
+            result_count: Some(1),
+        });
         cases.push(Case {
             name: "named-view preparation has no record touch",
             kind: ToolKind::ManageNamedViews,
@@ -5441,5 +5622,42 @@ mod tests {
         assert_eq!(stats.declarations_completed, 1);
         db.close().await;
         declaration_db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod saved_tabs_contract_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn saved_tabs_extracts_nested_records_and_only_committed_mutations() {
+        for outcome in ["created", "updated", "converged", "retired"] {
+            let result = json!({"outcome":outcome,"changed":true,"tab":{"record_id":"one"}});
+            let extraction = extract(ToolKind::ManageSavedTabs, &json!({}), &result);
+            assert_eq!(extraction.touches.len(), 1);
+            assert_eq!(extraction.touches[0].record_id, "one");
+            assert_eq!(extraction.touches[0].interaction, Interaction::Mutated);
+        }
+        for outcome in ["existing", "replayed", "conflict", "retired"] {
+            let result = json!({"outcome":outcome,"changed":false,"tab":{"record_id":"one"}});
+            let extraction = extract(ToolKind::ManageSavedTabs, &json!({}), &result);
+            assert_eq!(extraction.touches.len(), 1);
+            assert_eq!(extraction.touches[0].record_id, "one");
+            assert_eq!(extraction.touches[0].interaction, Interaction::Opened);
+        }
+        let result = json!({"tabs":[{"record_id":"one"},{"record_id":"two"}],"next_cursor":null});
+        assert_eq!(
+            extract(ToolKind::ManageSavedTabs, &json!({}), &result)
+                .touches
+                .len(),
+            2
+        );
+        assert!(extract(
+            ToolKind::ManageSavedTabs,
+            &json!({}),
+            &json!({"outcome":"unavailable"})
+        )
+        .touches
+        .is_empty());
     }
 }

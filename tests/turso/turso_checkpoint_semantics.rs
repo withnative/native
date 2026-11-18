@@ -441,14 +441,19 @@ async fn verify_copy(
         )
         .await;
     drop(engine);
-    let rendered = serde_json::to_string(
-        &fetched.map_err(|error| format!("get_record failed against the copy: {error}"))?,
-    )
-    .unwrap();
+    let fetched =
+        fetched.map_err(|error| format!("get_record failed against the copy: {error}"))?;
     drop(reopened);
+    let records = fetched["records"]
+        .as_array()
+        .ok_or_else(|| "get_record returned no records array".to_string())?;
     let missing = expected_ids
         .iter()
-        .filter(|id| !rendered.contains(&format!("\"{id}\"")))
+        .filter(|id| {
+            !records.iter().any(|record| {
+                record["status"] == "found" && record["id"].as_str() == Some(id.as_str())
+            })
+        })
         .count();
     if missing != 0 {
         return Err(format!("copy is missing {missing} seeded records"));
@@ -517,6 +522,15 @@ async fn a_checkpointed_copy_taken_from_a_live_handle_passes_every_runtime_gate(
     assert!(
         identity.is_ok(),
         "the copy must carry the seeded records: {identity:?}"
+    );
+
+    // Missing-result envelopes echo requested IDs; those IDs are not proof
+    // that the artifact contains a record. Exercise that negative oracle too.
+    let mut with_missing = ids.clone();
+    with_missing.push(checkpoint_record_id(FAMILY_TORN, 999));
+    assert_eq!(
+        verify_copy(&live, logical, &with_missing).await,
+        Err("copy is missing 1 seeded records".to_string())
     );
 
     // The live runtime is unharmed and still writable afterwards.
@@ -721,34 +735,49 @@ async fn verification_refuses_to_fabricate_the_artifact_it_is_verifying() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_uncheckpointed_live_copy_fails_closed_at_user_version_zero() {
-    // Without a checkpoint the difference is not merely detectable: the copy is
-    // rejected by the very first gate, because even the schema install lives
-    // only in the WAL and the main file still reads `user_version = 0`. This is
-    // the property that makes a checkpoint the load-bearing step rather than an
-    // optimisation.
+async fn a_wal_only_schema_copy_fails_closed_at_user_version_zero() {
+    // Use a controlled WAL-only schema. Full runtime genesis can cross the
+    // engine's automatic checkpoint threshold, so its main file need not
+    // remain at version zero merely because this test never checkpoints it.
     let logical = "checkpoint-semantics-uncheckpointed";
     let directory = tempfile::tempdir().unwrap();
     let source_config = config(directory.path(), logical);
-    let db = source_config.open().await.unwrap();
-    let engine = EngineHandle::TursoLocal(db.clone());
-    let ids = seed_records(&engine, FAMILY_TORN, 8).await;
+    let source_path = source_config.database_path();
+    let (_database, connection) = raw_local(&source_path).await;
+    connection
+        .execute("CREATE TABLE wal_only_probe(id INTEGER PRIMARY KEY)", ())
+        .await
+        .unwrap();
+    connection
+        .execute(
+            &format!(
+                "PRAGMA user_version = {}",
+                native_ce::CURRENT_ENGINE_SCHEMA_VERSION
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    let mut version = connection.query("PRAGMA user_version", ()).await.unwrap();
+    assert_eq!(
+        version.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(native_ce::CURRENT_ENGINE_SCHEMA_VERSION)
+    );
+    drop(version);
+    assert!(
+        file_len(&wal_sidecar(&source_path)) > 0,
+        "fixture must retain WAL frames"
+    );
 
     let copy_root = tempfile::tempdir().unwrap();
     let destination = copy_root.path().join("uncheckpointed");
-    copy_database_file(
-        &source_config.database_path(),
-        &config(&destination, logical).database_path(),
-    );
-    let verdict = verify_copy(&destination, logical, &ids).await;
+    copy_database_file(&source_path, &config(&destination, logical).database_path());
+    let verdict = verify_copy(&destination, logical, &[]).await;
     assert_eq!(
         verdict,
         Err("preflight user_version = 0".to_string()),
-        "an un-checkpointed live copy must fail closed at the preflight"
+        "a WAL-only schema copy must fail closed before runtime open"
     );
-
-    drop(engine);
-    drop(db);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -24,6 +24,7 @@ use super::super::ToolKind;
 use super::{echo_act, parse_args, require_nonblank_reason, require_record_in, REASON_DESCRIPTION};
 
 const TOOL: &str = "resolve_suggestions";
+const KEYED_LIVE_REFUSAL: &str = "resolve_suggestions: idempotency_key is not supported while a live editing session is routing this record's body; retry without a key";
 const MAX_BATCH: usize = 100;
 const OLD_FACET: &str = "anchor.old";
 const DIGEST_FACET: &str = "anchor.base_digest";
@@ -304,6 +305,7 @@ async fn mark_stale_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
+    target_id: &str,
     causes: &[Value],
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<()> {
@@ -317,9 +319,15 @@ async fn mark_stale_in(
             .get("code")
             .and_then(Value::as_str)
             .unwrap_or("precondition_failed");
+        // Pin the receipt's own cause and target on the marker: the
+        // attestation's content outputs are V1's keyed-receipt storage, so a
+        // redelivery after the world moved still rebuilds exactly what the
+        // first call answered. The projector only reads known fields.
         let payload = json!({
             "lifecycle": "stale",
             "summary": format!("Stale: {code}"),
+            "stale_target_id": target_id,
+            "stale_cause": cause,
         });
         append_in(
             db,
@@ -418,12 +426,134 @@ pub(crate) fn simulate(
     Ok(prospective)
 }
 
+/// Rebuild an accept receipt from its attestation, without writing. An
+/// acceptance writes one target event plus one per suggestion; a stale write
+/// touches only the suggestions, so the presence of a target event tells the
+/// two apart. Both receipts are rebuilt from the attestation alone, so a
+/// redelivery after the world moved still answers exactly what the first
+/// call answered. The attested target is authorized before anything is
+/// returned: the suggestions' current links may point elsewhere by now, and
+/// a caller who lost access to the original target must get the same opaque
+/// refusal as an ordinary access refusal.
+async fn replay_accept(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    replay: &super::keyed_replay::KeyedReplay,
+    ids: &[String],
+) -> Result<Value> {
+    let in_batch = |id: &str| ids.iter().any(|wanted| wanted == id);
+    let attested_target = replay
+        .content()
+        .iter()
+        .find(|event| event.event_type == "record.updated" && !in_batch(&event.record_id))
+        .map(|event| event.record_id.as_str())
+        .or_else(|| {
+            replay
+                .content()
+                .iter()
+                .find_map(|event| event.payload.get("stale_target_id").and_then(Value::as_str))
+        });
+    let Some(attested_target) = attested_target else {
+        return Err(Error::engine(format!(
+            "{TOOL}: idempotent receipt is incomplete"
+        )));
+    };
+    if require_record_in(tx, caller, TOOL, attested_target, Capability::Edit)
+        .await
+        .is_err()
+    {
+        return Err(Error::engine(format!("{TOOL}: suggestion does not exist")));
+    }
+    let target_event = replay
+        .content()
+        .iter()
+        .find(|event| event.event_type == "record.updated" && !in_batch(&event.record_id));
+    let Some(target_event) = target_event else {
+        return replay_stale_accept(replay, ids);
+    };
+    if replay.content().len() != ids.len() + 1
+        || ids.iter().any(|id| replay.content_for(id).count() != 1)
+    {
+        return Err(Error::engine(format!(
+            "{TOOL}: idempotent receipt is incomplete"
+        )));
+    }
+    echo_act(
+        json!({
+        "status": "accepted",
+        "target_id": target_event.record_id,
+        "suggestion_ids": ids,
+        }),
+        replay.act(),
+    )
+}
+
+/// Rebuild the stale receipt a keyed accept already committed, without
+/// writing again and without reading live state. Each stale marker carries
+/// the receipt's own cause and target (`mark_stale_in`), so a redelivery
+/// after the world moved still answers exactly what the first call answered.
+/// A marker without them fails closed: keyed accepts only exist after this
+/// pinning (an earlier keyed accept was refused before writing), so every
+/// replayable stale attestation has them.
+fn replay_stale_accept(replay: &super::keyed_replay::KeyedReplay, ids: &[String]) -> Result<Value> {
+    let incomplete = || Error::engine(format!("{TOOL}: idempotent receipt is incomplete"));
+    if !replay.relationship().is_empty() {
+        return Err(incomplete());
+    }
+    let mut target_id: Option<&str> = None;
+    let mut causes = Vec::with_capacity(replay.content().len());
+    let mut seen = std::collections::HashSet::new();
+    for event in replay.content() {
+        if event.event_type != "record.updated"
+            || !ids.iter().any(|id| id == &event.record_id)
+            || !seen.insert(event.record_id.clone())
+        {
+            return Err(incomplete());
+        }
+        let cause = event
+            .payload
+            .get("stale_cause")
+            .filter(|cause| cause.is_object());
+        let target = event.payload.get("stale_target_id").and_then(Value::as_str);
+        let (Some(cause), Some(target)) = (cause, target) else {
+            return Err(incomplete());
+        };
+        if cause.get("suggestion_id").and_then(Value::as_str) != Some(event.record_id.as_str()) {
+            return Err(incomplete());
+        }
+        match target_id {
+            Some(first) if first != target => return Err(incomplete()),
+            Some(_) => {}
+            None => target_id = Some(target),
+        }
+        causes.push(cause.clone());
+    }
+    let Some(target_id) = target_id else {
+        return Err(incomplete());
+    };
+    let stale_ids: Vec<&str> = causes
+        .iter()
+        .filter_map(|cause| cause.get("suggestion_id").and_then(Value::as_str))
+        .collect();
+    echo_act(
+        json!({
+        "status": "stale",
+        "target_id": target_id,
+        "suggestion_ids": stale_ids,
+        "causes": causes,
+        }),
+        replay.act(),
+    )
+}
+
 async fn accept(
     db: Db,
     caller: Caller,
     ids: Vec<String>,
     reason: String,
     dry_run: bool,
+    keyed: bool,
+    provenance_arguments: Value,
 ) -> Result<Value> {
     // Single-writer rule: the live-session guard must be taken before the
     // write transaction, so the target is read once up front and re-checked
@@ -438,10 +568,28 @@ async fn accept(
         .await?,
         None => None,
     };
-    // A dry run takes no guard (it can never cut a version or discard a
-    // session); it previews against the in-memory live text instead.
-    let mut live_write = if dry_run {
+    // A keyed redelivery writes nothing, so it must not flush a live session
+    // first: the in-transaction lookup below is the authority, and a
+    // concurrent duplicate serializes on BEGIN. A keyed call can never be
+    // routed into a live session (its merged version could not be replayed),
+    // so it is refused up front like update_record. A dry run takes no guard
+    // (it can never cut a version or discard a session); it previews against
+    // the in-memory live text instead.
+    let may_replay = keyed
+        && !dry_run
+        && super::keyed_replay::replay_may_exist(&db, &caller, TOOL, &provenance_arguments).await?;
+    let mut live_write = if dry_run || may_replay {
         None
+    } else if keyed {
+        Some(
+            crate::coedit::live::begin_unrouted_body_write(
+                &db,
+                expected_target.as_deref().unwrap_or(""),
+                &caller,
+                KEYED_LIVE_REFUSAL,
+            )
+            .await?,
+        )
     } else {
         Some(
             crate::coedit::live::begin_body_write(
@@ -476,6 +624,19 @@ async fn accept(
         return Err(Error::engine(format!(
             "{TOOL}: all accepted suggestions must share one part_of target"
         )));
+    }
+    // Keyed replay: after the target-edit checks, before the lifecycle and
+    // precondition checks the first acceptance's own effect would now trip.
+    if keyed && !dry_run {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            let receipt = replay_accept(&mut tx, &caller, &replay, &ids).await?;
+            tx.rollback().await?;
+            replay.settle();
+            return Ok(receipt);
+        }
     }
     let suggestions = read_suggestions_in(&mut tx, &ids).await?;
     let target_id = suggestions[0].target_id.clone();
@@ -522,7 +683,7 @@ async fn accept(
             .map(|id| json!({ "suggestion_id": id, "code": "target_missing" }))
             .collect();
         if !dry_run {
-            mark_stale_in(&db, &mut tx, &caller, &causes, &mut act_alloc).await?;
+            mark_stale_in(&db, &mut tx, &caller, &target_id, &causes, &mut act_alloc).await?;
             db.commit_content(tx).await?;
         }
         return echo_act(
@@ -536,7 +697,7 @@ async fn accept(
             .map(|id| json!({ "suggestion_id": id, "code": "target_deleted" }))
             .collect();
         if !dry_run {
-            mark_stale_in(&db, &mut tx, &caller, &causes, &mut act_alloc).await?;
+            mark_stale_in(&db, &mut tx, &caller, &target_id, &causes, &mut act_alloc).await?;
             db.commit_content(tx).await?;
         }
         return echo_act(
@@ -557,7 +718,7 @@ async fn accept(
     let stale = stale_causes(&suggestions, &preconditions, target_body.as_deref());
     if !stale.is_empty() {
         if !dry_run {
-            mark_stale_in(&db, &mut tx, &caller, &stale, &mut act_alloc).await?;
+            mark_stale_in(&db, &mut tx, &caller, &target_id, &stale, &mut act_alloc).await?;
             db.commit_content(tx).await?;
         }
         let stale_ids: Vec<&str> = stale
@@ -640,6 +801,7 @@ async fn accept(
         )
         .await?;
     }
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     if let (Some((event_id, seq)), Some(write)) = (routed_event, live_write) {
         write.finish(&event_id, seq).await;
@@ -765,13 +927,18 @@ pub(super) async fn resolve_suggestions(db: Db, caller: Caller, arguments: Value
         )));
     }
     match args.action.as_str() {
-        // Accept is not keyed: it can route the body into a live editing
-        // session, and its stale and conflict outcomes embed the target's live
-        // digest and match counts, which a replay could not pin.
-        "accept" if keyed => Err(Error::engine(format!(
-            "{TOOL}: accept does not accept idempotency_key yet; retry without a key"
-        ))),
-        "accept" => accept(db, caller, args.suggestion_ids, args.reason, args.dry_run).await,
+        "accept" => {
+            accept(
+                db,
+                caller,
+                args.suggestion_ids,
+                args.reason,
+                args.dry_run,
+                keyed,
+                provenance_arguments,
+            )
+            .await
+        }
         "reject" if args.dry_run => Err(Error::engine(format!(
             "{TOOL}: dry_run is only valid with action accept"
         ))),

@@ -1,0 +1,35 @@
+{
+  "base": "3792546d010bee777debe99ce57d6a35b7162b6b",
+  "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+  "exit": 0,
+  "binary_sha256": "59f47aa75bc8f66821ec3e2303d24d5e6f088f88e461146753d3e0118416effb",
+  "test_source_sha256": "170883f9c72085014fdb1a6f69bd1fb76e31f878724f4b57f7dd9c7e4db70ea6",
+  "log_sha256": "b0768a7897a9acd4b85d07526c37887a2939590c5b32fa8fe153436bed5e40fe",
+  "scope": "test-only valid selected95 maintenance health/barrier refusal and unchanged floor precede original unknown-selection priority and auth/gateway cases",
+  "functional_mutation": "pending rerun; old priority-only receipt retained separately",
+  "priority_only_history": {
+    "qualification": "priority-only; not counted as functional health/floor proof",
+    "receipt": {
+      "mutation": "node-probe-maintenance-bypass",
+      "head": "3792546d010bee777debe99ce57d6a35b7162b6b",
+      "path": "src/node/failover.rs",
+      "original_sha256": "9e548810e4b8bf5a89ace142968a4e7a677d005f294cc204230ad14e9be579ef",
+      "mutant_sha256": "689e24f91dce8d91da33e5c241404c1d1c3d287cd5505b581cc51bf10649d905",
+      "tests": [
+        {
+          "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries stdout ----\n\nthread 'node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries' (2874383) panicked at src/node/failover/tests.rs:4573:5:\nassertion `left == right` failed\n  left: \"receiver_shape_unsupported\"\n right: \"hosted authority act is serving a maintenance snapshot\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.97s\n\n"
+        }
+      ],
+      "result": "bypass fails"
+    },
+    "preserved_files": {
+      "node-probe-maintenance-priority-only.json": "557de9c0fd1b0403d68c26e1697f83fa074c1f71ad28e6666b7d8d37a717107b",
+      "node-probe-maintenance-priority-only-compile.log": "151b2cdde9b5f9f84bf88c8ab1a8922576c4f8574283f9a46419dfc96e527e39",
+      "node-probe-maintenance-priority-only-compile.jsonl": "6a66937baeb9af26579194aab248b79b3b4c5bcef030b4e64e280ebbb1d4892c",
+      "node-probe-maintenance-priority-only.log": "ffeca335bfc09303cfd14b7e5351e677dea54f3cff66ffd7a50fc8784d7e042b"
+    }
+  }
+}

@@ -39,6 +39,14 @@ impl Fixture {
     }
 
     async fn with_body(body: Option<&str>) -> Self {
+        Self::with_type_and_body("Document", "note", body).await
+    }
+
+    async fn work_item(kind: &str, body: Option<&str>) -> Self {
+        Self::with_type_and_body("WorkItem", kind, body).await
+    }
+
+    async fn with_type_and_body(record_type: &str, kind: &str, body: Option<&str>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("live.sqlite");
         let db = crate::create_database(path.to_str().unwrap())
@@ -46,7 +54,7 @@ impl Fixture {
             .unwrap();
         let mut tools = ToolRegistry::new();
         crate::mcp::register_surface_tools(&mut tools).unwrap();
-        let mut args = json!({"type": "Document", "kind": "note", "name": "live doc",
+        let mut args = json!({"type": record_type, "kind": kind, "name": "live doc",
                               "reason": "live session fixture"});
         if let Some(body) = body {
             args["body"] = json!(body);
@@ -4015,4 +4023,635 @@ async fn database_freeze_drains_acknowledged_dirty_text_and_leaves_other_session
     store.unfreeze("a").unwrap();
     alice.leave().await;
     bob.leave().await;
+}
+
+/// Task/epic descriptions use exactly the same body protocol as Documents;
+/// title and workflow remain ordinary record metadata.
+#[tokio::test]
+async fn work_item_bodies_converge_route_metadata_and_reopen_from_persistence() {
+    for kind in ["task", "epic"] {
+        let fx = Fixture::work_item(kind, Some("Draft")).await;
+        let (alice, a) = fx.open(ALICE).await;
+        let (bob, b) = fx.open(BOB).await;
+        let mut a_rx = alice.subscribe();
+        let mut b_rx = bob.subscribe();
+        alice.apply("a1", &a.insert(0, "# ")).await.unwrap();
+        let bob_update = b.append(" together");
+        // A title/workflow write races a description edit through the tool
+        // surface. Metadata must not replace the live body or cut a version.
+        let (applied, metadata) = tokio::join!(
+            bob.apply("b1", &bob_update),
+            fx.update(
+                AGENT,
+                json!({"id": fx.id, "name": "New title",
+                    "lifecycle": "in_progress", "reason": "start work"})
+            ),
+        );
+        applied.unwrap();
+        metadata.unwrap();
+        deliver(&a, &alice, &drain(&mut a_rx));
+        deliver(&b, &bob, &drain(&mut b_rx));
+        assert_eq!(a.body(), "# Draft together");
+        assert_eq!(a.body(), b.body());
+        assert_eq!(fx.committed().await, "Draft");
+
+        assert!(fx.versions().await.is_empty());
+        assert_eq!(fx.get(ALICE).await["body_state"], "live");
+        fx.update(
+            AGENT,
+            json!({"id": fx.id, "body_replace": [
+            {"old": "Draft", "new": "Plan"}], "reason": "refine description"}),
+        )
+        .await
+        .unwrap();
+        deliver(&a, &alice, &drain(&mut a_rx));
+        deliver(&b, &bob, &drain(&mut b_rx));
+        assert_eq!(a.body(), "# Plan together");
+        assert_eq!(a.body(), b.body());
+        assert_eq!(fx.committed().await, a.body());
+        let record = fx.get(ALICE).await;
+        assert_eq!(record["name"], "New title");
+        assert_eq!(
+            record["lifecycle_interpretation"]["value"]["canonical"],
+            "in_progress"
+        );
+        let versions = fx.versions().await;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0]["contributors"].as_array().unwrap().len(), 2);
+        assert_eq!(versions[1]["contributors"][0]["principal"], AGENT);
+        for version in &versions {
+            assert_span_map_tiles(version);
+        }
+        let original_session = alice.session().clone();
+        alice.leave().await;
+        bob.leave().await;
+
+        // A committed ordinary write invalidates the clean grace doc. The
+        // next open must seed from storage, rather than reuse in-memory text.
+        fx.update(
+            AGENT,
+            json!({"id": fx.id, "body_append": "!",
+            "reason": "after the session"}),
+        )
+        .await
+        .unwrap();
+        let (reopened, client) = fx.open(ALICE).await;
+        assert_ne!(reopened.session(), &original_session);
+        assert_eq!(client.body(), "# Plan together!");
+        reopened.leave().await;
+    }
+}
+
+#[tokio::test]
+async fn work_item_empty_and_absent_bodies_seed_empty_markdown() {
+    for kind in ["task", "epic"] {
+        for body in [None, Some("")] {
+            let fx = Fixture::work_item(kind, body).await;
+            let (alice, a) = fx.open(ALICE).await;
+            assert_eq!(a.body(), "");
+            let stored: Option<String> = sqlx::query_scalar("SELECT body FROM records WHERE id=?")
+                .bind(&fx.id)
+                .fetch_one(fx.db.pool())
+                .await
+                .unwrap();
+            assert_eq!(stored.as_deref(), body, "opening must not write");
+            alice
+                .apply("first", &a.append("Description"))
+                .await
+                .unwrap();
+            alice.leave().await;
+            assert_eq!(fx.committed().await, "Description");
+        }
+    }
+}
+
+#[tokio::test]
+async fn work_item_ordinary_body_writes_keep_live_guards() {
+    for kind in ["task", "epic"] {
+        let fx = Fixture::work_item(kind, Some("Draft")).await;
+        assert_eq!(
+            live::open(
+                &fx.db,
+                &Caller::authenticated("acct:stranger"),
+                OpenRequest {
+                    record_id: fx.id.clone(),
+                    mode: PeerKind::Edit,
+                    resume_peer: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .code,
+            RefusalCode::Forbidden
+        );
+        let (viewer, view_client) = fx.open_with(BOB, PeerKind::View, None, None).await;
+        assert_eq!(
+            viewer
+                .apply("view", &view_client.append(" refused"))
+                .await
+                .unwrap_err()
+                .code,
+            RefusalCode::Forbidden
+        );
+        viewer.leave().await;
+        let (alice, a) = fx.open(ALICE).await;
+        alice.apply("a1", &a.append(" live")).await.unwrap();
+        assert!(fx
+            .update(
+                "acct:stranger",
+                json!({"id": fx.id, "body_append": " refused",
+            "reason": "unauthorized"})
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            fx.committed().await,
+            "Draft",
+            "unauthorized writers must not flush"
+        );
+        for guard in [None, Some(body_digest(Some("Draft")))] {
+            let mut args = json!({"id": fx.id, "body_set": "erase", "reason": "unsafe"});
+            if let Some(digest) = guard {
+                args["if_body_digest"] = json!(digest);
+            }
+            let error = fx.update(AGENT, args).await.unwrap_err().to_string();
+            assert!(error.contains("live_session_changed"), "{error}");
+            assert_eq!(fx.get(ALICE).await["body"], "Draft live");
+        }
+        let error = crate::store::append(
+            &fx.db,
+            crate::store::AppendSpec {
+                record_id: fx.id.clone(),
+                event_type: "record.updated".into(),
+                payload: json!({"body": "bypass"}),
+                actor: Some(ALICE.into()),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("live editing session"), "{error}");
+        let digest = fx.get(AGENT).await["body_digest"].clone();
+        fx.update(
+            AGENT,
+            json!({"id": fx.id, "body_set": "Revised live",
+            "if_body_digest": digest, "reason": "guarded replacement"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fx.committed().await, "Revised live");
+        let synced = Client::new(1, &alice.sync(&[]).await.unwrap());
+        assert_eq!(synced.body(), "Revised live");
+        alice.leave().await;
+    }
+}
+
+#[tokio::test]
+async fn work_item_permission_loss_preserves_accepted_edits_and_deletion_closes() {
+    for kind in ["task", "epic"] {
+        let fx = Fixture::work_item(kind, Some("Shared")).await;
+        let (alice, _) = fx.open(ALICE).await;
+        let (bob, b) = fx.open(BOB).await;
+        bob.apply("b1", &b.append(" by Bob")).await.unwrap();
+        fx.grant(&[ALICE, AGENT]).await;
+        assert_eq!(
+            bob.recheck_access(&Caller::authenticated(BOB))
+                .await
+                .unwrap_err()
+                .code,
+            RefusalCode::AccessLost
+        );
+        assert_eq!(
+            bob.apply("b2", &b.append(" refused"))
+                .await
+                .unwrap_err()
+                .code,
+            RefusalCode::UndeclaredSession
+        );
+        alice.version("keep accepted edits").await.unwrap();
+        assert_eq!(fx.committed().await, "Shared by Bob");
+        let mut rx = alice.subscribe();
+        fx.tools
+            .call(
+                fx.db.clone(),
+                Caller::local(),
+                "delete_record",
+                json!({"id": fx.id, "reason": "remove work"}),
+            )
+            .await
+            .unwrap();
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            SessionEvent::Closed {
+                peer: None,
+                reason: CloseReason::AccessLost
+            }
+        )));
+        assert!(live::open(
+            &fx.db,
+            &Caller::authenticated(ALICE),
+            OpenRequest {
+                record_id: fx.id.clone(),
+                mode: PeerKind::Edit,
+                resume_peer: None,
+            }
+        )
+        .await
+        .is_err());
+    }
+}
+
+#[tokio::test]
+async fn work_item_kind_support_is_governed_and_revalidated_on_heartbeat() {
+    use crate::generated::kinds::CoreKind;
+    for (kind, identity) in [
+        ("task", CoreKind::WorkItemTask),
+        ("epic", CoreKind::WorkItemEpic),
+    ] {
+        for dirty in [false, true] {
+            let fx = Fixture::work_item(kind, Some("Description")).await;
+            let (alice, a) = fx.open(ALICE).await;
+            let mut rx = alice.subscribe();
+            if dirty {
+                alice.apply("a1", &a.append(" pending")).await.unwrap();
+            }
+            // Fixture-only governance mutation: support can disappear without a
+            // record content event. Retired canonical kinds must fail closed.
+            sqlx::query("UPDATE vocabulary_values SET status='deprecated' WHERE id=?")
+                .bind(identity.value_id())
+                .execute(fx.db.write_pool())
+                .await
+                .unwrap();
+            assert!(fx
+                .update(
+                    AGENT,
+                    json!({"id": fx.id, "body_append": " refused",
+            "reason": "after kind retirement"})
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("live body write refused"));
+            assert!(fx.versions().await.is_empty(), "refusal must not flush");
+            assert_eq!(
+                alice
+                    .recheck_access(&Caller::authenticated(ALICE))
+                    .await
+                    .unwrap_err()
+                    .code,
+                RefusalCode::AccessLost
+            );
+            assert!(drain(&mut rx).iter().any(|event| matches!(
+                event,
+                SessionEvent::Closed {
+                    peer: None,
+                    reason: CloseReason::AccessLost
+                }
+            )));
+            // Unsupported bodies cannot receive a version. The client keeps its
+            // pending update for recovery, and storage retains the last version.
+            assert_eq!(
+                a.body(),
+                if dirty {
+                    "Description pending"
+                } else {
+                    "Description"
+                }
+            );
+            assert_eq!(fx.committed().await, "Description");
+            assert_eq!(
+                live::open(
+                    &fx.db,
+                    &Caller::authenticated(ALICE),
+                    OpenRequest {
+                        record_id: fx.id.clone(),
+                        mode: PeerKind::Edit,
+                        resume_peer: None,
+                    }
+                )
+                .await
+                .unwrap_err()
+                .code,
+                RefusalCode::RecordUnsupported
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn work_item_runtime_and_unknown_kinds_are_not_markdown_sessions() {
+    for kind in ["task", "epic"] {
+        let fx = Fixture::work_item(kind, Some("runtime source")).await;
+        let (alice, a) = fx.open(ALICE).await;
+        alice.apply("a1", &a.append(" pending")).await.unwrap();
+        // The body must be saved before a scope-changing ordinary writer
+        // adds runtime metadata, then the session closes after commit.
+        let mut write = live::begin_body_write(&fx.db, &fx.id, &Caller::authenticated(ALICE))
+            .await
+            .unwrap();
+        write
+            .begin_scope_change(&fx.db, &Caller::authenticated(ALICE))
+            .await
+            .unwrap();
+        let mut rx = alice.subscribe();
+        crate::store::append(
+            &fx.db,
+            crate::store::AppendSpec {
+                record_id: fx.id.clone(),
+                event_type: "facet.set".into(),
+                payload: json!({"key": "runtime", "value": "native.html.v1"}),
+                actor: Some(ALICE.into()),
+            },
+        )
+        .await
+        .unwrap();
+        write.finish_scope_change(&fx.db).await;
+        assert_eq!(fx.committed().await, "runtime source pending");
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            SessionEvent::Closed {
+                peer: None,
+                reason: CloseReason::AccessLost
+            }
+        )));
+        assert_eq!(
+            live::open(
+                &fx.db,
+                &Caller::authenticated(ALICE),
+                OpenRequest {
+                    record_id: fx.id.clone(),
+                    mode: PeerKind::Edit,
+                    resume_peer: None,
+                }
+            )
+            .await
+            .unwrap_err()
+            .code,
+            RefusalCode::RecordUnsupported
+        );
+    }
+    let fx = Fixture::work_item("task", Some("description")).await;
+    sqlx::query("UPDATE records SET kind='unknown-work' WHERE id=?")
+        .bind(&fx.id)
+        .execute(fx.db.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        live::open(
+            &fx.db,
+            &Caller::authenticated(ALICE),
+            OpenRequest {
+                record_id: fx.id.clone(),
+                mode: PeerKind::Edit,
+                resume_peer: None,
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        RefusalCode::RecordUnsupported
+    );
+}
+
+#[tokio::test]
+async fn work_item_aliases_resolve_and_supported_kind_changes_keep_the_session() {
+    use crate::generated::kinds::CoreKind;
+    for (kind, identity) in [
+        ("task", CoreKind::WorkItemTask),
+        ("epic", CoreKind::WorkItemEpic),
+    ] {
+        let fx = Fixture::work_item(kind, Some("Description")).await;
+        let alias = crate::meta::propose_value_with_kind_metadata_as(
+            &fx.db,
+            "kind:WorkItem",
+            "old-work",
+            None,
+            0.0,
+            crate::meta::VocabularyValueTerminality::Open,
+            Some(crate::meta::kind::KindMetadataV1::legacy(
+                "WorkItem", "old-work",
+            )),
+            None,
+        )
+        .await
+        .unwrap();
+        crate::meta::alias_value(&fx.db, &alias, identity.value_id())
+            .await
+            .unwrap();
+        // Historical records may store aliases; ordinary writes canonicalize.
+        sqlx::query("UPDATE records SET kind='old-work' WHERE id=?")
+            .bind(&fx.id)
+            .execute(fx.db.write_pool())
+            .await
+            .unwrap();
+        let (alice, a) = fx.open(ALICE).await;
+        alice.apply("a1", &a.append(" live")).await.unwrap();
+        let other = if kind == "task" { "epic" } else { "task" };
+        fx.update(
+            AGENT,
+            json!({"id": fx.id, "kind": other,
+            "reason": "supported kind change"}),
+        )
+        .await
+        .unwrap();
+        alice
+            .recheck_access(&Caller::authenticated(ALICE))
+            .await
+            .unwrap();
+        alice.apply("a2", &a.append("!")).await.unwrap();
+        alice.leave().await;
+        assert_eq!(fx.committed().await, "Description live!");
+    }
+}
+
+#[tokio::test]
+async fn work_item_type_correction_never_saves_late_edits_into_unsupported_bodies() {
+    for kind in ["task", "epic"] {
+        for (target_type, target_kind, runtime) in [
+            ("Configuration", "schema", None),
+            ("Program", "module", None),
+            ("Outcome", "impact", None),
+            ("Document", "artifact", None),
+            ("Document", "instruction", None),
+            ("Document", "note", Some("native.html.v1")),
+        ] {
+            let fx = Fixture::work_item(kind, Some("Description")).await;
+            let (alice, a) = fx.open(ALICE).await;
+            let mut rx = alice.subscribe();
+            let mut tx = crate::db::begin_write(fx.db.write_pool()).await.unwrap();
+            let mut act = crate::act::ActAllocation::new();
+            if let Some(runtime) = runtime {
+                crate::store::append_in(
+                    &fx.db,
+                    &mut tx,
+                    crate::store::AppendSpec {
+                        record_id: fx.id.clone(),
+                        event_type: "facet.set".into(),
+                        payload: json!({"key": "runtime", "value": runtime}),
+                        actor: Some(ALICE.into()),
+                    },
+                    &mut act,
+                )
+                .await
+                .unwrap();
+            }
+            // Storage-level correction fixture, deliberately entering below
+            // the prepared operation's ops guard to exercise the defensive
+            // final cut when a correction commits around an acknowledged op.
+            crate::store::append_record_type_correction_in(
+                &fx.db,
+                &mut tx,
+                crate::store::AppendSpec {
+                    record_id: fx.id.clone(),
+                    event_type: "record.type_corrected.v1".into(),
+                    payload: json!({
+                        "from": {"type": "WorkItem", "kind": kind},
+                        "to": {"type": target_type, "kind": target_kind},
+                        "mode": "confirmed", "reason": "correction race fixture",
+                        "plan_id": "wpl1:coedit-correction-fixture",
+                        "effect_digest": format!("sha256:{}", "a".repeat(64)),
+                        "schema_state_revision": "schema-state-v1:meta:0:content:1",
+                        "confirmation_required": true
+                    }),
+                    actor: Some(ALICE.into()),
+                },
+                &mut act,
+            )
+            .await
+            .unwrap();
+            alice.apply("late", &a.append(" pending")).await.unwrap();
+            fx.db.commit_content(tx).await.unwrap();
+            let closed = wait_for(&mut rx, |event| match event {
+                SessionEvent::Closed { peer: None, reason } => Some(*reason),
+                _ => None,
+            })
+            .await;
+            assert_eq!(closed, CloseReason::AccessLost);
+            assert_eq!(fx.committed().await, "Description");
+            assert!(
+                fx.versions().await.is_empty(),
+                "unsupported target must receive no recovery version"
+            );
+            assert_eq!(
+                a.body(),
+                "Description pending",
+                "client retains recovery text"
+            );
+            assert_eq!(
+                live::open(
+                    &fx.db,
+                    &Caller::authenticated(ALICE),
+                    OpenRequest {
+                        record_id: fx.id.clone(),
+                        mode: PeerKind::Edit,
+                        resume_peer: None,
+                    }
+                )
+                .await
+                .unwrap_err()
+                .code,
+                RefusalCode::RecordUnsupported
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn offline_merge_metadata_tracks_only_accepted_changes_until_cut() {
+    use super::live::OfflineMerge;
+    let fx = Fixture::new("base").await;
+    let (old, _) = fx.open(ALICE).await;
+    let old_id = old.peer().clone();
+    old.leave_and_expire_grace_for_test().await;
+    let (peer, client) = fx
+        .open_with(ALICE, PeerKind::Edit, None, Some(old_id.clone()))
+        .await;
+    assert_ne!(peer.peer(), &old_id, "expired grace requires a fresh peer");
+    let hint = OfflineMerge {
+        started_at_ms: 1000,
+        reconnected_at_ms: 2000,
+    };
+    peer.apply_with_offline_merge("offline", &client.append(" offline"), Some(hint))
+        .await
+        .unwrap();
+    peer.version("offline merge").await.unwrap();
+    for detail in ["metadata", "full"] {
+        let history = fx
+            .tools
+            .call(
+                fx.db.clone(),
+                Caller::authenticated(ALICE),
+                "get_history",
+                json!({"record_id":fx.id,"detail":detail}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            history["events"].as_array().unwrap().iter().any(|event| {
+                let value = if detail == "full" {
+                    &event["payload"]
+                } else {
+                    event
+                };
+                value["merged_offline"] == json!(true)
+                    && value["offline_interval"]["client_reported"] == json!(true)
+            }),
+            "{detail} history exposes offline metadata: {history}"
+        );
+    }
+    let versions = fx.versions().await;
+    assert_eq!(versions.last().unwrap()["merged_offline"], json!(true));
+    assert_eq!(
+        versions.last().unwrap()["offline_interval"],
+        json!({"started_at_ms":1000,"reconnected_at_ms":2000,"client_reported":true})
+    );
+    // A duplicate/no-op hint cannot contaminate a later ordinary cut.
+    let empty = client
+        .doc
+        .transact()
+        .encode_diff_v1(&client.doc.transact().state_vector());
+    peer.apply_with_offline_merge("empty", &empty, Some(hint))
+        .await
+        .unwrap();
+    peer.apply("ordinary", &client.append(" live"))
+        .await
+        .unwrap();
+    peer.leave().await;
+    let versions = fx.versions().await;
+    assert!(versions.last().unwrap().get("merged_offline").is_none());
+    assert!(versions.last().unwrap().get("offline_interval").is_none());
+    let (viewer, v) = fx.open_with(BOB, PeerKind::View, None, None).await;
+    assert_eq!(
+        viewer
+            .apply_with_offline_merge("view", &v.append(" forbidden"), Some(hint))
+            .await
+            .unwrap_err()
+            .code,
+        RefusalCode::Forbidden
+    );
+    viewer.leave().await;
+}
+
+#[tokio::test]
+async fn offline_merge_invalid_interval_is_advisory_and_does_not_mark_a_cut() {
+    let fx = Fixture::new("base").await;
+    let (peer, client) = fx.open(ALICE).await;
+    peer.apply_with_offline_merge(
+        "bad-clock",
+        &client.append(" still accepted"),
+        Some(super::live::OfflineMerge {
+            started_at_ms: 2000,
+            reconnected_at_ms: 1000,
+        }),
+    )
+    .await
+    .unwrap();
+    peer.leave().await;
+    assert!(fx
+        .versions()
+        .await
+        .last()
+        .unwrap()
+        .get("merged_offline")
+        .is_none());
 }

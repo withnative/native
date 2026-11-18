@@ -85,6 +85,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -96,6 +97,33 @@ pub const BINDING_VERSION: u32 = 1;
 pub const CHECKPOINT_VERSION: u32 = 1;
 /// Spool envelope version.
 pub const SPOOL_VERSION: u32 = 1;
+
+pub(super) fn runtime_declaration() -> Value {
+    use super::format_declaration as format;
+    let formats = [
+        ("binding", BINDING_VERSION),
+        ("checkpoint", CHECKPOINT_VERSION),
+        ("spool", SPOOL_VERSION),
+    ]
+    .map(|(variant, version)| {
+        format(
+            "agent_session",
+            variant,
+            version.into(),
+            true,
+            ("production", true),
+            &[],
+            &[
+                "matching_binding_and_agent",
+                "checkpoint_spool_order_and_fingerprints",
+                "keyed_proposal_semantics",
+            ],
+        )
+    });
+    json!({"source":"src/node/session_persist.rs","formats":formats,
+        "unknown_fields":"reject","unknown_format":"reject_preserve_pending_files_do_not_continue"})
+}
+
 /// Frozen reason byte, stable across restarts and re-enrolment (§6.1).
 pub const REASON_STEP: &str = "Saved agent session step";
 /// Proposed `Document` type/kind for step creates (names only; S3a performs
@@ -1930,6 +1958,44 @@ mod tests {
                 "if_facets":{"native.session.writer_generation":1,"native.session.writer":"srv-a/instance/boot"},
                 "idempotency_key":key}),
         }
+    }
+
+    #[test]
+    fn runtime_declaration_tracks_persisted_session_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let checkpoint = store.load_checkpoint("agent-1").unwrap();
+        store.save_checkpoint(&checkpoint).unwrap();
+        let root = chain_root("srv-a", "agent-1").unwrap();
+        let request = freeze_sample(&store, "agent-1", 1, &root, "retained original");
+        let path = store.freeze_spool(&request, "agent-1").unwrap();
+        let report = runtime_declaration();
+        for (variant, version) in [
+            ("binding", store.binding().version),
+            (
+                "checkpoint",
+                store.load_checkpoint("agent-1").unwrap().version,
+            ),
+            (
+                "spool",
+                store.load_spool("agent-1").unwrap().unwrap().version,
+            ),
+        ] {
+            let row = report["formats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["variant"] == variant)
+                .unwrap();
+            assert_eq!(row["version"], version);
+        }
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        future["version"] = serde_json::json!(999);
+        let bytes = serde_json::to_vec(&future).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(store.load_spool("agent-1").is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

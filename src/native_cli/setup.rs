@@ -48,21 +48,27 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// generate; they survive a regeneration.
 const PRESERVED_NODE_KEYS: [&str; 2] = ["disk_floor_bytes", "markdown_folder"];
 /// Likewise for the refresh config's tuning.
-const REFRESH_TUNING_KEYS: [&str; 3] = [
+const REFRESH_TUNING_KEYS: [&str; 6] = [
     "refresh_interval_seconds",
     "full_refresh_min_interval_seconds",
     "full_refresh_repair_retry_seconds",
+    "kernel_in_place_deltas",
+    "kernel_audit_interval_seconds",
+    "projection_proof_interval_seconds",
 ];
 /// Bound on a config file setup will read.
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// The fields each config file's schema defines; nothing else is ever shown.
-const NODE_KEYS: [&str; 11] = [
+const NODE_KEYS: [&str; 14] = [
     "hosted_base_url",
     "home_id",
     "db_id",
     "account_id",
     "credential_file",
     "oauth_auth_file",
+    "node_install_key_file",
+    "hosted_kernel_v2",
+    "local_reads_by_default",
     "socket_directory",
     "standby_config",
     "refresh_config",
@@ -74,7 +80,7 @@ const STANDBY_KEYS: [&str; 3] = [
     "hosted_route_database_id",
     "origin_database_id",
 ];
-const REFRESH_KEYS: [&str; 7] = [
+const REFRESH_KEYS: [&str; 10] = [
     "contract",
     "version",
     "hosted_origin",
@@ -82,6 +88,9 @@ const REFRESH_KEYS: [&str; 7] = [
     "refresh_interval_seconds",
     "full_refresh_min_interval_seconds",
     "full_refresh_repair_retry_seconds",
+    "kernel_in_place_deltas",
+    "kernel_audit_interval_seconds",
+    "projection_proof_interval_seconds",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +244,30 @@ pub async fn setup(options: SetupOptions) -> Result<SetupOutcome> {
     let existing_standby = read_existing(&config_dir.join(STANDBY_FILE))?;
     let existing_refresh = read_existing(&config_dir.join(REFRESH_FILE))?;
     let existing_node = read_existing(&config_dir.join(NODE_FILE))?;
+    let install_path = config_dir.join(super::login_node::INSTALL_KEY_FILE);
+    let install_key = match read_existing(&config_dir.join(super::login_node::ENROLLMENT_FILE))? {
+        Existing::Absent => None,
+        Existing::Json(enrollment) if enrollment["contract"] == "native.cli-node-enrollment.v1" => {
+            let matches_origin = enrollment["resource"]
+                .as_str()
+                .and_then(|resource| url::Url::parse(resource).ok())
+                .is_some_and(|resource| resource.origin() == origin_url.origin());
+            if !matches_origin {
+                return Err(
+                    Error::engine("the enrolled node resource differs from --hosted").into(),
+                );
+            }
+            let key = crate::node_credential::InstallKey::load(&install_path)?;
+            if enrollment["install_id"] != key.id() {
+                return Err(Error::engine(
+                    "the enrolled node key differs from its verified enrollment",
+                )
+                .into());
+            }
+            Some(key)
+        }
+        _ => return Err(Error::engine("the node enrollment record is invalid").into()),
+    };
 
     // 0. A fresh bearer. A real run takes the node's own renewal pass (shared
     //    lock, 90 s window). A dry run never writes: it only asks whether the
@@ -243,6 +276,13 @@ pub async fn setup(options: SetupOptions) -> Result<SetupOutcome> {
     if !auth_path.exists() || !token_path.exists() {
         return Err(not_signed_in());
     }
+    oauth::check_install_grant(
+        &auth_path,
+        &expected_token_endpoint,
+        &origin_url.origin(),
+        install_key.is_some(),
+    )
+    .map_err(Error::from)?;
     if dry_run {
         match oauth::grant_is_due(&auth_path, &expected_token_endpoint) {
             Ok(false) => {}
@@ -278,23 +318,79 @@ pub async fn setup(options: SetupOptions) -> Result<SetupOutcome> {
         .to_owned();
 
     // 1. Identity and workspace choice.
-    let candidates = owned_workspaces(&http, &origin, &bearer).await?;
-    let chosen = choose_workspace(&candidates, workspace.as_deref())?;
+    let chosen = if install_key.is_some() {
+        let id = workspace
+            .as_deref()
+            .filter(|id| {
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+            .ok_or_else(|| {
+                Error::engine(
+                    "enrolled setup requires --workspace with the exact hosted workspace ID",
+                )
+            })?;
+        Workspace {
+            id: id.into(),
+            name: None,
+        }
+    } else {
+        let candidates = owned_workspaces(&http, &origin, &bearer).await?;
+        choose_workspace(&candidates, workspace.as_deref())?
+    };
 
     // 2. The canonical account, as the workspace itself knows the caller.
-    let account_id = canonical_account(&http, &origin, &chosen.id, &bearer).await?;
+    let account_id = if let Some(key) = &install_key {
+        canonical_account_for_node(
+            &http,
+            &origin,
+            &chosen.id,
+            &bearer,
+            &Default::default(),
+            Some(key),
+        )
+        .await?
+    } else {
+        canonical_account(&http, &origin, &chosen.id, &bearer).await?
+    };
 
     // 3. The authority head: learn the origin database id, then confirm it
     //    with the transport the refresh uses (route, origin pin, contract).
-    let origin_database_id = authority_origin(&http, &origin, &chosen.id, &bearer).await?;
-    AuthorityActTransport::new(&origin, &chosen.id, &origin_database_id, &bearer)?
-        .head()
-        .await?;
+    let origin_database_id =
+        authority_origin(&http, &origin, &chosen.id, &bearer, install_key.as_ref()).await?;
+    AuthorityActTransport::new_with_install_key(
+        &origin,
+        &chosen.id,
+        &origin_database_id,
+        &bearer,
+        Default::default(),
+        install_key.clone(),
+    )?
+    .head()
+    .await?;
 
     // 4. Plan the three files.
     let data_dir = private_dir(&data_dir, !dry_run)?;
     let replica_root = data_dir.join("replica");
     let socket_directory = data_dir.join("run");
+    if let Some(key) = install_key.as_ref() {
+        if replica_root.exists() || socket_directory.exists() {
+            // The earlier read-only enrollment format held no working
+            // originals. A writer with a recorded id must keep that id.
+            let same_install = matches!(&existing_node, Existing::Json(old)
+                if old["node_install_key_file"] == json!(install_path)
+                    && old["socket_directory"] == json!(socket_directory)
+                    && (old["node_install_id"].is_null() || old["node_install_id"] == json!(key.id())));
+            if !same_install {
+                return Err(Error::engine(
+                    "enrolled setup requires a fresh data directory; existing custody is retained",
+                )
+                .into());
+            }
+        }
+    }
     let standby_path = config_dir.join(STANDBY_FILE);
     let refresh_path = config_dir.join(REFRESH_FILE);
     let node_path = config_dir.join(NODE_FILE);
@@ -322,6 +418,12 @@ pub async fn setup(options: SetupOptions) -> Result<SetupOutcome> {
         "standby_config": standby_path,
         "refresh_config": refresh_path,
     });
+    if let Some(key) = install_key.as_ref() {
+        node["node_install_key_file"] = json!(install_path);
+        node["node_install_id"] = json!(key.id());
+        node["hosted_kernel_v2"] = json!(true);
+        node["local_reads_by_default"] = json!(true);
+    }
     keep_hand_added(&mut node, &existing_node, &PRESERVED_NODE_KEYS);
 
     // The real loaders accept what we are about to write.
@@ -831,6 +933,8 @@ async fn mcp_structured(
     db_id: &str,
     bearer: &str,
     body: Value,
+    compatibility: &crate::client_compatibility::Monitor,
+    install_key: Option<&crate::node_credential::InstallKey>,
 ) -> Result<Value> {
     let tool_name = body
         .pointer("/params/name")
@@ -838,8 +942,17 @@ async fn mcp_structured(
         .unwrap_or("")
         .to_owned();
     let route = percent_encoding::utf8_percent_encode(db_id, percent_encoding::NON_ALPHANUMERIC);
-    let response = http
-        .post(format!("{origin}/mcp/{route}"))
+    let endpoint = if install_key.is_some() {
+        format!("{origin}/internal/node/databases/{route}/mcp")
+    } else {
+        format!("{origin}/mcp/{route}")
+    };
+    let builder = http
+        .post(endpoint)
+        .header(
+            crate::client_compatibility::HEADER,
+            crate::client_compatibility::advertisement(),
+        )
         .bearer_auth(bearer)
         .header(
             reqwest::header::ACCEPT,
@@ -849,10 +962,20 @@ async fn mcp_structured(
         .header("MCP-Protocol-Version", crate::mcp::PROTOCOL_VERSION)
         .header("Mcp-Method", "tools/call")
         .header("Mcp-Name", &tool_name)
-        .json(&body)
-        .send()
+        .json(&body);
+    let response = crate::node_credential::send_request(http, builder, install_key)
         .await
         .map_err(|_| Error::engine("cannot reach hosted Native"))?;
+    let family = body
+        .pointer("/params/arguments/executor")
+        .and_then(Value::as_str)
+        .unwrap_or(&tool_name);
+    let operation = body
+        .pointer("/params/arguments/operation")
+        .and_then(Value::as_str)
+        .unwrap_or(&tool_name);
+    let response =
+        crate::client_compatibility::inspect(response, compatibility, family, operation).await?;
     let envelope = read_json_response(response, "hosted workspace call").await?;
     if envelope.get("error").is_some()
         || envelope.pointer("/result/isError") == Some(&Value::Bool(true))
@@ -869,14 +992,36 @@ async fn mcp_structured(
         .ok_or_else(|| Error::engine("hosted Native returned no structured result").into())
 }
 
-/// The caller's canonical `acct_...` token. `/auth/me`'s `user.id` is the
-/// catalog user UUID, a different namespace; the node's account binding is the
-/// engine principal the workspace itself records for the caller.
-async fn canonical_account(
+/// The caller's portable `acct_...` binding. Kernel v2's current_principal()
+/// returns a native UUID, so resolve its caller-scoped portable alias before
+/// comparing with an existing node binding. Catalogue user UUIDs inhabit a
+/// separate namespace.
+pub(crate) async fn canonical_account(
     http: &reqwest::Client,
     origin: &str,
     db_id: &str,
     bearer: &str,
+) -> Result<String> {
+    canonical_account_with_monitor(http, origin, db_id, bearer, &Default::default()).await
+}
+
+pub(crate) async fn canonical_account_with_monitor(
+    http: &reqwest::Client,
+    origin: &str,
+    db_id: &str,
+    bearer: &str,
+    compatibility: &crate::client_compatibility::Monitor,
+) -> Result<String> {
+    canonical_account_for_node(http, origin, db_id, bearer, compatibility, None).await
+}
+
+pub(crate) async fn canonical_account_for_node(
+    http: &reqwest::Client,
+    origin: &str,
+    db_id: &str,
+    bearer: &str,
+    compatibility: &crate::client_compatibility::Monitor,
+    install_key: Option<&crate::node_credential::InstallKey>,
 ) -> Result<String> {
     let body = executor_call(
         "sql_read",
@@ -884,21 +1029,63 @@ async fn canonical_account(
         json!({"sql": "SELECT current_principal() AS principal"}),
         Some("json"),
     );
-    let result = mcp_structured(http, origin, db_id, bearer, body).await?;
+    let result = mcp_structured(
+        http,
+        origin,
+        db_id,
+        bearer,
+        body,
+        compatibility,
+        install_key,
+    )
+    .await?;
     let principal = result
         .pointer("/rows/0/principal")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::engine("hosted Native did not report your account"))?;
-    let ok = principal.starts_with("acct_")
-        && principal.len() > 5
-        && principal.len() <= 256
-        && principal
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'));
-    if !ok {
+    let portable = |id: &str| {
+        id.starts_with("acct_")
+            && id.len() > 5
+            && id.len() <= 256
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+    };
+    if portable(principal) {
+        return Ok(principal.to_owned());
+    }
+    if uuid::Uuid::parse_str(principal).is_err() {
         return Err(Error::engine("hosted Native reported an unusable account id").into());
     }
-    Ok(principal.to_owned())
+    // The logical bindings relation exposes only the caller's verified
+    // aliases. Its canonical v2 alias is the UUID; the portable alias retains
+    // compatibility with existing node configurations. Missing or ambiguous
+    // mappings remain inconclusive, including when no Person is available.
+    let aliases = mcp_structured(
+        http,
+        origin,
+        db_id,
+        bearer,
+        executor_call(
+            "sql_read",
+            "query_sql",
+            json!({"sql": "SELECT identifier AS principal FROM bindings WHERE system = 'account' AND identifier LIKE 'acct_%' ORDER BY identifier LIMIT 2"}),
+            Some("json"),
+        ),
+        compatibility,
+        install_key,
+    )
+    .await?;
+    let rows = aliases.get("rows").and_then(Value::as_array);
+    let account = rows
+        .filter(|rows| rows.len() == 1)
+        .and_then(|rows| rows[0].get("principal"))
+        .and_then(Value::as_str)
+        .filter(|account| portable(account))
+        .ok_or_else(|| {
+            Error::engine("hosted Native did not report one portable account binding")
+        })?;
+    Ok(account.to_owned())
 }
 
 /// The workspace's portable origin database id, from its authority head.
@@ -907,12 +1094,22 @@ async fn authority_origin(
     origin: &str,
     db_id: &str,
     bearer: &str,
+    install_key: Option<&crate::node_credential::InstallKey>,
 ) -> Result<String> {
     // Export is not advertised directly on the hosted lean tool surface.
     let mut body = executor_call("export", "authority_act_head", json!({}), None);
     body["params"]["name"] = json!("call_executor");
     body["params"]["arguments"]["executor"] = json!("export");
-    let result = mcp_structured(http, origin, db_id, bearer, body).await?;
+    let result = mcp_structured(
+        http,
+        origin,
+        db_id,
+        bearer,
+        body,
+        &Default::default(),
+        install_key,
+    )
+    .await?;
     let id = result
         .pointer("/head/origin_database_id")
         .and_then(Value::as_str)
@@ -955,6 +1152,8 @@ pub(crate) mod tests {
         /// (id, role, name)
         workspaces: Mutex<Vec<(String, String, String)>>,
         accepted_bearer: Mutex<String>,
+        principal: Mutex<String>,
+        portable_bindings: Mutex<Vec<String>>,
         /// Request log: "GET /auth/me", "POST /mcp/<db> sql_read", ...
         pub(crate) log: Mutex<Vec<String>>,
         /// Answers `tools/list` and `tools/call` (but not the two calls setup
@@ -1017,6 +1216,10 @@ pub(crate) mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
+        assert_eq!(
+            headers[crate::client_compatibility::HEADER],
+            crate::client_compatibility::advertisement()
+        );
         let name = body["params"]["name"].as_str().unwrap_or("").to_owned();
         let method = body["method"].as_str().unwrap_or("").to_owned();
         h.log.lock().unwrap().push(format!(
@@ -1072,7 +1275,16 @@ pub(crate) mod tests {
                     .unwrap_or("");
                 if sql.contains("current_principal()") {
                     assert_eq!(body["params"]["arguments"]["format"], "json");
-                    json!({"columns": ["principal"], "rows": [{"principal": ACCOUNT}], "row_count": 1})
+                    json!({"columns": ["principal"], "rows": [{"principal": *h.principal.lock().unwrap()}], "row_count": 1})
+                } else if sql.contains("FROM bindings") {
+                    let rows: Vec<_> = h
+                        .portable_bindings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|binding| json!({"principal": binding}))
+                        .collect();
+                    json!({"columns": ["principal"], "row_count": rows.len(), "rows": rows})
                 } else {
                     // A node's own catalogue query: nothing to report.
                     json!({"columns": [], "rows": [], "row_count": 0})
@@ -1127,6 +1339,8 @@ pub(crate) mod tests {
                     .collect(),
             ),
             accepted_bearer: Mutex::new(BEARER.into()),
+            principal: Mutex::new(ACCOUNT.into()),
+            portable_bindings: Mutex::new(Vec::new()),
             log: Mutex::new(Vec::new()),
             engine: Mutex::new(None),
             db,
@@ -1218,6 +1432,33 @@ pub(crate) mod tests {
 
     fn json_of(path: &Path) -> Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn canonical_account_resolves_only_an_unambiguous_portable_alias() {
+        let hosted = start_hosted(&[(WS_A, "owner", "Native HQ")]).await;
+        let http = reqwest::Client::new();
+        for (principal, aliases, expected) in [
+            (ACCOUNT, vec![], Some(ACCOUNT)),
+            (WS_A, vec![ACCOUNT], Some(ACCOUNT)),
+            (WS_A, vec![], None),
+            (WS_A, vec![ACCOUNT, "acct_other"], None),
+            (WS_A, vec!["acct_invalid!"], None),
+            ("unrecognised-principal", vec![ACCOUNT], None),
+        ] {
+            *hosted.principal.lock().unwrap() = principal.into();
+            *hosted.portable_bindings.lock().unwrap() =
+                aliases.into_iter().map(str::to_owned).collect();
+            hosted.log.lock().unwrap().clear();
+            let result = canonical_account(&http, &hosted.base, WS_A, BEARER).await;
+            match expected {
+                Some(account) => assert_eq!(result.unwrap(), account),
+                None => assert!(result.is_err(), "principal {principal}: {result:?}"),
+            }
+            let expected_requests = if principal == WS_A { 2 } else { 1 };
+            assert_eq!(hosted.log.lock().unwrap().len(), expected_requests);
+        }
+        hosted.shut_down();
     }
 
     #[tokio::test]
@@ -1846,6 +2087,77 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn in_place_tuning_survives_regeneration_and_absent_stays_absent() {
+        let hosted = start_hosted(&[(WS_A, "owner", "Native HQ")]).await;
+        let install = signed_in(&hosted, 3600).await;
+        setup(options(&hosted, &install)).await.unwrap();
+        let refresh_path = install.config.join(REFRESH_FILE);
+
+        // A fresh setup does not add the in-place keys on its own.
+        let fresh = json_of(&refresh_path);
+        assert!(
+            fresh.get("kernel_in_place_deltas").is_none()
+                && fresh.get("kernel_audit_interval_seconds").is_none()
+                && fresh.get("projection_proof_interval_seconds").is_none(),
+            "fresh setup adds in-place tuning: {fresh}"
+        );
+
+        // Hand-set in-place tuning (bool true plus both intervals) survives.
+        let mut tuned = fresh.clone();
+        tuned["kernel_in_place_deltas"] = json!(true);
+        tuned["kernel_audit_interval_seconds"] = json!(300);
+        tuned["projection_proof_interval_seconds"] = json!(900);
+        std::fs::write(&refresh_path, serde_json::to_vec(&tuned).unwrap()).unwrap();
+
+        // Tuning alone is not a difference: nothing is rewritten.
+        let outcome = setup(options(&hosted, &install)).await.unwrap();
+        assert!(outcome.written.is_empty() && outcome.differences.is_empty());
+
+        // A forced rewrite caused by a real difference keeps the bool and
+        // both intervals.
+        tuned["hosted_origin"] = json!("https://elsewhere.example");
+        std::fs::write(&refresh_path, serde_json::to_vec(&tuned).unwrap()).unwrap();
+        let mut forced = options(&hosted, &install);
+        forced.force = true;
+        let outcome = setup(forced).await.unwrap();
+        assert_eq!(outcome.written, std::slice::from_ref(&refresh_path));
+        let rewritten = json_of(&refresh_path);
+        assert_eq!(rewritten["hosted_origin"], json!(hosted.base));
+        assert_eq!(rewritten["kernel_in_place_deltas"], json!(true));
+        assert_eq!(rewritten["kernel_audit_interval_seconds"], json!(300));
+        assert_eq!(rewritten["projection_proof_interval_seconds"], json!(900));
+        let loaded =
+            StandbyRefreshConfig::from_json(&std::fs::read(&refresh_path).unwrap()).unwrap();
+        assert!(loaded.kernel_in_place_deltas);
+        assert_eq!(loaded.kernel_audit_interval_seconds, Some(300));
+        assert_eq!(loaded.projection_proof_interval_seconds, Some(900));
+
+        // Without the keys, a forced rewrite stays without them.
+        let mut bare = rewritten.clone();
+        bare.as_object_mut()
+            .unwrap()
+            .remove("kernel_in_place_deltas");
+        bare.as_object_mut()
+            .unwrap()
+            .remove("kernel_audit_interval_seconds");
+        bare.as_object_mut()
+            .unwrap()
+            .remove("projection_proof_interval_seconds");
+        bare["hosted_origin"] = json!("https://elsewhere.example");
+        std::fs::write(&refresh_path, serde_json::to_vec(&bare).unwrap()).unwrap();
+        let mut forced = options(&hosted, &install);
+        forced.force = true;
+        setup(forced).await.unwrap();
+        let reread = json_of(&refresh_path);
+        assert!(
+            reread.get("kernel_in_place_deltas").is_none()
+                && reread.get("kernel_audit_interval_seconds").is_none()
+                && reread.get("projection_proof_interval_seconds").is_none(),
+            "setup added in-place tuning it does not generate: {reread}"
+        );
+    }
+
+    #[tokio::test]
     async fn force_replaces_a_config_that_is_not_json_without_showing_it() {
         let hosted = start_hosted(&[(WS_A, "owner", "Native HQ")]).await;
         for file in [NODE_FILE, STANDBY_FILE, REFRESH_FILE] {
@@ -1893,6 +2205,7 @@ pub(crate) mod tests {
         let socket = config.socket_path();
         // A local build is stamped `dev` and cannot serve a standby copy; the
         // node otherwise runs exactly as `native node serve` would.
+        #[cfg(feature = "mcp-executor-prototype")]
         crate::node::set_test_consumer_identity(Some(
             crate::standby::generation_store::tests::observed(),
         ));
@@ -1934,5 +2247,48 @@ pub(crate) mod tests {
             "{status}"
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn canonical_account_update_required_is_inconclusive_and_auth_stays_distinct() {
+        for status in [426, 401, 403] {
+            let app = axum::Router::new().fallback(axum::routing::any(move |headers:HeaderMap| async move {
+                assert_eq!(headers[crate::client_compatibility::HEADER],crate::client_compatibility::advertisement());
+                (StatusCode::from_u16(status).unwrap(),Json(json!({"error_code":"client_update_required","outcome":"refused","applied":false,"principal":"acct_untrusted"})))
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let monitor = crate::client_compatibility::Monitor::default();
+            let result = canonical_account_with_monitor(
+                &reqwest::Client::new(),
+                &origin,
+                WS_A,
+                BEARER,
+                &monitor,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "an update envelope cannot authenticate an account"
+            );
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.kind,
+                if status == 426 {
+                    SetupErrorKind::Other
+                } else {
+                    SetupErrorKind::NotSignedIn
+                }
+            );
+            assert_eq!(
+                monitor.status()["status"],
+                if status == 426 {
+                    "demand_recorded"
+                } else {
+                    "no_demand"
+                }
+            );
+            server.abort();
+        }
     }
 }

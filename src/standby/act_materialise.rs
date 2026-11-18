@@ -398,6 +398,7 @@ pub(crate) async fn apply_authority_act_delta_and_finalize_head(
     db: &Db,
     delta: &TrustedAuthorityActDelta,
 ) -> Result<ActMaterialiseOutcome> {
+    // Preserve pure preflight before the existing wrapper opens a transaction.
     let plan = preflight(delta.validated())?;
 
     let mut tx = db.write_pool().begin().await?;
@@ -422,6 +423,27 @@ pub(crate) async fn apply_authority_act_delta_and_finalize_head(
             Err(error)
         }
     }
+}
+
+/// Materialise the original authenticated delta inside the caller's already
+/// owned transaction. The caller owns rollback/commit and private publication;
+/// this never certifies a speculative destination as an accepted generation.
+/// The caller must first remove every speculative effect to the exact F1 cut.
+#[cfg(test)]
+pub(crate) async fn apply_trusted_delta_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    delta: &TrustedAuthorityActDelta,
+) -> Result<ActMaterialiseOutcome> {
+    use sqlx::{sqlite::SqliteTransactionManager, TransactionManager};
+    require(
+        SqliteTransactionManager::get_transaction_depth(tx) == 1,
+        "trusted working fold requires its caller-owned top-level transaction",
+    )?;
+    let plan = preflight(delta.validated())?;
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(&mut **tx)
+        .await?;
+    run_materialisation(tx, delta, &plan).await
 }
 
 /// Pure structural preflight on the validated delta, before any transaction.
@@ -521,7 +543,7 @@ fn carried_validity_attestation_ids(section: &Section) -> Result<Vec<String>> {
 /// or a backwards step refuses here with a named error. Every addition is
 /// overflow-checked.
 async fn require_validity_ordinal_continuation(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     section: &Section,
 ) -> Result<()> {
     let attestation_index = section
@@ -587,7 +609,7 @@ async fn require_validity_ordinal_continuation(
 }
 
 async fn run_materialisation(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     delta: &TrustedAuthorityActDelta,
     plan: &MaterialisePlan,
 ) -> Result<ActMaterialiseOutcome> {
@@ -669,6 +691,7 @@ async fn run_materialisation(
     // hold is the head allowed to advance.
     require_exact_act_sections(tx, cut).await?;
     require_exact_companion_closure(tx, cut).await?;
+    crate::provenance::verify_keyed_receipt_anchor_coverage_on(tx).await?;
 
     // R4 finalisation: exactly one write, the singleton act counter from `F1`
     // to `F2`, compare-and-set on the expected `F1`. Zero rows means a
@@ -706,7 +729,7 @@ async fn run_materialisation(
 /// is not the `F1` the delta was cut from, rather than silently overwriting a
 /// concurrent writer's state. No other table or column is touched.
 async fn finalize_act_state(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     from_exclusive_act: i64,
     to_inclusive_act: i64,
 ) -> Result<()> {
@@ -735,7 +758,7 @@ async fn finalize_act_state(
 /// companion, with R1's conflict modes: act logs refuse any existing primary
 /// key, companions admit an exactly identical retry and refuse divergence.
 async fn ingest_except_relationship(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     cut: &crate::standby::act_cut::AuthorityActCut,
 ) -> Result<(usize, usize)> {
     let mut inserted_rows = 0usize;
@@ -766,7 +789,7 @@ async fn ingest_except_relationship(
 /// by an in-window content event is admitted under the deferred foreign keys;
 /// the content fold below then creates the record before commit.
 async fn fold_binding_audit(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     from_exclusive_act: i64,
     to_inclusive_act: i64,
     outcome: &mut ActMaterialiseOutcome,
@@ -785,7 +808,7 @@ async fn fold_binding_audit(
 /// Fold the content log through the one projector, in `seq` order. `project`
 /// never appends a log row and never allocates an act.
 async fn fold_content(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     from_exclusive_act: i64,
     to_inclusive_act: i64,
     outcome: &mut ActMaterialiseOutcome,
@@ -811,7 +834,7 @@ async fn fold_content(
 /// distinct affected record. The refresh is bounded to the changed records'
 /// subtrees; it never walks the whole record tree.
 async fn fold_policy(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     from_exclusive_act: i64,
     to_inclusive_act: i64,
     outcome: &mut ActMaterialiseOutcome,
@@ -834,7 +857,7 @@ async fn fold_policy(
 /// Fold the independent meta, control and derivation logs through their own
 /// per-event projectors in `seq` order.
 async fn fold_meta_control_derivation(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     from_exclusive_act: i64,
     to_inclusive_act: i64,
     outcome: &mut ActMaterialiseOutcome,
@@ -868,7 +891,7 @@ async fn fold_meta_control_derivation(
 /// The candidate fold is a separate per-event fold because the candidate log is
 /// its own authoritative source; a rebuild must never re-emit candidates.
 async fn fold_awareness_and_candidates(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     from_exclusive_act: i64,
     to_inclusive_act: i64,
     outcome: &mut ActMaterialiseOutcome,
@@ -900,7 +923,7 @@ async fn fold_awareness_and_candidates(
 /// exactly the replayed events. This is bounded to the replayed rows; it never
 /// scans or recomputes the whole relationship log.
 async fn fold_relationship(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     plan: &MaterialisePlan,
     outcome: &mut ActMaterialiseOutcome,
 ) -> Result<()> {
@@ -923,7 +946,7 @@ async fn fold_relationship(
 /// The validity rows themselves were exact-ingested above; this is the bounded
 /// derived-state fold the live validity writer performs after its insert.
 async fn fold_validity_and_admissions(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     plan: &MaterialisePlan,
     outcome: &mut ActMaterialiseOutcome,
 ) -> Result<()> {
@@ -1241,7 +1264,7 @@ fn section_is_at_act(section: &Section, act_index: usize, expected: i64) -> Resu
 /// the carried section: format, revision, name, ordered columns, declared
 /// primary key and ordered rows with exact cell storage classes.
 async fn require_exact_act_sections(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     cut: &crate::standby::act_cut::AuthorityActCut,
 ) -> Result<()> {
     for (index, table) in crate::act::ACT_STAMPED_TABLES.iter().enumerate() {
@@ -1260,7 +1283,7 @@ async fn require_exact_act_sections(
 /// Re-derive every companion through the one shared closure SQL and require
 /// exact equality with the carried companion closure.
 async fn require_exact_companion_closure(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     cut: &crate::standby::act_cut::AuthorityActCut,
 ) -> Result<()> {
     let derived = companion_closure::read_companion_sections_on(
@@ -2002,6 +2025,50 @@ mod tests {
             "retry refusal: {retry}"
         );
 
+        destination.close().await;
+        source.close().await;
+    }
+
+    /// A working owner may atomically publish private metadata with the fold;
+    /// its rollback must leave neither domain effects nor that metadata.
+    #[tokio::test]
+    async fn caller_owned_trusted_delta_rolls_back_with_private_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = fresh_source().await;
+        append_record(&source, SEED_RECORD_ID, "caller-owned seed").await;
+        let f1 = head_act(&source).await;
+        let destination = destination_at_current_head(&source, dir.path(), "owned.db").await;
+        let (_, f2) = emit_two_multidomain_acts(&source).await;
+        let (bytes, _) = build_delta(&source, f1).await;
+        let delta = trust(validate_authority_act_delta(&bytes).unwrap());
+        let mut tx = crate::db::begin_write(destination.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE private_publication(value INTEGER)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let outcome = apply_trusted_delta_on(&mut tx, &delta).await.unwrap();
+        assert_eq!(outcome.to_inclusive_act, f2);
+        let head = read_authority_act_head_on(&mut tx).await.unwrap();
+        assert_eq!(head.head_act, f2);
+        sqlx::query("INSERT INTO private_publication VALUES(?)")
+            .bind(f2)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(act_state(&destination).await, f1);
+        let private_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='private_publication')",
+        )
+        .fetch_one(destination.pool())
+        .await
+        .unwrap();
+        assert!(
+            !private_exists,
+            "native fold and private metadata share rollback"
+        );
         destination.close().await;
         source.close().await;
     }
@@ -3272,6 +3339,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_cancellation_authority_survives_authenticated_delta_and_full_snapshot() {
+        let source = fresh_source().await;
+        let dir = tempfile::tempdir().unwrap();
+        let base = head_act(&source).await;
+        let destination =
+            destination_at_current_head(&source, dir.path(), "before-cancel.db").await;
+        let args = serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"type":"Document","kind":"note","name":"held","idempotency_key":"standby-held-key","reason":"test"});
+        let verified = crate::provenance::cancellation::VerifiedHeldCommand::for_test_command(
+            &crate::identity::database_id(&source).await.unwrap(),
+            "local",
+            "create_record",
+            &args,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let _staged = crate::provenance::cancellation::cancel_in(&mut tx, &verified)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let (bytes, _) = build_delta(&source, base).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(&destination, "provenance_local_command_cancellations").await,
+            1
+        );
+        let full = destination_at_current_head(&source, dir.path(), "after-cancel.db").await;
+        for db in [&destination, &full] {
+            assert_eq!(count(db, "provenance_local_command_cancellations").await, 1);
+            let mut registry = crate::mcp::ToolRegistry::new();
+            crate::mcp::register_surface_tools(&mut registry).unwrap();
+            let error = registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "create_record",
+                    args.clone(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("held_command_cancelled"), "{error}");
+            assert!(crate::provenance::state_violations(db)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        full.close().await;
+        destination.close().await;
+        source.close().await;
+    }
+
+    #[tokio::test]
     async fn alpha_tab_provenance_updates_and_restore_materialise_exactly() {
         use crate::control::alpha_tab_provenance_tests as alpha;
         use crate::control::ALPHA_TAB_ADOPTION_VERIFIED;
@@ -3951,5 +4077,76 @@ mod tests {
         crate::relationship::read_all_relationship_events(&mut conn)
             .await
             .unwrap()
+    }
+    #[tokio::test]
+    async fn v1_webhook_configuration_submission_and_revocation_survive_separate_act_deltas() {
+        use crate::mcp::tools::webhooks::{self as intake, tests as fixtures};
+        let (source, caller) = fixtures::fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let destination =
+            destination_at_current_head(&source, dir.path(), "intake-standby.db").await;
+        let base = head_act(&source).await;
+        let endpoint = fixtures::endpoint(&source, &caller).await;
+        let (bytes, _) = build_delta(&source, base).await;
+        let delta = trust(validate_authority_act_delta(&bytes).unwrap());
+        apply_authority_act_delta_and_finalize_head(&destination, &delta)
+            .await
+            .unwrap();
+        let base = head_act(&source).await;
+        let delegated = fixtures::delegated(&source, &caller, &endpoint).await;
+        let raw = fixtures::payload("replicated-application");
+        let accepted = intake::ingest(&source, &delegated, &endpoint, &raw)
+            .await
+            .unwrap();
+        let (bytes, _) = build_delta(&source, base).await;
+        let delta = trust(validate_authority_act_delta(&bytes).unwrap());
+        apply_authority_act_delta_and_finalize_head(&destination, &delta)
+            .await
+            .unwrap();
+        let before = head_act(&destination).await;
+        let retried = intake::ingest(&destination, &delegated, &endpoint, &raw)
+            .await
+            .unwrap();
+        assert_eq!(retried["outcome"], "duplicate");
+        assert_eq!(retried["delivery_id"], accepted["delivery_id"]);
+        assert_eq!(retried["record_id"], accepted["record_id"]);
+        assert_eq!(head_act(&destination).await, before);
+        let bytes: Vec<u8> =
+            sqlx::query_scalar("SELECT bytes FROM blobs WHERE mime='application/json'")
+                .fetch_one(destination.pool())
+                .await
+                .unwrap();
+        assert_eq!(bytes, raw);
+        let head = read_authority_act_head(&source).await.unwrap();
+        assert_eq!(head.webhook_endpoint_count, 0);
+        assert_eq!(head.webhook_credential_count, 0);
+        let full = destination_at_current_head(&source, dir.path(), "intake-full.db").await;
+        let recovered = intake::ingest(&full, &delegated, &endpoint, &raw)
+            .await
+            .unwrap();
+        assert_eq!(recovered["delivery_id"], accepted["delivery_id"]);
+        full.close().await;
+        let base = head_act(&source).await;
+        intake::manage(
+            &source,
+            &caller,
+            serde_json::json!({"action":"revoke", "endpoint_id":endpoint}),
+        )
+        .await
+        .unwrap();
+        let (bytes, _) = build_delta(&source, base).await;
+        let delta = trust(validate_authority_act_delta(&bytes).unwrap());
+        apply_authority_act_delta_and_finalize_head(&destination, &delta)
+            .await
+            .unwrap();
+        assert!(intake::ingest(&destination, &delegated, &endpoint, &raw)
+            .await
+            .is_err());
+        let diff = crate::conformance::rebuild_and_diff(&destination)
+            .await
+            .unwrap();
+        assert!(diff.equal, "{diff:?}");
+        destination.close().await;
+        source.close().await;
     }
 }

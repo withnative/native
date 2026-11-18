@@ -1,0 +1,31 @@
+{
+  "failed_ci": {
+    "head": "3792546d010bee777debe99ce57d6a35b7162b6b",
+    "run": 43672503259,
+    "job": 132687500258,
+    "merge": "5e6a8d3b372c2459b7c976f8b95398da8a74b3c9",
+    "base": "07a07e76f7f4c87103ba86a3666f94291288cb10",
+    "failure": "old expected refusal message; refusal still occurred"
+  },
+  "scope": "test-only exact per-fault expectation alignment and owned snapshot/manifest byte preservation; all seven unwrap_err/no-rebind-receipt checks retained",
+  "shipping_change": false,
+  "observed_refusals": {
+    "schema": "receiver_shape_unsupported",
+    "owned-schema": "kernel-v2 generation schema differs from compiled owned schema",
+    "reader-version": "unknown standby snapshot manifest contract",
+    "reader-format": "receiver_shape_unsupported",
+    "consumer-reader-format": "accepting executable has an unknown primary format",
+    "reader-contract": "unknown standby snapshot manifest contract",
+    "platform": "standby consumer rebind platform or wire mismatch"
+  },
+  "learn_result": "All seven errors, unchanged owned bytes and no receipts passed before final comparison against old messages failed",
+  "learn_log_sha256": "6548a8001b1b97368f8493aab0f5a9129cc83d49e0aae583a630bd55df0f834e",
+  "positive_result": "whole seven-fault matrix passed; 1 libtest case",
+  "positive_log_sha256": "cb675011b9435e0c53b04b4c2d3768fe02bc3507af62000447977d9e5b469106",
+  "test_binary_sha256": "4f32c04693857aa02a39b3723c265d385e0adad91a616a467cb0a650c75a19fd",
+  "test_source_sha256": "83034a527b618c2cfe36174d194b51de2237f8abbcd5a2ae4798ea1e0a83b642",
+  "type_check": "cargo check -p native-ce --tests --features v2-kernel-probe passed",
+  "format": "passed",
+  "initial_iteration": "misplaced diagnostic vector declaration caught in diff/compiler; not qualification evidence; corrected before learn execution",
+  "final_ci": "pending; no final-head pass claim"
+}

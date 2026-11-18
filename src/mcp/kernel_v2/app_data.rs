@@ -33,13 +33,18 @@ async fn gate(
     // Message state and home-policy/roster events
     // live in content. Keep this internal epoch out of viewer revision digests.
     // Drop/rejoin and revoke/regrant cannot restore an old subscription gate.
-    let authorization_epoch = if declaration(source)?.get("contract").is_none() {
+    let mut authorization_epoch = if declaration(source)?.get("contract").is_none() {
         authorization_epoch_on(conn).await?
     } else {
         // The native contract's declared frame has no data; preserve its
         // existing gate. Its app-host requests recheck their own live scopes.
         String::new()
     };
+    // A scope change must not keep serving a subscription gated on the
+    // old grant: fold the grant into the epoch revalidation compares.
+    if source.scope.is_scoped() {
+        authorization_epoch = format!("{authorization_epoch}:{}", source.scope.fingerprint());
+    }
 
     Ok(AppDataGate {
         principal: source.principal.clone(),
@@ -69,7 +74,7 @@ async fn gate(
 // Include native link revisions, Direct destinations, carrier binding/type
 // changes, and the realtime authority families; body-only edits stay out.
 async fn authorization_epoch_on(conn: &mut sqlx::SqliteConnection) -> Result<String> {
-    let epochs: (i64, i64) = sqlx::query_as("SELECT (SELECT coalesce(max(seq),0) FROM main.meta_events),(SELECT coalesce(max(seq),0) FROM main.content_events WHERE type LIKE 'kernel.home_%' OR type LIKE 'kernel.record_rehomed.%' OR type LIKE 'kernel.principal_%' OR type LIKE 'kernel.hosted_%' OR type LIKE 'kernel.import_%' OR type IN ('kernel.archive_changed.v1','kernel.record_deleted.v1','kernel.message_state.v1') OR type LIKE 'kernel.generic_link_%' OR type LIKE 'kernel.link_added.%' OR type LIKE 'kernel.link_removed.%' OR type IN ('kernel.root_admin_bootstrapped.v1','kernel.record_rebound.v1','kernel.identity_binding_added.v1','kernel.attachment_bound.v1','kernel.message_destination_set.v1') OR (type IN ('kernel.record_revised.v1','kernel.record_revised.v2') AND (json_type(payload,'$.fields.v1_type') IS NOT NULL OR json_type(payload,'$.fields.v1_kind') IS NOT NULL)))")
+    let epochs: (i64, i64) = sqlx::query_as("SELECT (SELECT coalesce(max(seq),0) FROM main.meta_events),(SELECT coalesce(max(seq),0) FROM main.content_events WHERE type LIKE 'kernel.home_%' OR type LIKE 'kernel.record_rehomed.%' OR type LIKE 'kernel.principal_%' OR type LIKE 'kernel.hosted_%' OR type LIKE 'kernel.import_%' OR type IN ('kernel.archive_changed.v1','kernel.record_deleted.v1','kernel.message_state.v1') OR type LIKE 'kernel.generic_link_%' OR type LIKE 'kernel.link_added.%' OR type LIKE 'kernel.link_removed.%' OR type IN ('kernel.root_admin_bootstrapped.v1','kernel.record_rebound.v1','kernel.record_type_corrected.v1','kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1','kernel.identity_bindings_reconciled.v1','kernel.attachment_bound.v1','kernel.message_destination_set.v1') OR (type IN ('kernel.record_revised.v1','kernel.record_revised.v2') AND (json_type(payload,'$.fields.v1_type') IS NOT NULL OR json_type(payload,'$.fields.v1_kind') IS NOT NULL)))")
         .fetch_one(conn).await?;
     Ok(crate::canonical_json::digest_json(&json!(epochs)))
 }
@@ -157,6 +162,7 @@ async fn evaluate_declared(
 ) -> Result<AppDataEvaluation> {
     use crate::kernel::app_installs::declarations;
     use crate::mcp::tools::alpha_tabs as alpha;
+    let admission_started = std::time::Instant::now();
     let actor = super::principal(db, caller).await?;
     let initial = installs::admit_data_as(
         db,
@@ -165,6 +171,7 @@ async fn evaluate_declared(
         &request.expected_install_event_id,
     )
     .await?;
+    tracing::debug!(target: "native_ce::read_staging", phase = "app_initial_admission", elapsed_us = admission_started.elapsed().as_micros() as u64);
     let declared = declaration(&initial)?;
     let legacy = declared.get("contract").is_none();
     let parsed = if legacy {
@@ -195,9 +202,31 @@ async fn evaluate_declared(
     if legacy && request.need.is_none() && selected.is_empty() {
         return Err(invalid("undeclared_need"));
     }
-    let statements: Vec<_> = selected.iter().map(|need| need.sql.as_str()).collect();
-    super::sql::with_query_read_session(db, &actor, &statements, async {
+    let queries = selected
+        .iter()
+        .map(|need| {
+            let params = if request.need.is_some() {
+                Some(&request.params)
+            } else {
+                None
+            };
+            let parameters = alpha::bind_sql_params(need, params).map_err(invalid)?;
+            Ok(json!({"sql":need.sql,"parameters":parameters}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Declared reads run as the person with no provenance app claim; carry
+    // the admitted install's grant into the kernel gates explicitly.
+    let scope = initial.scope.clone();
+    installs::scope::with_scope_override(&actor, scope, super::sql::with_bound_query_read_session(db, &actor, &queries, async {
+        let admission_started = std::time::Instant::now();
         let (source, gate) = source_and_gate(db, &actor, request).await?;
+        tracing::debug!(target: "native_ce::read_staging", phase = "app_snapshot_admission", elapsed_us = admission_started.elapsed().as_micros() as u64);
+        // Staging used the grant admitted before the snapshot opened; if the
+        // person changed it in between, refuse rather than return rows
+        // staged under the old grant bound to the new gate.
+        if source.scope != initial.scope {
+            return Err(invalid("admission_gate_changed"));
+        }
         let pin = json!({"package":source.package,"version":source.version,"digest":source.pin["digest"],
             "artifact_id":source.pin["artifact_id"],"source_revision":source.pin["source_revision"],
             "declaration_digest":source.pin["declaration_digest"]});
@@ -244,6 +273,11 @@ async fn evaluate_declared(
                 "records":rows,"records_sha256":rows_sha256,"inputs":{}});
             if !input_sql.is_empty() { input["sql"] = Value::Object(input_sql); }
             response["need"] = json!(if legacy { alpha::ATTENTION_QUERY_NEED } else { SNAPSHOT });
+            if legacy {
+                // Legacy snapshot consumers verify this compatibility mapping
+                // before delivering rows, including SQL-only declarations.
+                response["declared_port"] = alpha::alpha_tab_attention_port_mapping();
+            }
             response["declared_needs"] = declared["needs"].clone();
             response["input_digest"] = json!(alpha::alpha_tab_sample_input_digest(&input));
             response["input"] = input;
@@ -253,7 +287,7 @@ async fn evaluate_declared(
             response["window"] = json!({"bounded_window":true});
         }
         Ok(AppDataEvaluation {result:response,gate,time_dependent})
-    }).await
+    })).await
 }
 
 impl AppDataNeeds for NativeAppDataNeeds {
@@ -303,18 +337,24 @@ pub(super) async fn batch_read(
     };
     // A malformed statement is an item refusal, not a batch setup failure.
     // The ordinary query guard repeats full validation when that item runs.
-    let statements: Vec<_> = parsed
+    let queries: Vec<_> = parsed
         .as_ref()
         .into_iter()
         .flat_map(|p| p.sql.iter())
-        .filter(|need| {
-            reads.iter().any(|item| {
-                item.need == need.key
-                    || (item.need == alpha::ATTENTION_QUERY_NEED && need.params.is_empty())
+        .flat_map(|need| {
+            reads.iter().filter_map(move |item| {
+                let snapshot = item.need == alpha::ATTENTION_QUERY_NEED && need.params.is_empty();
+                if item.need != need.key && !snapshot {
+                    return None;
+                }
+                let parameters = alpha::bind_sql_params(
+                    need,
+                    if snapshot { None } else { item.params.as_ref() },
+                )
+                .ok()?;
+                Some(json!({"sql":need.sql,"parameters":parameters}))
             })
         })
-        .map(|need| need.sql.as_str())
-        .filter(|sql| crate::query::sql::public_reads_ad_hoc(sql).is_ok())
         .collect();
     let request = AppDataRequest {
         package: package.clone(),
@@ -322,8 +362,15 @@ pub(super) async fn batch_read(
         need: None,
         params: json!({}),
     };
-    let (mut response, held) = super::sql::with_query_read_session(db, &actor, &statements, async {
+    let staged_scope = source.scope.clone();
+    let (mut response, held) = installs::scope::with_scope_override(
+        &actor,
+        source.scope.clone(),
+        super::sql::with_bound_query_read_session(db, &actor, &queries, async {
         let (source, held) = source_and_gate(db, &actor, &request).await?;
+        if source.scope != staged_scope {
+            return Err(invalid("admission_gate_changed"));
+        }
         let mut results = Vec::with_capacity(reads.len());
         for item in reads {
             let snapshot = item.need == alpha::ATTENTION_QUERY_NEED;
@@ -353,7 +400,9 @@ pub(super) async fn batch_read(
             "pin":{"package":source.package,"version":source.version,"digest":source.pin["digest"],"artifact_id":source.pin["artifact_id"],"source_revision":source.pin["source_revision"],"declaration_digest":source.pin["declaration_digest"]},
             "source":{"event_id":source.pin["source_revision"],"bundle_sha256":source.pin["bundle_sha256"],"runtime":"native.html.v1"},
             "results":results,"live_reads":true,"effects_wired":false}), held))
-    }).await?;
+        }),
+    )
+    .await?;
     // Once the session ends, recheck current authority rather than returning
     // captured rows after a concurrent revoke/regrant or policy change.
     let (_, fresh) = source_and_gate(db, &actor, &request).await?;
@@ -566,6 +615,8 @@ mod authority_tests {
             "kernel.message_destination_set.v1",
             "kernel.record_rebound.v1",
             "kernel.identity_binding_added.v1",
+            "kernel.identity_binding_removed.v1",
+            "kernel.identity_bindings_reconciled.v1",
             "kernel.attachment_bound.v1",
             "kernel.root_admin_bootstrapped.v1",
             "kernel.generic_link_removed.v1",

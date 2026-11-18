@@ -148,10 +148,10 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         return read(db, actor, args).await;
     }
     // These operations are deliberately outside this executor slice.
-    if matches!(action, "share_history" | "delete" | "edit") {
+    if matches!(action, "share_history" | "edit") {
         return Err(unsupported(
             "manage_messages",
-            "history sharing, message editing and deletion and live notification delivery",
+            "history sharing, message editing and live notification delivery",
         ));
     }
     let classification = matches!(action, "classify" | "unclassify" | "move");
@@ -199,6 +199,37 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         let receipt: Value = serde_json::from_str(&receipt)?;
         if action == "send" && args.get("speaker").is_some() {
             resolve_speaker(&mut tx, actor, args.get("speaker")).await?;
+        }
+        if action == "delete" {
+            // A tombstoned Message cannot pass the View re-checks below:
+            // the first call's deletion is exactly why it is now hidden.
+            // Mirror v1: replay only against the durable deletion event
+            // this caller wrote for this key's exact Message.
+            let id = text(&args, "message_id")?;
+            // Bind replay to the keyed command's own output event, as v1
+            // does, not to any deletion this caller wrote for the record.
+            let seq = receipt["write_receipt"]["event"]["seq"].as_i64();
+            let evidenced: bool = match seq {
+                Some(seq) => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM main.content_events WHERE seq=? AND record_id=? AND type=? AND actor=?)",
+                    )
+                    .bind(seq)
+                    .bind(id)
+                    .bind(kernel::deletion::EVENT)
+                    .bind(actor)
+                    .fetch_one(&mut *tx)
+                    .await?
+                }
+                None => false,
+            };
+            if receipt["status"] != "deleted" || receipt["message_id"] != id || !evidenced {
+                return Err(Error::engine(
+                    "manage_messages.delete retry has no valid durable evidence",
+                ));
+            }
+            tx.rollback().await?;
+            return Ok(receipt);
         }
         if receipt["collection_id"].is_string() {
             if receipt["present"] == true {
@@ -419,6 +450,8 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         }
         let changed = results.iter().any(|row| row["changed"] == true);
         json!({"status":if changed {"applied"} else {"unchanged"},"results":results,"exact_message_ids":ids,"message_ids":ids,"changed":changed})
+    } else if action == "delete" {
+        delete_message(db, &mut tx, &mut acts, actor, &args).await?
     } else {
         let id = text(&args, "message_id")?;
         let mut state = require(&mut tx, actor, id).await?;
@@ -729,6 +762,143 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         hub.wake();
     }
     Ok(receipt)
+}
+
+/// v1 `manage_messages.delete` over the kernel tombstone: the author may
+/// delete, and so may a caller with Manage on the Message's origin
+/// Collection. The channel is strictly the Collection declared as the
+/// Message's communication origin at send time; classification into a
+/// Conversation never counts, because filing needs only Edit and counting
+/// it would let any editor file a colleague's Message into their own
+/// Conversation and then delete it. A direct Message has no channel, so it
+/// stays author-only. A persona-voiced Message follows the same rule: its
+/// owner is its sender (`state.author` is the sending principal either
+/// way). The `kernel.record_deleted.v1` projector writes the tombstone
+/// every kernel read already filters on, retires mentions and withdraws
+/// the Message's notification candidates in this same transaction; the
+/// stored Message state and history are kept.
+async fn delete_message(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut ActAllocation,
+    actor: &str,
+    args: &Value,
+) -> Result<Value> {
+    let id = text(args, "message_id")?;
+    let state = m::on(tx, id)
+        .await?
+        .ok_or_else(|| Error::engine(kernel::HIDDEN_OR_MISSING))?;
+    let is_author = state.author.as_deref() == Some(actor);
+    let tombstoned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM kernel_import_tombstones WHERE record_id=?)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if tombstoned {
+        // Named as deleted only to its author; to anyone else the Message
+        // is indistinguishable from missing.
+        if is_author {
+            return Err(Error::engine(format!(
+                "manage_messages.delete: Message {id} is already deleted"
+            )));
+        }
+        return Err(Error::engine(kernel::HIDDEN_OR_MISSING));
+    }
+    // Non-disclosure before any authorship wording: a caller who cannot
+    // see the Message learns nothing about who may delete it.
+    kernel::kernel_require(tx, actor, id, Capability::View).await?;
+    let channel = (state.origin["type"] == "collection")
+        .then(|| state.origin["collection_id"].as_str())
+        .flatten();
+    // Kernel admission for the tombstone event accepts Manage on the
+    // Message, or — for a Message only — View on it plus Manage on its
+    // origin Collection (kernel::deletion::admit); View is already
+    // required above. v1's rule is the same disjunction stated here: the
+    // author, or a channel manager. The author arm keeps folding Manage
+    // on the Message in, so the refusal carries v1's wording instead of
+    // admission's missing-or-hidden for a caller who can see the
+    // Message. Manage allows Edit; both are stated because Edit is v1's
+    // author threshold and Manage is what admission requires of an
+    // author tombstone. The channel arm needs no such fold: a
+    // Collection owner whose Manage on the channel comes only from
+    // owning that record, with no Manage on the Message, moderates
+    // exactly as on v1 — including when they authored the Message. An
+    // author without Manage on their own Message is hard to reach for
+    // native sends, where the author is the record owner and the owner
+    // floor grants Manage; imported Messages whose record owner is not
+    // their author can reach it, and the channel arm then applies to
+    // them as it would to any other moderator.
+    let on_message = kernel::kernel_effective_capability_on(tx, actor, id).await?;
+    let channel_manage = if let Some(channel) = channel {
+        let channel = if channel == "native:root" {
+            crate::events::KERNEL_ROOT_ID
+        } else {
+            channel
+        };
+        // A channel id with no kernel record grants nothing; its
+        // missing-or-hidden outcome is not this caller's error to see.
+        match kernel::kernel_effective_capability_on(tx, actor, channel).await {
+            Ok(capability) => capability.allows(Capability::Manage),
+            Err(Error::Engine(message)) if message == kernel::HIDDEN_OR_MISSING => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
+    let allowed =
+        (is_author && on_message.allows(Capability::Manage) && on_message.allows(Capability::Edit))
+            || channel_manage;
+    if !allowed {
+        let persona_suffix = if state.speaker.is_some() {
+            " sent as a persona"
+        } else {
+            ""
+        };
+        if is_author {
+            // The caller is the author, so "only the author" would
+            // contradict the facts: they hold neither Manage on the
+            // Message nor Manage on its channel.
+            let channel_clause = if channel.is_some() {
+                " or on this channel"
+            } else {
+                ""
+            };
+            return Err(Error::engine(format!(
+                "manage_messages.delete: the author can delete a Message{persona_suffix} only with Manage on it{channel_clause}"
+            )));
+        }
+        let manager_clause = if channel.is_some() {
+            " or someone who manages this channel"
+        } else {
+            ""
+        };
+        return Err(Error::engine(format!(
+            "manage_messages.delete: only the author{manager_clause} can delete a Message{persona_suffix}"
+        )));
+    }
+    let previous_seq: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(seq) FROM main.content_events WHERE record_id=?")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let previous_seq = previous_seq.ok_or_else(|| Error::engine(kernel::HIDDEN_OR_MISSING))?;
+    let event = crate::store::append_in(
+        db,
+        tx,
+        AppendSpec {
+            record_id: id.into(),
+            event_type: kernel::deletion::EVENT.into(),
+            payload: serde_json::to_value(kernel::deletion::Deleted {
+                reason: text(args, "reason")?.into(),
+                previous_seq,
+            })?,
+            actor: Some(actor.into()),
+        },
+        acts,
+    )
+    .await?;
+    Ok(json!({"status":"deleted","message_id":id,"deleted_at":event.created_at}))
 }
 
 async fn send(
@@ -1472,7 +1642,7 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
         }
         tx.rollback().await?;
         return Ok(
-            json!({"schema":"native.message-state.v1","content_head":content,"messages":messages,"viewer_relative":true,"snapshot_consistent":true}),
+            json!({"schema":"native.message-state.v1","content_head":content,"messages":messages,"viewer_relative":true,"snapshot_consistent":true,"capabilities":{"edit":false,"delete":true,"reactions":true,"saved_session_sharing":false}}),
         );
     }
     let conversation = args["conversation_id"].as_str();
@@ -1770,7 +1940,7 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
                     crate::mcp::tools::messaging::apply_preview(row, limit_chars);
                 }
             }
-            let mut response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":rows,"snapshot":snapshot,"next_after":if has_more {Some(offset)} else {None},"newer_available":content!=snapshot_head,"heads":{"content":content,"awareness":content,"candidates":candidate_head,"control":0,"authorization":content},"counts_are_distinct_message_ids":true});
+            let mut response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":rows,"snapshot":snapshot,"next_after":if has_more {Some(offset)} else {None},"newer_available":content!=snapshot_head,"heads":{"content":content,"awareness":content,"candidates":candidate_head,"control":0,"authorization":content},"counts_are_distinct_message_ids":true,"capabilities":{"edit":false,"delete":true,"reactions":true,"saved_session_sharing":false}});
             if direct_scope {
                 response["scope"] = json!("direct");
                 response["candidate_cap"] = json!(crate::mcp::tools::messaging::direct_scope_cap());
@@ -1840,7 +2010,7 @@ pub(super) async fn mentions_as(
 }
 
 /// Map the kernel principal to the caller-visible v1 Person identity.
-pub(super) async fn visible_person(
+pub(crate) async fn visible_person(
     tx: &mut sqlx::SqliteConnection,
     actor: &str,
     principal: Option<&str>,

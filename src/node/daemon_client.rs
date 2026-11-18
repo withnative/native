@@ -101,6 +101,13 @@ impl DaemonCredentials {
         &self.token
     }
 
+    /// Borrow the token for the broker's single handshake send, zeroized on
+    /// drop. Same redaction contract as the saver: never logged, never
+    /// formatted.
+    pub(crate) fn handshake_token(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(self.token.clone())
+    }
+
     /// `ws://` URL for the daemon's websocket endpoint.
     fn ws_url(&self) -> String {
         format!("ws://{}/", self.listen.trim())

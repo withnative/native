@@ -1348,7 +1348,7 @@ async fn named_view_retained_isolation_and_body_only_columns_precede_execution()
         "isolation follows the failed combined attempt"
     );
     assert_eq!(view_validation::builds(&bad_plan.digest), 1);
-    let catalog = kernel_v2::sql::query_sql(&db,&admin,json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"})).await.unwrap();
+    let catalog = kernel_v2::sql::query_sql(&db,&admin,json!({"sql":"SELECT relation_name FROM catalog_relations WHERE substr(relation_name,1,5)='view_'"})).await.unwrap();
     assert_eq!(catalog["rows"], json!([{"relation_name":"view_a_good"}]));
     let count = kernel_v2::sql::query_sql(
         &db,

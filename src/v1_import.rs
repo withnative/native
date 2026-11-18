@@ -95,6 +95,24 @@ pub struct Report {
     pub instruction_bindings: InstructionBindingsReport,
     pub nonfinite_facets: Vec<NonfiniteFacet>,
     pub metadata_coverage: MetadataCoverage,
+    /// How the v1 workspace administrator (the v2 root owner) was chosen.
+    /// `None` only when the import refused before that decision.
+    pub admin_source: Option<AdminSource>,
+}
+/// Evidence for the single v1 account that becomes the v2 root owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminSource {
+    /// Exactly one account holds Manage on the v1 root policy (HQ shape).
+    RootManage,
+    /// No root Manage grant exists (the modern `account_bootstrap` personal
+    /// shape, whose root policy is only `members: edit`), and the source and
+    /// live roster agree on one owner: exactly one canonical account binding
+    /// on a live person, a roster of exactly that account, and that account's
+    /// matching member context. The v1 host-owner authority over the root
+    /// (root policy, workspace name) comes from the hosting catalog, not the
+    /// policy table; v2 carries it as root ownership.
+    SoleAccountBinding,
 }
 #[derive(Serialize)]
 pub struct OwnerOverride {
@@ -171,6 +189,8 @@ pub struct SourceInstructionBinding {
 pub struct Issue {
     pub id: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_conflict: Option<crate::OriginalConflict>,
 }
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct Record {
@@ -372,6 +392,7 @@ fn issue(id: &str, reason: &str) -> Issue {
     Issue {
         id: id.into(),
         reason: reason.into(),
+        original_conflict: None,
     }
 }
 
@@ -793,6 +814,14 @@ async fn import_record_row(
             }
         }
         Ok(k::ImportResult::Unchanged) => report.unchanged += 1,
+        Err(crate::Error::OriginalConflict(conflict)) => {
+            report.refusals.push(Issue {
+                id: record.id.clone(),
+                reason: "original record ID is durably retired".into(),
+                original_conflict: Some(*conflict),
+            });
+            return Ok(());
+        }
         Err(error) => {
             report.refusals.push(issue(
                 &record.id,
@@ -1266,10 +1295,21 @@ pub(crate) async fn resolve_home_on(
     principal: &str,
     requested: &str,
 ) -> crate::Result<String> {
+    resolve_home_on_connection(tx, principal, requested).await
+}
+
+/// Same home resolution and View checks on the caller's actual connection.
+/// Does not acquire, begin, commit, or roll back a transaction.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn resolve_home_on_connection(
+    tx: &mut sqlx::SqliteConnection,
+    principal: &str,
+    requested: &str,
+) -> crate::Result<String> {
     let native: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
             .bind(requested)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
     let home = if native {
         requested.to_owned()
@@ -1279,7 +1319,7 @@ pub(crate) async fn resolve_home_on(
         let derived = derived(requested);
         let mapped: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM content_events e JOIN kernel_roots h ON h.root_id=e.record_id WHERE e.record_id=? AND e.type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(e.payload,'$.source_record_id')=?)",
-        ).bind(&derived).bind(requested).fetch_one(&mut **tx).await?;
+        ).bind(&derived).bind(requested).fetch_one(&mut *tx).await?;
         if !mapped {
             // Do not misdiagnose a visible, older native folder as hidden.
             // The View gate still makes missing and inaccessible IDs identical.
@@ -1318,7 +1358,7 @@ pub(crate) async fn resolve_home_on(
         .await?;
         derived
     };
-    let tombstoned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e JOIN kernel_import_tombstones t ON t.record_id=json_extract(e.payload,'$.source_record_id') WHERE e.record_id=? AND e.type='kernel.import_home.v1')").bind(&home).fetch_one(&mut **tx).await?;
+    let tombstoned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e JOIN kernel_import_tombstones t ON t.record_id=json_extract(e.payload,'$.source_record_id') WHERE e.record_id=? AND e.type='kernel.import_home.v1')").bind(&home).fetch_one(&mut *tx).await?;
     if tombstoned {
         return Err(crate::Error::engine(k::HIDDEN_OR_MISSING));
     }
@@ -1567,9 +1607,115 @@ fn redact_record_error(error: &str, record: &Record, state: &k::ImportRecordStat
     message
 }
 
+/// The workspace administrator of a source with no root Manage grant, or the
+/// fixed reason it cannot be chosen without an explicit ownership review.
+///
+/// A database created by hosted `account_bootstrap` has the genesis root
+/// policy `members: edit` and no account Manage entry at the root: its owner
+/// administers the root through the hosting catalog's Owner role. The only
+/// source evidence for that owner is the verified identity the first sign-in
+/// established, so every independent witness must name the same one account.
+/// Anything wider — a second bound account, a roster that is not exactly that
+/// account, a missing or divergent member context, or an account without the
+/// owner-only onboarding obligation — stays a refusal.
+/// Reasons are fixed text: they never carry source identifiers or values.
+pub async fn sole_account_binding_admin(
+    source: &mut SqliteConnection,
+    roster: Option<&BTreeSet<String>>,
+) -> Result<std::result::Result<String, &'static str>> {
+    let Some(roster) = roster else {
+        return Ok(Err("source has no root Manage account; choosing the workspace owner from its sole account binding requires --members-file from the live hosted roster"));
+    };
+    let bindings: Vec<(String, String)> = sqlx::query_as(
+        "SELECT record_id,identifier FROM bindings WHERE system='account' AND is_canonical=1 ORDER BY record_id,identifier",
+    )
+    .fetch_all(&mut *source)
+    .await?;
+    let [(person, account)] = bindings.as_slice() else {
+        return Ok(Err("source has no root Manage account and not exactly one canonical account binding; explicit workspace owner review required"));
+    };
+    let live_person: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND type='Entity' AND kind='person' AND deleted_at IS NULL)",
+    )
+    .bind(person)
+    .fetch_one(&mut *source)
+    .await?;
+    if !live_person {
+        return Ok(Err("source has no root Manage account and its sole canonical account binding is not on a live person; explicit workspace owner review required"));
+    }
+    if roster.len() != 1 || !roster.contains(account) {
+        return Ok(Err("source has no root Manage account and the members roster is not exactly its sole canonical account binding; explicit workspace owner review required"));
+    }
+    let contexts_present: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='member_contexts')",
+    )
+    .fetch_one(&mut *source)
+    .await?;
+    let contexts: Vec<(String, Option<String>)> = if contexts_present {
+        sqlx::query_as(
+            "SELECT account_id,person_record_id FROM member_contexts ORDER BY account_id",
+        )
+        .fetch_all(&mut *source)
+        .await?
+    } else {
+        Vec::new()
+    };
+    if !matches!(contexts.as_slice(), [(a, Some(p))] if a == account && p == person) {
+        return Ok(Err("source has no root Manage account and its sole canonical account binding has no single matching member context; explicit workspace owner review required"));
+    }
+    // Owner evidence: member provisioning writes the owner first-run
+    // obligation only for a hosted Owner arrival (or a standalone file
+    // operator), and the member/guest programmes for every other role. The
+    // row survives completion and generation rebases. A sole Member or Guest
+    // arrival, or an owner who has not arrived since programmes existed,
+    // therefore refuses rather than becoming the v2 root owner.
+    let obligations_present: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='member_obligations')",
+    )
+    .fetch_one(&mut *source)
+    .await?;
+    let programmes: Vec<String> = if obligations_present {
+        sqlx::query_scalar(
+            "SELECT DISTINCT programme_id FROM member_obligations WHERE account_id=? ORDER BY 1",
+        )
+        .bind(account)
+        .fetch_all(&mut *source)
+        .await?
+    } else {
+        Vec::new()
+    };
+    if programmes != [crate::instruction_templates::OWNER_PROGRAMME_ID] {
+        return Ok(Err("source has no root Manage account and its sole canonical account binding has no owner-only onboarding evidence; explicit workspace owner review required"));
+    }
+    Ok(Ok(account.clone()))
+}
+
 /// Reads one SQLite transaction; target writes exclusively through kernel APIs.
 /// Errors deliberately omit engine messages which can contain source values.
 pub async fn run(options: Options) -> Result<Report> {
+    let mut retained_target = None;
+    run_retiring_target(options, &mut retained_target).await
+}
+
+// The CLI immediately reopens the target to create its receipt. Keep ownership
+// through every post-acquisition exit instead of racing SQLx's worker teardown.
+async fn run_retiring_target(options: Options, retained_target: &mut Option<Db>) -> Result<Report> {
+    debug_assert!(retained_target.is_none());
+    let result = run_import(options, retained_target).await;
+    if let Some(target) = retained_target.as_ref() {
+        let acknowledged = target.fence_body_retirement().drain().await;
+        // Current importer constructors use physical (legacy) retirement. A
+        // future body-only kernel acknowledgement must not become a handoff.
+        let retired = acknowledged && target.enrolled_retirement_complete();
+        if result.is_ok() && !retired {
+            return Err("import target retirement unverified; target may still be held; inspect owned work before reopening or retrying --resume with the same source".into());
+        }
+    }
+    // Preserve the original import error after attempting target retirement.
+    result
+}
+
+async fn run_import(options: Options, retained_target: &mut Option<Db>) -> Result<Report> {
     let total_started = Instant::now();
     let snapshot_started = Instant::now();
     #[cfg(unix)]
@@ -1602,6 +1748,15 @@ pub async fn run(options: Options) -> Result<Report> {
         .execute(&mut source)
         .await?;
     sqlx::query("BEGIN").execute(&mut source).await?;
+    // Before target creation/resume, on the SAME snapshot as all source reads.
+    // A fence committed later invalidates the initial/final receipt digest.
+    cutover::require_unfenced_source_on(&mut source).await?;
+    let intake_state: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE type IN ('webhook.configured.v1','webhook.revoked.v1','webhook.accepted.v1','webhook.diagnostic.v1'))")
+        .fetch_one(&mut source).await?;
+    if intake_state {
+        report.refusals.push(issue("webhook_intake", "v1 webhook state requires an explicit reviewed handoff preserving endpoint credentials and accepted retry identities before v2 import"));
+        return Ok(refusal_breakdown::without_source(report));
+    }
     report.table_coverage = table_coverage::check(&mut source).await?;
     if !report.table_coverage.unclassified.is_empty() {
         report.refusals.push(issue(
@@ -1631,6 +1786,56 @@ pub async fn run(options: Options) -> Result<Report> {
         }
         return Ok(refusal_breakdown::without_source(report));
     }
+    // Choose the workspace owner from the source alone, before the target
+    // lock exists: an ownership refusal leaves no target-side file behind.
+    let raw_policies: Vec<(String,String,String,String)> = sqlx::query_as("SELECT policy_anchor_id,subject_kind,subject_id,capability FROM policy_entries ORDER BY 1,2,3")
+        .fetch_all(&mut source).await?;
+    let admin_accounts: Vec<_> = raw_policies
+        .iter()
+        .filter(|(a, s, _, c)| a == V1_ROOT && s == "account" && c == "manage")
+        .map(|(_, _, id, _)| id.clone())
+        .collect();
+    if admin_accounts.len() > 1 {
+        return Err("source must have exactly one workspace admin account".into());
+    }
+    let members: BTreeSet<String> = options
+        .members_file
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path).map(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let admin_account = match admin_accounts.into_iter().next() {
+        Some(account) => {
+            report.admin_source = Some(AdminSource::RootManage);
+            account
+        }
+        None => match sole_account_binding_admin(
+            &mut source,
+            options.members_file.as_ref().map(|_| &members),
+        )
+        .await?
+        {
+            Ok(account) => {
+                report.admin_source = Some(AdminSource::SoleAccountBinding);
+                account
+            }
+            Err(reason) => {
+                report
+                    .refusals
+                    .push(issue("native:workspace-owner", reason));
+                return Ok(refusal_breakdown::without_source(report));
+            }
+        },
+    };
+    let admin_account = &admin_account;
     // Hold one importer across the full multi-act resume, not just individual
     // SQLite transactions: two source frontiers must never interleave.
     let mut lock_name = options.target.as_os_str().to_os_string();
@@ -1663,31 +1868,6 @@ pub async fn run(options: Options) -> Result<Report> {
             return Err("target has hosted v2 activation; --resume is forbidden".into());
         }
     }
-    let raw_policies: Vec<(String,String,String,String)> = sqlx::query_as("SELECT policy_anchor_id,subject_kind,subject_id,capability FROM policy_entries ORDER BY 1,2,3")
-        .fetch_all(&mut source).await?;
-    let admin_accounts: Vec<_> = raw_policies
-        .iter()
-        .filter(|(a, s, _, c)| a == V1_ROOT && s == "account" && c == "manage")
-        .map(|(_, _, id, _)| id.clone())
-        .collect();
-    if admin_accounts.len() != 1 {
-        return Err("source must have exactly one workspace admin account".into());
-    }
-    let admin_account = &admin_accounts[0];
-    let members: BTreeSet<String> = options
-        .members_file
-        .as_ref()
-        .map(|path| {
-            std::fs::read_to_string(path).map(|text| {
-                text.lines()
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
     report.instruction_bindings.source_table_present = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='instruction_bindings')"
     ).fetch_one(&mut source).await?;
@@ -1911,6 +2091,7 @@ pub async fn run(options: Options) -> Result<Report> {
     let (db, admin) = if exists {
         let db =
             crate::db::open_database(options.target.to_str().ok_or("invalid target path")?).await?;
+        *retained_target = Some(db.clone());
         // Refuse pre-isolation targets even when this resume omits --history.
         // Canonical placement is immutable; a new target is required.
         let old_private: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE type='kernel.legacy_recorded.v1' AND record_id NOT GLOB 'kernel:app-custody:*' AND (json_extract(payload,'$.legacy.event_type') GLOB 'alpha_tab.*' OR (json_extract(payload,'$.legacy.source.stream')='control_events' AND (json_type(payload,'$.legacy.payload.account_id') IS NOT NULL OR json_extract(payload,'$.legacy.payload.scope_kind')='account'))))")
@@ -1940,6 +2121,7 @@ pub async fn run(options: Options) -> Result<Report> {
             binding,
         )
         .await?;
+        *retained_target = Some(db.clone());
         // Source identity is a separate durable marker, never a caller binding.
         k::create_principal(&db, "agent", "V1 import source", &source_binding, &admin).await?;
         (db, admin)
@@ -2110,6 +2292,7 @@ pub async fn run(options: Options) -> Result<Report> {
         standard::document4_package(),
         standard::relates_to::package(),
         standard::claims_v1::package(),
+        standard::saved_tabs::package(),
     ];
     for manifest in &packages {
         ensure_import_package(&db, &admin, manifest).await?;
@@ -2948,3 +3131,41 @@ pub async fn run(options: Options) -> Result<Report> {
 
 #[cfg(test)]
 mod tests;
+
+// Fixed synthetic-import test setup; no production authority or generic factory.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) struct NativePeerAdoptedAppFixture {
+    pub(crate) db: crate::db::Db,
+    pub(crate) principal: String,
+    pub(crate) administrator: String,
+    pub(crate) source_id: String,
+    pub(crate) pin: crate::kernel::app_installs::InstallRequest,
+    pub(crate) staged_generation: String,
+    pub(crate) adopted_generation: String,
+    pub(crate) staged_caller: crate::mcp::registry::Caller,
+    pub(crate) adopted_caller: crate::mcp::registry::Caller,
+    _directory: tempfile::TempDir,
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn native_peer_adopted_app_fixture_for_test(
+) -> std::sync::Arc<NativePeerAdoptedAppFixture> {
+    tests::native_peer_adopted_app_fixture().await
+}
+
+// Fixed two-account sibling; original owner retains the SAME real TempDir.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) struct NativePeerTwoAdoptedAppsFixture {
+    pub(crate) owner: std::sync::Arc<NativePeerAdoptedAppFixture>,
+    pub(crate) second_principal: String,
+    pub(crate) second_pin: crate::kernel::app_installs::InstallRequest,
+    pub(crate) _second_staged_generation: String,
+    pub(crate) second_adopted_generation: String,
+    pub(crate) _second_staged_caller: crate::mcp::registry::Caller,
+    pub(crate) second_adopted_caller: crate::mcp::registry::Caller,
+}
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn native_peer_two_adopted_apps_fixture_for_test(
+) -> std::sync::Arc<NativePeerTwoAdoptedAppsFixture> {
+    tests::native_peer_two_adopted_apps_fixture().await
+}

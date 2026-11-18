@@ -603,6 +603,7 @@ mod tests {
 
     fn test_consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -660,6 +661,7 @@ mod tests {
         manifest.contract = crate::standby::kernel_v2::MANIFEST.into();
         manifest.engine.name = crate::standby::kernel_v2::ENGINE.into();
         manifest.engine.schema_version = 0;
+        manifest.engine.ddl_sha256 = crate::standby::kernel_v2::INITIAL_READER_SCHEMA_SHA256.into();
         manifest.frontier = CanonicalFrontierV1 {
             contract: STANDBY_FRONTIER_CONTRACT.into(),
             version: 1,
@@ -678,6 +680,7 @@ mod tests {
         };
         manifest.head_act = Some(1);
         manifest.kernel_v2 = Some(crate::standby::kernel_v2::KernelGeneration {
+            reader_format: crate::standby::kernel_v2::KERNEL_V2_READER_FORMAT,
             application_id: crate::db::V2_APPLICATION_ID,
             genesis_event_id: HANDLE.into(),
             content_event_seq: 1,

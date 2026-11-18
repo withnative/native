@@ -118,13 +118,9 @@ export function planInstall(p) {
   const digests = computeDigests(html, descriptor.declaration, descriptor.runtime);
   const iconFacets = Object.hasOwn(descriptor, "icon") && parseIconFacet(descriptor.icon)
     ? { app_icon: descriptor.icon } : {};
-  // The package marker: a bundle over the ordinary HTML body limit (512 KiB)
-  // is created with this facet so the engine admits it up to the package
-  // limit (1 MiB). A bundle within the ordinary limit does not need it, so its
-  // plan is unchanged. The chunked route sets it on the re-kind, which is
-  // where the complete document is first validated.
-  const packageFacet = Buffer.byteLength(html, "utf8") > LIMITS.html.body_max_bytes
-    ? { [LIMITS.install.package_facet_key]: LIMITS.install.package_facet_value } : {};
+  // Every app bundle gets the package body and image/font allowances, even
+  // below 512 KiB. Chunked plans set the marker at the validating re-kind.
+  const packageFacet = { [LIMITS.install.package_facet_key]: LIMITS.install.package_facet_value };
   const bindings = p.bindings ?? [];
   // A native.app.v2 install has no input ports: it reads and writes through
   // the host's call surface and the one Adopt is the whole consent. So the

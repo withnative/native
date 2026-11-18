@@ -11,10 +11,10 @@
       "source_commit": "a490122d98d05c8f2b84fd35fd1d07f3d0ef0410",
       "exit_code": 0,
       "log": "logs/p1-default-tests.log",
-      "log_sha256": "3c08936725047cb0be0c28a05648b6e9fef8b2215d49b4aef62d42df0cae90bd",
+      "log_sha256": "13dcb1139481027b087179925c1739ee428d4341c3d10e6ac9dd0082c46c00f8",
       "scope": "275 unit passed/3 existing ignored; 1 integration and 5 doctests passed. Only two-file regex proof follow-up differs; affected tests rerun at final source.",
       "captured_log_sha256": "f5b1fb03a35db5cf54b3b02f567e64090040bf93fa7b340e32233133d5a7ade5",
-      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks and the operator checkout path replaced."
     },
     {
       "command": [
@@ -53,10 +53,10 @@
       "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
       "exit_code": 0,
       "log": "logs/p1-combined-release.log",
-      "log_sha256": "e01bf664d2e01be363806d1054184a8c6c0fb56659d159f77dd579f4dbe2fb4f",
+      "log_sha256": "4de643e6d0bfc6e0673362d4bf7afaa1a87db41a676d9058e0a2934ffc41e96b",
       "scope": "Release includes historical raw parser baseline separately; production combined probes use P1.",
       "captured_log_sha256": "ceb2756f759b8f9ed5612e3e0d4848a30a306db29a19d708de36f469e309f22b",
-      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks and the operator checkout path replaced."
     },
     {
       "command": [
@@ -72,10 +72,10 @@
       "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
       "exit_code": 0,
       "log": "logs/p1-regex-debug-final.log",
-      "log_sha256": "2cd4d537621e4c10c82c8a66c16ca0fb175fcc2ad489ef8fd9440eb12d2b8c8a",
+      "log_sha256": "1c1ade079f0106fdb4e44aa9fa3a677e99f0ccbb7d72e4ae66c463040265128e",
       "scope": "Public searches must return Ok(Bool) and stay within bound, actual named 4/8MiB workers.",
       "captured_log_sha256": "e05be12eab03fc6ed3ed39f8c731712064743397b7a64fbd070ee062d96ee9b8",
-      "log_normalization": "Trailing empty lines stripped for Git whitespace checks; substantive stdout/stderr unchanged."
+      "log_normalization": "Trailing empty lines stripped for Git whitespace checks and the operator checkout path replaced."
     },
     {
       "command": [
@@ -150,8 +150,10 @@
       "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
       "exit_code": 0,
       "log": "logs/p1-clippy-default.log",
-      "log_sha256": "f1d2b9ea414ba8d6ef625dc5b1db3615b71fb61d8f3cecd5381819c86728a930",
-      "scope": "Default all targets."
+      "log_sha256": "62e3039a6e1a56a6cc2a8e3f42c48dcc6d279feffae1365f8b88733d9758554b",
+      "scope": "Default all targets.",
+      "captured_log_sha256": "f1d2b9ea414ba8d6ef625dc5b1db3615b71fb61d8f3cecd5381819c86728a930",
+      "log_normalization": "Operator checkout path replaced."
     },
     {
       "command": [
@@ -169,8 +171,10 @@
       "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
       "exit_code": 0,
       "log": "logs/p1-clippy-tools.log",
-      "log_sha256": "5f5a8eaff30192e8689b1a5d0e0834fc896753bc6641a097ae436f9749f6616f",
-      "scope": "Evidence feature all targets."
+      "log_sha256": "fa5a3454ed5ecaa3faf47a4e945005f0ea157712f49ccc52eb62c3ffa4253a89",
+      "scope": "Evidence feature all targets.",
+      "captured_log_sha256": "5f5a8eaff30192e8689b1a5d0e0834fc896753bc6641a097ae436f9749f6616f",
+      "log_normalization": "Operator checkout path replaced."
     },
     {
       "command": [
@@ -212,8 +216,10 @@
       "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
       "exit_code": 0,
       "log": "logs/p1-clippy-default-final-tree.log",
-      "log_sha256": "79458e429fb70d643e498f4c5a672f0c77190a0c9b3d9e0dd7ea2588f31a52c9",
-      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical."
+      "log_sha256": "be3edddeae3414de9e1d1f2788a931ca6905ebc6a43126df29e1705c150bf945",
+      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical.",
+      "captured_log_sha256": "79458e429fb70d643e498f4c5a672f0c77190a0c9b3d9e0dd7ea2588f31a52c9",
+      "log_normalization": "Operator checkout path replaced."
     },
     {
       "command": [
@@ -231,8 +237,10 @@
       "source_commit": "b307a2c5954630eb58b69159495f8422ee6c800f",
       "exit_code": 0,
       "log": "logs/p1-clippy-tools-final-tree.log",
-      "log_sha256": "a69ee01c867f6163e7966fa400057380bf4d5e3864318e45846d106a179fd8d6",
-      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical."
+      "log_sha256": "6724edc3764a8d50fdcdb50a4848789329293a431bfbf9bff7dfd9ba45a9ae13",
+      "scope": "Final packaging tree: only api.rs/policy.rs comment changes plus docs/artifacts since measured source; noncomment lines verified identical.",
+      "captured_log_sha256": "a69ee01c867f6163e7966fa400057380bf4d5e3864318e45846d106a179fd8d6",
+      "log_normalization": "Operator checkout path replaced."
     },
     {
       "command": [

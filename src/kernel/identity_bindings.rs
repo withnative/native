@@ -5,6 +5,13 @@ use serde_json::json;
 #[cfg(feature = "v2-kernel-probe")]
 use serde_json::Value;
 
+mod mutations;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use mutations::{
+    canonicalize_on, reconcile_on, remove_on, Reconciliation, Removal, RECONCILED_EVENT,
+    REMOVED_EVENT,
+};
+
 pub(crate) const EVENT: &str = "kernel.identity_binding_added.v1";
 pub(crate) const DDL: &str = "CREATE TABLE kernel_identity_bindings (
  system TEXT NOT NULL CHECK(system IN ('native-principal','native-record')),
@@ -51,25 +58,36 @@ pub(crate) async fn list_on(conn: &mut SqliteConnection, record: &str) -> Result
         .collect())
 }
 
-/// Opaque CAS over the current binding audit frontier and subject content.
+/// Opaque CAS over canonical event IDs for binding audit and subject content.
 /// A token from the v1 engine cannot authorize a write against a v2 snapshot.
 pub(crate) async fn revision_on(conn: &mut SqliteConnection, record: &str) -> Result<String> {
+    revision_for_on(conn, &[record]).await
+}
+
+pub(crate) async fn revision_for_on(
+    conn: &mut SqliteConnection,
+    records: &[&str],
+) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let audit: i64 =
-        sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM main.content_events WHERE type=?")
-            .bind(EVENT)
-            .fetch_one(&mut *conn)
-            .await?;
-    let content: i64 = sqlx::query_scalar(
-        "SELECT coalesce(max(seq),0) FROM main.content_events WHERE record_id=?",
-    )
-    .bind(record)
-    .fetch_one(&mut *conn)
-    .await?;
+    let audit: Option<String> = sqlx::query_scalar("SELECT id FROM main.content_events WHERE type IN ('kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1','kernel.identity_bindings_reconciled.v1') ORDER BY seq DESC LIMIT 1")
+        .fetch_optional(&mut *conn).await?;
+    let mut records = records.to_vec();
+    records.sort_unstable();
+    records.dedup();
+    let mut heads = Vec::new();
+    for record in records {
+        let head: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM main.content_events WHERE record_id=? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(record)
+        .fetch_optional(&mut *conn)
+        .await?;
+        heads.push((record, head));
+    }
     Ok(format!(
         "ibsv2:{}",
         hex::encode(Sha256::digest(serde_jcs::to_vec(
-            &json!({"record_id":record,"content_seq":content,"binding_audit_seq":audit})
+            &json!({"records":heads,"binding_audit_id":audit})
         )?))
     ))
 }
@@ -95,40 +113,7 @@ async fn transition_on(
     if addition.reason.trim().is_empty() {
         return Err(Error::engine("manage_bindings: reason must be nonblank"));
     }
-    match addition.binding.system.as_str() {
-        "email" | "account" => {
-            return Err(Error::engine(format!(
-                "forbidden binding-system operation: '{}' is reserved",
-                addition.binding.system
-            )))
-        }
-        "native-principal" | "native-record" => {}
-        _ => {
-            return Err(Error::engine(format!(
-                "unknown binding system '{}'",
-                addition.binding.system
-            )))
-        }
-    }
-    let claim = BindingClaim {
-        system: addition.binding.system.clone(),
-        identifier: crate::identity::normalize_identifier(
-            &addition.binding.system,
-            &addition.binding.identifier,
-        )?,
-    };
-    // Runtime callers have already passed Manage. Replay validates projected
-    // record shape without re-authorizing old writes through today's H3 roster.
-    let (typ,kind): (Option<String>,Option<String>) = sqlx::query_as("SELECT CASE WHEN r.pin_family=? AND r.pin_version=1 THEN json_extract(t.value_json,'$') ELSE r.primary_type END,CASE WHEN r.pin_family=? AND r.pin_version=1 THEN json_extract(k.value_json,'$') ELSE r.kind END FROM kernel_records r LEFT JOIN kernel_record_fields t ON t.record_id=r.id AND t.name='v1_type' LEFT JOIN kernel_record_fields k ON k.record_id=r.id AND k.name='v1_kind' WHERE r.id=?")
-        .bind(crate::v2_standard::v1_compat::FAMILY).bind(crate::v2_standard::v1_compat::FAMILY).bind(record).fetch_optional(&mut *conn).await?.ok_or_else(||Error::engine(HIDDEN_OR_MISSING))?;
-    if claim.system == "native-principal"
-        && (typ.as_deref() != Some("Entity") || kind.as_deref() != Some("person"))
-    {
-        return Err(Error::engine(format!(
-            "incompatible record kind for binding system '{}' on record '{}'",
-            claim.system, record
-        )));
-    }
+    let claim = claim_on(conn, record, &addition.binding).await?;
     if let Some(expected) = expected_revision {
         let current = revision_on(conn, record).await?;
         if current != expected {
@@ -180,6 +165,44 @@ async fn transition_on(
     .map_err(|e| Error::engine(e.to_string()))
 }
 
+async fn claim_on(
+    conn: &mut SqliteConnection,
+    record: &str,
+    binding: &BindingClaim,
+) -> Result<BindingClaim> {
+    match binding.system.as_str() {
+        "email" | "account" => {
+            return Err(Error::engine(format!(
+                "forbidden binding-system operation: '{}' is reserved",
+                binding.system
+            )))
+        }
+        "native-principal" | "native-record" => {}
+        _ => {
+            return Err(Error::engine(format!(
+                "unknown binding system '{}'",
+                binding.system
+            )))
+        }
+    }
+    let claim = BindingClaim {
+        system: binding.system.clone(),
+        identifier: crate::identity::normalize_identifier(&binding.system, &binding.identifier)?,
+    };
+    // Replay validates historical shape without reauthorizing today's roster.
+    let (typ,kind): (Option<String>,Option<String>) = sqlx::query_as("SELECT CASE WHEN r.pin_family=? AND r.pin_version=1 THEN json_extract(t.value_json,'$') ELSE r.primary_type END,CASE WHEN r.pin_family=? AND r.pin_version=1 THEN json_extract(k.value_json,'$') ELSE r.kind END FROM kernel_records r LEFT JOIN kernel_record_fields t ON t.record_id=r.id AND t.name='v1_type' LEFT JOIN kernel_record_fields k ON k.record_id=r.id AND k.name='v1_kind' WHERE r.id=?")
+        .bind(crate::v2_standard::v1_compat::FAMILY).bind(crate::v2_standard::v1_compat::FAMILY).bind(record).fetch_optional(&mut *conn).await?.ok_or_else(||Error::engine(HIDDEN_OR_MISSING))?;
+    if claim.system == "native-principal"
+        && (typ.as_deref() != Some("Entity") || kind.as_deref() != Some("person"))
+    {
+        return Err(Error::engine(format!(
+            "incompatible record kind for binding system '{}' on record '{}'",
+            claim.system, record
+        )));
+    }
+    Ok(claim)
+}
+
 async fn kernel_require_on(
     conn: &mut SqliteConnection,
     actor: &str,
@@ -196,6 +219,7 @@ async fn kernel_require_on(
 }
 
 pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    mutations::admit_mutation(conn, event).await?;
     if event.event_type == EVENT {
         if event.record_id != crate::events::KERNEL_ROOT_ID {
             return Err(Error::engine(
@@ -216,6 +240,9 @@ pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Resu
 }
 
 pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    if event.event_type != EVENT {
+        return mutations::project_mutation(conn, event).await;
+    }
     let addition: Addition = event_payload(event)?;
     if event.record_id != crate::events::KERNEL_ROOT_ID {
         return Err(Error::engine(

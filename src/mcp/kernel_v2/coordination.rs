@@ -1,10 +1,10 @@
 //! Probe-gated coordination over kernel-owned run and claim authority.
+use super::bootstrap_diagnostics::stage;
 use super::*;
 use crate::v2_standard::claims_v1::Command;
 
 const OMISSIONS: &[&str] = &[
-    "Onboarding programmes and member state are imported read-only; obligation delivery and mutation are unavailable.",
-    "Purpose-relative briefing, resumability, overlap, comments and dependency context are not implemented.",
+    "Purpose-relative briefing, resumability, overlap, comments and dependency context are not implemented by Native. These limits do not disable host worker notifications.",
     "Standing instructions resolve imported workspace and member bindings; template provenance is unavailable.",
     "Run model/client declarations, interaction capture and realtime wakeups are not implemented.",
 ];
@@ -25,7 +25,23 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
             )?;
         };
     }
-    handler!("bootstrap", bootstrap);
+    registry.register_engine_handler(
+        "bootstrap",
+        EngineKind::KernelV2,
+        |engine, caller, args| async move {
+            use tracing::Instrument;
+            // A random attempt id correlates failures across stages without
+            // exposing the caller, database, request arguments or run key.
+            let span = tracing::warn_span!(target: "native_ce::bootstrap", "kernel_v2_bootstrap", attempt = %uuid::Uuid::new_v4());
+            async move {
+                let EngineHandle::KernelV2(db) = engine else {
+                    unreachable!()
+                };
+                let actor = stage("caller_admission", principal(&db, &caller)).await?;
+                stage("response", bootstrap(&db, &actor, &caller, args)).await
+            }.instrument(span).await
+        },
+    )?;
     handler!("set_intent", set_intent);
     handler!("close_run", close_run);
     handler!("start_work", start_work);
@@ -43,8 +59,9 @@ pub(crate) async fn existing_run(
     actor: &str,
     key: &str,
 ) -> Result<Option<kernel::RunContext>> {
+    // Every keyed call resolves its run here (via intent_at): read pool.
     let id: Option<String> = sqlx::query_scalar("SELECT r.id FROM kernel_runs r JOIN kernel_principals p ON p.principal_id=r.run_principal WHERE p.auth_binding=?")
-        .bind(format!("mcp-run:{key}")).fetch_optional(db.write_pool()).await?;
+        .bind(format!("mcp-run:{key}")).fetch_optional(db.pool()).await?;
     match id {
         Some(id) => Ok(Some(kernel::run_ledger::context_as(db, actor, &id).await?)),
         None => Ok(None),
@@ -66,54 +83,56 @@ struct EmptyArgs {}
 async fn bootstrap(db: &Db, actor: &str, caller: &Caller, args: Value) -> Result<Value> {
     let _: EmptyArgs = parse("bootstrap", args)?;
     let read_only = caller.request_persistence_suppressed();
-    let (key, context) = if read_only {
-        let key = caller.run_key().map(str::to_owned);
-        let context = match key.as_deref() {
-            Some(key) => existing_run(db, actor, key).await?,
-            None => None,
-        };
-        (key, context)
-    } else {
-        let (key, context) = match caller.run_key() {
-            Some(key) => (key.to_owned(), kernel::open_run_as(db, actor, key).await?),
-            None => kernel::run_ledger::mint_run_with_context_as(db, actor, None).await?,
-        };
-        (Some(key), Some(context))
-    };
-    let (kind, label): (String, String) =
-        sqlx::query_as("SELECT kind,display_label FROM kernel_principals WHERE principal_id=?")
-            .bind(actor)
-            .fetch_one(db.write_pool())
-            .await?;
-    let workspace_name = kernel::workspace_metadata::read(db)
+    let (key, context) = stage("run_context", async {
+        Ok(if read_only {
+            let key = caller.run_key().map(str::to_owned);
+            let context = match key.as_deref() {
+                Some(key) => existing_run(db, actor, key).await?,
+                None => None,
+            };
+            (key, context)
+        } else {
+            let (key, context) = match caller.run_key() {
+                Some(key) => (key.to_owned(), kernel::open_run_as(db, actor, key).await?),
+                None => kernel::run_ledger::mint_run_with_context_as(db, actor, None).await?,
+            };
+            (Some(key), Some(context))
+        })
+    })
+    .await?;
+    let principal = stage("principal", async {
+        bootstrap_principal_on(&mut *db.pool().acquire().await?, actor).await
+    })
+    .await?;
+    let workspace_name = stage("workspace_metadata", kernel::workspace_metadata::read(db))
         .await?
         .map(|metadata| metadata.name)
         .unwrap_or_else(|| "Native workspace".into());
     // The Workbench tree consumes the same View-gated logical root as
     // get_record/get_structure; a neutral kernel root is not a fake record.
-    let root_items = if super::read_surface::root(db, actor, "native:root")
-        .await?
-        .is_some()
-    {
-        super::read_surface::get_structure(
-            db,
-            actor,
-            json!({"root_id":"native:root","max_depth":0,"max_children_per_node":0}),
-        )
-        .await?["nodes"]
-            .clone()
-    } else {
-        json!([])
-    };
+    let root_items = stage(
+        "root_preview",
+        super::read_surface::bootstrap_roots(db, actor),
+    )
+    .await?;
     let roots = json!({"total":root_items.as_array().expect("root nodes").len(),
         "items":root_items,"continuation":{"tool":"get_structure","arguments":{"root_id":"native:root"}}});
-    let instructions = standing_instructions(db, actor, caller).await?;
-    let source_context = {
+    let instructions = stage(
+        "standing_instructions",
+        standing_instructions(db, actor, caller),
+    )
+    .await?;
+    let source_context = stage("source_context", async {
         let mut tx = db.pool().begin().await?;
-        kernel::v1_state::member_context::online_on(&mut tx, actor).await?
-    };
+        kernel::v1_state::member_context::online_on(&mut tx, actor).await
+    })
+    .await?;
     let closed = match context.as_ref() {
-        Some(context) => Some(kernel::run_witness_as(db, context).await?.closed),
+        Some(context) => Some(
+            stage("run_witness", kernel::run_witness_as(db, context))
+                .await?
+                .closed,
+        ),
         None => None,
     };
     let status = match closed {
@@ -124,46 +143,98 @@ async fn bootstrap(db: &Db, actor: &str, caller: &Caller, args: Value) -> Result
     let guidance = if read_only {
         "Read-only bootstrap: no run was created or updated. A carried key is correlation only unless an existing owned run was resolved."
     } else if closed == Some(true) {
-        "This run is closed. Its key is retained for correlation; writes requiring an open run will fail run_closed. Bootstrap without this key (or with run_key='new') to start a new run."
+        "This run is closed. Its key is retained for correlation; writes requiring an open run will fail run_closed. Use set_intent with run_key='new' to start a new run; retain the returned key."
     } else {
-        "Reuse this exact run_key on subsequent calls, reads included. Declare intent separately with set_intent; close with close_run."
+        crate::instructions::RUN_CONTINUATION_GUIDANCE
     };
+    // A completed response has resolved caller footing, roots and instruction
+    // bindings. Onboarding is independent of bootstrap readiness.
+    let ready = instructions["status"] == "ready";
     Ok(json!({
-        "principal": {"principal_id":actor, "kind":kind, "display_name":label, "identity_basis":"authenticated kernel auth_binding"},
-        "workspace": {"primary_workspace":{"id":crate::events::KERNEL_ROOT_ID,"name":workspace_name}},
-        "source_context": source_context,
-        "orientation":{"template_key":crate::instructions::ENGINE_ORIENTATION_TEMPLATE_KEY,
-            "template_version":crate::instructions::ENGINE_ORIENTATION_TEMPLATE_VERSION,
-            "content":crate::instructions::ENGINE_ORIENTATION},
-        "instructions":instructions,
-        "roots":roots,
-        "pending_obligations":kernel::v1_state::onboarding_as(db,actor,caller.is_host_member()).await?,
         "run":{"run_key":key,"closed":closed,"status":status,"read_only":read_only,"durable":context.is_some()},
         "session":{"run_key":key,"reuse_required":!read_only && closed == Some(false),"guidance":guidance},
+        "principal": principal,
+        "workspace": {"primary_workspace":{"id":crate::events::KERNEL_ROOT_ID,"name":workspace_name}},
+        "source_context": source_context,
+        "bootstrap_readiness":{"contract":crate::instructions::BOOTSTRAP_CONTRACT,
+            "status":if ready {"complete"} else {"partial"}},
+        "orientation":{"template_key":"compact-engine-orientation",
+            "template_version":crate::instructions::COMPACT_ORIENTATION_VERSION,
+            "content":crate::instructions::COMPACT_ORIENTATION},
+        "instructions":instructions,
+        "roots":roots,
         "unsupported_capabilities":OMISSIONS,
         "engine":{"name":"kernel-v2","probe_gated":true}
     }))
 }
 
+/// The caller has already been authenticated. Select only its own native
+/// footing; no directory or imported identity inference is introduced here.
+pub(crate) async fn bootstrap_principal_on(
+    connection: &mut sqlx::SqliteConnection,
+    actor: &str,
+) -> Result<Value> {
+    let (kind, label): (String, String) =
+        sqlx::query_as("SELECT kind,display_label FROM kernel_principals WHERE principal_id=?")
+            .bind(actor)
+            .fetch_one(connection)
+            .await?;
+    Ok(
+        json!({"principal_id":actor,"kind":kind,"display_name":label,"identity_basis":"authenticated kernel auth_binding"}),
+    )
+}
+
 async fn standing_instructions(db: &Db, actor: &str, caller: &Caller) -> Result<Value> {
+    // A read snapshot: bootstrap must not hold a writer slot to read instructions.
+    let mut snapshot = db.pool().begin().await?;
+    let result = standing_instructions_on(&mut snapshot, actor, caller.is_host_member()).await;
+    snapshot.rollback().await?;
+    result
+}
+
+pub(crate) async fn standing_instructions_on(
+    connection: &mut sqlx::SqliteConnection,
+    actor: &str,
+    is_member: bool,
+) -> Result<Value> {
+    Ok(
+        selected_standing_instructions_on(connection, actor, is_member)
+            .await?
+            .instructions,
+    )
+}
+
+/// Capture keeps the ordinary native instruction response unchanged while
+/// retaining authorized sources even when their body is empty. Bootstrap's
+/// world preview must not mistake those sources for ordinary recent work.
+pub(crate) struct SelectedStandingInstructions {
+    pub instructions: Value,
+    pub source_ids: std::collections::BTreeSet<String>,
+}
+pub(crate) async fn selected_standing_instructions_on(
+    connection: &mut sqlx::SqliteConnection,
+    actor: &str,
+    is_member: bool,
+) -> Result<SelectedStandingInstructions> {
     // The import host preserves original v1 scope IDs and explicitly maps
     // account scopes to kernel principals. Membership is host-authenticated;
     // each target additionally passes ordinary kernel record visibility.
     let bindings: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id,scope_kind,source_record_id FROM kernel_instruction_bindings
+        "SELECT id,scope_kind,source_record_id FROM main.kernel_instruction_bindings
          WHERE enabled=1 AND ((scope_kind='database' AND scope_id='native:database' AND ?)
            OR (scope_kind='account' AND account_principal=?))
          ORDER BY CASE WHEN scope_kind='database' THEN 0 ELSE 1 END,position,source_record_id,id",
     )
-    .bind(caller.is_host_member())
+    .bind(is_member)
     .bind(actor)
-    .fetch_all(db.write_pool())
+    .fetch_all(&mut *connection)
     .await?;
     let mut entries = Vec::new();
     let mut diagnostics = Vec::new();
     let mut bytes = 0;
+    let mut source_ids = std::collections::BTreeSet::new();
     for (binding, scope, id) in bindings {
-        let record = kernel::read_record_as(db, actor, &id).await?;
+        let record = kernel::read_record_on(connection, actor, &id).await?;
         let Some(record) = record.filter(|r| !r.archived) else {
             // Workspace sources must be indistinguishable from absent bindings
             // when unreadable. Only the caller's own account layer may name
@@ -174,6 +245,7 @@ async fn standing_instructions(db: &Db, actor: &str, caller: &Caller) -> Result<
             diagnostics.push(json!({"binding_id":binding,"record_id":id,"reason":"Bound instruction record is missing, archived or not visible to this caller."}));
             continue;
         };
+        source_ids.insert(id.clone());
         let title = record
             .fields
             .get("title")
@@ -193,12 +265,13 @@ async fn standing_instructions(db: &Db, actor: &str, caller: &Caller) -> Result<
         entries.push(json!({"entry_id":binding,"scope":if scope == "database" {"workspace"} else {"member"},
             "kind":"standing_instruction","source":{"type":"record","record_id":id,"title":title},"content":body}));
     }
-    Ok(
-        json!({"status":if diagnostics.is_empty() {"ready"} else {"partial"},
+    Ok(SelectedStandingInstructions {
+        instructions: json!({"status":if diagnostics.is_empty() {"ready"} else {"partial"},
         "resolved_bytes":bytes,"limit_bytes":crate::instructions::MAX_RESOLVED_INSTRUCTION_BYTES,
         "entries":entries,"guidance":crate::instructions::NEUTRAL_PRECEDENCE_GUIDANCE,
         "diagnostics":diagnostics}),
-    )
+        source_ids,
+    })
 }
 
 async fn set_intent(db: &Db, actor: &str, caller: &Caller, args: Value) -> Result<Value> {
@@ -357,15 +430,33 @@ async fn start_work(db: &Db, actor: &str, caller: &Caller, args: Value) -> Resul
 pub(crate) fn render_bootstrap_text(value: &Value) -> String {
     use std::fmt::Write as _;
     let text = |pointer| value.pointer(pointer).and_then(Value::as_str).unwrap_or("");
-    let mut out = text("/orientation/content").to_owned();
+    let mut out = String::new();
+    let state_note = if value.pointer("/run/closed").and_then(Value::as_bool) == Some(true) {
+        "This run is closed; bootstrap retains its key for correlation."
+    } else if value.pointer("/run/read_only").and_then(Value::as_bool) == Some(true) {
+        "Read-only bootstrap creates or updates no run."
+    } else if value.pointer("/run/status").and_then(Value::as_str) == Some("unknown") {
+        "This carried run key is unknown to this copy and is echoed for correlation only. No durable run, ownership, or open/closed status is established locally."
+    } else if value.pointer("/run/status").and_then(Value::as_str) == Some("pending_on_hosted") {
+        "This key was issued locally and is not yet durable. An accepted set_intent, claim or close_run establishes it on hosted Native."
+    } else {
+        "Bootstrap opens a durable run owned by the authenticated principal."
+    };
+    let key = text("/session/run_key");
+    if key.is_empty() {
+        out.push_str("Run key: none issued (read-only bootstrap)\n");
+    } else {
+        let _ = writeln!(out, "Run key: `{key}`");
+    }
+    let _ = writeln!(out, "\n{} {}\n", state_note, text("/session/guidance"));
+    out.push_str(text("/orientation/content"));
     let _ = writeln!(
         out,
-        "\n\n## Current footing\n\nPrincipal: {} (`{}`; {})\nWorkspace: {}\nWorkspace root: `{}`\n",
-        text("/principal/display_name"),
-        text("/principal/principal_id"),
-        text("/principal/kind"),
+        "\n\nWorkspace: {} (`{}`)\nPrincipal: {} ({})\n",
         text("/workspace/primary_workspace/name"),
-        text("/workspace/primary_workspace/id")
+        text("/workspace/primary_workspace/id"),
+        text("/principal/display_name"),
+        text("/principal/kind")
     );
     let _ = writeln!(
         out,
@@ -405,17 +496,5 @@ pub(crate) fn render_bootstrap_text(value: &Value) -> String {
             let _ = writeln!(out, "- {note}");
         }
     }
-    let state_note = if value.pointer("/run/closed").and_then(Value::as_bool) == Some(true) {
-        "This run is closed; bootstrap retains its key for correlation."
-    } else {
-        "Bootstrap opens a durable run owned by the authenticated principal. Repeating bootstrap with this key continues the same open run."
-    };
-    let _ = writeln!(
-        out,
-        "\n## Run continuation\n\nRun key: `{}`\n\n{} {}",
-        text("/session/run_key"),
-        state_note,
-        text("/session/guidance")
-    );
     out
 }

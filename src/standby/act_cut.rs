@@ -361,8 +361,11 @@ impl AuthorityActCut {
             // The exact inventory above admits one authority-local companion
             // retained by same-database snapshots/deltas, never portable import.
             require(
-                section.name == "provenance_local_attestation_authority"
-                    || crate::interchange::SECTION_NAMES.contains(&section.name.as_str()),
+                matches!(
+                    section.name.as_str(),
+                    "provenance_local_attestation_authority"
+                        | "provenance_local_command_cancellations"
+                ) || crate::interchange::SECTION_NAMES.contains(&section.name.as_str()),
                 "authority act cut companion is missing from canonical interchange",
             )?;
             let kind = crate::schema::standby_classification::TABLE_CLASSIFICATIONS

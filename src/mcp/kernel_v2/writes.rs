@@ -1,23 +1,42 @@
 //! Ordinary probe writes. The adapter receipt and every kernel event commit
 //! together; a failed field/body/facet/link operation rolls back the whole act.
+use super::write_diagnostics::{phase, Stage};
 use super::{parse, principal};
 use crate::{
     act::ActAllocation,
     authorization::Capability,
     db::{begin_write, Db},
     kernel,
-    mcp::registry::{EngineHandle, EngineKind, ToolRegistry},
-    store::{append_in, AppendSpec},
+    mcp::fetch::FetchConfig,
+    mcp::registry::{Caller, EngineHandle, EngineKind, ToolRegistry},
+    store::AppendSpec,
     v2_standard::{relates_to as relation, v1_compat},
     Error, Result,
 };
 use serde_json::{json, Map, Value};
-use sqlx::{Sqlite, Transaction};
+use sqlx::{Sqlite, SqliteConnection, Transaction};
+
+#[cfg(all(feature = "v2-kernel-probe", feature = "mcp-executor-prototype"))]
+use crate::kernel::original_settlement::installed::WriteAdmission;
 
 mod batch;
+mod create_many;
 pub(crate) mod named_views;
+pub(crate) mod publication;
+pub(crate) mod replay;
+pub(super) mod url_attachment;
 
 pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
+    register_with_fetch(registry, FetchConfig::default())
+}
+
+/// Register the v2 write handlers with an explicit fetch guard — the seam
+/// the URL-attachment tests use to point `attach_from_url` at a loopback
+/// server. Production callers use [`register`].
+pub(super) fn register_with_fetch(
+    registry: &mut ToolRegistry,
+    fetch_config: FetchConfig,
+) -> Result<()> {
     for tool in [
         "attach_text",
         "create_record",
@@ -25,7 +44,7 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
         "manage_links",
         "archive_record",
         "batch_write",
-        "manage_named_views",
+        "create_many",
     ] {
         registry.register_engine_handler(
             tool,
@@ -34,7 +53,78 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
                 let EngineHandle::KernelV2(db) = engine else {
                     unreachable!()
                 };
-                if tool == "manage_named_views" {
+                let actor = principal(&db, &caller).await?;
+                if tool == "batch_write" {
+                    return batch::execute(&db, &actor, &caller, args).await;
+                }
+                if tool == "update_record" {
+                    return execute_update_owned(
+                        &db,
+                        &actor,
+                        &caller,
+                        args,
+                        #[cfg(all(
+                            feature = "v2-kernel-probe",
+                            feature = "mcp-executor-prototype"
+                        ))]
+                        None,
+                    )
+                    .await;
+                }
+                execute(&db, &actor, tool, args).await
+            },
+        )?;
+    }
+    // URL import rides its own registration (not the loop above): the fetch
+    // guard is per-registry configuration, and the handler fetches with no
+    // transaction open before committing, which the shared `execute` path
+    // cannot express. The shared tool list above is untouched.
+    let url_fetch_config = fetch_config;
+    registry.register_engine_handler(
+        "attach_from_url",
+        EngineKind::KernelV2,
+        move |engine, caller, args| {
+            let url_fetch_config = url_fetch_config.clone();
+            async move {
+                let EngineHandle::KernelV2(db) = engine else {
+                    unreachable!()
+                };
+                let actor = principal(&db, &caller).await?;
+                url_attachment::execute(&db, &actor, args, &url_fetch_config).await
+            }
+        },
+    )?;
+    if registry.get("manage_publication").is_some() {
+        registry.register_engine_handler(
+            "manage_publication",
+            EngineKind::KernelV2,
+            |engine, caller, args| async move {
+                let EngineHandle::KernelV2(db) = engine else {
+                    unreachable!()
+                };
+                publication::execute(&db, &caller, args).await
+            },
+        )?;
+    }
+    // Pick the source route before constructing either async state. A read
+    // never carries the effectful dispatcher's state (or its writer setup).
+    registry.register_engine_handler(
+        "manage_named_views",
+        EngineKind::KernelV2,
+        |engine, caller, args| -> futures::future::BoxFuture<'static, Result<Value>> {
+            let EngineHandle::KernelV2(db) = engine else {
+                unreachable!()
+            };
+            if args["action"] == "propose_view" {
+                Box::pin(async move {
+                    let actor = principal(&db, &caller).await?;
+                    Box::pin(crate::named_views::proposal::execute(
+                        &db, &actor, &caller, args,
+                    ))
+                    .await
+                })
+            } else {
+                Box::pin(async move {
                     crate::named_views::gate::require()?;
                     if matches!(
                         args["action"].as_str(),
@@ -50,15 +140,12 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
                             ));
                         }
                     }
-                }
-                let actor = principal(&db, &caller).await?;
-                if tool == "manage_named_views" {
-                    return named_views::execute(&db, &actor, &caller, args).await;
-                }
-                execute(&db, &actor, tool, args).await
-            },
-        )?;
-    }
+                    let actor = principal(&db, &caller).await?;
+                    named_views::execute(&db, &actor, &caller, args).await
+                })
+            }
+        },
+    )?;
     Ok(())
 }
 
@@ -82,7 +169,9 @@ fn optional_text<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
 }
 fn allowed(args: &Value, keys: &[&str]) -> Result<()> {
     for key in object(args)?.keys() {
-        if !keys.contains(&key.as_str()) {
+        if !keys.contains(&key.as_str())
+            || (!minted_ids_enabled() && matches!(key.as_str(), "id_nonce" | "attachment_id"))
+        {
             return Err(invalid(format!("unsupported argument {key}")));
         }
     }
@@ -97,49 +186,96 @@ fn allowed(args: &Value, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
-// Durable adapter state, deliberately independent of rebuildable kernel
-// projections. BEGIN IMMEDIATE serializes lookup, mutation and receipt insert.
+// BEGIN IMMEDIATE serializes lookup, mutation and the canonical outcome fact.
+// The retry ledger is its certified, rebuildable projection.
 pub(super) const RECEIPTS: &str = crate::kernel::MCP_WRITE_RECEIPTS_DDL;
 
-// Digest only attachment text; retain every other argument for exact conflicts.
-// Accept old receipts on retry, then replace their full text after authorization.
-fn request_fingerprint(tool: &str, mut request: Value) -> Result<String> {
-    object(&request)?;
-    request.as_object_mut().unwrap().remove("idempotency_key");
-    if tool == "attach_text" {
-        if let Some(text) = request["text"].as_str() {
-            use sha2::{Digest, Sha256};
-            request["text"] = json!({"sha256":hex::encode(Sha256::digest(text.as_bytes())),"size_bytes":text.len()});
-        }
-    }
-    request.sort_all_objects();
-    Ok(serde_json::to_string(&request)?)
-}
-
-// Always envelope both user and app requests. An ordinary caller passing an
-// app-shaped JSON object as tool arguments must not impersonate stored intent.
-fn intent_fingerprint(tool: &str, request: Value, app: Value) -> Result<String> {
-    let arguments: Value = serde_json::from_str(&request_fingerprint(tool, request)?)?;
-    let mut intent = json!({"schema":"kernel.mcp.intent.v1", "app":app, "arguments":arguments});
-    intent.sort_all_objects();
-    Ok(serde_json::to_string(&intent)?)
-}
-
-// Preserve the stored identity; legacy flat receipts are ordinary-user intent.
-fn stored_fingerprint(tool: &str, request: Value) -> Result<String> {
-    if request["schema"] == "kernel.mcp.intent.v1" {
-        intent_fingerprint(tool, request["arguments"].clone(), request["app"].clone())
+// Preserve the adapter's established fingerprint identity during replay and migration.
+pub(super) use crate::kernel::mcp_write_receipts::{intent_fingerprint, stored_fingerprint};
+/// The admission identity the current dispatch would fingerprint under:
+/// the ambient app claim, plus the mint context exactly when the compound
+/// envelope applies (minted-ID tool with an id_nonce while the feature is
+/// enabled). Shared by [`dispatched_fingerprint`] and the replay seam so the
+/// ambient selection cannot drift from the ordinary path.
+pub(super) fn ambient_proposal_identity(
+    tool: &str,
+    request: &Value,
+) -> Result<replay::ProposalIdentity> {
+    // An explicit JSON null app counts as unset, matching from_original's
+    // normalization so the two sides cannot disagree on it.
+    let app = kernel::app_installs::dispatched_identity().filter(|app| !app.is_null());
+    let mint_context = if matches!(tool, "create_record" | "attach_text" | "attach_from_url")
+        && request.get("id_nonce").is_some()
+        && minted_ids_enabled()
+    {
+        Some(crate::provenance::record_mint_context()?)
     } else {
-        intent_fingerprint(tool, request, Value::Null)
-    }
+        None
+    };
+    Ok(replay::ProposalIdentity { app, mint_context })
 }
 
-fn dispatched_fingerprint(tool: &str, request: Value) -> Result<String> {
-    intent_fingerprint(
-        tool,
-        request,
-        kernel::app_installs::dispatched_identity().unwrap_or(Value::Null),
-    )
+pub(super) fn dispatched_fingerprint(tool: &str, request: Value) -> Result<String> {
+    // Thin wrapper: select the identity from the current dispatch, then
+    // fingerprint purely; [`replay::proposal_fingerprint`] is the single
+    // normalization path.
+    let identity = ambient_proposal_identity(tool, &request)?;
+    replay::proposal_fingerprint(tool, &request, &identity)
+}
+
+// Explicit server opt-in, matching the environment-selected v2/standby pilots.
+pub(super) fn minted_ids_enabled() -> bool {
+    #[cfg(test)]
+    if let Ok(enabled) = MINTED_IDS_TEST.try_with(|enabled| *enabled) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NATIVE_CE_V2_MINTED_RECORD_IDS").is_ok_and(|v| v == "1"))
+}
+#[cfg(test)]
+tokio::task_local! { static MINTED_IDS_TEST: bool; }
+
+fn mint_evidence(actor: &str, args: &Value, id_key: &str) -> Result<Option<Value>> {
+    mint_evidence_in_context(actor, args, id_key, None)
+}
+fn mint_evidence_in_context(
+    actor: &str,
+    args: &Value,
+    id_key: &str,
+    captured: Option<&replay::FirstPartyCreateContext>,
+) -> Result<Option<Value>> {
+    if !minted_ids_enabled() {
+        return Ok(None);
+    }
+    let id = optional_text(args, id_key)?;
+    let nonce = optional_text(args, "id_nonce")?;
+    if id.is_none() && nonce.is_none() {
+        return Ok(None);
+    }
+    let principal = crate::record_id::qualified_principal(actor);
+    let context = match captured {
+        Some(context) => context.observed().to_owned(),
+        None => crate::provenance::record_mint_context()?,
+    };
+    if !id
+        .zip(nonce)
+        .is_some_and(|(id, nonce)| crate::record_id::verify(&principal, &context, id, nonce))
+    {
+        return Err(invalid("invalid record id proof"));
+    }
+    Ok(Some(
+        json!({"record_id_mint":{"version":1,"principal":principal,"context":context,"nonce":nonce}}),
+    ))
+}
+
+async fn refuse_minted_occupancy(tx: &mut SqliteConnection, id: &str) -> Result<()> {
+    kernel::mcp_write_receipts::fences::refuse_retired_on(tx, id, None).await?;
+    let used: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id=? UNION ALL SELECT 1 FROM kernel_roots WHERE root_id=? UNION ALL SELECT 1 FROM kernel_principals WHERE principal_id=?)")
+        .bind(id).bind(id).bind(id).fetch_one(&mut *tx).await?;
+    if used {
+        return Err(Error::conflict("id unavailable"));
+    }
+    Ok(())
 }
 
 async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value> {
@@ -148,11 +284,195 @@ async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value>
             "named view operations require authenticated caller dispatch",
         ));
     }
-    if tool == "batch_write" {
-        return batch::execute(db, actor, args).await;
+    if tool == "create_many" {
+        return create_many::execute(db, actor, args).await;
     }
     if tool == "manage_links" && args["action"] == "list" {
         return list_links(db, actor, args).await;
+    }
+    let mut tx = begin_write(db.write_pool()).await?;
+    let receipt = execute_transaction(db, &mut tx, actor, tool, args, None).await?;
+    db.commit_kernel_content(tx).await?;
+    Ok(receipt)
+}
+
+async fn execute_transaction(
+    db: &Db,
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &str,
+    tool: &str,
+    args: Value,
+    context: Option<&mut crate::coedit::live::kernel_writes::KernelBodyWrite>,
+) -> Result<Value> {
+    execute_write_driver(
+        db,
+        WriteDriver::Ordinary {
+            tx,
+            tool,
+            context,
+            create_context: None,
+        },
+        actor,
+        args,
+    )
+    .await
+}
+
+#[cfg(all(feature = "v2-kernel-probe", feature = "mcp-executor-prototype"))]
+pub(crate) async fn execute_installed(
+    db: &Db,
+    caller: Caller,
+    admission: WriteAdmission,
+) -> Result<Value> {
+    let original = admission.original();
+    let actor = original.principal_id.clone();
+    let args = original.arguments.clone();
+    if original.operation == "update_record" {
+        return execute_update_owned(db, &actor, &caller, args, Some(admission)).await;
+    }
+    let db = db.clone();
+    crate::coedit::live::kernel_writes::owned_result(db.clone(), async move {
+        let mut tx = begin_write(db.write_pool()).await?;
+        if super::principal_on(&mut tx, &caller).await? != actor {
+            return Err(Error::auth("installed writer caller binding changed"));
+        }
+        let original = admission.original();
+        admission.recheck(&mut tx, &actor).await?;
+        replay::admit_enrolled_node_on(&mut tx, &actor, original).await?;
+        let receipt = if original.operation == "create_record" {
+            let context = replay::FirstPartyCreateContext::for_enrolled_node()?;
+            execute_captured_create_transaction(&db, &mut tx, &actor, args, &context).await?
+        } else {
+            execute_transaction(&db, &mut tx, &actor, &original.operation, args, None).await?
+        };
+        db.commit_kernel_content(tx).await?;
+        Ok(receipt)
+    })
+    .await
+}
+
+async fn execute_captured_create_transaction(
+    db: &Db,
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &str,
+    args: Value,
+    captured: &replay::FirstPartyCreateContext,
+) -> Result<Value> {
+    execute_write_driver(
+        db,
+        WriteDriver::Ordinary {
+            tx,
+            tool: "create_record",
+            context: None,
+            create_context: Some(captured),
+        },
+        actor,
+        args,
+    )
+    .await
+}
+
+/// The connection-only variant cannot select any non-update tool. Ordinary
+/// callers still own their real SQLx Transaction and old dispatcher surface.
+enum WriteDriver<'a, 'conn> {
+    Ordinary {
+        tx: &'a mut Transaction<'conn, Sqlite>,
+        tool: &'a str,
+        context: Option<&'a mut crate::coedit::live::kernel_writes::KernelBodyWrite>,
+        create_context: Option<&'a replay::FirstPartyCreateContext>,
+    },
+    Update {
+        transaction: &'a mut crate::coedit::live::kernel_writes::KernelTransaction<
+            crate::coedit::live::kernel_writes::KernelBodyWrite,
+        >,
+        caller: &'a Caller,
+    },
+}
+impl WriteDriver<'_, '_> {
+    fn connection(&mut self) -> &mut SqliteConnection {
+        match self {
+            Self::Ordinary { tx, .. } => tx,
+            Self::Update { transaction, .. } => transaction.parts().0,
+        }
+    }
+    fn live(&mut self) -> bool {
+        match self {
+            Self::Ordinary { context, .. } => context.as_ref().is_some_and(|owner| owner.is_live()),
+            Self::Update { transaction, .. } => transaction.parts().1.is_live(),
+        }
+    }
+}
+async fn execute_update_connection(
+    db: &Db,
+    transaction: &mut crate::coedit::live::kernel_writes::KernelTransaction<
+        crate::coedit::live::kernel_writes::KernelBodyWrite,
+    >,
+    caller: &Caller,
+    actor: &str,
+    args: Value,
+) -> Result<Value> {
+    execute_write_driver(
+        db,
+        WriteDriver::Update {
+            transaction,
+            caller,
+        },
+        actor,
+        args,
+    )
+    .await
+}
+
+async fn execute_write_driver(
+    db: &Db,
+    mut driver: WriteDriver<'_, '_>,
+    actor: &str,
+    args: Value,
+) -> Result<Value> {
+    let tool = match &driver {
+        WriteDriver::Ordinary { tool, .. } => *tool,
+        WriteDriver::Update { .. } => "update_record",
+    };
+    let create_context = match &driver {
+        WriteDriver::Ordinary { create_context, .. } => *create_context,
+        _ => None,
+    };
+    // Pure proof verification precedes receipt and occupancy reads. Transport
+    // identity resolution remains the ordinary authenticated admission boundary.
+    let minted = if matches!(tool, "create_record" | "attach_text") {
+        mint_evidence_in_context(
+            actor,
+            &args,
+            if tool == "create_record" {
+                "id"
+            } else {
+                "attachment_id"
+            },
+            create_context,
+        )?
+    } else {
+        None
+    };
+    let can_publish_personal_app =
+        matches!(&driver, WriteDriver::Update { caller, .. } if caller.can_update_personal_app());
+    let live = driver.live();
+    let tx = driver.connection();
+
+    if tool == "update_record"
+        && ["body", "body_set", "body_append", "body_replace"]
+            .iter()
+            .any(|k| args.get(*k).is_some())
+    {
+        let id = text(&args, "id")?;
+        let record = phase(Stage::InitialView, view(tx, actor, id)).await?;
+        if kernel::app_installs::is_artifact_on(tx, &record).await? {
+            if !can_publish_personal_app {
+                return Err(Error::auth(
+                    "app source publication requires an eligible workspace member",
+                ));
+            }
+            kernel::app_installs::sources::require_owner_on(tx, actor, id, None).await?;
+        }
     }
     let key = optional_text(&args, "idempotency_key")?
         .map(str::trim)
@@ -163,11 +483,16 @@ async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value>
     if tool == "attach_text" {
         text(&args, "text")?;
     }
-    let request_json = dispatched_fingerprint(tool, args.clone())?;
-    let mut tx = begin_write(db.write_pool()).await?;
+    let request_json = match create_context {
+        Some(context) => replay::proposal_fingerprint(tool, &args, &context.identity())?,
+        None => dispatched_fingerprint(tool, args.clone())?,
+    };
+    if let Some(key) = key {
+        kernel::mcp_write_receipts::fences::refuse_key_on(tx, actor, tool, key).await?;
+    }
     // Current consent and source View are checked before success-receipt
     // lookup, on the same serialized snapshot that will perform the effects.
-    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
+    kernel::app_installs::admit_dispatched_on(tx, actor).await?;
     sqlx::query(RECEIPTS).execute(&mut *tx).await?;
     if let Some(key) = key {
         let old: Option<(String,String)> = sqlx::query_as("SELECT request_json,receipt_json FROM kernel_mcp_write_receipts WHERE principal_id=? AND operation=? AND operation_key=?")
@@ -178,7 +503,8 @@ async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value>
                     "idempotency_key reused for different request",
                 ));
             }
-            let receipt: Value = serde_json::from_str(&receipt)?;
+            let receipt_raw = receipt;
+            let receipt: Value = serde_json::from_str(&receipt_raw)?;
             // Replay does not confer access after revocation or a move.
             let id = if tool == "attach_text" {
                 text(&receipt, "attachment_id")?
@@ -186,21 +512,23 @@ async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value>
                 text(&receipt, "id")?
             };
             if tool == "attach_text" {
-                kernel::kernel_require(
-                    &mut tx,
-                    actor,
-                    text(&receipt, "record_id")?,
-                    Capability::Edit,
-                )
-                .await?;
-                kernel::blobs::metadata(&mut tx, actor, id).await?;
+                kernel::kernel_require(tx, actor, text(&receipt, "record_id")?, Capability::Edit)
+                    .await?;
+                kernel::blobs::metadata(tx, actor, id).await?;
             }
             if tool == "update_record" && args.get("home_id").is_some() {
-                kernel::kernel_require(&mut tx, actor, id, Capability::Manage).await?;
-                let home =
-                    crate::v1_import::resolve_home_on(&mut tx, actor, text(&args, "home_id")?)
-                        .await?;
-                kernel::kernel_require(&mut tx, actor, &home, Capability::Edit).await?;
+                kernel::kernel_require(tx, actor, id, Capability::Manage).await?;
+                let home = crate::v1_import::resolve_home_on_connection(
+                    tx,
+                    actor,
+                    receipt
+                        .get("redirected_home")
+                        .and_then(|r| r.get("applied"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(text(&args, "home_id")?),
+                )
+                .await?;
+                kernel::kernel_require(tx, actor, &home, Capability::Edit).await?;
             }
             let required = if tool == "archive_record" {
                 Capability::Manage
@@ -212,63 +540,390 @@ async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value>
             // the comment. Updates and archives keep the Edit fence, so
             // replay confers nothing after revocation.
             let creation_is_comment =
-                tool == "create_record" && kernel::comments_v2::is_comment_on(&mut tx, id).await?;
+                tool == "create_record" && kernel::comments_v2::is_comment_on(tx, id).await?;
             if !creation_is_comment {
-                kernel::kernel_require(&mut tx, actor, id, required).await?;
+                kernel::kernel_require(tx, actor, id, required).await?;
             }
             for target in receipt["link_targets"].as_array().into_iter().flatten() {
-                kernel::kernel_require(&mut tx, actor, target.as_str().unwrap(), Capability::View)
+                kernel::kernel_require(tx, actor, target.as_str().unwrap(), Capability::View)
                     .await?;
             }
             // Compact legacy receipts only after current-policy authorization.
-            sqlx::query("UPDATE kernel_mcp_write_receipts SET request_json=? WHERE principal_id=? AND operation=? AND operation_key=?")
-                .bind(&request_json).bind(actor).bind(tool).bind(key).execute(&mut *tx).await?;
-            tx.commit().await?;
+            let mut replay_acts = ActAllocation::new();
+            kernel::mcp_write_receipts::record_on(
+                db,
+                tx,
+                &mut replay_acts,
+                kernel::mcp_write_receipts::Outcome {
+                    principal: actor,
+                    operation: tool,
+                    key,
+                    request: &request_json,
+                    receipt: &receipt_raw,
+                },
+            )
+            .await?;
             return Ok(receipt);
         }
     }
+    if minted.is_some() {
+        let id = text(
+            &args,
+            if tool == "attach_text" {
+                "attachment_id"
+            } else {
+                "id"
+            },
+        )?;
+        refuse_minted_occupancy(tx, id).await?;
+    }
+    if key.is_some() && live {
+        return Err(Error::engine(
+            "new keyed kernel body/scope writes are refused while live; replay remains available",
+        ));
+    }
     let mut acts = ActAllocation::new();
     use sha2::{Digest, Sha256};
+    let request_digest = hex::encode(Sha256::digest(request_json.as_bytes()));
     let pending = kernel::app_installs::start_app_action_in(
         db,
-        &mut tx,
+        tx,
         actor,
         tool,
-        hex::encode(Sha256::digest(request_json.as_bytes())),
+        request_digest.clone(),
         optional_text(&args, "reason")?.map(str::to_owned),
         &mut acts,
     )
     .await?;
-    let mut receipt = match tool {
-        "attach_text" => attach_text(db, &mut tx, &mut acts, actor, &args).await?,
-        "create_record" => create(db, &mut tx, &mut acts, actor, &args).await?,
-        "update_record" => update(db, &mut tx, &mut acts, actor, &args).await?,
-        "manage_links" => mutate_link(db, &mut tx, &mut acts, actor, &args).await?,
-        "archive_record" => archive(db, &mut tx, &mut acts, actor, &args).await?,
-        _ => unreachable!(),
+    let mut receipt = match &mut driver {
+        WriteDriver::Update {
+            transaction,
+            caller,
+        } => {
+            let (tx, context) = transaction.parts();
+            let binding = if context.is_live() {
+                Some(
+                    kernel::app_installs::bind_update_action_on(
+                        tx,
+                        pending.as_deref(),
+                        caller,
+                        actor,
+                        &args,
+                        &request_digest,
+                        &acts,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            update_with_context(
+                db,
+                tx,
+                &mut acts,
+                actor,
+                &args,
+                None,
+                Some(context),
+                binding,
+                can_publish_personal_app,
+                None,
+            )
+            .await?
+        }
+        WriteDriver::Ordinary { tx, context, .. } => match tool {
+            "attach_text" => attach_text(db, tx, &mut acts, actor, &args).await?,
+            "create_record" => {
+                create_with_details(db, tx, &mut acts, actor, &args, None, None, create_context)
+                    .await?
+            }
+            "update_record" => {
+                update_with_context(
+                    db,
+                    tx,
+                    &mut acts,
+                    actor,
+                    &args,
+                    None,
+                    context.take(),
+                    None,
+                    false,
+                    None,
+                )
+                .await?
+            }
+            "manage_links" => mutate_link(db, tx, &mut acts, actor, &args).await?,
+            "archive_record" => archive(db, tx, &mut acts, actor, &args).await?,
+            _ => unreachable!(),
+        },
     };
+    let tx = driver.connection();
     if let Some(attribution) =
-        kernel::app_installs::finish_app_action_in(db, &mut tx, actor, pending, &mut acts).await?
+        kernel::app_installs::finish_app_action_in(db, tx, actor, pending, &mut acts).await?
     {
         receipt["app_attribution"] = attribution;
     }
     if let Some(key) = key {
-        sqlx::query("INSERT INTO kernel_mcp_write_receipts VALUES(?,?,?,?,?)")
-            .bind(actor)
-            .bind(tool)
-            .bind(key)
-            .bind(request_json)
-            .bind(serde_json::to_string(&receipt)?)
-            .execute(&mut *tx)
-            .await?;
+        kernel::mcp_write_receipts::record_on(
+            db,
+            tx,
+            &mut acts,
+            kernel::mcp_write_receipts::Outcome {
+                principal: actor,
+                operation: tool,
+                key,
+                request: &request_json,
+                receipt: &serde_json::to_string(&receipt)?,
+            },
+        )
+        .await?;
     }
-    db.commit_kernel_content(tx).await?;
     Ok(receipt)
 }
 
-async fn event(
+struct OwnedUpdateDisposition {
+    // A separately durable effect; dropping a waiter/result cannot undo it.
+    preflush: Option<crate::coedit::live::Versioned>,
+    outer: Result<Value>,
+}
+
+async fn execute_update_owned(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    actor: &str,
+    caller: &crate::mcp::Caller,
+    args: Value,
+    #[cfg(all(feature = "v2-kernel-probe", feature = "mcp-executor-prototype"))] installed: Option<
+        WriteAdmission,
+    >,
+) -> Result<Value> {
+    use crate::coedit::live::kernel_writes::{
+        owned_result, KernelBodyWrite, KernelTransaction, KernelWriteMode,
+    };
+    validate_update_shape(&args)?;
+    #[cfg(all(feature = "v2-kernel-probe", feature = "mcp-executor-prototype"))]
+    if installed.is_some()
+        && optional_text(&args, "idempotency_key")?.is_none_or(|key| key.trim().is_empty())
+    {
+        return Err(invalid("installed writes require an original key"));
+    }
+    let (db, actor, caller) = (db.clone(), actor.to_owned(), caller.clone());
+    #[cfg(test)]
+    let fixture_owner =
+        crate::coedit::live::kernel_writes::capture_writer_fixture_owner_for_test(&db);
+    let disposition = owned_result(
+        db.clone(),
+        super::write_diagnostics::update_record(async move {
+            let id = text(&args, "id")?;
+            let body = ["body", "body_set", "body_append", "body_replace"]
+                .iter()
+                .any(|key| args.get(*key).is_some());
+            let scope = args.get("home_id").is_some()
+                || args
+                    .get("facets")
+                    .and_then(Value::as_object)
+                    .is_some_and(|facets| facets.contains_key("runtime"));
+            let keyed =
+                optional_text(&args, "idempotency_key")?.is_some_and(|key| !key.trim().is_empty());
+            let mode = if !body && !scope {
+                KernelWriteMode::Metadata
+            } else if keyed {
+                KernelWriteMode::ReplayOnly
+            } else if scope {
+                KernelWriteMode::RefuseLive
+            } else {
+                KernelWriteMode::RouteBody
+            };
+            let ownership = phase(Stage::Ownership, async {
+                #[cfg(test)]
+                let result = KernelBodyWrite::acquire_fixture_owned_update_for_test(
+                    &db,
+                    &caller,
+                    Some(id),
+                    mode,
+                    fixture_owner,
+                )
+                .await;
+                #[cfg(not(test))]
+                let result = KernelBodyWrite::acquire(&db, &caller, Some(id), mode).await;
+                result
+            })
+            .await?;
+            let (ownership, preflush) = if mode == KernelWriteMode::RouteBody {
+                phase(
+                    Stage::Preflush,
+                    ownership.flush(&caller, "saved before a routed kernel write"),
+                )
+                .await?
+            } else {
+                (ownership, None)
+            };
+            let outer = async {
+                #[cfg(test)]
+                if mode == KernelWriteMode::RouteBody {
+                    crate::coedit::live::kernel_writes::test_checkpoint(
+                        &db,
+                        crate::coedit::live::kernel_writes::TestStage::AfterFlush,
+                    )
+                    .await?;
+                }
+                let mut transaction = phase(
+                    Stage::Begin,
+                    KernelTransaction::begin(&db, ownership, KernelBodyWrite::quarantine),
+                )
+                .await?;
+                let result = async {
+                    {
+                        let (tx, _) = transaction.parts();
+                        let current = super::principal_on(tx, &caller).await?;
+                        if current != actor {
+                            return Err(Error::auth("kernel writer caller binding changed"));
+                        }
+                        if caller.verified_release_append() {
+                            super::release_append::validate_on(tx, &actor, &args).await?;
+                        }
+                        #[cfg(all(
+                            feature = "v2-kernel-probe",
+                            feature = "mcp-executor-prototype"
+                        ))]
+                        if let Some(installed) = &installed {
+                            installed.recheck(tx, &actor).await?;
+                            replay::admit_enrolled_node_on(tx, &actor, installed.original())
+                                .await?;
+                        }
+                    }
+                    let receipt = phase(
+                        Stage::Mutation,
+                        execute_update_connection(&db, &mut transaction, &caller, &actor, args),
+                    )
+                    .await?;
+                    #[cfg(test)]
+                    crate::coedit::live::kernel_writes::test_checkpoint(
+                        &db,
+                        crate::coedit::live::kernel_writes::TestStage::AfterMutation,
+                    )
+                    .await?;
+                    let (tx, ownership) = transaction.parts();
+                    phase(Stage::Validate, ownership.validate_in(tx)).await?;
+                    Ok::<_, Error>(receipt)
+                }
+                .await;
+                let receipt = match result {
+                    Ok(receipt) => receipt,
+                    Err(error) => return Err(transaction.rollback(error).await),
+                };
+                let mut ownership = phase(Stage::Commit, transaction.commit()).await?;
+                ownership.install_committed()?;
+                Ok(receipt)
+            }
+            .await;
+            Ok(OwnedUpdateDisposition { preflush, outer })
+        }),
+    )
+    .await?;
+    // This preserves public Result<Value>; a known preflush remains separately
+    // true in durable history even when outer is Err or delivery is cancelled.
+    let OwnedUpdateDisposition {
+        preflush: _known_preflush,
+        outer,
+    } = disposition;
+    outer
+}
+
+fn validate_update_shape(args: &Value) -> Result<()> {
+    allowed(
+        args,
+        &[
+            "id",
+            "home_id",
+            "name",
+            "summary",
+            "lifecycle",
+            "persistence",
+            "maturity",
+            "body",
+            "body_set",
+            "body_append",
+            "body_replace",
+            "if_body_digest",
+            "if_unmodified_since",
+            "if_policy_revision",
+            "sources",
+            "facets",
+            "links",
+            "reason",
+            "response_mode",
+            "idempotency_key",
+        ],
+    )?;
+    text(args, "id")?;
+    super::source_basis::validate_input(args.get("sources"), "update_record")?;
+    let body_ops = ["body", "body_set", "body_append", "body_replace"]
+        .iter()
+        .filter(|key| args.get(**key).is_some())
+        .count();
+    if body_ops > 1 {
+        return Err(invalid("use exactly one body operation"));
+    }
+    for field in [
+        "body",
+        "body_set",
+        "name",
+        "summary",
+        "lifecycle",
+        "home_id",
+        "if_body_digest",
+        "if_unmodified_since",
+        "if_policy_revision",
+        "reason",
+        "idempotency_key",
+    ] {
+        optional_text(args, field)?;
+    }
+    if args.get("body_append").is_some() {
+        text(args, "body_append")?;
+    }
+    if let Some(replacements) = args.get("body_replace") {
+        let _: Vec<crate::mcp::tools::lifecycle::BodyReplace> =
+            parse("update_record.body_replace", replacements.clone())?;
+    }
+    if let Some(key) = optional_text(args, "idempotency_key")? {
+        if key.trim().chars().count() > 200 {
+            return Err(invalid("idempotency_key must be 1..200 characters"));
+        }
+    }
+    if let Some(facets) = args.get("facets").filter(|value| !value.is_null()) {
+        object(facets)?;
+    }
+    if let Some(links) = args.get("links").filter(|value| !value.is_null()) {
+        for link in links
+            .as_array()
+            .ok_or_else(|| invalid("links must be an array"))?
+        {
+            allowed(link, &["target_id", "relationship", "note"])?;
+            text(link, "target_id")?;
+            text(link, "relationship")?;
+            optional_text(link, "note")?;
+        }
+    }
+    if let Some(persistence) = args.get("persistence") {
+        if !matches!(persistence.as_str(), Some("enduring" | "occurrent")) {
+            return Err(invalid(
+                "persistence must be enduring or occurrent; cannot clear persistence",
+            ));
+        }
+    }
+    optional_text(args, "maturity")?;
+    if let Some(expected) = optional_text(args, "if_unmodified_since")? {
+        chrono::DateTime::parse_from_rfc3339(expected)
+            .map_err(|_| invalid("if_unmodified_since must be RFC3339"))?;
+    }
+    validate_lifecycle(args)?;
+    Ok(())
+}
+
+pub(super) async fn event(
+    db: &Db,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     id: &str,
@@ -278,7 +933,7 @@ async fn event(
     // Callers must authorize before entering a lane: create_input_in checks
     // home Edit; update uses record_edit (Edit + CAS); archive requires Manage.
     // Keep that order when composing lanes. append_in also runs kernel admission.
-    append_in(
+    crate::store::append_on(
         db,
         tx,
         AppendSpec {
@@ -293,22 +948,23 @@ async fn event(
     Ok(())
 }
 async fn view(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     actor: &str,
     id: &str,
 ) -> Result<kernel::KernelRecordView> {
     // Comment visibility derives through the bearer chain inside the kernel
     // capability check; writes still authorize per lane below.
-    kernel::read_record_on(tx, actor, id)
-        .await?
-        .ok_or_else(|| Error::engine(kernel::HIDDEN_OR_MISSING))
+    match kernel::read_record_on(tx, actor, id).await? {
+        Some(record) => Ok(record),
+        None => match kernel::app_scope_direct_refusal_on(tx, actor, id, Capability::View).await? {
+            Some(error) => Err(error),
+            None => Err(Error::engine(kernel::HIDDEN_OR_MISSING)),
+        },
+    }
 }
 // Mint a globally unambiguous UUID prefix, including hidden records and
 // imported exact-prefix identities. Saturated scans fall back to the full id.
-async fn short_reference(
-    tx: &mut Transaction<'static, Sqlite>,
-    id: &str,
-) -> Result<Option<String>> {
+pub(crate) async fn short_reference(tx: &mut SqliteConnection, id: &str) -> Result<Option<String>> {
     let Ok(uuid) = uuid::Uuid::parse_str(id) else {
         return Ok(None);
     };
@@ -319,7 +975,7 @@ async fn short_reference(
     let candidates: Vec<String> =
         sqlx::query_scalar("SELECT id FROM kernel_records WHERE id LIKE ? ORDER BY id LIMIT 32")
             .bind(format!("{}%", &hex[..7]))
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?;
     if candidates.len() >= 32 {
         return Ok(None);
@@ -338,7 +994,7 @@ async fn short_reference(
 }
 
 async fn receipt(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     actor: &str,
     id: &str,
     effect: &str,
@@ -350,7 +1006,7 @@ async fn receipt(
     let primary_type: Option<String> =
         sqlx::query_scalar("SELECT primary_type FROM kernel_records WHERE id=?")
             .bind(id)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
     let (record_type, kind) = super::v1_type_and_kind(
         current.family.as_deref(),
@@ -384,7 +1040,7 @@ async fn receipt(
         ) = sqlx::query_as(
             "SELECT seq,id,type,record_id,created_at,act FROM content_events ORDER BY seq DESC LIMIT 1",
         )
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         result["act"] = json!(act);
         result["write_receipt"] = json!({"kind":"kernel_content_event","event":{"seq":seq,"event_id":event_id,"event_type":event_type,"record_id":record_id,"created_at":created_at}});
@@ -394,7 +1050,7 @@ async fn receipt(
 
 async fn archive(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
@@ -445,11 +1101,23 @@ fn validate_lifecycle(args: &Value) -> Result<()> {
 
 async fn metadata_patch(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     id: &str,
     args: &Value,
+) -> Result<()> {
+    metadata_patch_with_basis(db, tx, acts, actor, id, args, &mut None).await
+}
+
+async fn metadata_patch_with_basis(
+    db: &Db,
+    tx: &mut SqliteConnection,
+    acts: &mut ActAllocation,
+    actor: &str,
+    id: &str,
+    args: &Value,
+    basis: &mut Option<Value>,
 ) -> Result<()> {
     let current = kernel::record_metadata::read_on(tx, id).await?;
     let mut patch = Map::new();
@@ -470,6 +1138,9 @@ async fn metadata_patch(
         }
     }
     if !patch.is_empty() {
+        if let Some(basis) = basis.take() {
+            patch.insert("basis".into(), basis);
+        }
         event(
             db,
             tx,
@@ -486,7 +1157,7 @@ async fn metadata_patch(
 
 pub(super) async fn create(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
@@ -495,40 +1166,42 @@ pub(super) async fn create(
 }
 pub(super) async fn create_with_origin(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
     origin: Value,
 ) -> Result<Value> {
-    create_with_details(db, tx, acts, actor, args, None, Some(origin)).await
+    create_with_details(db, tx, acts, actor, args, None, Some(origin), None).await
 }
 pub(super) async fn create_with_message(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
     message: Option<&kernel::MessageState>,
 ) -> Result<Value> {
-    create_with_details(db, tx, acts, actor, args, message, None).await
+    create_with_details(db, tx, acts, actor, args, message, None, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn create_with_details(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
     message: Option<&kernel::MessageState>,
     origin: Option<Value>,
+    captured: Option<&replay::FirstPartyCreateContext>,
 ) -> Result<Value> {
     allowed(
         args,
         &[
             "type",
             "id",
+            "id_nonce",
             "kind",
             "name",
             "summary",
@@ -548,8 +1221,35 @@ async fn create_with_details(
             "sources",
         ],
     )?;
+    if minted_ids_enabled()
+        && origin.is_some()
+        && ["id", "id_nonce"]
+            .iter()
+            .any(|key| args.get(*key).is_some())
+    {
+        return Err(invalid(
+            "caller record IDs are not supported for origin-bearing creates",
+        ));
+    }
+    let mint = if message.is_none() {
+        mint_evidence_in_context(actor, args, "id", captured)?
+    } else {
+        None
+    };
+    if mint.is_some() {
+        refuse_minted_occupancy(tx, text(args, "id")?).await?;
+    }
+    let origin = match mint {
+        Some(mint) => Some(mint),
+        None => origin,
+    };
     let typ = text(args, "type")?;
+    let redirected_home =
+        crate::mcp::tools::redirects_root_filing(Some(typ), optional_text(args, "home_id")?);
     let raw_kind = text(args, "kind")?;
+    if typ == "Configuration" && raw_kind == "saved_tab" {
+        return Err(invalid("saved tabs require manage_saved_tabs.create"));
+    }
     let canonical_kind = kernel::v1_state::interpreter_on(tx, actor)
         .await?
         .canonical_imported_kind(typ, raw_kind);
@@ -560,7 +1260,7 @@ async fn create_with_details(
     if typ == "Message" && message.is_none() {
         return Err(invalid("use manage_messages.send to seal the audience"));
     }
-    if message.is_none() && args.get("id").is_some() {
+    if message.is_none() && args.get("id").is_some() && !minted_ids_enabled() {
         return Err(invalid("id is only supported for messaging sends"));
     }
     if typ == "Document" && kind == "attachment" {
@@ -670,8 +1370,11 @@ async fn create_with_details(
         // Comments validate their bearer/home through the thread plan.
         Some(plan) => plan.home.clone(),
         None => {
-            let requested =
-                optional_text(args, "home_id")?.unwrap_or(crate::events::KERNEL_ROOT_ID);
+            let requested = if redirected_home {
+                crate::schema::UNFILED_RECORD_ID
+            } else {
+                optional_text(args, "home_id")?.unwrap_or(crate::events::KERNEL_ROOT_ID)
+            };
             let selector = annotation_placement
                 .as_ref()
                 .filter(|(scope, _)| requested == scope)
@@ -714,6 +1417,8 @@ async fn create_with_details(
                 kernel::FieldInput::Raw(&raw),
                 &home,
                 &plan.bearer,
+                optional_text(args, "id")?,
+                origin.clone(),
                 basis.clone(),
             )
             .await?
@@ -803,6 +1508,9 @@ async fn create_with_details(
         kernel::comments_v2::append_bearer_link_in(db, tx, acts, actor, &id, &bearer).await?;
     }
     let mut result = receipt(tx, actor, &id, "created", None, targets).await?;
+    if redirected_home {
+        crate::mcp::tools::disclose_root_filing(&mut result);
+    }
     if let Some(feedback) =
         super::super::tools::lifecycle::declared_basis_feedback(declared_sources)
     {
@@ -813,7 +1521,7 @@ async fn create_with_details(
 
 pub(crate) async fn update(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
@@ -823,11 +1531,27 @@ pub(crate) async fn update(
 
 pub(super) async fn update_with_origin(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
     origin: Option<Value>,
+) -> Result<Value> {
+    update_with_context(db, tx, acts, actor, args, origin, None, None, false, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_with_context(
+    db: &Db,
+    tx: &mut SqliteConnection,
+    acts: &mut ActAllocation,
+    actor: &str,
+    args: &Value,
+    origin: Option<Value>,
+    context: Option<&mut crate::coedit::live::kernel_writes::KernelBodyWrite>,
+    binding: Option<kernel::app_installs::RoutedActionBinding<'_>>,
+    can_publish_personal_app: bool,
+    resolved_basis: Option<Option<Value>>,
 ) -> Result<Value> {
     if kernel::messaging::is_message(tx, text(args, "id")?).await? {
         return Err(invalid(
@@ -851,6 +1575,7 @@ pub(super) async fn update_with_origin(
             "if_body_digest",
             "if_unmodified_since",
             "if_policy_revision",
+            "sources",
             "facets",
             "links",
             "reason",
@@ -863,12 +1588,43 @@ pub(super) async fn update_with_origin(
     // terminal bearer (with v1's insufficient-capability refusal when the
     // thread is visible), while every other record keeps the Edit fence.
     // Hidden records read as missing either way.
-    let previous = view(tx, actor, id).await?;
+    let previous = phase(Stage::PreviousView, view(tx, actor, id)).await?;
+    // Resolve the public type on the same snapshot as the move. Preserve the
+    // original request for the command fingerprint and retry receipt.
+    let redirected_home = if optional_text(args, "home_id")? == Some(crate::schema::ROOT_RECORD_ID)
+    {
+        let primary_type: Option<String> =
+            sqlx::query_scalar("SELECT primary_type FROM kernel_records WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let (typ, _) = super::v1_type_and_kind(
+            previous.family.as_deref(),
+            previous.pin.as_ref().map(|p| p.version),
+            primary_type.as_deref(),
+            previous.kind.as_deref(),
+            &previous.fields,
+        );
+        crate::mcp::tools::redirects_root_filing(typ, Some(crate::schema::ROOT_RECORD_ID))
+    } else {
+        false
+    };
+
+    if let Some(basis) = context.as_ref().and_then(|owner| owner.live_body()) {
+        // Routed body operations start only after their own dirty cut, with
+        // ops held. Canonical and live basis must now agree exactly.
+        if previous.body.as_deref().unwrap_or("") != basis && args.get("idempotency_key").is_none()
+        {
+            return Err(Error::conflict(
+                "kernel live basis disagrees with committed body",
+            ));
+        }
+    }
     // App admission may already own the act. Only events appended by this
     // update count as a data change; allocating attribution is not a save.
     let before_event_seq: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM main.content_events")
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
     if super::comments::record_is_comment(&previous) {
         // Resolve and every other comment write need Edit on the thread,
@@ -905,13 +1661,18 @@ pub(super) async fn update_with_origin(
         if super::comments::record_is_comment(&previous) {
             return Err(invalid("a comment moves only with its terminal bearer"));
         }
+        let requested = if redirected_home {
+            crate::schema::UNFILED_RECORD_ID
+        } else {
+            requested
+        };
         kernel::folder_home_in(db, tx, acts, actor, requested).await?;
-        let home = crate::v1_import::resolve_home_on(tx, actor, requested).await?;
+        let home = crate::v1_import::resolve_home_on_connection(tx, actor, requested).await?;
         kernel::kernel_require(tx, actor, &home, Capability::Edit).await?;
         // A native home ID must not bypass the liveness/Edit checks on its
         // imported logical folder.
         let logical: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
-            .bind(&home).fetch_optional(&mut **tx).await?;
+            .bind(&home).fetch_optional(&mut *tx).await?;
         let destination_id = logical.as_deref().unwrap_or(requested);
         if destination_id != crate::events::KERNEL_ROOT_ID
             && destination_id != crate::schema::ROOT_RECORD_ID
@@ -919,7 +1680,7 @@ pub(super) async fn update_with_origin(
             let native: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
                     .bind(destination_id)
-                    .fetch_one(&mut **tx)
+                    .fetch_one(&mut *tx)
                     .await?;
             if !native {
                 let destination = view(tx, actor, destination_id).await?;
@@ -947,7 +1708,11 @@ pub(super) async fn update_with_origin(
         let expected = chrono::DateTime::parse_from_rfc3339(expected)
             .map_err(|_| invalid("if_unmodified_since must be RFC3339"))?;
         let updated = kernel::record_metadata::updated_at_on(tx, id).await?;
-        let updated = chrono::DateTime::parse_from_rfc3339(&updated)
+        let guard_updated = context
+            .as_ref()
+            .map(|owner| owner.guard_updated_at(&updated))
+            .unwrap_or(&updated);
+        let updated = chrono::DateTime::parse_from_rfc3339(guard_updated)
             .map_err(|_| invalid("invalid kernel timestamp"))?;
         if updated != expected {
             return Err(Error::conflict(
@@ -960,7 +1725,7 @@ pub(super) async fn update_with_origin(
         let primary_type: Option<String> =
             sqlx::query_scalar("SELECT primary_type FROM kernel_records WHERE id=?")
                 .bind(id)
-                .fetch_one(&mut **tx)
+                .fetch_one(&mut *tx)
                 .await?;
         let (typ, kind) = super::v1_type_and_kind(
             previous.family.as_deref(),
@@ -1021,11 +1786,12 @@ pub(super) async fn update_with_origin(
     if body_ops.len() > 1 {
         return Err(invalid("use exactly one body operation"));
     }
+    let mut publish_app_source = false;
     if !body_ops.is_empty() {
         let primary_type: Option<String> =
             sqlx::query_scalar("SELECT primary_type FROM kernel_records WHERE id=?")
                 .bind(id)
-                .fetch_one(&mut **tx)
+                .fetch_one(&mut *tx)
                 .await?;
         let (typ, kind) = super::v1_type_and_kind(
             previous.family.as_deref(),
@@ -1035,7 +1801,24 @@ pub(super) async fn update_with_origin(
             &previous.fields,
         );
         if typ == Some("Document") && kind == Some("artifact") {
-            return Err(invalid("artifact body writes require the native source-attestation lane (unsupported_on_v2)"));
+            if !can_publish_personal_app {
+                return Err(Error::auth(
+                    "app source publication requires an eligible workspace member",
+                ));
+            }
+            if optional_text(args, "if_body_digest")?.is_none() {
+                return Err(invalid("app source publication requires if_body_digest"));
+            }
+            kernel::app_installs::sources::require_owner_on(tx, actor, id, None).await?;
+            if args.get("facets").is_some() || args.get("home_id").is_some() {
+                return Err(invalid(
+                    "app source publication cannot change facets or home",
+                ));
+            }
+            if context.as_ref().is_some_and(|owner| owner.is_live()) {
+                return Err(invalid("app package body writes cannot use co-edit routing; publish with update_record and if_body_digest outside an active co-edit session"));
+            }
+            publish_app_source = true;
         }
     }
     let next_body = if let Some(op) = body_ops.first() {
@@ -1086,7 +1869,6 @@ pub(super) async fn update_with_origin(
     // Fence every lane with the captured revision without emitting an empty
     // field revision for body/facet/link-only operations or no-op patches.
     if super::comments::record_is_comment(&previous) {
-        let touched = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
         let touches_part_of = args
             .get("links")
             .and_then(Value::as_array)
@@ -1099,15 +1881,28 @@ pub(super) async fn update_with_origin(
             tx,
             id,
             &previous,
-            touched("lifecycle"),
+            args.get("lifecycle").is_some(),
             optional_text(args, "lifecycle")?,
-            touched("summary"),
+            args.get("summary").is_some(),
             optional_text(args, "summary")?,
             next_body.as_deref(),
             touches_part_of,
         )
         .await?;
     }
+    let mut basis = match resolved_basis {
+        Some(basis) => basis,
+        None => {
+            phase(
+                Stage::SourceBasis,
+                super::source_basis::resolve_on(tx, actor, args.get("sources"), "update_record"),
+            )
+            .await?
+        }
+    };
+    let declared_sources = basis
+        .as_ref()
+        .map(|b| b["sources"].as_array().unwrap().len());
     kernel::hq::record_edit(tx, actor, id, Some(previous.revision)).await?;
     // Field revisions must see the destination's schema. Re-prove the old
     // CAS first, move the whole thread, then fence revisions at the new head.
@@ -1119,7 +1914,7 @@ pub(super) async fn update_with_origin(
     };
     if !fields.is_empty() {
         let raw = serde_json::to_string(&fields)?;
-        kernel::revise_input_with_origin_in(
+        kernel::revise_input_with_basis_in(
             db,
             tx,
             acts,
@@ -1128,33 +1923,104 @@ pub(super) async fn update_with_origin(
             kernel::FieldInput::Raw(&raw),
             Some(edit_revision),
             origin.clone(),
+            basis.take(),
         )
         .await?;
     }
-    metadata_patch(db, tx, acts, actor, id, args).await?;
+    phase(
+        Stage::Metadata,
+        metadata_patch_with_basis(db, tx, acts, actor, id, args, &mut basis),
+    )
+    .await?;
     let explicit_body_effect = origin
         .as_ref()
         .is_some_and(|origin| origin["effect"] == "body.set");
-    if let Some(body) = next_body
-        .filter(|body| explicit_body_effect || body != previous.body.as_deref().unwrap_or(""))
-    {
+    let first_publication = publish_app_source
+        && kernel::app_installs::sources::needs_initial_publication_on(tx, id).await?;
+    if let Some(body) = next_body.filter(|body| {
+        explicit_body_effect || first_publication || body != previous.body.as_deref().unwrap_or("")
+    }) {
         let mut payload = json!({"body":body});
         if let Some(origin) = &origin {
             payload["origin"] = origin.clone();
         }
-        event(db, tx, acts, actor, id, "kernel.body_set.v1", payload).await?;
+        let body_basis = basis.take();
+        if let Some(basis) = &body_basis {
+            payload["basis"] = basis.clone();
+        }
+        let routed = match context {
+            Some(owner) => {
+                // The actual Caller is retained by the operation owner; native
+                // contributor minting must not reconstruct it from actor text.
+                phase(
+                    Stage::LiveBody,
+                    owner.append_dispatched_body_with_basis_in(
+                        tx,
+                        id,
+                        &body,
+                        origin.clone(),
+                        body_basis,
+                        optional_text(args, "reason")?.unwrap_or("record updated"),
+                        acts,
+                        binding,
+                    ),
+                )
+                .await?
+            }
+            None => false,
+        };
+        if routed && publish_app_source {
+            return Err(Error::engine("app package body writes cannot use co-edit routing; publish with update_record and if_body_digest outside an active co-edit session"));
+        }
+        if !routed {
+            phase(
+                Stage::BodyEvent,
+                event(db, tx, acts, actor, id, "kernel.body_set.v1", payload),
+            )
+            .await?;
+            if publish_app_source {
+                kernel::app_installs::sources::publish_on(db, tx, acts, actor, id).await?;
+            }
+        }
     }
-    facets(db, tx, acts, actor, id, args.get("facets"), "update_record").await?;
+    facets_with_basis(
+        db,
+        tx,
+        acts,
+        actor,
+        id,
+        args.get("facets"),
+        "update_record",
+        None,
+        &mut basis,
+    )
+    .await?;
     // Updates never carry a comment bearer link: part_of on a comment is
     // refused by check_update above, so no bearer skips apply here.
     let targets = new_links(db, tx, acts, actor, id, args.get("links"), None).await?;
     let changed: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE seq>?)")
             .bind(before_event_seq)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
     let effect = if changed { "updated" } else { "unchanged" };
-    receipt(tx, actor, id, effect, Some(&previous), targets).await
+    let mut result = phase(
+        Stage::Receipt,
+        receipt(tx, actor, id, effect, Some(&previous), targets),
+    )
+    .await?;
+    if redirected_home {
+        crate::mcp::tools::disclose_root_filing(&mut result);
+    }
+    if basis.is_some() {
+        result["basis"] = json!({"status":"not_recorded", "source_count":0,
+            "message":"No source basis recorded: no field, metadata, body or facet event changed."});
+    } else if let Some(feedback) =
+        super::super::tools::lifecycle::declared_basis_feedback(declared_sources)
+    {
+        result["basis"] = feedback;
+    }
+    Ok(result)
 }
 
 fn replace_body(body: &str, args: Value) -> Result<String> {
@@ -1167,7 +2033,7 @@ type FacetRow = (Option<String>, Option<f64>, Option<String>, String);
 
 pub(crate) async fn facets(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     id: &str,
@@ -1180,13 +2046,28 @@ pub(crate) async fn facets(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn facets_with_origin(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     id: &str,
     values: Option<&Value>,
     tool: &str,
     origin: Option<Value>,
+) -> Result<()> {
+    facets_with_basis(db, tx, acts, actor, id, values, tool, origin, &mut None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn facets_with_basis(
+    db: &Db,
+    tx: &mut SqliteConnection,
+    acts: &mut ActAllocation,
+    actor: &str,
+    id: &str,
+    values: Option<&Value>,
+    tool: &str,
+    origin: Option<Value>,
+    basis: &mut Option<Value>,
 ) -> Result<()> {
     let Some(values) = values.filter(|v| !v.is_null()) else {
         return Ok(());
@@ -1271,7 +2152,7 @@ pub(super) async fn facets_with_origin(
         )
         .bind(id)
         .bind(key)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some((current_value, num, vocab, as_of)) = current {
             let current_time = chrono::DateTime::parse_from_rfc3339(&as_of)
@@ -1290,6 +2171,9 @@ pub(super) async fn facets_with_origin(
             continue;
         }
         let mut payload = serde_json::to_value(observation)?;
+        if let Some(basis) = basis.take() {
+            payload["basis"] = basis;
+        }
         if let Some(origin) = &origin {
             payload["origin"] = origin.clone();
         }
@@ -1300,7 +2184,7 @@ pub(super) async fn facets_with_origin(
 
 async fn new_links(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     id: &str,
@@ -1346,7 +2230,7 @@ async fn new_links(
 #[allow(clippy::too_many_arguments)]
 async fn directed_link(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     source: &str,
@@ -1386,7 +2270,7 @@ async fn directed_link(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn change_link(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     source: &str,
@@ -1404,7 +2288,7 @@ pub(super) async fn change_link(
     {
         // Updating the existing bearer's note does not change its identity.
         let same_bearer: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_generic_links WHERE source_id=? AND target_id=? AND relationship='part_of' AND active=1)")
-            .bind(source).bind(target).fetch_one(&mut **tx).await?;
+            .bind(source).bind(target).fetch_one(&mut *tx).await?;
         if remove || !same_bearer {
             return Err(invalid("manage_links: Document kind:attachment requires exactly one outgoing part_of link to its bearer; use attach_text to create a new attachment"));
         }
@@ -1466,7 +2350,7 @@ pub(super) async fn change_link(
 
 async fn mutate_link(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
@@ -1706,16 +2590,19 @@ pub(crate) fn render_links(value: &Value) -> String {
     }
 }
 
-async fn attach_text(
+pub(super) async fn attach_text(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
 ) -> Result<Value> {
+    let mint = mint_evidence(actor, args, "attachment_id")?;
     allowed(
         args,
         &[
+            "attachment_id",
+            "id_nonce",
             "record_id",
             "text",
             "filename",
@@ -1726,6 +2613,9 @@ async fn attach_text(
             "idempotency_key",
         ],
     )?;
+    if mint.is_some() {
+        refuse_minted_occupancy(tx, text(args, "attachment_id")?).await?;
+    }
     let bearer = text(args, "record_id")?;
     kernel::kernel_require(tx, actor, bearer, Capability::Edit).await?;
     let parent = view(tx, actor, bearer).await?;
@@ -1768,6 +2658,8 @@ async fn attach_text(
         bearer,
         kernel::FieldInput::Raw(&raw),
         &home,
+        optional_text(args, "attachment_id")?,
+        mint,
     )
     .await?;
     facets(db, tx, acts, actor, &id, args.get("facets"), "attach_text").await?;
@@ -1792,3 +2684,13 @@ async fn attach_text(
         .await?;
     Ok(json!({"attachment_id":id,"record_id":bearer,"name":name,"blob":meta,"act":acts.get()}))
 }
+
+#[cfg(test)]
+pub(crate) async fn with_minted_ids_for_settlement_test<F: std::future::Future>(
+    work: F,
+) -> F::Output {
+    MINTED_IDS_TEST.scope(true, work).await
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe", feature = "mcp-executor-prototype"))]
+mod original_settlement_writer_tests;

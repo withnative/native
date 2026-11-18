@@ -12,6 +12,79 @@ struct World {
 
 #[cfg(feature = "v2-kernel-probe")]
 #[tokio::test]
+async fn kernel_v2_scoped_currency_message_and_derived_sources_keep_audience_gate() {
+    let w = world().await;
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    for (index, person) in ["person:viewer", "person:outsider"].iter().enumerate() {
+        let mut args = send_args(&w, &format!("currency-message-{index}"));
+        args["origin"] = json!({"type":"direct","participant_ids":["person:admin",person]});
+        args["addressed_to"] = json!([person]);
+        let message = call(&w, "acct:admin", "manage_messages", args)
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let comment = call(&w,"acct:admin","create_record",json!({"type":"Annotation","kind":"comment","body":"Currency bearer","links":[{"target_id":message,"relationship":"part_of"}],"reason":"Currency audience parity"})).await.unwrap()["id"].as_str().unwrap().to_owned();
+        // Imported generic links exercise the existing currency representation
+        // without relaxing sealed Message mutation rules or adding a new kind
+        // of imported-link dependency to the reader.
+        for (kind, source) in [("message", message), ("comment", comment)] {
+            kernel::generic_links::import_generic_link_as(
+                &w.db,
+                &host,
+                &kernel::GenericLink {
+                    link_id: format!("currency-{kind}-{index}"),
+                    source_id: source,
+                    target_id: w.origin.clone(),
+                    relationship: "supersedes".into(),
+                    note: None,
+                    created_at: "2026-11-09T00:00:00Z".into(),
+                    actor: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let args = json!({"sql":"SELECT id,home_id,successor_count,is_current FROM records WHERE id=?1","parameters":[{"type":"text","value":w.origin}]});
+    for replay in [false, true] {
+        if replay {
+            kernel::replay_all_projections(&w.db).await.unwrap();
+        }
+        for (credential, expected) in [("acct:admin", 4), ("acct:viewer", 2), ("acct:outsider", 2)]
+        {
+            let (narrow, stats) =
+                super::sql::measured(call(&w, credential, "query_sql", args.clone())).await;
+            let full = super::sql::with_full_record_scope_staging(call(
+                &w,
+                credential,
+                "query_sql",
+                args.clone(),
+            ))
+            .await
+            .unwrap();
+            let narrow = narrow.unwrap();
+            assert_eq!(
+                narrow["rows"], full["rows"],
+                "{credential}, replay={replay}; {stats:?}"
+            );
+            assert_eq!(
+                narrow["rows"][0]["successor_count"], expected,
+                "{credential}, replay={replay}"
+            );
+            assert_eq!(stats.staged_currency_records, expected, "{stats:?}");
+        }
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
 async fn workbench_direct_bindings_are_verified_visible_and_read_only() {
     let w = world().await;
     let read = |id: &str| {
@@ -525,6 +598,7 @@ async fn whats_changed_fallback_refreshes_cross_actor_messages_without_private_s
     .await
     .unwrap();
     assert!(inbox.to_string().contains(id));
+    assert_eq!(inbox["capabilities"]["saved_session_sharing"], false);
     let mut next = poll;
     let mut sequences = BTreeSet::new();
     loop {
@@ -2018,9 +2092,7 @@ async fn sealed_audience_blocks_every_record_read_path_including_admin_and_deriv
 }
 
 #[cfg(feature = "v2-kernel-probe")]
-#[tokio::test]
-async fn frozen_v1_rules_reconcile_live_action_and_decision_evidence() {
-    let w = world().await;
+async fn import_work_completion_rules(w: &World) {
     let package = crate::v2_standard::v1_compat::package();
     let def = &package.definitions[0];
     let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
@@ -2070,6 +2142,13 @@ async fn frozen_v1_rules_reconcile_live_action_and_decision_evidence() {
     )
     .await
     .unwrap();
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn frozen_v1_rules_reconcile_live_action_and_decision_evidence() {
+    let w = world().await;
+    import_work_completion_rules(&w).await;
     for expectation in ["action", "decision"] {
         let mut request = send_args(&w, expectation);
         request["expectation"] = json!(expectation);
@@ -2149,6 +2228,171 @@ async fn frozen_v1_rules_reconcile_live_action_and_decision_evidence() {
     let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
     kernel::replay_all_projections(&w.db).await.unwrap();
     assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+}
+
+/// Ordinary MCP credentials can record completed work without claiming either
+/// a human interaction or a server-verified agent identity (record 8af970b).
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn direct_action_completion_uses_recipient_work_without_awareness_attestation() {
+    let w = world().await;
+    import_work_completion_rules(&w).await;
+    let origin = json!({"type":"direct","participant_ids":["person:admin","person:viewer","person:outsider"]});
+    let mut request = send_args(&w, "delegated-action-request");
+    request["origin"] = origin.clone();
+    request["addressed_to"] = json!(["person:viewer", "person:outsider"]);
+    request["expectation"] = json!("action");
+    let sent = call(&w, "acct:admin", "manage_messages", request)
+        .await
+        .unwrap();
+    let id = sent["id"].as_str().unwrap();
+    let state = |who: &'static str| {
+        call(
+            &w,
+            who,
+            "manage_messages",
+            json!({"action":"list_message_state","message_ids":[id]}),
+        )
+    };
+    let needs_me = |who: &'static str| {
+        call(
+            &w,
+            who,
+            "manage_messages",
+            json!({"action":"list_inbox","view":"needs_me"}),
+        )
+    };
+    let before = state("acct:viewer").await.unwrap();
+    assert_eq!(
+        before["messages"][0]["message_expectation_state"]["state"],
+        "open"
+    );
+    assert_eq!(
+        needs_me("acct:viewer").await.unwrap()["items"][0]["message_id"],
+        id
+    );
+
+    // These are real authority boundaries, not alternative completion paths.
+    for (args, refusal) in [
+        (
+            json!({"action":"set_routing","message_id":id,"obligation_state":"satisfied","executor_route":"closed","expected_version":0,"idempotency_key":"unattested-route","reason":"Person reported completion"}),
+            "routing requires attested principal choice",
+        ),
+        (
+            json!({"action":"set_agent_disposition","message_id":id,"state":"resolved","expected_version":0,"evidence":[],"idempotency_key":"unattested-agent","reason":"Person reported completion"}),
+            "agent disposition requires server-verified executor",
+        ),
+        (
+            json!({"action":"mutate_human_awareness","message_ids":[id],"stage":"acknowledged","expected_versions":{id:0},"idempotency_key":"unattested-awareness","reason":"Person reported completion"}),
+            "human awareness requires a server-verified interaction",
+        ),
+    ] {
+        let error = call(&w, "acct:viewer", "manage_messages", args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(refusal), "{error}");
+        assert!(error.contains("recipient-authored WorkItem"), "{error}");
+        assert!(error.contains("messaging guide"), "{error}");
+    }
+    assert_eq!(before, state("acct:viewer").await.unwrap());
+
+    // A reply that says "done" does not, by itself, complete action work.
+    call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({
+            "action":"send","body":"The recipient says this is done.","origin":origin,
+            "addressed_to":["person:admin"],"expectation":"none",
+            "links":[{"target_id":id,"relationship":"reply_to"}],
+            "idempotency_key":"delegated-action-reply","reason":"Record the recipient's report"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state("acct:viewer").await.unwrap()["messages"][0]["message_expectation_state"]["state"],
+        "open"
+    );
+
+    for private in [false, true] {
+        let mut work = json!({
+            "type":"WorkItem","kind":"task","name":"Requested action completed",
+            "body":"The recipient confirmed completion; this records their report.",
+            "lifecycle":"done","links":[{"target_id":id,"relationship":"derived_from"}],
+            "reason":"Record the recipient's confirmed completion"
+        });
+        if private {
+            work["access_policy"] = json!("account_only");
+        }
+        let evidence = call(&w, "acct:viewer", "create_record", work)
+            .await
+            .unwrap();
+        let evidence_id = evidence["id"].as_str().unwrap();
+        for replay in [false, true] {
+            if replay {
+                kernel::replay_all_projections(&w.db).await.unwrap();
+            }
+            // Public evidence still needs the recipient's authorship; private
+            // evidence must stay unreadable to the other addressed participant.
+            assert_eq!(
+                kernel::read_record_as(&w.db, &w.outsider, evidence_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                private
+            );
+            let completed = state("acct:viewer").await.unwrap();
+            assert_eq!(
+                completed["messages"][0]["message_expectation_state"]["state"],
+                "satisfied"
+            );
+            assert_eq!(
+                completed["messages"][0]["message_expectation_state"]["evidence"],
+                json!({"kind":"completed_work_item","record_id":evidence_id})
+            );
+            assert_eq!(
+                completed["messages"][0]["human"],
+                before["messages"][0]["human"]
+            );
+            assert_eq!(
+                completed["messages"][0]["attention"],
+                before["messages"][0]["attention"]
+            );
+            assert!(needs_me("acct:viewer").await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                state("acct:outsider").await.unwrap()["messages"][0]["message_expectation_state"]
+                    ["state"],
+                "open"
+            );
+            assert_eq!(
+                needs_me("acct:outsider").await.unwrap()["items"][0]["message_id"],
+                id
+            );
+        }
+        // The person can correct their report; satisfaction follows the live work.
+        call(
+            &w,
+            "acct:viewer",
+            "update_record",
+            json!({"id":evidence_id,"lifecycle":"open","reason":"Correct the reported completion"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state("acct:viewer").await.unwrap()["messages"][0]["message_expectation_state"]
+                ["state"],
+            "open"
+        );
+        assert_eq!(
+            needs_me("acct:viewer").await.unwrap()["items"][0]["message_id"],
+            id
+        );
+    }
 }
 
 #[cfg(feature = "v2-kernel-probe")]
@@ -2281,6 +2525,29 @@ async fn collection_policy_and_all_direct_participants_govern_visibility() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn record_reads_render_message_speaker() {
+    let w = world().await;
+    let persona = call(&w, "acct:admin", "manage_participants", json!({"action":"register_persona","name":"Render persona","reason":"Read proof","idempotency_key":"render-persona"})).await.unwrap();
+    let mut args = send_args(&w, "render-speaker");
+    args["speaker"] = json!({"persona_id":persona["persona_id"]});
+    let sent = call(&w, "acct:admin", "manage_messages", args)
+        .await
+        .unwrap();
+    let record = call(&w, "acct:admin", "get_record", json!({"ids":[sent["id"]]}))
+        .await
+        .unwrap();
+    let rendered = call(&w, "acct:admin", "render_record", json!({"id":sent["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(rendered["speaker"], record["records"][0]["speaker"]);
+    assert!(rendered["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("\nSpeaker: Render persona (client_asserted)\n"));
 }
 
 #[cfg(feature = "v2-kernel-probe")]
@@ -3456,32 +3723,950 @@ async fn bounded_message_get_and_discovery_match_full_staging_and_old_filter() {
     w.db.close().await;
 }
 
-/// Message edit and delete are v1-only for now: v2 refuses them by name and
-/// writes nothing, rather than failing as an unknown action or half-applying.
+/// Message edit is v1-only for now: v2 refuses it by name and writes
+/// nothing, rather than failing as an unknown action or half-applying.
+/// Delete is implemented below (`kernel_v2_message_delete_*`).
 #[cfg(feature = "v2-kernel-probe")]
 #[tokio::test]
-async fn message_edit_and_delete_are_unsupported_on_v2_and_write_nothing() {
+async fn message_edit_is_unsupported_on_v2_and_writes_nothing() {
     let w = world().await;
     let sent = call(
         &w,
         "acct:admin",
         "manage_messages",
-        send_args(&w, "edit-delete-send"),
+        send_args(&w, "edit-send"),
     )
     .await
     .unwrap();
     let id = sent["id"].as_str().unwrap();
+    let state = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        json!({"action":"list_message_state","message_ids":[id]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state["capabilities"],
+        json!({"edit":false,"delete":true,"reactions":true,"saved_session_sharing":false})
+    );
     let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
-    for args in [
+    let error = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
         json!({"action":"edit","message_id":id,"body":"changed","idempotency_key":"e","reason":"fixture"}),
-        json!({"action":"delete","message_id":id,"idempotency_key":"d","reason":"fixture"}),
-    ] {
-        let error = call(&w, "acct:admin", "manage_messages", args)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("unsupported"), "{error}");
-    }
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("unsupported"), "{error}");
     assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+}
+
+fn delete_args(id: &str, key: &str, reason: &str) -> Value {
+    json!({"action":"delete","message_id":id,"idempotency_key":key,"reason":reason})
+}
+
+/// Send one channel Message in the world origin from `who` to one person.
+async fn send_from(w: &World, who: &str, key: &str, addressed: &str) -> String {
+    let mut args = send_args(w, key);
+    args["addressed_to"] = json!([addressed]);
+    call(w, who, "manage_messages", args).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn context_ids(w: &World, who: &str) -> Vec<String> {
+    let context = call(
+        w,
+        who,
+        "manage_messages",
+        json!({"action":"list_context","origin":{"type":"collection","collection_id":w.origin},"limit":200}),
+    )
+    .await
+    .unwrap();
+    context["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+async fn deletion_event_count(w: &World, id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='kernel.record_deleted.v1'",
+    )
+    .bind(id)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap()
+}
+
+/// v1 parity (messaging_delete_tests.rs): the author's delete tombstones
+/// the Message, hides it from every reader, withdraws its notification
+/// candidates and keeps the stored state for history/replay.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_author_tombstones_hides_and_withdraws() {
+    let w = world().await;
+    let id = send_from(&w, "acct:admin", "del-author-send", "person:viewer").await;
+    assert!(context_ids(&w, "acct:viewer").await.contains(&id));
+    let inbox = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"list_inbox","view":"browse"}),
+    )
+    .await
+    .unwrap();
+    assert!(inbox.to_string().contains(&id), "{inbox}");
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    assert!(
+        kernel::notifications::count_on(&mut conn, &w.viewer, &id)
+            .await
+            .unwrap()
+            > 0
+    );
+    drop(conn);
+
+    // Give the Message a reply, a reaction and two classifications, so the
+    // replay check below covers a deleted parent with live dependents.
+    // v2 has no deleted-parent stub: the parent drops out of every list
+    // and the reply stays.
+    let mut reply_args = send_args(&w, "del-author-reply");
+    reply_args["addressed_to"] = json!(["person:admin"]);
+    reply_args["links"] = json!([{"target_id":id,"relationship":"reply_to"}]);
+    let reply = call(&w, "acct:viewer", "manage_messages", reply_args)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"add_reaction","message_id":id,"emoji":"👍","idempotency_key":"del-author-react","reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let mut conversations = Vec::new();
+    for name in ["del thread a", "del thread b"] {
+        let conversation = call(
+            &w,
+            "acct:admin",
+            "create_record",
+            json!({"type":"Conversation","kind":"thread","name":name,"reason":"fixture"}),
+        )
+        .await
+        .unwrap();
+        conversations.push(conversation["id"].as_str().unwrap().to_owned());
+    }
+    for (message, conversation) in [
+        (&id, &conversations[0]),
+        (&reply, &conversations[0]),
+        (&id, &conversations[1]),
+    ] {
+        call(
+            &w,
+            "acct:admin",
+            "manage_messages",
+            json!({"action":"classify","message_id":message,"conversation_id":conversation}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let receipt = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&id, "del-author", "Taking it back."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["status"], "deleted");
+    assert_eq!(receipt["message_id"], id.as_str());
+    assert!(receipt["deleted_at"].is_string(), "{receipt}");
+    assert_eq!(deletion_event_count(&w, &id).await, 1);
+    let tombstone_at: Option<String> =
+        sqlx::query_scalar("SELECT deleted_at FROM kernel_import_tombstones WHERE record_id=?")
+            .bind(&id)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(tombstone_at.as_deref(), receipt["deleted_at"].as_str());
+
+    for who in ["acct:admin", "acct:viewer"] {
+        assert!(!context_ids(&w, who).await.contains(&id), "{who}");
+        let error = call(
+            &w,
+            who,
+            "manage_messages",
+            json!({"action":"list_message_state","message_ids":[id]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing or hidden"), "{error}");
+    }
+    // The reply survives in the channel, and each Conversation drops only
+    // the deleted parent.
+    assert!(context_ids(&w, "acct:viewer").await.contains(&reply));
+    for (conversation, keeps_reply) in [(&conversations[0], true), (&conversations[1], false)] {
+        let listed = call(
+            &w,
+            "acct:viewer",
+            "manage_messages",
+            json!({"action":"list_conversation","conversation_id":conversation}),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<String> = listed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!ids.contains(&id), "{listed}");
+        assert_eq!(ids.contains(&reply), keeps_reply, "{listed}");
+    }
+    let inbox = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"list_inbox","view":"browse"}),
+    )
+    .await
+    .unwrap();
+    assert!(!inbox.to_string().contains(&id), "{inbox}");
+
+    // Notification candidates are withdrawn, not left effective.
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    assert_eq!(
+        kernel::notifications::count_on(&mut conn, &w.viewer, &id)
+            .await
+            .unwrap(),
+        0
+    );
+    drop(conn);
+    let status: String = sqlx::query_scalar(
+        "SELECT json_extract(state,'$.status') FROM kernel_message_candidates WHERE message_id=? LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "withdrawn");
+
+    // A reaction on the deleted Message is refused as missing.
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"add_reaction","message_id":id,"emoji":"👍","idempotency_key":"del-react","reason":"fixture"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("missing or hidden"), "{error}");
+
+    // The Message state is not erased, and projections replay identically.
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kernel_messages WHERE message_id=?")
+        .bind(&id)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+    let after = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(after, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    w.db.close().await;
+}
+
+/// The viewer authors in the origin channel; admin holds Manage there
+/// (Manage on the root home the collection and its Messages live in), so
+/// admin may moderate. The deletion is attributed to the moderator with
+/// the reason kept, and a keyed retry replays without a second event.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_channel_manager_moderates_and_retry_replays() {
+    let w = world().await;
+    let id = send_from(&w, "acct:viewer", "del-mgr-send", "person:admin").await;
+    let receipt = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&id, "del-mgr", "Moderation: spam."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["status"], "deleted");
+    assert_eq!(receipt["message_id"], id.as_str());
+    let (actor, payload): (Option<String>, String) = sqlx::query_as(
+        "SELECT actor,payload FROM content_events WHERE record_id=? AND type='kernel.record_deleted.v1'",
+    )
+    .bind(&id)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(actor.as_deref(), Some(w.admin.as_str()));
+    assert!(payload.contains("Moderation: spam."), "{payload}");
+    assert!(!context_ids(&w, "acct:viewer").await.contains(&id));
+
+    let replay = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&id, "del-mgr", "Moderation: spam."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["status"], receipt["status"]);
+    assert_eq!(replay["message_id"], receipt["message_id"]);
+    assert_eq!(replay["deleted_at"], receipt["deleted_at"]);
+    assert_eq!(deletion_event_count(&w, &id).await, 1);
+    w.db.close().await;
+}
+
+/// Edit on the channel (viewer) and View only (outsider) are not Manage:
+/// neither may delete admin's Message. A persona-voiced Message follows
+/// the same rule; its owner is its sender and may delete it.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_edit_and_view_members_are_refused() {
+    let w = world().await;
+    let id = send_from(&w, "acct:admin", "del-members-send", "person:viewer").await;
+    for (who, key) in [
+        ("acct:viewer", "del-viewer"),
+        ("acct:outsider", "del-outsider"),
+    ] {
+        let error = call(
+            &w,
+            who,
+            "manage_messages",
+            delete_args(&id, key, "Not mine to remove."),
+        )
+        .await
+        .unwrap_err();
+        // No-event first: these callers are refused before anything is
+        // written. In this fixture the executor gate and kernel admission
+        // agree (neither holds Manage anywhere relevant); the moved-channel
+        // test below isolates the channel check on its own.
+        assert_eq!(deletion_event_count(&w, &id).await, 0, "{who}");
+        assert!(
+            error
+                .to_string()
+                .contains("only the author or someone who manages this channel can delete"),
+            "{who}: {error}"
+        );
+    }
+    assert_eq!(deletion_event_count(&w, &id).await, 0);
+    assert!(context_ids(&w, "acct:viewer").await.contains(&id));
+
+    let persona = call(
+        &w,
+        "acct:admin",
+        "manage_participants",
+        json!({"action":"register_persona","name":"Chief","reason":"fixture","idempotency_key":"del-persona"}),
+    )
+    .await
+    .unwrap();
+    let mut spoken = send_args(&w, "del-persona-send");
+    spoken["speaker"] = json!({"persona_id":persona["persona_id"]});
+    let spoken = call(&w, "acct:admin", "manage_messages", spoken)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&spoken, "del-persona-viewer", "Not mine to remove."),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &spoken).await, 0);
+    assert!(error.to_string().contains("only the author"), "{error}");
+    assert!(error.to_string().contains("sent as a persona"), "{error}");
+    call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&spoken, "del-persona-owner", "Taking it back."),
+    )
+    .await
+    .unwrap();
+    w.db.close().await;
+}
+
+/// Filing a channel Message into a Conversation the filer manages (the
+/// viewer owns the Conversation they create) confers no delete authority:
+/// only the origin channel counts, never classification.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_classified_conversation_manager_gets_no_delete() {
+    let w = world().await;
+    let id = send_from(&w, "acct:admin", "del-filed-send", "person:viewer").await;
+    let conversation = call(
+        &w,
+        "acct:viewer",
+        "create_record",
+        json!({"type":"Conversation","kind":"thread","name":"viewer's filing thread","reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+    call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"classify","message_id":id,"conversation_id":conversation_id}),
+    )
+    .await
+    .unwrap();
+    let listed = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"list_conversation","conversation_id":conversation_id}),
+    )
+    .await
+    .unwrap();
+    assert!(listed.to_string().contains(&id), "{listed}");
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&id, "del-filed", "Filed it, so mine."),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &id).await, 0);
+    assert!(
+        error
+            .to_string()
+            .contains("only the author or someone who manages this channel can delete"),
+        "{error}"
+    );
+    assert!(context_ids(&w, "acct:viewer").await.contains(&id));
+    w.db.close().await;
+}
+
+/// A Collection owner holds Manage on the channel through the owner floor
+/// alone, with only Edit on the Message itself. Like v1, that channel
+/// Manage is enough to moderate: kernel admission for a Message tombstone
+/// accepts Manage on the Message's origin Collection as an alternative to
+/// Manage on the Message. The tombstone is attributed to the creator with
+/// the reason kept, exactly one event is written, and projections replay
+/// identically. Generic `delete_record` does not gain the channel route:
+/// it stays Manage-on-the-record for every type, Messages included, so
+/// the creator is still refused there and moderation goes through
+/// `manage_messages.delete` only. The same channel route covers an
+/// author who manages the channel without Manage on their own Message,
+/// and never a channel manager who cannot see the Message — the gate
+/// and kernel admission both refuse that case.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_collection_owner_without_message_manage_moderates() {
+    let w = world().await;
+    // The viewer creates (and so owns) the channel; admin posts there.
+    let channel = call(
+        &w,
+        "acct:viewer",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"viewer's channel","reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let channel_id = channel["id"].as_str().unwrap().to_owned();
+    let mut send = send_args(&w, "del-owner-send");
+    send["origin"] = json!({"type":"collection","collection_id":channel_id});
+    let id = call(&w, "acct:admin", "manage_messages", send)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Pin the premise and the generic-delete choice together: the creator
+    // has no Manage on the Message, so generic delete_record refuses and
+    // writes nothing, even though moderated delete below succeeds.
+    let error = call(
+        &w,
+        "acct:viewer",
+        "delete_record",
+        json!({"id":id,"reason":"Generic delete has no channel route"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &id).await, 0);
+    assert!(error.to_string().contains("missing or hidden"), "{error}");
+    let receipt = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&id, "del-owner", "My channel, my call."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["status"], "deleted");
+    assert_eq!(receipt["message_id"], id.as_str());
+    assert_eq!(deletion_event_count(&w, &id).await, 1);
+    let (actor, payload): (Option<String>, String) = sqlx::query_as(
+        "SELECT actor,payload FROM content_events WHERE record_id=? AND type='kernel.record_deleted.v1'",
+    )
+    .bind(&id)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(actor.as_deref(), Some(w.viewer.as_str()));
+    assert!(payload.contains("My channel, my call."), "{payload}");
+    // The Message is gone from the channel for moderator and author alike.
+    for who in ["acct:viewer", "acct:admin"] {
+        let context = call(
+            &w,
+            who,
+            "manage_messages",
+            json!({"action":"list_context","origin":{"type":"collection","collection_id":channel_id},"limit":200}),
+        )
+        .await
+        .unwrap();
+        assert!(!context.to_string().contains(&id), "{who}: {context}");
+    }
+    // The creator-moderator tombstone replays identically: projection
+    // replay does not re-evaluate today's channel authority.
+    let after = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(after, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+
+    // The channel arm also covers the author, as on v1: an author who
+    // lacks Manage on their own Message but manages its channel may
+    // delete it. Native sends cannot produce that state (the author is
+    // the record owner, and the owner floor grants Manage), so simulate
+    // an imported Message whose record owner is not its author by
+    // moving ownership to the outsider. The Message and its channel
+    // live in a home where admin holds only Edit, so after the move
+    // admin has Edit — not Manage — on the Message, while still owning
+    // (and so managing) the channel Collection. No replay comparison
+    // follows: replay would restore the created owner this simulates
+    // away.
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "manage"), (&w.admin, "edit")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let own_channel = call(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"author's own channel","home_id":home,"reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let own_channel_id = own_channel["id"].as_str().unwrap().to_owned();
+    let mut own_send = send_args(&w, "del-owner-author-send");
+    own_send["origin"] = json!({"type":"collection","collection_id":own_channel_id});
+    let own = call(&w, "acct:admin", "manage_messages", own_send)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sqlx::query("UPDATE kernel_records SET owner_id=? WHERE id=?")
+        .bind(&w.outsider)
+        .bind(&own)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    // Pin the premise: with no Manage on the Message, generic
+    // delete_record refuses the author and writes nothing.
+    let error = call(
+        &w,
+        "acct:admin",
+        "delete_record",
+        json!({"id":own,"reason":"Generic delete has no channel route"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &own).await, 0);
+    assert!(error.to_string().contains("missing or hidden"), "{error}");
+    let receipt = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&own, "del-owner-author", "My post, my channel."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["status"], "deleted");
+    assert_eq!(receipt["message_id"], own.as_str());
+    assert_eq!(deletion_event_count(&w, &own).await, 1);
+    let actor: Option<String> = sqlx::query_scalar(
+        "SELECT actor FROM content_events WHERE record_id=? AND type='kernel.record_deleted.v1'",
+    )
+    .bind(&own)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(actor.as_deref(), Some(w.admin.as_str()));
+
+    // Defence in depth: channel Manage without View on the Message is
+    // not enough, at the gate or in kernel admission itself. The
+    // viewer owns this channel, but the Message has been rehomed into
+    // a home only admin can see.
+    let hidden_channel = call(
+        &w,
+        "acct:viewer",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"unseen channel posts","reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let hidden_channel_id = hidden_channel["id"].as_str().unwrap().to_owned();
+    let mut hidden_send = send_args(&w, "del-owner-hidden-send");
+    hidden_send["origin"] = json!({"type":"collection","collection_id":hidden_channel_id});
+    let hidden = call(&w, "acct:admin", "manage_messages", hidden_send)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let private_home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.admin, "manage")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, &hidden, &private_home)
+        .await
+        .unwrap();
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&hidden, "del-owner-hidden", "My channel, sight unseen."),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &hidden).await, 0);
+    assert!(error.to_string().contains("missing or hidden"), "{error}");
+    // Bypassing the executor gate does not help: appends run kernel
+    // admission, which requires View on the Message for the channel
+    // route. Nothing is committed either way.
+    let head: i64 =
+        sqlx::query_scalar("SELECT MAX(seq) FROM main.content_events WHERE record_id=?")
+            .bind(&hidden)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    let mut tx = crate::db::begin_write(w.db.write_pool()).await.unwrap();
+    let mut acts = crate::act::ActAllocation::new();
+    let error = crate::store::append_in(
+        &w.db,
+        &mut tx,
+        crate::store::AppendSpec {
+            record_id: hidden.clone(),
+            event_type: kernel::deletion::EVENT.into(),
+            payload: serde_json::to_value(kernel::deletion::Deleted {
+                reason: "Direct tombstone bypass".into(),
+                previous_seq: head,
+            })
+            .unwrap(),
+            actor: Some(w.viewer.clone()),
+        },
+        &mut acts,
+    )
+    .await
+    .unwrap_err();
+    drop(tx);
+    assert_eq!(deletion_event_count(&w, &hidden).await, 0);
+    assert!(error.to_string().contains("missing or hidden"), "{error}");
+    w.db.close().await;
+}
+
+/// The moderator's Manage comes from a policy grant on the channel's own
+/// home, not from the root: the viewer holds only Edit on the root home
+/// but Manage in this home, where the Collection and admin's Message
+/// live, and may delete admin's Message there.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_moderator_manages_through_the_channel_home_grant() {
+    let w = world().await;
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "manage"), (&w.admin, "edit")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let channel = call(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"granted channel","home_id":home,"reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let channel_id = channel["id"].as_str().unwrap().to_owned();
+    let mut send = send_args(&w, "del-grant-send");
+    send["origin"] = json!({"type":"collection","collection_id":channel_id});
+    let id = call(&w, "acct:admin", "manage_messages", send)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let receipt = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&id, "del-grant", "Moderation: off-topic."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["status"], "deleted");
+    assert_eq!(receipt["message_id"], id.as_str());
+    assert_eq!(deletion_event_count(&w, &id).await, 1);
+    let (actor, payload): (Option<String>, String) = sqlx::query_as(
+        "SELECT actor,payload FROM content_events WHERE record_id=? AND type='kernel.record_deleted.v1'",
+    )
+    .bind(&id)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(actor.as_deref(), Some(w.viewer.as_str()));
+    assert!(payload.contains("Moderation: off-topic."), "{payload}");
+    w.db.close().await;
+}
+
+/// The one case only the channel check can refuse: the viewer keeps
+/// Manage on the Message (through the home it was sent in) but the
+/// channel Collection has since moved to the root, where the viewer
+/// holds only Edit. Kernel admission would admit this delete, so the
+/// refusal proves the executor's Manage-on-origin-channel check on its
+/// own. This matches v1: someone who no longer manages a channel loses
+/// moderation over its older Messages.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_moved_channel_leaves_only_the_channel_check_to_refuse() {
+    let w = world().await;
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "manage"), (&w.admin, "manage")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let channel = call(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"movable channel","home_id":home,"reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let channel_id = channel["id"].as_str().unwrap().to_owned();
+    let mut send = send_args(&w, "del-moved-send");
+    send["origin"] = json!({"type":"collection","collection_id":channel_id});
+    let id = call(&w, "acct:admin", "manage_messages", send)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    kernel::rehome_record_as(&w.db, &w.admin, &channel_id, KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&id, "del-moved", "I managed this channel once."),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &id).await, 0);
+    assert!(
+        error
+            .to_string()
+            .contains("only the author or someone who manages this channel can delete a Message"),
+        "{error}"
+    );
+    let context = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"list_context","origin":{"type":"collection","collection_id":channel_id},"limit":200}),
+    )
+    .await
+    .unwrap();
+    assert!(context.to_string().contains(&id), "{context}");
+    // Pin that admission was not the refusal: the viewer really does hold
+    // Manage on the Message itself, proven by the generic record delete
+    // succeeding where the moderated delete was refused.
+    call(
+        &w,
+        "acct:viewer",
+        "delete_record",
+        json!({"id":id,"reason":"Prove Message Manage"}),
+    )
+    .await
+    .unwrap();
+    w.db.close().await;
+}
+
+/// A direct Message has no channel, so delete stays author-only and the
+/// refusal does not mention one; the author's delete then works.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_direct_message_is_author_only() {
+    let w = world().await;
+    let mut dm = send_args(&w, "del-dm-send");
+    dm["origin"] = json!({"type":"direct","participant_ids":["person:admin","person:viewer"]});
+    let id = call(&w, "acct:admin", "manage_messages", dm).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&id, "del-dm-viewer", "Not mine to remove."),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deletion_event_count(&w, &id).await, 0);
+    let refusal = error.to_string();
+    assert!(
+        refusal.contains("only the author can delete a Message"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("channel"), "{refusal}");
+
+    call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&id, "del-dm-author", "Taking it back."),
+    )
+    .await
+    .unwrap();
+    let context = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        json!({"action":"list_context","origin":{"type":"direct","participant_ids":["person:admin","person:viewer"]},"limit":200}),
+    )
+    .await
+    .unwrap();
+    assert!(!context.to_string().contains(&id), "{context}");
+    w.db.close().await;
+}
+
+/// Keyed replay (in the channel-manager test) aside: a fresh key on an
+/// already-deleted Message is named as such to its author and reads as
+/// missing to anyone else; a key cannot be reused for a different
+/// Message; a caller who cannot see the Message gets the same refusal
+/// as for a missing id; blank reason and key are refused.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_message_delete_second_delete_and_non_viewer_refusals() {
+    let w = world().await;
+    let id = send_from(&w, "acct:admin", "del-again-send", "person:viewer").await;
+    let other = send_from(&w, "acct:admin", "del-again-other", "person:viewer").await;
+    call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&id, "del-again", "Taking it back."),
+    )
+    .await
+    .unwrap();
+    let error = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&id, "del-again-fresh", "Taking it back."),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("already deleted"), "{error}");
+    let error = call(
+        &w,
+        "acct:viewer",
+        "manage_messages",
+        delete_args(&id, "del-again-viewer", "Not mine to remove."),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("missing or hidden"), "{error}");
+    assert_eq!(deletion_event_count(&w, &id).await, 1);
+
+    let error = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&other, "del-again", "Taking it back."),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("idempotency_key"), "{error}");
+    assert!(context_ids(&w, "acct:viewer").await.contains(&other));
+
+    // The outsider cannot see a direct Message between admin and viewer:
+    // its delete refusal is indistinguishable from a missing id's.
+    let mut dm = send_args(&w, "del-hidden-send");
+    dm["origin"] = json!({"type":"direct","participant_ids":["person:admin","person:viewer"]});
+    let dm = call(&w, "acct:admin", "manage_messages", dm).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hidden = call(
+        &w,
+        "acct:outsider",
+        "manage_messages",
+        delete_args(&dm, "del-hidden", "Not mine to remove."),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    let missing = call(
+        &w,
+        "acct:outsider",
+        "manage_messages",
+        delete_args("missing-message", "del-missing", "Not mine to remove."),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(deletion_event_count(&w, &dm).await, 0);
+    assert_eq!(hidden, missing);
+
+    let mut blank = delete_args(&other, "del-blank-reason", "Taking it back.");
+    blank["reason"] = json!("  ");
+    assert!(call(&w, "acct:admin", "manage_messages", blank)
+        .await
+        .is_err());
+    assert!(call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        delete_args(&other, "  ", "Taking it back.")
+    )
+    .await
+    .is_err());
+    assert!(context_ids(&w, "acct:viewer").await.contains(&other));
+    w.db.close().await;
 }
 
 fn arrival_args(arrival: &str, key: &str) -> Value {
@@ -4258,6 +5443,15 @@ async fn bounded_global_history_matches_reaction_headers_across_private_windows(
         call(&w, "acct:admin", "manage_messages", json!({"action":"set_preference","message_id":id,"preference":if n%2==0 {"mute"} else {"unmute"},"expected_version":n,"idempotency_key":format!("window-private-{n}"),"reason":"Private state is not public history"})).await.unwrap();
     }
     call(&w, "acct:admin", "manage_messages", json!({"action":"remove_reaction","message_id":id,"emoji":"👍","idempotency_key":"window-unreact","reason":"Public reaction removal"})).await.unwrap();
+    let scan = call(&w, "acct:admin", "scan", json!({"scope":id}))
+        .await
+        .unwrap();
+    let latest=call(&w,"acct:admin","query_sql",json!({"sql":"SELECT created_at FROM content_events WHERE record_id=?1 AND type='message.reaction.removed.v1' ORDER BY local_seq DESC LIMIT 1","parameters":[{"type":"text","value":id}]})).await.unwrap();
+    assert_eq!(scan["axes"]["authored_by"]["count"], 1);
+    assert_eq!(
+        scan["axes"]["authored_by"]["samples"][0]["authored_at"],
+        latest["rows"][0]["created_at"]
+    );
     let reads = &[
         ("content_events", "local_seq"),
         ("content_events", "record_id"),
@@ -6303,6 +7497,437 @@ async fn relevance_raw_events_require_the_annotations_own_message_bearer() {
     assert_eq!(
         before_replay,
         kernel::dump_all_kernel_tables(&w.db).await.unwrap()
+    );
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn record_reads_scan_reaction_after_import_baseline() {
+    let w = world().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    import_legacy_to_viewer(&w, &id, true).await;
+    let before = call(&w, "acct:admin", "scan", json!({"scope":id}))
+        .await
+        .unwrap();
+    assert_eq!(before["axes"]["authored_by"]["count"], 0);
+    call(&w,"acct:admin","manage_messages",json!({"action":"add_reaction","message_id":id,"emoji":"👍","idempotency_key":"scan-imported-react","reason":"Exercise reaction attribution from an imported predecessor"})).await.unwrap();
+    let after = call(&w, "acct:admin", "scan", json!({"scope":id}))
+        .await
+        .unwrap();
+    assert_eq!(after["axes"]["authored_by"]["count"], 1, "{after}");
+    assert_eq!(after["axes"]["authored_by"]["samples"][0]["id"], id);
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn record_reads_scan_actor_person_visibility_and_hidden_agent_class() {
+    let w = world().await;
+    let id = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        send_args(&w, "scan-person"),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let private = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.admin, "manage")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, "person:admin", &private)
+        .await
+        .unwrap();
+    // Root View also discloses native principals: use an explicit message
+    // home and remove that independent grant before testing the Person gate.
+    let visible = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view"), (&w.admin, "manage")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, &id, &visible)
+        .await
+        .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, &w.origin, &visible)
+        .await
+        .unwrap();
+    kernel::replace_home_policy(&w.db, &w.admin, KERNEL_ROOT_ID, &[(&w.admin, "manage")])
+        .await
+        .unwrap();
+    let scan = || call(&w, "acct:viewer", "scan", json!({"scope":id}));
+    let hidden = scan().await.unwrap();
+    assert_eq!(
+        hidden["census"]["provenance"]["buckets"],
+        json!([{"key":"unknown","count":1}])
+    );
+    kernel::rehome_record_as(&w.db, &w.admin, "person:admin", &visible)
+        .await
+        .unwrap();
+    let disclosed = scan().await.unwrap();
+    assert_eq!(
+        disclosed["census"]["provenance"]["buckets"],
+        json!([{"key":"other_account","count":1}])
+    );
+    kernel::rehome_record_as(&w.db, &w.admin, "person:admin", &private)
+        .await
+        .unwrap();
+    let agent_id = crate::store::with_event_annotations(
+        crate::store::EventAnnotations {
+            run_key: Some("undisclosed-agent-run".into()),
+            ..Default::default()
+        },
+        kernel::create_record_as(&w.db, &w.admin, &visible),
+    )
+    .await
+    .unwrap();
+    let stored_run: String = sqlx::query_scalar("SELECT e.run_key FROM kernel_records r JOIN content_events e ON e.seq=r.created_seq WHERE r.id=?")
+        .bind(&agent_id).fetch_one(w.db.write_pool()).await.unwrap();
+    assert_eq!(stored_run, "undisclosed-agent-run");
+    let agent = call(&w, "acct:viewer", "scan", json!({"scope":agent_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent["census"]["provenance"]["buckets"],
+        json!([{"key":"agent","count":1}])
+    );
+    for text in [
+        agent.to_string(),
+        crate::mcp::render::render("scan", &agent).unwrap(),
+    ] {
+        for secret in [
+            &w.admin,
+            "acct:admin",
+            "person:admin",
+            "undisclosed-agent-run",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains("other_account counts only actors"));
+    }
+    w.db.close().await;
+}
+
+/// Read-only projection benchmark: bulk-loads the same indexed record,
+/// retained-header, message-state and link shapes as the producer fixtures.
+/// Setup is excluded; the timed call includes visibility, all axes, admission,
+/// reaction derivation and sample enrichment. No scope or type filter.
+/// Run: RUST_MIN_STACK=67108864 cargo test -p native-ce --lib --features v2-kernel-probe record_reads_scan_hq_size_timing -- --ignored --nocapture
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+#[ignore = "opt-in HQ-size read deadline measurement"]
+async fn record_reads_scan_hq_size_timing() {
+    use tracing_subscriber::prelude::*;
+    // Opt in to per-statement timings when phase intervals are too coarse to
+    // assess cooperative-budget overruns. Fixture data only; default stays terse.
+    let statements = std::env::var_os("NATIVE_MEASURE_SQL_STATEMENTS").is_some();
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_filter(tracing_subscriber::filter::filter_fn(move |m| {
+                    m.target() == "native_ce::read_staging"
+                        || (statements && m.target() == "sqlx::query")
+                })),
+        )
+        .try_init();
+    let w = world().await;
+    let template = "hq-template";
+    import_legacy_to_viewer(&w, template, true).await;
+    let private = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.admin, "manage")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, "person:outsider", &private)
+        .await
+        .unwrap();
+    let baseline = call(&w, "acct:viewer", "scan", json!({})).await.unwrap()["corpus_size"]
+        .as_i64()
+        .unwrap();
+    let owner_before = call(&w, "acct:admin", "scan", json!({})).await.unwrap();
+    let owner_baseline = owner_before["corpus_size"].as_i64().unwrap();
+    let owner_authored = owner_before["axes"]["authored_by"]["count"]
+        .as_i64()
+        .unwrap();
+    let n = 16_500 - baseline;
+    let mut tx = w.db.write_pool().begin().await.unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('hq:%05d',x),r.home_id,r.owner_id,r.primary_type,r.kind,printf('hq-accession:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?2")
+        .bind(n).bind(template).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields SELECT r.id,f.name,CASE WHEN f.name='title' THEN json_quote(r.id) WHEN f.name='v1_type' AND r.id<='hq:00360' THEN '\"Collection\"' WHEN f.name='v1_kind' AND r.id<='hq:00360' THEN '\"folder\"' WHEN f.name='v1_type' AND r.id<=printf('hq:%05d',?1-2000) THEN '\"Document\"' WHEN f.name='v1_kind' AND r.id<=printf('hq:%05d',?1-2000) THEN '\"note\"' ELSE f.value_json END,f.created_seq FROM kernel_records r CROSS JOIN kernel_record_fields f WHERE r.id LIKE 'hq:%' AND f.record_id=?2")
+        .bind(n).bind(template).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'birth:'||r.id,r.id,CASE WHEN r.id>='hq:09001' AND r.id<=printf('hq:%05d',?1-2000) THEN 'kernel.record_created.v1' ELSE 'kernel.import_state.v1' END,json_object('state',json_object('message',json(m.state))),?2,'2026-11-08T00:00:00Z',1,'legacy_unknown' FROM kernel_records r CROSS JOIN kernel_messages m WHERE r.id LIKE 'hq:%' AND m.message_id=?3")
+        .bind(n).bind(&w.admin).bind(template).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE kernel_records AS r SET created_seq=(SELECT seq FROM content_events e WHERE e.id='birth:'||r.id) WHERE r.id LIKE 'hq:%'").execute(&mut *tx).await.unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<360) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'home:'||x,printf('hq-home:%03d',x),'kernel.import_home.v1',json_object('source_record_id',printf('hq:%05d',x)),?1,'2020-01-01T00:00:00Z',1,'legacy_unknown' FROM n")
+        .bind(&w.admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_roots SELECT record_id,CASE WHEN CAST(substr(id,6) AS INTEGER)%6=1 THEN ?1 ELSE printf('hq-home:%03d',CAST(substr(id,6) AS INTEGER)-1) END,?2,seq,created_at FROM content_events WHERE id LIKE 'home:%'")
+        .bind(KERNEL_ROOT_ID).bind(&w.admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_policies SELECT root_id,created_at FROM kernel_roots WHERE root_id LIKE 'hq-home:%' AND CAST(substr(root_id,9) AS INTEGER)%6=1; INSERT INTO kernel_policy_entries SELECT root_id,'account',?1,'allow','view' FROM kernel_roots WHERE root_id LIKE 'hq-home:%' AND CAST(substr(root_id,9) AS INTEGER)%6=1")
+        .bind(&w.viewer).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=CASE WHEN id<='hq:00360' THEN CASE WHEN CAST(substr(id,4) AS INTEGER)%6=1 THEN ?1 ELSE printf('hq-home:%03d',CAST(substr(id,4) AS INTEGER)-1) END ELSE printf('hq-home:%03d',(CAST(substr(id,4) AS INTEGER)-1)%360+1) END WHERE id LIKE 'hq:%'")
+        .bind(KERNEL_ROOT_ID).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'lifecycle','\"active\"',created_seq FROM kernel_records WHERE id BETWEEN 'hq:00361' AND 'hq:03960'")
+        .execute(&mut *tx).await.unwrap();
+    // Two recorded moves per non-folder record, ending at current placement.
+    sqlx::query("WITH moves(k) AS (VALUES(1),(2)) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'move:'||r.id||':'||k,r.id,'kernel.record_rehomed.v1',json_object('new_home_id',CASE WHEN k=2 THEN r.home_id ELSE printf('hq-home:%03d',(CAST(substr(r.id,4) AS INTEGER)+71)%360+1) END,'logical_home_id',CASE WHEN k=2 THEN printf('hq:%05d',(CAST(substr(r.id,4) AS INTEGER)-1)%360+1) ELSE printf('hq:%05d',(CAST(substr(r.id,4) AS INTEGER)+71)%360+1) END),?1,'2026-11-08T01:30:00Z',1,'legacy_unknown' FROM moves CROSS JOIN kernel_records r WHERE r.id>'hq:00360' AND r.id LIKE 'hq:%' ORDER BY k,r.id")
+        .bind(&w.admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_messages SELECT r.id,m.state,r.created_seq FROM kernel_records r CROSS JOIN kernel_messages m WHERE r.id>printf('hq:%05d',?1-2000) AND r.id LIKE 'hq:%' AND m.message_id=?2")
+        .bind(n).bind(template).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'legacy:'||id,id,'kernel.legacy_recorded.v1','{}',?1,'2020-01-01T00:00:00Z',1,'legacy_unknown' FROM kernel_records WHERE id BETWEEN 'hq:00001' AND 'hq:09000'")
+        .bind(&w.admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_legacy_sql_events SELECT seq,id,record_id,'record.created','v1:acct:admin',NULL,NULL,'2020-01-01T00:00:00Z','content_events' FROM content_events WHERE id LIKE 'legacy:hq:%'; INSERT INTO kernel_legacy_history SELECT seq,'record.created',json_array(record_id),NULL,0,0,0,2 FROM content_events WHERE id LIKE 'legacy:hq:%'; INSERT INTO kernel_legacy_subjects SELECT record_id,seq FROM content_events WHERE id LIKE 'legacy:hq:%'; INSERT OR REPLACE INTO kernel_legacy_sql_progress VALUES(1,(SELECT max(seq) FROM content_events WHERE type='kernel.legacy_recorded.v1'),1,1)").execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'reaction:'||message_id,message_id,'kernel.message_state.v1',json_set(state,'$.reactions',json_object(?1,json_array('👍'))),?1,'2026-11-08T01:00:00Z',1,'legacy_unknown' FROM kernel_messages WHERE message_id LIKE 'hq:%'")
+        .bind(&w.viewer).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE kernel_messages AS m SET state=(SELECT payload FROM content_events e WHERE e.id='reaction:'||m.message_id),event_seq=(SELECT seq FROM content_events e WHERE e.id='reaction:'||m.message_id) WHERE message_id LIKE 'hq:%'").execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'hq-link:'||id,id,'kernel.generic_link_imported.v1',json_object('link_id','link:'||id),?1,'2026-11-08T00:00:00Z',1,'legacy_unknown' FROM kernel_records WHERE id BETWEEN 'hq:00002' AND 'hq:04001'")
+        .bind(&w.admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_generic_links SELECT 'link:'||record_id,record_id,printf('hq:%05d',CAST(substr(record_id,4) AS INTEGER)+178),'related_to',NULL,created_at,actor,1,seq,1 FROM content_events WHERE id LIKE 'hq-link:%'")
+        .execute(&mut *tx).await.unwrap();
+    // Twenty-four retained owner edits, one member edit, birth and two
+    // rehomes model about 28 events per record. Excluded retained envelopes
+    // carry synthetic bulk to catch accidental event-row hydration.
+    sqlx::query("WITH RECURSIVE edits(k) AS (VALUES(1) UNION ALL SELECT k+1 FROM edits WHERE k<25) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'hq-authored:'||r.id||':'||k,r.id,'kernel.legacy_recorded.v1',json_object('padding',printf('%02048d',0)),?1,CASE WHEN k=25 THEN '2026-11-08T03:00:00Z' ELSE '2026-11-08T02:00:00Z' END,1,'legacy_unknown' FROM edits CROSS JOIN kernel_records r WHERE r.id LIKE 'hq:%' ORDER BY k,r.id")
+        .bind(&w.admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_legacy_sql_events SELECT seq,id,record_id,'record.updated',CASE WHEN id LIKE '%:25' THEN 'v1:acct:viewer' ELSE 'v1:acct:admin' END,NULL,NULL,created_at,'content_events' FROM content_events WHERE id LIKE 'hq-authored:%'; INSERT INTO kernel_legacy_history SELECT seq,'record.updated',json_array(record_id),NULL,0,0,0,2 FROM content_events WHERE id LIKE 'hq-authored:%'; INSERT INTO kernel_legacy_subjects SELECT record_id,seq FROM content_events WHERE id LIKE 'hq-authored:%'; INSERT OR REPLACE INTO kernel_legacy_sql_progress VALUES(1,(SELECT max(seq) FROM content_events WHERE type='kernel.legacy_recorded.v1'),1,1)")
+        .execute(&mut *tx).await.unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'hq-hidden-chain:'||x,'hq:00001','kernel.link_removed.v1',json_object('target_id','person:outsider'),?1,'2026-11-08T02:00:00Z',1,'legacy_unknown' FROM n")
+        .bind(&w.viewer).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_metadata SELECT r.id,'enduring',NULL,'2026-11-08T03:00:00Z',coalesce(m.event_seq,r.created_seq) FROM kernel_records r LEFT JOIN kernel_messages m ON m.message_id=r.id WHERE r.id LIKE 'hq:%'")
+        .execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let dimensions: (i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM kernel_roots WHERE root_id LIKE 'hq-home:%'),(SELECT count(*) FROM kernel_record_fields WHERE name='lifecycle' AND value_json='\"active\"'),(SELECT count(*) FROM content_events WHERE id LIKE 'move:hq:%'),(SELECT count(*) FROM kernel_legacy_sql_events WHERE source_id LIKE 'hq-authored:%' AND actor='v1:acct:admin'),(SELECT count(DISTINCT source_id) FROM kernel_generic_links WHERE link_id LIKE 'link:hq:%'),(SELECT count(DISTINCT target_id) FROM kernel_generic_links WHERE link_id LIKE 'link:hq:%')")
+        .fetch_one(w.db.write_pool()).await.unwrap();
+    assert_eq!(dimensions, (360, 3600, 2 * (n - 360), 24 * n, 4000, 4000));
+    let depth: i64 = sqlx::query_scalar("WITH RECURSIVE homes(id,depth) AS (SELECT root_id,1 FROM kernel_roots WHERE root_id LIKE 'hq-home:%' AND parent_id=?1 UNION ALL SELECT h.root_id,p.depth+1 FROM kernel_roots h JOIN homes p ON h.parent_id=p.id) SELECT max(depth) FROM homes")
+        .bind(KERNEL_ROOT_ID).fetch_one(w.db.write_pool()).await.unwrap();
+    assert_eq!(depth, 6);
+    let mut failures = Vec::new();
+    for (label, credential, expected_size, expected_authored, authored_at) in [
+        (
+            "owner",
+            "acct:admin",
+            n + owner_baseline,
+            n + owner_authored,
+            "2026-11-08T02:00:00Z",
+        ),
+        (
+            "member",
+            "acct:viewer",
+            n + baseline,
+            n,
+            "2026-11-08T03:00:00Z",
+        ),
+    ] {
+        eprintln!("HQ-shaped scan begin caller={label}: {expected_size} visible, 360 folder homes in 60 six-level branches, 32272 rehomes, 3600 lifecycles, 4000 distributed links, 24 retained owner edits + 2 rehomes and 1 member edit per non-folder record, 4096 newer hidden edits; debug_assertions={}",cfg!(debug_assertions));
+        let started = std::time::Instant::now();
+        let result = call(&w, credential, "scan", json!({"high_degree_min":1})).await;
+        eprintln!(
+            "HQ-shaped scan end caller={label}: elapsed={:?}, result={}",
+            started.elapsed(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        match result {
+            Ok(out) => {
+                assert_eq!(out["corpus_size"], expected_size);
+                assert_eq!(out["axes"]["authored_by"]["count"], expected_authored);
+                assert_eq!(
+                    out["axes"]["authored_by"]["samples"][0]["authored_at"],
+                    authored_at
+                );
+                assert_eq!(out["axes"]["high_degree"]["count"], 4178);
+                assert_eq!(out["axes"]["high_degree"]["samples"][0]["degree"], 2);
+                assert!(out["census"]["by_lifecycle"]["buckets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"key":"active","count":3600})));
+            }
+            Err(error) => {
+                eprintln!("HQ-shaped scan caller={label}: {error}");
+                failures.push(label);
+            }
+        }
+    }
+    w.db.close().await;
+    assert!(
+        failures.is_empty(),
+        "HQ-shaped scan exceeded the unchanged deadline: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_root_filing_preserves_root_origin_message() {
+    let w = world().await;
+    let mut args = send_args(&w, "root-filing-message-proof");
+    args["origin"] = json!({"type":"collection","collection_id":"native:root"});
+    args["home_id"] = json!("native:root");
+    let sent = call(&w, "acct:admin", "manage_messages", args)
+        .await
+        .unwrap();
+    assert!(sent.get("redirected_home").is_none());
+    let row = kernel::read_record_as(&w.db, &w.admin, sent["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.home_id, KERNEL_ROOT_ID);
+}
+
+/// Extended query_record anchor narrowing (Native 3a3eabb), owed Message
+/// placement fixture: a direct Message's logical home is its direct home
+/// (LOGICAL_DIRECT_HOME_SQL), not its physical root. P1 admits every
+/// Message as a candidate; containment plus narrowed/full byte-identity for
+/// participants and a non-participant, on each home a Message lands in.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn extended_query_record_message_placements_lie_within_anchor_candidates() {
+    let w = world().await;
+    let mut sent = Vec::new();
+    for (key, origin) in [
+        ("anchor-collection", None),
+        (
+            "anchor-direct-viewer",
+            Some(["person:admin", "person:viewer"]),
+        ),
+        (
+            "anchor-direct-outsider",
+            Some(["person:admin", "person:outsider"]),
+        ),
+    ] {
+        let mut args = send_args(&w, key);
+        if let Some(participants) = origin {
+            args["origin"] = json!({"type":"direct","participant_ids":participants});
+            args["addressed_to"] = json!([participants[1]]);
+        }
+        sent.push(
+            call(&w, "acct:admin", "manage_messages", args)
+                .await
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    // Every home a Message is placed in, as admin sees it.
+    let mut homes = BTreeSet::from([
+        w.origin.clone(),
+        KERNEL_ROOT_ID.to_owned(),
+        "native:root".to_owned(),
+    ]);
+    let mut direct_differs = false;
+    for id in &sent {
+        let got = call(
+            &w,
+            "acct:admin",
+            "query_record",
+            json!({"steps":[{"step":"filter","ids":[id]}],"order":"name_asc"}),
+        )
+        .await
+        .unwrap();
+        let home = got["records"][0]["home_id"].as_str().unwrap().to_owned();
+        let physical: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+            .bind(id)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+        direct_differs |= home != physical;
+        homes.insert(home);
+        homes.insert(physical);
+    }
+    assert!(
+        direct_differs,
+        "fixture must place a Message away from its physical root"
+    );
+    let mut checked = 0;
+    for home in &homes {
+        for order in ["updated_desc", "last_activity_desc", "name_asc"] {
+            let args =
+                json!({"steps":[{"step":"filter","home_id":home}],"order":order,"limit":500});
+            let plan = super::read_surface::recognize_args(&args)
+                .unwrap_or_else(|| panic!("not recognised: {args}"));
+            let mut conn = w.db.pool().acquire().await.unwrap();
+            let candidates = super::read_surface::direct_candidates_on(&mut conn, &plan)
+                .await
+                .unwrap();
+            drop(conn);
+            for credential in ["acct:admin", "acct:viewer", "acct:outsider"] {
+                for (limit, offset) in [(500, 0), (2, 1), (1, 0), (3, 1000)] {
+                    let mut variant = args.clone();
+                    variant["limit"] = json!(limit);
+                    variant["offset"] = json!(offset);
+                    let full = super::read_surface::FORCE_FULL_STAGING
+                        .scope(true, call(&w, credential, "query_record", variant.clone()))
+                        .await;
+                    let narrowed = call(&w, credential, "query_record", variant.clone()).await;
+                    match (&full, &narrowed) {
+                        (Ok(a), Ok(b)) => assert_eq!(
+                            serde_json::to_string(a).unwrap(),
+                            serde_json::to_string(b).unwrap(),
+                            "{credential} {variant}: narrowed output differs"
+                        ),
+                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                        _ => {
+                            panic!("{credential} {variant}: full {full:?} vs narrowed {narrowed:?}")
+                        }
+                    }
+                }
+                let Ok(result) = call(&w, credential, "query_record", args.clone()).await else {
+                    continue;
+                };
+                for r in result["records"].as_array().unwrap() {
+                    let id = r["id"].as_str().unwrap();
+                    assert!(
+                        candidates.contains(id),
+                        "{credential} {args}: {id} outside candidates"
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 30, "oracle exercised {checked} calls");
+}
+
+#[tokio::test]
+async fn kernel_v2_batch_guard_only_supports_immutable_messages() {
+    let w = world().await;
+    let sent = call(
+        &w,
+        "acct:admin",
+        "manage_messages",
+        send_args(&w, "batch-message-guard"),
+    )
+    .await
+    .unwrap();
+    let record = call(&w, "acct:admin", "get_record", json!({"ids":[sent["id"]]}))
+        .await
+        .unwrap();
+    let updated = &record["records"][0]["updated_at"];
+    assert!(updated.is_string(), "{record}");
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let result = call(&w,"acct:admin","batch_write",json!({"reason":"assert message unchanged","items":[{"op":"update","id":sent["id"],"if_unmodified_since":updated}]})).await.unwrap();
+    assert_eq!(result["changed"], 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap(),
+        before
     );
     w.db.close().await;
 }

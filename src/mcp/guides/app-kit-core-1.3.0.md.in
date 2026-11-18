@@ -1,0 +1,386 @@
+# Native core app kit 1.3.0
+
+Major 1 defaulted to 1.3.0 at first; the current default is 1.7.0 (read `app-kit-core-1.7.0`).
+1.2.0, 1.1.2, 1.1.1, 1.1.0 and 1.0.0 are retained for host rollback. 1.3.0 is compatible with 1.2.0 and adds Paseo agent sessions
+(Native Desktop only): `useAgentSessions`, a framework-free `createAgentSessions`, and a
+folder chooser (below). It keeps 1.2.0's safe writes (`useWrite`, `WriteStatus`,
+`createWriteHelper`), 1.1.2's Markdown fixes and 1.1.1's quiet read recovery in
+`useQueryFeed` and `FeedNotice`.
+The host installs frozen `window.native.kit` synchronously before the
+first author script. No imports, npm, JSX compiler or build are required.
+An unavailable requested major refuses `kit_major_unavailable`.
+
+## Prepare an install from Native MCP alone
+
+Create the complete HTML as a `Document/artifact` with runtime `native.html.v1`.
+Use its write receipt's `body_digest` (or body-carrying `source_event_id`) to call
+`artifacts_read.manage_alpha_tabs.prepare_install` through `call_executor`:
+
+```json
+{"executor":"artifacts_read","operation":"manage_alpha_tabs.prepare_install","arguments":{"artifact_id":"<source id>","expected_body_digest":"<body_digest>","package":"agent.my-app","version":"1.0.0","declaration":{"needs":[],"effects":[]},"reason":"Install my authored app"}}
+```
+
+Include your actual consent declaration, including each SQL snapshot need.
+When `ready` is true, pass the returned `next_call` to `call_executor`, adding
+your `run_key`. It contains the server-computed digests, source revision and
+install/update event precondition; no shell, hash computation or build is needed.
+When false, read the bounded findings, fix the source/declaration and prepare again.
+Malformed package/version/reason/request/guard arguments and authority failures
+are normal API errors, rather than `ready:false` findings. Preparation caps the
+echoed declaration at 65,536 serialized JSON bytes; `require_declaration` has
+entry limits but no total byte cap. An optional `request` is validated and passed
+through, including a reinstall over a removed tab; updates must preserve it.
+Kit availability is advisory against the packaged default; delivery checks its
+own selection. Preparation grants nothing, installs nothing and locks nothing.
+The returned revision pins historical bytes; later source edits do not silently
+replace them. Re-prepare after edits. Current update CAS and consent rules still
+apply. `ready:true` means prepared, not usable. Read `adoption`: when it is
+`requires_person_preview_adopt`, tell the signed-in person to Preview/Adopt after
+install/update; MCP cannot mint that authority. `carried` means the update can
+carry proven adoption for an unchanged canonical declaration. An unadopted
+predecessor still requires Preview/Adopt even when the declaration is unchanged.
+
+Alpha tabs pin a package/version/digest, a viewable live `Document/artifact`, its
+source revision and consented needs/effects. Updates check exact bytes/digest and
+event CAS, preserving status/request. Keyed retries return the original receipt
+and current install without reapplying. Disable/restore/remove use event CAS;
+disabled or removed tabs stop reads/actions. Target resolution fails closed;
+inspect `target_resolves`. List before reorder: reorder replaces the strip order,
+appends omitted installs, and refuses unknown/removed/duplicate entries. Without
+a saved order, the strip uses agents/folders/tasks/graph/installs.
+
+Preview checks exact source/digest and returns sample HTML with an expiring
+account/pin/session receipt; it writes nothing. Preview/adopt/adopt_authored
+require a hosted cookie and trusted Origin, never Bearer credentials. Adopt
+checks the receipt, pin, event and attestation. Launch checks adoption, event,
+View and source; its one-use URL delivers sample input only, without live rows.
+`live_read` returns only the caller's authorized consented inputs:
+`attention.query.v1` at `input.records`, up to eight `sql.snapshot.v1` SELECT/WITH
+needs with 200 rows each at `input.sql[key]`. `params[0]` binds `?1`; omitted
+optional parameters bind NULL. Use `live_read.need` to request a consented `records.search.v1` with
+`params:{query,limit}` (`limit` at most 30), `records.resolve_reference.v1` with
+`params:{reference}`, or a SQL need by key with its declared parameter schema.
+Omit `need` for the snapshot. Subscriptions are connection-bound; use the stream-frame token;
+subscriptions and `if_revision` apply only to snapshot reads. An `if_revision`
+equal to `revision_digest` returns `unchanged:true` with pins/revision and no rows.
+Use `if_revision` to resynchronize. Revision information includes `id` and
+`time_dependent`; `now_ms()` uses `as_of_ms`. `subscribe_refused` includes the
+read. `live_unsubscribe` is idempotent and connection-scoped.
+`admit_reveal_target` checks consented `surface.reveal.v1` and one visible
+canonical target/pin; delivery is push-only, never via `live_read`.
+Supply the full record id or a reserved id such as `native:root`; prefixes refuse.
+
+## A source-only feed app
+
+This complete source-only app displays a declared `records.recent` param-less
+`sql.snapshot.v1` feed. Declare that need in the install declaration; the kit
+policy below adds no data permission. Use this exact declaration:
+
+```json
+{
+  "needs": [
+    {
+      "need": "sql.snapshot.v1",
+      "key": "records.recent",
+      "label": "Up to 200 visible records, newest first",
+      "sql": "SELECT id, substr(name, 1, 160) AS name, type, kind, updated_at FROM records WHERE deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM facet_values fv WHERE fv.record_id = records.id AND fv.key = 'archived') ORDER BY updated_at_ms DESC, id ASC LIMIT 200"
+    }
+  ],
+  "effects": []
+}
+```
+
+The SQL selects `id` and `name`, the columns the example renders. Apps own
+CSS; the components use simple `kit-*` classes and add no reset.
+
+```html
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Recent notes</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem}.kit-record-link{cursor:pointer}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact) root.textContent = 'Open in a Native host with core kit 1.2.0.';
+else {
+  const { html, render, useFeed, Loading, Empty, ErrorState, RecordLink } = kit.preact;
+  function App() {
+    const feed = useFeed('records.recent');
+    if (feed.status === 'loading') return html`<${Loading} what="notes" />`;
+    const result = feed.status === 'ready' ? feed.result : feed.last;
+    return html`<section><h1>Recent notes</h1>
+      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} />`}
+      ${feed.status === 'error' && result && html`<p>Last good rows; may be out of date.</p>`}
+      ${result && html`<p>${kit.countLabel(result)} notes</p>`}
+      ${result?.rows.length ? html`<ul>${result.rows.map(row => html`<li key=${row.id}>
+        <${RecordLink} id=${row.id}>${row.name || row.id}<//></li>`)}</ul>`
+        : html`<${Empty}>No notes delivered.<//>`}
+    </section>`;
+  }
+  try { await kit.ready; render(html`<${App} />`, root); }
+  catch (error) { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>
+```
+
+`kit.preact` supplies one Preact instance: `h`, `render`, `Fragment`,
+`createContext`, standard hooks, and `html = htm.bind(h)`. Use its hooks for its
+components. `useFeed(key)` uses core snapshots; `useQueryFeed(query)` waits for
+ready and uses the optional negotiated app-v2 `window.native.subscribe`.
+Equivalent JSON query values keep the subscription; changed queries and
+unmounts unsubscribe and suppress late deliveries. Errors retain last-good
+rows and delivery time. Inside a v2 component, pass `feed.retry`
+to the retry button:
+
+```js
+const feed = kit.preact.useQueryFeed({ sql: 'SELECT id, name FROM records LIMIT 20' });
+if (feed.status === 'error')
+  return html`<${ErrorState} error=${feed.error} onRetry=${feed.retry} />`;
+```
+
+`retry()` resubscribes to the same query; a terminal error closes the old
+subscription. Hooks mounted after kit disposal return a `closed` error.
+Query answers have `truncated`, not a total count.
+
+### Quiet read recovery (1.1.1, unchanged)
+
+`useQueryFeed` keeps the last good rows on screen through errors and retries,
+including while a manual `retry()` reloads: the `loading` state carries `last`
+and `deliveredAt` for the same query, and a changed query starts clean (except
+after a definite answer, below). It also
+recovers quietly, so a brief blip never reaches the person:
+
+- Only transient errors keep the saved rows: `offline`, `busy`, `timeout`,
+  `unavailable`, `query_timeout`, `network_lost`, `engine_error`,
+  `subscription_limit`, `database_pool_timeout`, `http_408/429/5xx` and the hub's
+  `authority_changed:<n>` recheck. A *terminal* transient error resubscribes
+  after 1, 2, 4 and 8 seconds, then stops; a resubscription that stays silent for
+  10 seconds counts as failed. A non-terminal one is left to the host's own retry
+  and fails after 15 seconds without recovery.
+- **Every other error is a definite answer** (`access_denied`, `forbidden`,
+  `unauthorized`, `undeclared`, 401/403, `query_refused`, `invalid_sql`,
+  `refused`, `port_closed`, any unknown code, terminal or not). It is never
+  retried, shows "Couldn’t refresh" with Try again at once, and the kit **drops
+  the saved rows** (`last`, `deliveredAt`): the transport cannot tell which
+  refusals still leave the old data authorised (an invalidated install arrives as
+  a plain `query_refused`). Try again starts clean; only a new answer brings rows
+  back.
+- `feed.notice` is `'none'` for the first 4 seconds of trouble, `'reconnecting'`
+  after that, and `'failed'` once retries are used up or cannot help. A host that
+  keeps reporting non-terminal errors reaches `'failed'` after 15 seconds.
+- `feed.truncated` is true when the rows shown (current or last good) are only
+  part of the answer.
+- While recovery is in progress an error carries `error.retrying`
+  (`'quiet'` or `'reconnecting'`). `ErrorState` renders nothing for `quiet`,
+  "Reconnecting…" for `reconnecting`, and the full error with Try again
+  otherwise, so `ErrorState error=${feed.error}` is already quiet. `status`
+  stays `'error'` for compatibility; read `notice` and `error.retrying`.
+
+`FeedNotice` renders the notice for you: "Reconnecting…", then "Couldn’t refresh"
+with a working Try again, plus "Showing part of the results." when truncated. It
+shows nothing when there is nothing to say. Render rows from
+`feed.status === 'ready' ? feed.result : feed.last` and add the notice beside them:
+
+```js
+const feed = kit.preact.useQueryFeed({ sql: 'SELECT id, name FROM records LIMIT 20' });
+const result = feed.status === 'ready' ? feed.result : feed.last;
+return html`<section><${FeedNotice} feed=${feed} />${result && renderRows(result.rows)}</section>`;
+```
+
+Defaults can be tuned per call: `useQueryFeed(query, { retryDelaysMs: [1000, 2000], noticeDelayMs: 4000 })`.
+
+A ready result is `{ rows, columns, truncated, cached? }`. Rows of a `{ sql }`
+query, like snapshot rows, are objects keyed by column name: read `row.id`, not
+`row[0]`. `columns` names them in select order. Rows of a structured `{ steps }`
+query are arrays aligned with `columns` (`id`, `type`, `kind`, `name`,
+`summary`, `home_id`, `lifecycle`, `maturity`, `updated_at`,
+`last_activity_at`). To accept either shape, use
+`Array.isArray(row) ? Object.fromEntries(columns.map((c, i) => [c, row[i]])) : row`.
+A host without subscriptions returns `status: 'unsupported'` with an explicit
+message. Core major 1 never grants app-v2 authority to an app-v1 install.
+
+For an app-v2 install, negotiated `query`, `subscribe` and `call` may also be
+used directly after `kit.ready`. Check each optional method. A write is saved
+only when `call(operation, args).confirmed` resolves; dispatch is not a receipt.
+Initial Preview/Adopt still requires the person's browser gesture.
+
+### Safe writes (1.2.0)
+
+Do not hand-roll "key, retry, did it send?" logic. `useWrite` does it, and
+`WriteStatus` tells the person the truth:
+
+```js
+const { useWrite, WriteStatus, html } = kit.preact;
+function NewNote({ folder }) {
+  const writes = useWrite({ operation: 'create_record', scope: folder });
+  const create = title => writes.submit({ type: 'Document', kind: 'note', name: title,
+    home_id: folder, reason: 'Create note from my app' });
+  return html`<button onClick=${() => create('Meeting')}>Create note</button>
+    ${writes.entries.map(entry => html`<${WriteStatus} key=${entry.id} entry=${entry}
+      onRetry=${() => writes.retry(entry.id)} onDiscard=${() => writes.discard(entry.id)} />`)}`;
+}
+```
+
+- **Freeze and key first.** `submit(request)` copies and freezes the request (plain
+  data only) and mints its `idempotency_key` before anything is sent, then calls
+  the operation in the same task, so a click is still a click. Later edits to your
+  form never change a write already submitted. For `operation`, the kit adds
+  `idempotency_key` to the arguments; do not set it yourself. To send some other
+  way, pass `dispatch(request, { key, attempt })` and use `key`.
+- **Busy retry.** A `busy` or `too_many_in_flight` refusal is retried twice (after
+  300 ms and 600 ms) with the same frozen request and key, then reported as not
+  sent. Tune with `busyDelaysMs`.
+- **Three kinds of ending.** *Definitely not sent*: a `refused` status, or code
+  `tool_not_dispatched`, `effect_not_dispatched` or `not_sent_timeout`. *Applied*:
+  only when the host affirms the whole write committed: `applied: true` (sent by
+  the host with `REPLAY_BOUND_EXCEEDED` when a single write's receipt could not be
+  rebuilt). *Possibly applied*: everything else that is not a confirmation: a
+  timeout, a lost connection, an unknown code, and also `REPLAY_BOUND_EXCEEDED`
+  without `applied: true` or with `applied: "partial"` (a `create_many` with
+  unfinished items). A possibly-applied write stays "May not have sent" under its
+  original key until a retry confirms it; it cannot be discarded or evicted.
+- **Retry identity.** `retry(id)` re-sends the same frozen request. While the
+  last attempt may have applied it reuses the key, so Native applies it once; only
+  after a definite "not sent" does it mint a new key. A refusal that arrives after
+  an uncertain attempt never clears it: the entry stays "May not have sent" with
+  its original request and key.
+- **Statuses.** Each entry has `status`: `pending`, `sent`, `uncertain` or
+  `failed`, and a plain `label` to show: "Sending…", "Sent", "May not have sent"
+  (Retry, no alarm) and "Not sent" (Retry or Discard; the person's frozen payload is
+  kept until they choose). `canRetry` and `canDiscard` say which buttons make sense;
+  an uncertain write cannot be discarded because its key is the only protection
+  against a duplicate. `entry.error` carries the host's `code`/`message` if you want
+  to word a reason; never show raw codes. Apps should render `label` and switch on
+  `status`, not on `custody`.
+- **Memory only.** Entries live in this page. Nothing survives a reload and no
+  label says "Saved". A later durable layer will add `custody` values and labels
+  such as "Saved on this device", "Saved, waiting for Native" and "Synced"
+  without changing `status` or this API, so do not exhaustively switch on `custody`.
+  Keep any draft the person has not submitted in your own state.
+- **Account boundary.** Pending, uncertain and refused entries are dropped when the
+  workspace or account moves: when any mounted `useQueryFeed` hears the hub's
+  `scope_changed`, or when the `scope` option's value changes (applied in the commit
+  that shows the new scope, never while rendering). Each write is bound to the scope,
+  and to the operation or `dispatch`, of the render whose handler submitted it; a later
+  render never retargets it. A write submitted by a child's mount effect, before its
+  parent's scope has committed, is kept and shown as "Sending…" and goes out when that
+  scope commits; if a different scope commits instead, or the component unmounts, it
+  is reported "Not sent" and dropped, never sent to the wrong scope. A handler from a
+  scope that has already been retired is refused outright ("Not sent", nothing kept). Late answers for dropped entries are ignored and
+  nothing is re-sent. (`authority_changed:<n>` is
+  a same-account recheck and keeps entries.) Unmounting the component or disposing
+  the kit cancels timers and ignores late answers, even before the first paint.
+- `submit` throws only if the page is closed or 256 writes are unresolved.
+  `writes.pending` is true while any write is being sent. Sent entries stay in
+  `entries` until you `discard(id)` them; render only what you need.
+
+Without Preact, `kit.createWriteHelper({ dispatch, busyDelaysMs?,
+maxEntries?, scope? })` returns `{ submit, retry, discard, get, entries, subscribe,
+dropAll, setScope, commit, dispose }` with the same rules. `submit(request, { dispatch?, scope?, generation? })`
+and `retry` return `{ id, done }`; `done` never rejects. Call `setScope(value)` (or
+`dropAll()`) yourself when your account or workspace changes (the kit also calls
+`dropAll` on `scope_changed` heard by a `useQueryFeed`) and `dispose()` when the
+page closes. On a host still delivering
+1.1.1, `kit.preact.useWrite` is undefined: feature-detect it and keep the old code.
+
+### Agent sessions (1.3.0, Native Desktop only)
+
+Paseo agent sessions are offered only by Native Desktop, and only to an app it has
+admitted. Everywhere else `native.agentSessions` does not exist. `useAgentSessions`
+checks for it, and reports `status: 'unsupported'` when it is absent, so an app carries
+on without it (show nothing about sessions). The list, retry and epoch rules are the same
+ones Attention and Focus use.
+
+```js
+const { useAgentSessions, FeedNotice, WriteStatus, html } = kit.preact;
+function Sessions() {
+  const s = useAgentSessions();
+  if (s.status === 'unsupported') return null;
+  return html`<${FeedNotice} feed=${s} />
+    <ul>${s.sessions.map(x => html`<li key=${x.hostId + x.hostEpoch + x.id}>${x.title ?? 'Untitled'}</li>`)}</ul>
+    <button onClick=${async () => {
+      const host = s.hosts.find(h => h.status === 'reachable' && h.epoch);
+      if (!host) return;
+      const choice = await s.chooseFolder({ hostId: host.id, hostEpoch: host.epoch });
+      if (choice.status === 'chosen') setFolder(choice.folder);
+    }}>Choose a folder…</button>`;
+}
+```
+
+- **The list.** `sessions` and `hosts` are the latest good list across the person's machines.
+  `status` is `loading`, `ready`, `error` or `unsupported`. A transient failure (`unavailable`,
+  `busy`) keeps the last good list on screen and reads it again quietly: after 1, 2, 4, 8, 16 then
+  every 30 seconds, at most 25 times and for at most 10 minutes, and not at all while the page is
+  hidden. Nothing shows inside the first 4 seconds; then `notice` is `reconnecting`; once the
+  retries are used up, or the answer is definite (`invalid`, `gone`), it is `failed`. Render
+  `FeedNotice` with the hook's result: "Reconnecting…", or "Couldn't refresh" with Try again
+  (`retry()`). The list stays live: a `listChanged` watch where the machine offers one and a
+  slow poll otherwise.
+- **Access refusals clear the list.** A `refused`, `invalid` or `gone` answer removes the
+  sessions you were showing (a refusal must not keep showing what it refused). `refused` is still
+  read again quietly, since Desktop can drop the app's launch handle and re-admit it, and the list
+  comes back if it does.
+- **Account boundary.** When any `useQueryFeed` hears `scope_changed`, the list is forgotten and
+  read again from nothing, follows end, and every write is dropped. Anything still awaited across the
+  change is dropped too: a follow that was starting delivers nothing, a folder choice answers `stale`, a
+  catalog or `createStatus` answers `{ ok: false, code: 'unavailable' }`. `useAgentSessions` reads nothing
+  until its component commits.
+- **Machines and epochs.** A machine's `epoch` changing means its sessions were re-established, so a
+  target that names the old epoch is dead. The hook drops those sessions, ends follows on that machine
+  (the handler gets `{ kind: 'ended', code: 'gone' }`), and refuses to send to it:
+  `isCurrent({ hostId, hostEpoch })` tells you, and a write to a dead epoch is "Not sent" without
+  reaching the machine.
+- **`chooseFolder({ hostId, hostEpoch })`** opens Desktop's chooser on that machine. Call it directly
+  from the click. It resolves `{ status: 'chosen', hostId, hostEpoch, folder }`, `{ status: 'cancelled' }`,
+  `{ status: 'stale', message }` (the machine reconnected while the person was choosing: choose again)
+  or `{ status: 'unavailable', message }` (the machine does not offer it; update Native Desktop).
+  One chooser is open at a time. A folder chosen this way can be the `workspaceId` of `create`.
+- **Writes use the safe-write helper.** `send`, `create` and `respond` are each the same shape as
+  `useWrite`: `entries`, `pending`, `submit`, `retry`, `discard`, and you render `WriteStatus`. There is
+  no second retry model.
+  - `send.submit({ hostId, hostEpoch, sessionId, text })` sends a message into a session.
+  - `create.submit({ hostId, hostEpoch, provider, model, workspaceId, initialPrompt })` starts a session
+    (get the choices from `catalog()`). `entry.result` is the new session once `sent`. The entry's `key`
+    is the start's request id: after "May not have sent", `createStatus(entry.key)` asks Desktop what
+    became of it (it needs a Desktop that offers that), and Retry sends the same request id again, which
+    Desktop deduplicates.
+  - `respond.submit({ hostId, hostEpoch, sessionId, permissionRequestId, action })` answers a pending
+    permission (`session.pendingPermission.requestId`). Never invent a second key for it. Desktop refuses an
+    operation key it has already seen, so an answer whose outcome is unknown is never sent again. The kit
+    reads the session instead. The entry becomes "Sent" only on positive information: the machine is reachable at
+    the same epoch, the session is in the list, and the session itself says the permission is no longer pending
+    (`pendingPermission` is `null`, or another request). A missing session, an unreachable machine or an omitted
+    `pendingPermission` prove nothing. Otherwise it stays "May not have sent" with no Retry (`canRetry` is false),
+    and `entry.error.message` says to check in the session. It looks again every time the list changes, and
+    nothing on screen changes while it is still undecided.
+  - The helper's key is the host's `requestId` (or `operationKey`). An acknowledged answer is "Sent";
+    a refusal, a request the machine could not take, or a request to a machine that has reconnected is
+    "Not sent" and a Retry takes a new key; an answer Desktop calls `unknown` (or anything this kit does
+    not recognise) is "May not have sent" and a Retry reuses the same key (except a permission answer, above). A started session whose answer
+    is not a usable session is also "May not have sent".
+  - A send that throws or is cut off after it was handed to Desktop is also "May not have sent" (same key), never "Not sent".
+  - Call `submit` from the click: Desktop ties each of these to a user gesture, and the kit reaches it in
+    the same task. For the same reason a busy machine is not retried on a timer; it is "Not sent" with Retry.
+  - After a machine reconnects, discard a failed `create` and submit a new one from a fresh `catalog()`:
+    the frozen request names the old epoch.
+- `catalog()`, `follow(target, onEvent)`, `openConversation(target, { depth })` and `createStatus(requestId)`
+  resolve `{ ok, value }` or `{ ok: false, code }`, never reject. `follow` returns `{ ok, value: { dispose } }`;
+  dispose when leaving the view.
+
+Without Preact, `kit.createAgentSessions({ noticeDelayMs? })` returns `{ state, subscribe, retry, isCurrent,
+catalog, chooseFolder, follow, openConversation, createStatus, send, create, respond, dispose }`. `send`,
+`create` and `respond` are write helpers (as `kit.createWriteHelper` returns); `state()` has the same fields
+as the hook. Call `dispose()` when the page closes. On a host still delivering 1.2.0,
+`kit.preact.useAgentSessions` and `kit.createAgentSessions` are undefined: feature-detect them and keep the
+old code.
+
+`Loading`, `Empty`, `ErrorState` (optional retry), `FeedNotice` (`feed`), `WriteStatus` (`entry`, `onRetry`, `onDiscard`), `PreviewBanner`, `Markdown`
+(`source`), `Avatar` (initials), `IconSvg` (app-owned children), and `RecordLink`
+(`id`) are supplied. Mount `PreviewBanner` only for known sample/preview mode.
+Markdown reuses the kit parser: raw HTML stays text, images show alt text,
+entities decode through an inert browser resolver, and navigation uses core
+attributes and trusted user activation. No editor, comments or CSS are supplied.
+Prepared documents retain their selected release. Kit bytes are exempt from
+author size/digest accounting; source and declaration still define the app pin.

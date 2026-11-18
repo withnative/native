@@ -1,4 +1,4 @@
-//! Native composite canvas promotion. Plans retain the v1 digest and wire shape.
+//! Native composite canvas promotion with optional preview and stale checks.
 use super::super::writes;
 use crate::mcp::tools::canvas::{
     self as legacy, frame_has_children, promotion_digest, version_moved, PromoteExpected,
@@ -82,7 +82,7 @@ pub(super) async fn execute(db: &Db, actor: &str, arguments: Value) -> Result<Va
     if items.iter().any(|item| !seen.insert(&item.object_id)) {
         return Ok(deny(&refusal(
             "duplicate_object",
-            "an object may be promoted once per plan",
+            "an object may be promoted once per request",
         )));
     }
     let mut tx = begin_write(db.write_pool()).await?;
@@ -113,8 +113,7 @@ pub(super) async fn execute(db: &Db, actor: &str, arguments: Value) -> Result<Va
         let loaded = canvas::load_object(&mut tx, &canvas_id, &item.object_id).await?;
         // An object the caller pinned a version for is one they had seen, so
         // its disappearance, tombstoning or conversion since is drift rather
-        // than an incoherent plan -- and drift must read as stale, because
-        // that is what the plan runtime turns into a 409.
+        // than an invalid request. Supplied preconditions must read as stale.
         let pinned_by_caller = expected
             .as_ref()
             .is_some_and(|pins| pins.objects.contains_key(&item.object_id));
@@ -174,7 +173,7 @@ pub(super) async fn execute(db: &Db, actor: &str, arguments: Value) -> Result<Va
                 if canvas_stale || drifted {
                     (
                         "would_stale",
-                        "this object has moved since the plan was made",
+                        "this object has moved since the supplied version",
                     )
                 } else {
                     ("would_accept", "")
@@ -203,10 +202,7 @@ pub(super) async fn execute(db: &Db, actor: &str, arguments: Value) -> Result<Va
         assessments.push(assessment);
     }
 
-    // Links are assessed too. A plan-required ceremony that previewed only
-    // the records would let a person approve a promotion whose link names a
-    // record they cannot write -- an approval spent on a plan guaranteed to
-    // fail inside the transaction, after the records were already minted.
+    // Assess link authority before minting any records in this transaction.
     let mut link_assessments: Vec<Value> = Vec::new();
     for link in &links {
         let from_planned = items.iter().any(|item| item.object_id == link.from);
@@ -266,22 +262,17 @@ pub(super) async fn execute(db: &Db, actor: &str, arguments: Value) -> Result<Va
         }));
     }
 
-    // Execution is bound to the plan. Both refusals are Error::Conflict rather
-    // than a 200 outcome: the executor's plan runtime keys `plan_stale` off a
-    // diagnostic containing "revision conflict", and a hosted caller needs the
-    // 409 to tell a stale plan from a rejected one.
-    let Some(supplied) = plan_digest else {
+    // A supplied digest is an additional stale precondition. Otherwise the
+    // current assessment inside this writer transaction authorizes execution.
+    if plan_digest
+        .as_ref()
+        .is_some_and(|supplied| supplied != &digest)
+        || !all_accept
+    {
         tx.rollback().await?;
-        return Err(Error::engine(
-            "promote: executing a plan requires the plan_digest a dry run returned",
+        return Err(Error::conflict(
+            "promote: revision conflict; current objects, links or supplied preconditions do not allow promotion; reload and retry",
         ));
-    };
-    if supplied != digest || !all_accept {
-        tx.rollback().await?;
-        return Err(Error::conflict(format!(
-            "promote: revision conflict; the canvas moved since the plan was made \
-             (plan {supplied}, current {digest}). Prepare again."
-        )));
     }
 
     let mut acts = crate::act::ActAllocation::new();
@@ -394,7 +385,9 @@ pub(super) async fn execute(db: &Db, actor: &str, arguments: Value) -> Result<Va
     let stored = match kernel::canvas_v2::prepare_promotion(&mut tx, &envelope, position).await? {
         kernel::canvas_v2::PreparedBatch::Ready(stored) => stored,
         kernel::canvas_v2::PreparedBatch::Conflicts(_) => {
-            return Err(Error::conflict("promote: revision conflict; prepare again"))
+            return Err(Error::conflict(
+                "promote: revision conflict; reload and retry",
+            ))
         }
     };
     let event = crate::store::append_with_event_id_in(

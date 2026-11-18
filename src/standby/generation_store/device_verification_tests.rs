@@ -601,7 +601,7 @@ async fn status_uses_cached_checks_and_discloses_invalidation() {
     assert_eq!(status.unverified_candidate_count, 1);
     assert_eq!(status.unusable_candidate_count, 0);
     assert!(store
-        .verify_generation_for_startup(id, &observed())
+        .verify_generation_for_startup(id, &observed(), "test")
         .await
         .is_err());
     let (status, logs) = capture(store.inspect_status(&observed())).await;
@@ -631,7 +631,7 @@ async fn status_invalidates_on_pointer_head_and_consumer_changes() {
         1
     );
     store
-        .verify_generation_for_startup(&generation.id, &observed())
+        .verify_generation_for_startup(&generation.id, &observed(), "test")
         .await
         .unwrap();
     assert!(store.inspect_status(&observed()).await.current.is_some());
@@ -653,7 +653,7 @@ async fn status_invalidates_on_pointer_head_and_consumer_changes() {
         .unwrap();
     // Creating a head changes its shape from checkpoint-only to recorded.
     store
-        .verify_generation_for_startup(&generation.id, &observed())
+        .verify_generation_for_startup(&generation.id, &observed(), "test")
         .await
         .unwrap();
     store
@@ -734,7 +734,7 @@ async fn transient_verification_failures_remain_unverified() {
     let id = &active.generation.id;
     let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let error = with_verification_cancellation(cancellation, || {
-        futures::executor::block_on(store.verify_generation_for_startup(id, &observed()))
+        futures::executor::block_on(store.verify_generation_for_startup(id, &observed(), "test"))
     })
     .unwrap_err();
     assert!(audit_infrastructure_error(&error));
@@ -754,7 +754,7 @@ async fn transient_verification_failures_remain_unverified() {
         .unwrap();
     writer.close().await;
     store
-        .verify_generation_for_startup(id, &observed())
+        .verify_generation_for_startup(id, &observed(), "test")
         .await
         .unwrap();
     assert!(store.inspect_status(&observed()).await.current.is_some());
@@ -764,7 +764,7 @@ async fn transient_verification_failures_remain_unverified() {
     fs::rename(&staging, &saved).unwrap();
     fs::write(&staging, b"not a scratch directory").unwrap();
     let error = store
-        .verify_generation_for_startup(id, &observed())
+        .verify_generation_for_startup(id, &observed(), "test")
         .await
         .unwrap_err();
     assert!(audit_infrastructure_error(&error), "{error}");

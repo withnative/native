@@ -993,9 +993,8 @@ fn every_tool_advertises_required_stable_run_key_reuse_without_tolerance_copy() 
             .as_str()
             .unwrap();
         for required in [
-            "Bootstrap run correlation handle",
-            "same key every call",
-            "reads included",
+            "Reuse bootstrap run_key",
+            "mint \"new\"",
             "new:<agent_key>",
             "coordination guide",
         ] {

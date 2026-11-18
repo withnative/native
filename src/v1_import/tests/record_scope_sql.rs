@@ -97,14 +97,38 @@ async fn finite_record_scope_matches_full_for_direct_derived_moves_revocation_an
     for account in ["account-a", "account-b"] {
         equivalent(&db, account).await;
     }
+    // Use a real folder outside the imported scoped overlay. Explicit root
+    // filing redirects WorkItems to Unfiled, absent from this legacy fixture.
+    let destination = ordinary_kernel_call(
+        &db,
+        "account-a",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Unscoped destination","home_id":"native:root"}),
+    )
+    .await
+    .unwrap();
     ordinary_kernel_call(
         &db,
         "account-a",
         "update_record",
-        json!({"id":"private","home_id":"native:root","lifecycle":"open"}),
+        json!({"id":"private","home_id":destination["id"],"lifecycle":"open"}),
     )
     .await
     .unwrap();
+    let relocated =
+        ordinary_kernel_call(&db, "account-a", "get_record", json!({"ids":["private"]}))
+            .await
+            .unwrap();
+    assert_eq!(relocated["records"][0]["home_id"], destination["id"]);
+    let still_private = ordinary_kernel_call(
+        &db,
+        "account-b",
+        "query_sql",
+        json!({"sql":"SELECT id FROM records WHERE id='private'"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(still_private["rows"], json!([]));
     for account in ["account-a", "account-b"] {
         equivalent(&db, account).await;
     }

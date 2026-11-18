@@ -134,7 +134,17 @@ pub fn register_export_tool(registry: &mut ToolRegistry, source: SnapshotSourceR
                         "source_sha": { "type": "string" },
                         "artifact_sha256": { "type": "string" },
                         "engine_schema_version": { "type": "integer", "minimum": 1 },
-                        "ddl_sha256": { "type": "string" }
+                        "ddl_sha256": { "type": "string" },
+                        "kernel_v2_reader": {
+                            "type": "object",
+                            "description": "Kernel-v2 reader coordinates. Omission means the fixed initial reader format and kernel schema.",
+                            "additionalProperties": false,
+                            "required": ["reader_format", "schema_sha256"],
+                            "properties": {
+                                "reader_format": { "type": "integer", "minimum": 1 },
+                                "schema_sha256": { "type": "string" }
+                            }
+                        }
                     }
                 }
             },

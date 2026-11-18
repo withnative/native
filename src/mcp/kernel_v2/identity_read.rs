@@ -56,6 +56,27 @@ pub async fn hosted_identity_as(
     ))
 }
 
+/// Recheck an app's current grant when a hosted roster read finishes. The
+/// catalogue page is workspace-wide, so a folder-scoped app must not receive
+/// it even if its grant changed after dispatch preflight.
+pub async fn require_unscoped_app_directory_as(db: &Db, caller: &Caller) -> Result<()> {
+    let mut tx = db.pool().begin().await?;
+    let actor: Option<String> = sqlx::query_scalar(
+        "SELECT principal_id FROM main.kernel_principals WHERE auth_binding=? AND kind='account'",
+    )
+    .bind(caller.credential())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let actor = actor.ok_or_else(|| Error::engine("database membership not found"))?;
+    if kernel::app_installs::admit_dispatched_on(&mut tx, &actor)
+        .await?
+        .is_some_and(|admitted| admitted.scope.is_scoped())
+    {
+        return Err(Error::engine(kernel::OUTSIDE_APP_SCOPE));
+    }
+    Ok(())
+}
+
 /// Display names of the People among `person_ids` that the caller's account
 /// can read on a hosted kernel v2 database (`manage_memberships list` with
 /// `include_person`). Unreadable or missing People are absent from the map.
@@ -209,6 +230,200 @@ pub(super) async fn sql_bindings_on(
         .collect())
 }
 
+/// Catalogue identities, portable authentication bindings and kernel principals
+/// inhabit different namespaces. These values are facts, never read authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogUserId(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableAccountBinding(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelPrincipalId(String);
+
+macro_rules! identity_input {
+    ($name:ident) => {
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+identity_input!(CatalogUserId);
+identity_input!(PortableAccountBinding);
+identity_input!(KernelPrincipalId);
+
+/// Host-trusted subjects only. Cursor facts must come from current admitted
+/// peers; contributors must come from engine events/history, never client JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoeditIdentitySubject {
+    Cursor {
+        catalog_user: CatalogUserId,
+        account: PortableAccountBinding,
+        principal: KernelPrincipalId,
+    },
+    Contributor {
+        principal: KernelPrincipalId,
+    },
+}
+
+/// Snapshot data, deliberately not serializable and carrying no publish permit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleCoeditIdentity {
+    pub person_id: String,
+    pub display_name: Option<String>,
+}
+
+/// Resolve at most 256 host-trusted subjects in one authorized native read
+/// snapshot. Input positions are preserved. Hidden/missing People are anonymous,
+/// including the viewer's own Person. Historical contributors need not remain
+/// members; live cursors must still match their current catalogue/native map.
+///
+/// Explicit app/source admission and record View here are snapshot read checks,
+/// not AppData data-needs admission or authority to publish a queued frame.
+/// Hosting must separately fence catalogue custody, incarnation and output.
+pub async fn coedit_identities_as(
+    db: &Db,
+    caller: &Caller,
+    record_id: &str,
+    subjects: &[CoeditIdentitySubject],
+) -> Result<Vec<Option<VisibleCoeditIdentity>>> {
+    coedit_identity_snapshot(db, caller, record_id, subjects, false).await
+}
+
+/// Non-app snapshot data for inactive hosted helpers. App-attributed disclosure
+/// remains unavailable until its read-scope/atomic acceptance is qualified.
+/// This is not enqueue authority; the host must still fence custody and output.
+pub async fn coedit_disclosure_identities_as(
+    db: &Db,
+    caller: &Caller,
+    record_id: &str,
+    subjects: &[CoeditIdentitySubject],
+) -> Result<Vec<Option<VisibleCoeditIdentity>>> {
+    coedit_identity_snapshot(db, caller, record_id, subjects, true).await
+}
+
+async fn coedit_identity_snapshot(
+    db: &Db,
+    caller: &Caller,
+    record_id: &str,
+    subjects: &[CoeditIdentitySubject],
+    non_app_disclosure: bool,
+) -> Result<Vec<Option<VisibleCoeditIdentity>>> {
+    // Fail at the explicit boundary before identity/target/install queries.
+    if non_app_disclosure
+        && (caller.host_asserted_app().is_some()
+            || crate::provenance::current_app_claim().is_some())
+    {
+        return Err(Error::engine("kernel coedit app disclosure unavailable"));
+    }
+    if subjects.len() > 256 {
+        return Err(Error::engine("coedit identity subject limit exceeded"));
+    }
+    let catalog_actor = caller
+        .hosting_principal()
+        .filter(|_| caller.is_host_member() && caller.hosting_database().is_some())
+        .ok_or_else(|| Error::engine("database membership not found"))?;
+    let mut snapshot = db.pool().begin().await?;
+    let actor: String = sqlx::query_scalar(
+        "SELECT principal_id FROM main.kernel_principals WHERE auth_binding=? AND kind='account'",
+    )
+    .bind(caller.credential())
+    .fetch_optional(&mut *snapshot)
+    .await?
+    .ok_or_else(|| Error::engine("database membership not found"))?;
+    if !kernel::hosted_identity::catalog_account_matches_on(
+        &mut snapshot,
+        catalog_actor,
+        caller.credential(),
+        &actor,
+    )
+    .await?
+        || !kernel::hosted_identity::admitted(&mut snapshot, &actor).await?
+    {
+        return Err(Error::engine("database membership not found"));
+    }
+    if let Some(app) = caller.host_asserted_app() {
+        kernel::app_installs::admit_app_on(&mut snapshot, &actor, app).await?;
+    }
+    kernel::app_installs::admit_dispatched_on(&mut snapshot, &actor).await?;
+    if kernel::read_record_on(&mut snapshot, &actor, record_id)
+        .await?
+        .is_none()
+    {
+        return Err(Error::engine(kernel::HIDDEN_OR_MISSING));
+    }
+    let mut result = Vec::with_capacity(subjects.len());
+    for subject in subjects {
+        let identity = match subject {
+            CoeditIdentitySubject::Cursor {
+                catalog_user,
+                account,
+                principal,
+            } => {
+                let mapping = kernel::hosted_identity::catalog_account_on(
+                    &mut snapshot,
+                    catalog_user.as_str(),
+                )
+                .await?;
+                if mapping.as_deref() != Some(account.as_str()) {
+                    result.push(None);
+                    continue;
+                }
+                let actual: Option<String> = sqlx::query_scalar(
+                    "SELECT principal_id FROM main.kernel_principals WHERE auth_binding=? AND kind='account'",
+                ).bind(account.as_str()).fetch_optional(&mut *snapshot).await?;
+                if actual.as_deref() != Some(principal.as_str())
+                    || !kernel::hosted_identity::catalog_account_matches_on(
+                        &mut snapshot,
+                        catalog_user.as_str(),
+                        account.as_str(),
+                        principal.as_str(),
+                    )
+                    .await?
+                {
+                    result.push(None);
+                    continue;
+                }
+                principal_identity_on(&mut snapshot, &actor, principal.as_str()).await?
+            }
+            CoeditIdentitySubject::Contributor { principal } => {
+                principal_identity_on(&mut snapshot, &actor, principal.as_str()).await?
+            }
+        };
+        let visible = match identity.and_then(|identity| identity.person_id) {
+            Some(person_id) => kernel::read_record_on(&mut snapshot, &actor, &person_id)
+                .await?
+                .map(|person| VisibleCoeditIdentity {
+                    person_id,
+                    display_name: person
+                        .fields
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                }),
+            None => None,
+        };
+        result.push(visible);
+    }
+    snapshot.rollback().await?;
+    Ok(result)
+}
+
+/// Fixture preparation only, absent from the production feature closure. This
+/// preserves the sealed importer's actual host and preactivation checks.
+#[cfg(feature = "body-read-test-support")]
+#[doc(hidden)]
+pub async fn prepare_hosted_identity_fixture(
+    db: &Db,
+    import_host: &str,
+    email_portable_pairs: Vec<(String, String)>,
+) -> Result<()> {
+    kernel::hosted_identity::import_accounts(db, import_host, email_portable_pairs).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +458,12 @@ mod tests {
     }
     async fn fixture_with_member_person(
         include_member: bool,
+    ) -> (tempfile::TempDir, Db, String, String) {
+        fixture_with_person_state(include_member, false).await
+    }
+    async fn fixture_with_person_state(
+        include_member: bool,
+        deleted_member: bool,
     ) -> (tempfile::TempDir, Db, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let (db, owner) = kernel::create_v2_database(
@@ -332,8 +553,289 @@ mod tests {
             .await
             .unwrap();
         }
+        if deleted_member {
+            kernel::import_removal_as(
+                &db,
+                &host,
+                "fixture-member-person",
+                kernel::ImportedRemovalKind::Record,
+                &kernel::ImportRemovalEvidence {
+                    source_origin: "fixture-source".into(),
+                    snapshot: "fixture-deleted-member".into(),
+                    reason: "Fixture Person was deleted in the verified source".into(),
+                    deleted_at: None,
+                    source_event: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
         reconcile(&db, "catalog-owner", true).await;
         (dir, db, owner, home)
+    }
+
+    fn historical(principal: &str) -> CoeditIdentitySubject {
+        CoeditIdentitySubject::Contributor {
+            principal: KernelPrincipalId::new(principal),
+        }
+    }
+    fn cursor(catalog: &str, account: &str, principal: &str) -> CoeditIdentitySubject {
+        CoeditIdentitySubject::Cursor {
+            catalog_user: CatalogUserId::new(catalog),
+            account: PortableAccountBinding::new(account),
+            principal: KernelPrincipalId::new(principal),
+        }
+    }
+    async fn coedit_target(db: &Db, owner: &str) -> String {
+        let member = kernel::resolve_principal_by_binding(db, "portable-member")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        let target_home = kernel::create_home(
+            db,
+            KERNEL_ROOT_ID,
+            Some(&[(owner, "manage"), (&member, "view")]),
+            owner,
+        )
+        .await
+        .unwrap();
+        kernel::create_json_as(db, owner, "fixture.person", "person", "{}", &target_home)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn coedit_identity_snapshot_obeys_own_and_other_person_view_without_writes() {
+        let (_dir, db, owner, people_home) = fixture_with_member_person(true).await;
+        let target = coedit_target(&db, &owner).await;
+        let member = kernel::resolve_principal_by_binding(&db, "portable-member")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        let caller = reconcile(&db, "catalog-member", true).await;
+        let subjects = [
+            historical(&owner),
+            cursor("catalog-member", "portable-member", &member),
+        ];
+        let before = kernel::dump_all_kernel_tables(&db).await.unwrap();
+        let visible = coedit_identities_as(&db, &caller, &target, &subjects)
+            .await
+            .unwrap();
+        assert_eq!(visible[0].as_ref().unwrap().person_id, "fixture-person");
+        assert_eq!(
+            visible[1].as_ref().unwrap().person_id,
+            "fixture-member-person"
+        );
+        assert_eq!(before, kernel::dump_all_kernel_tables(&db).await.unwrap());
+        kernel::replace_home_policy(&db, &owner, &people_home, &[(&owner, "manage")])
+            .await
+            .unwrap();
+        assert!(kernel::read_record_as(&db, &member, &target)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            coedit_disclosure_identities_as(&db, &caller, &target, &subjects)
+                .await
+                .unwrap(),
+            vec![None, None]
+        );
+        // Missing People never get fallback labels or bindings.
+        let viewer = reconcile(&db, "catalog-owner", true).await;
+        let before = kernel::dump_all_kernel_tables(&db).await.unwrap();
+        assert_eq!(
+            coedit_identities_as(&db, &viewer, &target, &[historical("missing")])
+                .await
+                .unwrap(),
+            vec![None]
+        );
+        assert_eq!(before, kernel::dump_all_kernel_tables(&db).await.unwrap());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn coedit_identity_snapshot_distinguishes_namespaces_and_departed_cursors() {
+        let (_dir, db, owner, _) = fixture_with_member_person(true).await;
+        let target = coedit_target(&db, &owner).await;
+        let member = kernel::resolve_principal_by_binding(&db, "portable-member")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        let viewer = reconcile(&db, "catalog-owner", true).await;
+        let bad = [
+            cursor("portable-member", "portable-member", &member),
+            cursor("catalog-member", "catalog-member", &member),
+            cursor("catalog-member", "portable-member", "portable-member"),
+            historical("portable-member"),
+        ];
+        assert_eq!(
+            coedit_identities_as(&db, &viewer, &target, &bad)
+                .await
+                .unwrap(),
+            vec![None; 4]
+        );
+        let viewer = reconcile(&db, "catalog-owner", false).await;
+        let result = coedit_identities_as(
+            &db,
+            &viewer,
+            &target,
+            &[
+                cursor("catalog-member", "portable-member", &member),
+                historical(&member),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0], None);
+        assert_eq!(
+            result[1].as_ref().unwrap().person_id,
+            "fixture-member-person"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn coedit_identity_snapshot_refuses_viewer_self_mapping_target_loss_and_budget() {
+        let (_dir, db, owner, home) = fixture().await;
+        let member = reconcile(&db, "catalog-member", true).await;
+        // Real H3 metadata with the wrong portable credential is not self identity.
+        let misbound = unsafe {
+            Caller::authenticated("portable-member").with_verified_hosted_v2_identity(
+                "catalog-owner",
+                "fixture-db",
+                true,
+            )
+        };
+        for caller in [
+            Caller::authenticated("portable-owner"),
+            misbound,
+            member.clone().with_hosting_member(false),
+        ] {
+            assert!(coedit_identities_as(&db, &caller, "fixture-person", &[])
+                .await
+                .is_err());
+        }
+        assert!(coedit_identities_as(&db, &member, "missing-target", &[])
+            .await
+            .is_err());
+        assert!(coedit_identities_as(
+            &db,
+            &member,
+            "fixture-person",
+            &vec![historical(&owner); 257]
+        )
+        .await
+        .is_err());
+        kernel::replace_home_policy(&db, &owner, &home, &[(&owner, "manage")])
+            .await
+            .unwrap();
+        assert!(coedit_identities_as(&db, &member, "fixture-person", &[])
+            .await
+            .is_err());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn coedit_disclosure_refuses_explicit_and_dispatched_app_before_lookup() {
+        let (_dir, db, _, _) = fixture().await;
+        let viewer = reconcile(&db, "catalog-owner", true).await;
+        let app = crate::mcp::app_attribution::AppAttribution::new(
+            "fixture.app",
+            "1.0.0",
+            "missing-install",
+        )
+        .unwrap();
+        let claimed = viewer.clone().with_host_asserted_app(app);
+        let error = coedit_disclosure_identities_as(&db, &claimed, "missing-target", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "kernel coedit app disclosure unavailable"
+        );
+        let dispatch = crate::provenance::ProvenanceDispatch::from_caller(
+            &claimed,
+            "get_record",
+            &json!({}),
+            None,
+        );
+        let error = dispatch
+            .scope(coedit_disclosure_identities_as(
+                &db,
+                &viewer,
+                "missing-target",
+                &[],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "kernel coedit app disclosure unavailable"
+        );
+        assert!(
+            coedit_identities_as(&db, &claimed, "fixture-person", &[])
+                .await
+                .is_err(),
+            "ordinary snapshot still admits the actual install"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn coedit_identity_snapshot_keeps_deleted_person_anonymous() {
+        let (_dir, db, owner, _) = fixture_with_person_state(true, true).await;
+        let viewer = reconcile(&db, "catalog-owner", true).await;
+        let member = kernel::resolve_principal_by_binding(&db, "portable-member")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        let before = kernel::dump_all_kernel_tables(&db).await.unwrap();
+        assert_eq!(
+            coedit_identities_as(
+                &db,
+                &viewer,
+                "fixture-person",
+                &[
+                    historical(&member),
+                    cursor("catalog-member", "portable-member", &member),
+                    historical(&owner),
+                ]
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_eq!(before, kernel::dump_all_kernel_tables(&db).await.unwrap());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn coedit_identity_snapshot_reads_physically_read_only_prepared_file() {
+        let (dir, db, owner, _) = fixture().await;
+        let viewer = reconcile(&db, "catalog-owner", true).await;
+        db.close().await;
+        let read = crate::db::open_marked_v2_database_read_only_at(&dir.path().join("identity.db"))
+            .await
+            .unwrap();
+        let before = kernel::dump_all_kernel_tables(&read).await.unwrap();
+        let result = coedit_disclosure_identities_as(
+            &read,
+            &viewer,
+            "fixture-person",
+            &[historical(&owner)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0].as_ref().unwrap().person_id, "fixture-person");
+        assert_eq!(before, kernel::dump_all_kernel_tables(&read).await.unwrap());
+        read.close().await;
     }
 
     #[tokio::test]

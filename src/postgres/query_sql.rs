@@ -1369,6 +1369,14 @@ pub(crate) fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
             deleted_at = portable_ts("record.deleted_at"),
             deleted_at_ms = portable_ts_ms("record.deleted_at"),
         ),
+        format!(
+            "CREATE TEMP VIEW viewer WITH (security_barrier=true) AS \
+             SELECT person.id COLLATE \"C\" AS person_id, person.name COLLATE \"C\" AS display_name \
+             FROM pg_temp._query_sql_principal principal \
+             LEFT JOIN {bindings} binding ON binding.system='account' AND binding.identifier=principal.account_id \
+             LEFT JOIN pg_temp._query_sql_visible_records visible ON visible.id=binding.record_id \
+             LEFT JOIN {records} person ON person.id=visible.id",
+        ),
         // Claim-shape is key existence, not a non-null value: `get_history`
         // treats `{"claimed_by_account": null}` as claim-shaped
         // (`.get(..).is_some()`), and `->>` would return SQL NULL for that
@@ -2127,7 +2135,10 @@ async fn execute_qualified(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
         };
         sqlx::query(isolation).execute(&mut *transaction).await?;
+        // JIT startup also affects the caller-filtered lifecycle schema read.
+        // Disable it before staging; LOCAL restores the session policy at end.
         for setting in [
+            "SET LOCAL jit=off",
             "SET LOCAL statement_timeout='2000ms'",
             "SET LOCAL lock_timeout='250ms'",
             "SET LOCAL idle_in_transaction_session_timeout='2500ms'",
@@ -2155,10 +2166,6 @@ async fn execute_qualified(
         if needs_lifecycle {
             populate_lifecycle_interpretations(&mut transaction, &db).await?;
         }
-        // JIT startup can consume the two-second governed read budget. Disable
-        // it before caller planning, after freshness and lifecycle staging;
-        // LOCAL restores the session setting when the transaction ends.
-        transaction.execute("SET LOCAL jit=off").await?;
         transaction
             .execute(format!("SET LOCAL ROLE {query_role}").as_str())
             .await?;
@@ -4024,6 +4031,152 @@ mod tests {
 
     #[cfg(feature = "postgres-tests")]
     #[tokio::test]
+    async fn pg_viewer_matches_sqlite_person_states() {
+        let Some(url) = std::env::var_os("NATIVE_CE_POSTGRES_TEST_URL") else {
+            return;
+        };
+        let cluster = crate::postgres::PostgresCluster::connect(url.to_str().unwrap())
+            .await
+            .unwrap();
+        let db = cluster.fresh_logical_database().await.unwrap();
+        seed_pg_conformance_fixture(&db).await;
+        let sqlite = crate::create_database(":memory:").await.unwrap();
+        for statement in crate::query::sql_conformance::SEED_SQL {
+            sqlx::query(statement)
+                .execute(sqlite.write_pool())
+                .await
+                .unwrap();
+        }
+        crate::authorization::replace_explicit_policy(
+            &sqlite,
+            "test:viewer",
+            "conf:common",
+            vec![crate::authorization::AllowEntry::account(
+                "alice",
+                crate::authorization::Capability::View,
+            )],
+        )
+        .await
+        .unwrap();
+        let records = db.qualified_table("records").unwrap();
+        let bindings = db.qualified_table("bindings").unwrap();
+        let sql = "SELECT person_id, display_name FROM viewer";
+        // A new account has no person and no history on either engine.
+        for account in ["newcomer", "alice"] {
+            let principal = crate::query::QueryPrincipal::authenticated(account, true);
+            let pg = qualification_query_sql(db.clone(), principal.clone(), request(sql))
+                .await
+                .unwrap();
+            let local =
+                crate::query::sql::query_sql_request_owned(sqlite.clone(), principal, request(sql))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(pg.rows).unwrap(),
+                serde_json::to_value(local.rows).unwrap()
+            );
+        }
+        for name in [
+            Some("Alice".to_owned()),
+            Some(String::new()),
+            Some("x".repeat(1501)),
+            Some("  Alice \t ".to_owned()),
+        ] {
+            sqlx::query(&format!(
+                "UPDATE {records} SET name=$1 WHERE id='conf:common'"
+            ))
+            .bind(&name)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query("UPDATE records SET name=? WHERE id='conf:common'")
+                .bind(&name)
+                .execute(sqlite.write_pool())
+                .await
+                .unwrap();
+            let principal = crate::query::QueryPrincipal::authenticated("alice", true);
+            let pg = qualification_query_sql(db.clone(), principal.clone(), request(sql))
+                .await
+                .unwrap();
+            let local =
+                crate::query::sql::query_sql_request_owned(sqlite.clone(), principal, request(sql))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(pg.rows).unwrap(),
+                serde_json::to_value(local.rows).unwrap()
+            );
+        }
+        // The shared corpus homes conf:alice in conf:common. Restore its
+        // original unhomed fixture state on both engines before deleting the
+        // bound person; deleting a folder with live members is forbidden.
+        sqlx::query(&format!(
+            "UPDATE {records} SET home_id=NULL WHERE home_id='conf:common'"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE records SET home_id=NULL WHERE home_id='conf:common'")
+            .execute(sqlite.write_pool())
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE {records} SET deleted_at=now() WHERE id='conf:common'"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        crate::store::delete_record(&sqlite, "conf:common")
+            .await
+            .unwrap();
+        let principal = crate::query::QueryPrincipal::authenticated("alice", true);
+        let pg = qualification_query_sql(db.clone(), principal.clone(), request(sql))
+            .await
+            .unwrap();
+        let local =
+            crate::query::sql::query_sql_request_owned(sqlite.clone(), principal, request(sql))
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(pg.rows).unwrap(),
+            serde_json::to_value(local.rows).unwrap()
+        );
+        // Binding to a hidden or deleted person withholds that identity;
+        // removing the binding keeps the singleton with NULL columns.
+        for person in [Some("conf:bea"), Some("conf:tomb"), None] {
+            sqlx::query(&format!(
+                "DELETE FROM {bindings} WHERE system='account' AND identifier='alice'"
+            ))
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM bindings WHERE system='account' AND identifier='alice'")
+                .execute(sqlite.write_pool())
+                .await
+                .unwrap();
+            if let Some(person) = person {
+                sqlx::query(&format!("INSERT INTO {bindings}(record_id,system,identifier,is_canonical) VALUES($1,'account','alice',TRUE)"))
+                    .bind(person).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO bindings(record_id,system,identifier,is_canonical) VALUES(?,'account','alice',1)")
+                    .bind(person).execute(sqlite.write_pool()).await.unwrap();
+            }
+            let principal = crate::query::QueryPrincipal::authenticated("alice", true);
+            let pg = qualification_query_sql(db.clone(), principal.clone(), request(sql))
+                .await
+                .unwrap();
+            let local =
+                crate::query::sql::query_sql_request_owned(sqlite.clone(), principal, request(sql))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(pg.rows).unwrap(),
+                serde_json::to_value(local.rows).unwrap()
+            );
+        }
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[tokio::test]
     async fn pg_lifecycle_relation_is_caller_relative_and_snapshot_pinned() {
         let Some(url) = std::env::var_os("NATIVE_CE_POSTGRES_TEST_URL") else {
             return;
@@ -4080,6 +4233,40 @@ mod tests {
             created_at: "2026-01-02T00:00:00.000Z".into(),
             act: None,
         })
+        .await
+        .unwrap();
+        // The owned schema view observes the setting at lifecycle staging,
+        // before caller preparation. Fail deterministically if staging still
+        // compiles JIT functions for its tiny governed schema read.
+        let fixture_jit: String = sqlx::query_scalar("SHOW jit")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(fixture_jit, "on", "the staging JIT guard requires jit=on");
+        let config = db.qualified_table("schema_config").unwrap();
+        let schema = quote_identifier(db.schema()).unwrap();
+        let backing = format!("{schema}.lifecycle_schema_config_fixture");
+        let guard = format!("{schema}.lifecycle_schema_data_guard");
+        sqlx::query(&format!(
+            "ALTER TABLE {config} RENAME TO lifecycle_schema_config_fixture"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "CREATE FUNCTION {guard}(value text) RETURNS text LANGUAGE plpgsql AS $$ \
+             BEGIN IF current_setting('jit') <> 'off' THEN \
+             RAISE EXCEPTION 'lifecycle staging must disable JIT'; END IF; \
+             RETURN value; END $$"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "CREATE VIEW {config} AS SELECT id,layer,name,{guard}(data::text) AS data,\
+             applies_to_collection_id,version_lineage,created_at FROM {backing}"
+        ))
+        .execute(db.pool())
         .await
         .unwrap();
         let sql = "SELECT record_id,status,raw,axis_key,value_id,terminality,reason FROM record_lifecycle_interpretations WHERE record_id LIKE 'conf:lifecycle%' ORDER BY record_id";

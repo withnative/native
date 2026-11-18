@@ -854,6 +854,7 @@ async fn alpha_tab_provenance_member_copy_v1_excludes_install_and_control_histor
             ordinal: 1,
             out_path: path.clone(),
             consumer: StandbyConsumerIdentity {
+                kernel_v2_reader: Default::default(),
                 contract: STANDBY_CONSUMER_CONTRACT.into(),
                 version: 1,
                 platform: StandbyConsumerPlatform::LinuxX8664,

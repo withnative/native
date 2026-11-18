@@ -17,10 +17,10 @@ Choose the door whose semantics faithfully match the question:
 1. Use `get_record` when you know the exact identity—including when you have a full id or short record reference—and need the record with its immediate context. Pass that address in `ids`; use `get_structure` for a bounded view of containment.
 2. Use `query_record` for exact structured constraints, placement, relationships, ordered pages, counts, and facet-based questions.
 3. Use `search` for lexical evidence in names and bodies. Its `query` is text, not a record address; use its address-valued `scope` to restrict lexical discovery beneath a known record. In this build it is stemmed full-text search with ANDed terms, not semantic similarity, so shorten and reformulate when the writer's words may differ from yours.
-4. Use `scan` when you do not yet know which axis contains the answer. Its optional `query` adds a lexical-text axis, while its address-valued `scope` bounds every axis beneath a known record. Its censuses and samples orient you; they are not complete matching sets. Refine through a more exact door once a useful axis appears.
+4. Use `scan` when it appears in your operation list and you do not yet know which axis contains the answer. Its optional `query` adds a lexical-text axis, while its address-valued `scope` bounds every axis beneath a known record. Its censuses and samples orient you; they are not complete matching sets. Refine through a more exact door once a useful axis appears. When `scan` is not advertised, orient with `get_dashboard` for the lifecycle census, attention, and recent work, then `search` for lexical evidence, `query_record` for filtering, and `get_structure` or `open_collection` for containers.
 5. Use `query_sql` only when a caller-filtered relational join or aggregation cannot be represented faithfully by the higher-level query surface. Inspect the live schema first and keep results bounded.
 
-On a lean MCP surface (bootstrap reports `tool_exposure.projection: "lean"`), `records_read` advertises `search` and `get_record` directly. Read with `sql_read` `query_sql` first, and reach `query_record`, `get_structure` and `scan` through `call_executor` with the same operation and arguments, for example `call_executor` with `{"executor":"records_read","operation":"get_history","arguments":{"record_id":reference}}`.
+On a lean MCP surface (bootstrap reports `tool_exposure.projection: "lean"`), `records_read` advertises `search` and `get_record` directly. Read with `sql_read` `query_sql` first, and reach `query_record` and `get_structure` through `call_executor` with the same operation and arguments, for example `call_executor` with `{"executor":"records_read","operation":"get_history","arguments":{"record_id":reference}}`. Reach `scan` the same way only when it appears in your operation list.
 
 History and activity answer a different question from record content. When you need to know why something changed, what landed since a known point, or whether concurrent work altered the premise, use the relevant history or change surface rather than trying to infer a timeline from current values.
 
@@ -34,7 +34,7 @@ Widen deliberately:
 
 - remove one constraint at a time, including the one that felt most certain;
 - try the author's likely nouns, synonyms, earlier terminology, and a single term instead of several;
-- move from lexical search to `scan` when the vocabulary or axis is unknown;
+- move from lexical search to `scan` when it is advertised and the vocabulary or axis is unknown;
 - move from exploration to `query_record` when structure becomes visible;
 - inspect history, placement, links, or archived state when the missing item may have moved or been retired;
 - use the lower-level relational door only when the question genuinely requires it.

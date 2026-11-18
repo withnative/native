@@ -1,0 +1,134 @@
+{
+  "observation": {
+    "as_of_seq": 90923,
+    "source": "caller-visible node-routed logical SQL; no serving-age/failover disclosure"
+  },
+  "schema": [
+    {
+      "id": "cef4536b-0551-4d25-9b8c-a9541bb20e51",
+      "layer": "user",
+      "data": "{\"shapes\":{\"Document\":{\"facets\":{\"area\":{\"vocab_ref\":\"area\"}}},\"WorkItem\":{\"facets\":{\"area\":{\"vocab_ref\":\"area\"}}}}}",
+      "applies_to_collection_id": null,
+      "version_lineage": null,
+      "created_at": "2026-08-18T11:04:47.852Z"
+    },
+    {
+      "id": "b5e5fbfc-114e-40fb-be84-8407a66445a0",
+      "layer": "user",
+      "data": "{\"shapes\":{\"Outcome\":{\"facets\":{\"strategy_lane\":{\"vocab_ref\":\"strategy-lane\",\"required\":false}}},\"WorkItem\":{\"facets\":{\"strategy_lane\":{\"vocab_ref\":\"strategy-lane\",\"required\":false}}},\"Resolution\":{\"facets\":{\"strategy_lane\":{\"vocab_ref\":\"strategy-lane\",\"required\":false}}},\"Program\":{\"facets\":{\"strategy_lane\":{\"vocab_ref\":\"strategy-lane\",\"required\":false}}}}}",
+      "applies_to_collection_id": null,
+      "version_lineage": "strategy-portfolio-v1",
+      "created_at": "2026-09-22T15:00:02.720Z"
+    }
+  ],
+  "vocabularies": [
+    {
+      "id": "voc:area",
+      "name": "area"
+    },
+    {
+      "id": "voc:strategy-lane",
+      "name": "strategy-lane"
+    }
+  ],
+  "values": [
+    {
+      "id": "vv:voc:area:agent-guidance",
+      "vocabulary_id": "voc:area",
+      "value": "agent-guidance",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:artifacts",
+      "vocabulary_id": "voc:area",
+      "value": "artifacts",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:ci",
+      "vocabulary_id": "voc:area",
+      "value": "ci",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:hosting",
+      "vocabulary_id": "voc:area",
+      "value": "hosting",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:identity",
+      "vocabulary_id": "voc:area",
+      "value": "identity",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:mcp",
+      "vocabulary_id": "voc:area",
+      "value": "mcp",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:schema",
+      "vocabulary_id": "voc:area",
+      "value": "schema",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:web-ui",
+      "vocabulary_id": "voc:area",
+      "value": "web-ui",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:area:workspace-ops",
+      "vocabulary_id": "voc:area",
+      "value": "workspace-ops",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:strategy-lane:direction",
+      "vocabulary_id": "voc:strategy-lane",
+      "value": "direction",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:strategy-lane:platform",
+      "vocabulary_id": "voc:strategy-lane",
+      "value": "platform",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:strategy-lane:product",
+      "vocabulary_id": "voc:strategy-lane",
+      "value": "product",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:strategy-lane:research",
+      "vocabulary_id": "voc:strategy-lane",
+      "value": "research",
+      "status": "active",
+      "alias_of": null
+    },
+    {
+      "id": "vv:voc:strategy-lane:users",
+      "vocabulary_id": "voc:strategy-lane",
+      "value": "users",
+      "status": "active",
+      "alias_of": null
+    }
+  ]
+}

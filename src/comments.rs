@@ -573,8 +573,8 @@ pub async fn validate_update_on(
     )
 }
 
-/// The one lifecycle transition a governed comment admits: an atomic root-only
-/// `open -> resolved` carrying a nonblank summary. Shared by both enforcement
+/// Governed root transitions: `open -> resolved` with a nonblank summary,
+/// or `resolved -> open` with the summary explicitly cleared. Shared by both enforcement
 /// paths so the rule and its diagnosis cannot drift apart.
 ///
 /// The refusal NAMES the state the root is actually in. Saying only that the
@@ -589,6 +589,15 @@ pub(crate) fn assert_resolution_transition(
     lifecycle_touched: bool,
     summary_touched: bool,
 ) -> Result<()> {
+    if lifecycle_touched
+        && summary_touched
+        && position == Position::Root
+        && current_lifecycle == Some(RESOLVED)
+        && resulting_lifecycle == Some(OPEN)
+        && resulting_summary.is_none()
+    {
+        return Ok(());
+    }
     if lifecycle_touched {
         if position != Position::Root
             || current_lifecycle != Some(OPEN)
@@ -656,6 +665,46 @@ pub async fn assert_bearer_immutable_on(
 #[cfg(test)]
 mod shape_text_tests {
     use super::*;
+
+    #[test]
+    fn comment_reopen_requires_root_resolved_and_explicit_summary_clear() {
+        assert!(assert_resolution_transition(
+            "update_record",
+            Position::Root,
+            Some(RESOLVED),
+            Some(OPEN),
+            None,
+            true,
+            true
+        )
+        .is_ok());
+        for (position, before, summary, lifecycle_touched, summary_touched) in [
+            (Position::Reply, Some(RESOLVED), None, true, true),
+            (Position::Root, Some(OPEN), None, true, true),
+            (Position::Root, Some(INFORMATIONAL), None, true, true),
+            (
+                Position::Root,
+                Some(RESOLVED),
+                Some("old resolution"),
+                true,
+                true,
+            ),
+            (Position::Root, Some(RESOLVED), Some(""), true, true),
+            (Position::Root, Some(RESOLVED), None, true, false),
+            (Position::Root, Some(RESOLVED), None, false, true),
+        ] {
+            assert!(assert_resolution_transition(
+                "update_record",
+                position,
+                before,
+                Some(OPEN),
+                summary,
+                lifecycle_touched,
+                summary_touched
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn rendered_texts_match_historical_validator_messages() {

@@ -1,12 +1,25 @@
 [
   {
+    "name": "patch release 1.1.2",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 1,
+          "version": "1.1.2"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
     "name": "default",
     "selector": {
       "schema": "native.app-kit.selector.v1",
       "selections": [
         {
           "major": 1,
-          "version": "1.1.0"
+          "version": "1.4.0"
         }
       ]
     },

@@ -52,6 +52,8 @@ pub(crate) use transaction_lifecycle::{
 };
 #[path = "domain_transaction/facets.rs"]
 mod facets;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use facets::vocabulary_and_active_values;
 pub(crate) use facets::{
     active_vocabulary_value, assert_open_facet_key, assert_required_not_worsened,
     assess_facet_write, classify_facet_key, declared_disambiguation, declared_type_is_json_object,
@@ -332,9 +334,16 @@ where
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
             | "kernel.notification_preference_set.v1"
+            | "kernel.mcp_write_receipt_recorded.v1"
+            | "kernel.mcp_write_fenced.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    if crate::mcp::tools::webhooks::is_event(&event.event_type) {
+        return Err(Error::engine(
+            "webhook events require the sealed hosting intake route",
         ));
     }
     if event.event_type.starts_with("kernel.hcp_") {
@@ -343,10 +352,37 @@ where
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if event.event_type.starts_with("kernel.publication_") {
+        return Err(Error::engine(
+            "publication events require the sealed publication route",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
     if crate::kernel::slots::is_slot_event(&event.event_type) {
         return Err(Error::engine(
             "slot events require the sealed kernel slot route",
         ));
+    }
+    append_and_project_admitted(
+        transaction,
+        event,
+        control,
+        RecordIdAuthority::CallerSupplied,
+        &CausalAdmission::LocalComputed,
+    )
+    .await
+}
+
+pub(crate) async fn append_and_project_webhook<T>(
+    transaction: &mut T,
+    event: &mut EventRow,
+    control: &ExecutionControl,
+) -> Result<ProjectorIntent>
+where
+    T: EventCursorPort + ProjectorPort,
+{
+    if !crate::mcp::tools::webhooks::is_event(&event.event_type) {
+        return Err(Error::engine("invalid sealed webhook event"));
     }
     append_and_project_admitted(
         transaction,
@@ -460,14 +496,27 @@ where
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
             | "kernel.notification_preference_set.v1"
+            | "kernel.mcp_write_receipt_recorded.v1"
+            | "kernel.mcp_write_fenced.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes require the sealed kernel commit port",
         ));
     }
+    if crate::mcp::tools::webhooks::is_event(&event.event_type) {
+        return Err(Error::engine(
+            "webhook events require the sealed hosting intake route",
+        ));
+    }
     if event.event_type.starts_with("kernel.hcp_") {
         return Err(Error::engine(
             "HCP events require the sealed kernel HCP route",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if event.event_type.starts_with("kernel.publication_") {
+        return Err(Error::engine(
+            "publication events require the sealed publication route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -510,6 +559,8 @@ where
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
             | "kernel.notification_preference_set.v1"
+            | "kernel.mcp_write_receipt_recorded.v1"
+            | "kernel.mcp_write_fenced.v1"
     ) {
         return Err(Error::engine(
             "kernel provider admission requires a provider outcome",
@@ -560,6 +611,28 @@ where
 {
     if !crate::kernel::slots::is_slot_event(&event.event_type) {
         return Err(Error::engine("kernel slot admission requires a slot event"));
+    }
+    append_and_project_admitted(
+        transaction,
+        event,
+        control,
+        RecordIdAuthority::CallerSupplied,
+        &CausalAdmission::LocalComputed,
+    )
+    .await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_and_project_kernel_publication<T>(
+    transaction: &mut T,
+    event: &mut EventRow,
+    control: &ExecutionControl,
+) -> Result<ProjectorIntent>
+where
+    T: EventCursorPort + ProjectorPort,
+{
+    if event.event_type != crate::kernel::publications::EVENT {
+        return Err(Error::engine("invalid sealed publication event"));
     }
     append_and_project_admitted(
         transaction,
@@ -716,6 +789,8 @@ impl ProjectorIntent {
                         | "kernel.instruction_binding_imported.v1"
                         | "kernel.instruction_binding_updated.v1"
                         | "kernel.notification_preference_set.v1"
+                        | "kernel.mcp_write_receipt_recorded.v1"
+                        | "kernel.mcp_write_fenced.v1"
                         | "kernel.principal_created.v1"
                         | "kernel.home_created.v1"
                         | "kernel.home_policy_replaced.v1"
@@ -729,6 +804,9 @@ impl ProjectorIntent {
                         | "kernel.host_transform_created.v1"
                         | "kernel.hosted_offboarding.v1"
                         | "kernel.hosted_membership.v1"
+                        | "kernel.hosted_membership.v2"
+                        | "kernel.membership_bundle_defined.v1"
+                        | "kernel.membership_bundle_updated.v1"
                         | "kernel.import_member_policy.v1"
                         | "kernel.import_hosted_accounts.v1"
                         | "kernel.host_import_created.v1"
@@ -740,7 +818,13 @@ impl ProjectorIntent {
                         | "kernel.artifact_excluded.v1"
                         | "kernel.app_install_removed.v1"
                         | "kernel.app_install_recorded.v1"
+                        | "kernel.app_catalog_update_materialized.v1"
+                        | "kernel.app_catalog_source_published.v1"
+                        | "kernel.app_source_published.v1"
                         | "kernel.app_install_adopted.v1"
+                        | "kernel.app_install_scope_set.v1"
+                        | "kernel.workspace_app_added.v1"
+                        | "kernel.workspace_app_removed.v1"
                         | "kernel.app_action_started.v1"
                         | "kernel.app_action_recorded.v1"
                         | "kernel.workspace_metadata_imported.v1"
@@ -759,7 +843,16 @@ impl ProjectorIntent {
                         | "kernel.body_set.v1"
                         | "kernel.metadata_set.v1"
                         | "kernel.identity_binding_added.v1"
+                        | "kernel.identity_binding_removed.v1"
+                        | "kernel.identity_bindings_reconciled.v1"
                         | "kernel.account_config_bound.v1"
+                        | "kernel.vocabulary_mutated.v1"
+                        | "kernel.schema_config_written.v1"
+                        | "kernel.webhook_configured.v1"
+                        | "kernel.webhook_revoked.v1"
+                        | "kernel.webhook_accepted.v1"
+                        | "kernel.webhook_diagnostic.v1"
+                        | "kernel.saved_tab_changed.v1"
                         | "kernel.generic_link_note_updated.v1"
                         | "kernel.generic_link_note_imported.v1"
                         | "kernel.generic_link_added.v1"
@@ -770,14 +863,17 @@ impl ProjectorIntent {
                         | "kernel.message_destination_set.v1"
                         | "kernel.message_created.v1"
                         | "kernel.message_state.v1"
+                        | "kernel.publication_changed.v1"
                         | "kernel.message_command_committed.v1"
                         | "kernel.persona_registered.v1"
                         | "kernel.persona_retired.v1"
                         | "kernel.comment_anchor_set.v1"
+                        | "kernel.comment_anchor_removed.v1"
                         | "kernel.comment_anchor_imported.v1"
                         | "kernel.facet_observed.v1"
                         | "kernel.archive_changed.v1"
                         | "kernel.record_deleted.v1"
+                        | "kernel.record_type_corrected.v1"
                         | "kernel.link_removed.v1"
                         | "kernel.hcp_entry_versioned.v1"
                         | "kernel.hcp_entry_status_set.v1"

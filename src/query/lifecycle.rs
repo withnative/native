@@ -120,6 +120,17 @@ fn select(relation: &'static str, fragments: &'static [&'static str]) -> Result<
     })
 }
 
+/// Terminality tokens the lifecycle interpreter treats as meaningful.
+/// This is the single source for the check in [`LifecycleInterpreter::interpret`]
+/// and the refusal guidance in `validate_imported_write`, so advice can never
+/// name a value the interpreter would not govern.
+fn interpretable_terminality(terminality: &str) -> bool {
+    matches!(
+        terminality,
+        "open" | "terminal_positive" | "terminal_negative"
+    )
+}
+
 impl VocabularyIndex {
     async fn load_with<E: DomainStatementExecutor>(executor: &mut E) -> Result<Self> {
         let vocabularies = select(
@@ -224,6 +235,36 @@ impl VocabularyIndex {
         };
         Some(canonical)
     }
+
+    /// Distinct canonical spellings an update may use under one vocabulary:
+    /// values that resolve to an active canonical with interpretable
+    /// terminality, minus the engine-reserved `archived` literal, which the
+    /// operation rejects before vocabulary validation (archive and restore via
+    /// the archive tool instead). Deprecated aliases resolve to their
+    /// canonical, so only canonicals are recommended. Sorted for stable
+    /// refusal messages across backends.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn usable_canonical_values(&self, vocabulary_id: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for state in self.values_by_id.values() {
+            if state.vocabulary_id != vocabulary_id {
+                continue;
+            }
+            let Some(canonical) = self.canonical_value(vocabulary_id, &state.value) else {
+                continue;
+            };
+            if !interpretable_terminality(&canonical.terminality) {
+                continue;
+            }
+            if canonical.value == "archived" {
+                continue;
+            }
+            out.push(canonical.value.clone());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 /// A read-only, point-in-time interpreter that amortizes schema and vocabulary
@@ -306,20 +347,53 @@ impl LifecycleInterpreter {
                 "lifecycle is required by the governing schema",
             ));
         }
-        if lifecycle.is_some()
-            && facets
-                .get("lifecycle")
-                .is_some_and(|s| s.get("vocab").or_else(|| s.get("vocab_ref")).is_some())
-            && !matches!(
-                self.interpret(typ, Some(kind), bearer, lifecycle),
-                LifecycleInterpretation::Governed(_)
-            )
+        let Some(raw) = lifecycle else {
+            return Ok(());
+        };
+        if !facets
+            .get("lifecycle")
+            .is_some_and(|s| s.get("vocab").or_else(|| s.get("vocab_ref")).is_some())
         {
-            return Err(Error::engine(
-                "lifecycle is unknown, inactive or has an uninterpretable governing vocabulary",
-            ));
+            return Ok(());
         }
-        Ok(())
+        if matches!(
+            self.interpret(typ, Some(kind), bearer, lifecycle),
+            LifecycleInterpretation::Governed(_)
+        ) {
+            return Ok(());
+        }
+        const GENERIC: &str =
+            "lifecycle is unknown, inactive or has an uninterpretable governing vocabulary";
+        let (axis, vocabulary) = self.context(typ, Some(kind), bearer);
+        let (Some(axis), Some(vocabulary)) = (axis, vocabulary) else {
+            return Err(Error::engine(GENERIC));
+        };
+        let usable = self.vocabularies.usable_canonical_values(&vocabulary.id);
+        let limit = crate::schema::GOVERNANCE_INLINE_ALTERNATIVES_LIMIT;
+        let detail = if !usable.is_empty() && usable.len() <= limit {
+            format!(
+                "usable lifecycle values of '{}': {}",
+                vocabulary.name,
+                usable.join(", ")
+            )
+        } else if !usable.is_empty() {
+            let list_arguments = serde_json::json!({
+                "vocabulary": vocabulary.name,
+                "status": "active",
+            });
+            format!(
+                "inspect the governing vocabulary with schema_read manage_vocabularies.list_values arguments {list_arguments}"
+            )
+        } else {
+            format!(
+                "governing vocabulary '{}' (id {}) has no usable lifecycle values",
+                vocabulary.name, vocabulary.id
+            )
+        };
+        Err(Error::engine(format!(
+            "{GENERIC}: {raw:?} is not an accepted lifecycle value in governing vocabulary '{}' (id {}) for {typ}:{kind} (axis {}); {detail}",
+            vocabulary.name, vocabulary.id, axis.key,
+        )))
     }
 
     pub async fn load(db: &Db, principal: Option<Principal<'_>>) -> Result<Self> {
@@ -489,10 +563,7 @@ impl LifecycleInterpreter {
                 reason: REASON_UNKNOWN_OR_INACTIVE_VALUE,
             });
         };
-        if !matches!(
-            canonical.terminality.as_str(),
-            "open" | "terminal_positive" | "terminal_negative"
-        ) {
+        if !interpretable_terminality(&canonical.terminality) {
             return LifecycleInterpretation::Unclassified(UnclassifiedLifecycleInterpretation {
                 raw: raw.to_string(),
                 reason: REASON_UNINTERPRETABLE_SCHEMA,
@@ -698,6 +769,134 @@ mod tests {
                 "raw": "completed",
                 "reason": "uninterpretable_schema_or_value"
             })
+        );
+    }
+
+    fn real_lifecycle_interpreter() -> LifecycleInterpreter {
+        let schema_rows = vec![SchemaConfigRow {
+            id: "pack:test".into(),
+            layer: "pack".into(),
+            name: None,
+            data: json!({
+                "shapes": {
+                    "WorkItem:task": {
+                        "facets": {
+                            "lifecycle": {
+                                "axis": { "key": "work_status", "label": "Work status" },
+                                "vocab_ref": "lifecycle",
+                                "required": true
+                            }
+                        }
+                    }
+                }
+            }),
+            applies_to_collection_id: None,
+            version_lineage: None,
+            created_at: String::new(),
+        }];
+        let mut vocabularies = VocabularyIndex::default();
+        vocabularies
+            .refs
+            .insert("lifecycle".into(), "voc:lifecycle".into());
+        vocabularies
+            .refs
+            .insert("voc:lifecycle".into(), "voc:lifecycle".into());
+        vocabularies
+            .names_by_id
+            .insert("voc:lifecycle".into(), "lifecycle".into());
+        // An active `archived` token mirrors the reviewer's case: the
+        // operation rejects the literal before vocabulary validation, so the
+        // refusal must not recommend it.
+        for (value, terminality, status) in [
+            ("open", "open", "active"),
+            ("in_progress", "open", "active"),
+            ("blocked", "open", "active"),
+            ("completed", "terminal_positive", "active"),
+            ("closed", "terminal_negative", "active"),
+            ("archived", "open", "active"),
+            ("retired", "open", "retired"),
+        ] {
+            let state = VocabularyValueState {
+                id: format!("vv:voc:lifecycle:{value}"),
+                vocabulary_id: "voc:lifecycle".into(),
+                value: value.into(),
+                status: status.into(),
+                terminality: terminality.into(),
+                alias_of: None,
+            };
+            vocabularies.values_by_vocab_and_value.insert(
+                (state.vocabulary_id.clone(), state.value.clone()),
+                state.id.clone(),
+            );
+            vocabularies.values_by_id.insert(state.id.clone(), state);
+        }
+        LifecycleInterpreter {
+            schema_rows,
+            vocabularies,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_canonical_and_alias_and_refuses_unknown_with_values() {
+        let interpreter = interpreter();
+        assert!(interpreter
+            .validate_imported_write("WorkItem", "task", None, Some("completed"))
+            .is_ok());
+        assert!(interpreter
+            .validate_imported_write("WorkItem", "task", None, Some("done"))
+            .is_ok());
+        let error = interpreter
+            .validate_imported_write("WorkItem", "task", None, Some("invented"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lifecycle is unknown, inactive"),
+            "keeps the established refusal phrase: {error}"
+        );
+        // Only the canonical spells: the deprecated `done` alias resolves, so
+        // it validates, but the advice recommends the canonical.
+        assert!(
+            error.contains("usable lifecycle values of 'task-state': completed"),
+            "names the exact alternatives: {error}"
+        );
+        assert!(!error.contains("done"), "{error}");
+        assert!(error.contains("work_status"), "{error}");
+    }
+
+    #[test]
+    fn validate_real_lifecycle_refuses_done_but_accepts_completed_close() {
+        let interpreter = real_lifecycle_interpreter();
+        // The helper accepts the canonical terminal values for validation.
+        // Operation-level closing is covered by the scoped update fixture.
+        assert!(interpreter
+            .validate_imported_write("WorkItem", "task", None, Some("completed"))
+            .is_ok());
+        assert!(interpreter
+            .validate_imported_write("WorkItem", "task", None, Some("closed"))
+            .is_ok());
+        // `done` is not a value of `voc:lifecycle`; the refusal must name the
+        // usable canonicals instead of leaving agents with a dead end.
+        let error = interpreter
+            .validate_imported_write("WorkItem", "task", None, Some("done"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lifecycle is unknown, inactive"),
+            "keeps the established refusal phrase: {error}"
+        );
+        assert!(
+            error.contains(
+                "usable lifecycle values of 'lifecycle': blocked, closed, completed, in_progress, open"
+            ),
+            "names the exact alternatives: {error}"
+        );
+        // Retired values and the engine-reserved `archived` literal are not
+        // usable lifecycle values, so neither is recommended.
+        assert!(!error.contains("retired"), "{error}");
+        assert!(!error.contains("archived"), "{error}");
+        assert!(
+            error.contains("\"done\""),
+            "names the rejected value: {error}"
         );
     }
 }

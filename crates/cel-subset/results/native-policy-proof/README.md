@@ -119,8 +119,8 @@ sticky auxiliary refusal cleanup have separate helper/public labels.
 
 [checks.json](checks.json) and logs retain narrow default tests, ordinary seeded
 proof, explicit default/tools all-target Clippy, format and inventory checks.
-Original test-log capture hashes are retained beside tracked-file hashes where
-trailing empty lines were stripped for Git whitespace policy. The full default
+Original capture hashes are retained beside tracked-file hashes where trailing
+empty lines were stripped or operator checkout paths were redacted. The full default
 suite ran at a490; only the subsequent two-file regex proof
 outcome/CLI correction differs, and affected tests were rerun at b307. The final
 certified generated report exercises the same unchanged proof core at b307.

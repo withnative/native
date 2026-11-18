@@ -1,0 +1,479 @@
+{
+  "qualification": "21 source-bound bypass-fails cases; each compiled successfully and failed the exact functional test. Sources restored in finally. These are not a final-head CI claim.",
+  "current_code_head": "58b80d26fe99b5788b0a150db0699a61b2d5cc8f",
+  "cases_completed": 21,
+  "cases_remaining": 0,
+  "source_binding": "Every original source hash matches git show at its recorded capture head. Current source hashes are provided for comparison; historical captures retain their actual identities.",
+  "excluded_attempts": [
+    {
+      "name": "node-probe-maintenance-priority-only",
+      "reason": "priority classification only; superseded by dbb functional valid95 maintenance refusal witness",
+      "receipt_sha256": "557de9c0fd1b0403d68c26e1697f83fa074c1f71ad28e6666b7d8d37a717107b"
+    },
+    {
+      "name": "stale-episode-private-helper-compile-failure",
+      "reason": "E0624 compilation failure is not a witness; corrected driver rerun succeeded",
+      "receipt_sha256": "6521aa80ad1d04ff694bebfa95ade075492340c0ed4ba7ac0dda664c44c3bc1f"
+    }
+  ],
+  "cases": [
+    {
+      "mutation": "compiled-primary-parity-functional",
+      "head": "35d013d7937fe29fc58037bca6e6a8e183714389",
+      "path": "src/standby_snapshot.rs",
+      "original_sha256": "e54b401961ae73bdc5a373d72183f9d85beb64bdb662555a7c7169c427b35dd8",
+      "mutant_sha256": "7213998f053cb1fd33af66fb5df60258abdb1d40e6ecdd08df4bb14302c62836",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin' (2055773) panicked at src/standby/generation_store/receiver_shape_tests.rs:177:5:\nsame95 FULL must preserve95 predecessor rows\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7886 filtered out; finished in 0.40s\n\n",
+          "raw_log_sha256": "e9f6ae0bf9bf6f5e6d9a215a663bc8140ad80ecdfdb0944acb8a1fc26f64c460"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "1068f27240fea97a48b5d3390c757c982b316aa4a71796e488e7795633ce4901",
+      "source_receipt_sha256": "06bf2f3a2006c64fa7a44f43dcd773a8fb3f549b780715f632cf3891248c5a67",
+      "current_source_sha256": "e54b401961ae73bdc5a373d72183f9d85beb64bdb662555a7c7169c427b35dd8",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "star-prefix",
+      "head": "35d013d7937fe29fc58037bca6e6a8e183714389",
+      "path": "src/standby/generation_store.rs",
+      "original_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "mutant_sha256": "bc71b51d56f2d12190eb2add14bcb7d89ffc8ed57c9e8507db09af2abaa9f5a2",
+      "tests": [
+        {
+          "test": "standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off stdout ----\n\nthread 'standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off' (2082087) panicked at src/standby/refresh/tests/kernel_v2_refresh.rs:88:10:\nadvanced94 prefix must compare and hand off to95: StandbyAdmission { check: SuccessorPreservation, source: Sqlx(Database(SqliteError { code: 1, message: \"SELECTs to the left and right of EXCEPT do not have the same number of result columns\" })) }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7886 filtered out; finished in 0.45s\n\n",
+          "raw_log_sha256": "71e874853290dbe6be323470cf6c605352f20d0e4ab62f500ebff3b1786898d8"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "7c45ec41b79084714ca2490b35b6b3291a0dcbd78e6972f93fe70954f818193f",
+      "source_receipt_sha256": "bab2e4386f174ad1cc87dc61f9e596cf9248566085d204aaea27ac75755f6ac6",
+      "current_source_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "v1-prewriter-zero-writer-bypass",
+      "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+      "path": "src/standby/refresh.rs",
+      "original_sha256": "dd3ef6d417ce217c30bed078705e34a2088813f7860d8633a13ef12a3a7fb3f8",
+      "mutant_sha256": "98564e16beb4fcb266fe47a1a252fea936f7c063ca2f3fa0aa31998a4bf07efc",
+      "tests": [
+        {
+          "test": "standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94 stdout ----\n\nthread 'standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94' (2374502) panicked at src/standby/refresh/tests/receiver_shapes.rs:177:9:\nassertion `left == right` failed: refused dialect must not open a generation writer\n  left: 1\n right: 0\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 1.13s\n\n",
+          "raw_log_sha256": "c4d8f7bffe3e3ca54658419e0888ea37bd09595747dcac4bebb1eccc1e44a447"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "c0d3416c9b85a5848f011a39907d20e9e7a1ffa01ef834842c30491ed776aac7",
+      "source_receipt_sha256": "64f9ef0757a2ba721f29e7c791c387297619b472a2e1172839f948042341ca8d",
+      "current_source_sha256": "a5556212f07485e1d112cb0b1d3699419c14beb991d9ca182f07f3c9d0b5bdbe",
+      "capture_source_still_identical": false
+    },
+    {
+      "mutation": "custody-pair-disabled",
+      "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+      "path": "src/node/gate/receiver_contracts.rs",
+      "original_sha256": "7351e0efeaa0c751618be6fc9b53d866596433b85a7190c10aff7c81ee3408ea",
+      "mutant_sha256": "35242c9d2173693ad66fd4b26fd31fde9d6d044c3ceab02a92f7d84911808510",
+      "tests": [
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery' (2388216) panicked at src/node/gate/v2_holding_tests.rs:2686:9:\n{\"jsonrpc\":\"2.0\",\"id\":11,\"error\":{\"code\":-32000,\"message\":\"Hosted v2 operation contract is incompatible; write was not held\",\"data\":{\"outcome\":\"not_sent\",\"held\":false}}}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.34s\n\n",
+          "raw_log_sha256": "94d2bf3fb5ff93abebf9f1901979de0373ad5d84475efd4df459f49f583bbda3"
+        },
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery' (2388224) panicked at src/node/gate/v2_holding_tests.rs:2791:5:\nassertion `left == right` failed\n  left: \"base\"\n right: \"base!\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.36s\n\n",
+          "raw_log_sha256": "bc355f8a11d0cc92e9407be8dad82dd67a6ac11fe0932837f971eea5ac9d20b1"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "d4e45e0e413c0e2bf832980f870a8e4c367d6399b2077683455d460d709cd161",
+      "source_receipt_sha256": "b90ca2abbb94d6c47903df36b3be0a657d08fb1b5d2ac8838d491b7773a65cac",
+      "current_source_sha256": "7351e0efeaa0c751618be6fc9b53d866596433b85a7190c10aff7c81ee3408ea",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "custody-hosted-descriptor-bypass",
+      "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+      "path": "src/node/gate/receiver_contracts.rs",
+      "original_sha256": "7351e0efeaa0c751618be6fc9b53d866596433b85a7190c10aff7c81ee3408ea",
+      "mutant_sha256": "ead079e61dc3aa5cff082dcb0dc76f1db82fcc88f4f20376919ba7f324c05137",
+      "tests": [
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded' (2402067) panicked at src/node/gate/v2_holding_tests.rs:2638:13:\nupdate_record digest\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.13s\n\n",
+          "raw_log_sha256": "346c306472aa64ef8b4f55383de699c2061911d026773680e5f202d3aae0725e"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "209e6cca5b713c4c3e6848534365b77424e95c9344b5951d3eee8ba518722247",
+      "source_receipt_sha256": "62a4b465a75611c7acdf85ae74d8f8755e3573b29b3a64e0145b578f80ec99d1",
+      "current_source_sha256": "7351e0efeaa0c751618be6fc9b53d866596433b85a7190c10aff7c81ee3408ea",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "audit-canonical-opener",
+      "head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+      "path": "src/standby/generation_store.rs",
+      "original_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "mutant_sha256": "8f2291de532c36a87e9a42cf993853fd36bc7b81d87b993d142c7023129d201a",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch' (2730545) panicked at src/standby/generation_store/receiver_shape_tests.rs:542:5:\nassertion failed: verify_awareness_projections(&unknown, dir.path()).await.is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 1.45s\n\n",
+          "raw_log_sha256": "1832a6f95c22944861356644b37aaaeb81879a41f6a62ce1f8c8328a16325084"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "91168ec20d40b9163a0e4314d206865285f13ab5fd52be6f92a796d9daa1d4b5",
+      "source_receipt_sha256": "f2d3a399f7f4e6182104228dc1507bcc752ec8aef384b3290276e0dea7026e4d",
+      "current_source_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "pretransfer-disk-bypass",
+      "head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+      "path": "src/standby/refresh/shape_transition.rs",
+      "original_sha256": "4d3e6d1d53f42a962c01141b9b92e49742dff84d64d48115c8e977746ca50cc5",
+      "mutant_sha256": "69a232b10f59d7a2d4e5fcd08aaec863a7c7a1f16f0f03966c9d6c481ffa851a",
+      "tests": [
+        {
+          "test": "standby::refresh::tests::kernel_v2_refresh::receiver_transition_disk_budget_refuses_before_range_or_page_tail",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::tests::kernel_v2_refresh::receiver_transition_disk_budget_refuses_before_range_or_page_tail stdout ----\n\nthread 'standby::refresh::tests::kernel_v2_refresh::receiver_transition_disk_budget_refuses_before_range_or_page_tail' (2757325) panicked at src/standby/refresh/tests/kernel_v2_refresh.rs:1121:5:\nassertion `left == right` failed: metadata refusal must precede every range GET\n  left: 9\n right: 0\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::kernel_v2_refresh::receiver_transition_disk_budget_refuses_before_range_or_page_tail\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 1.23s\n\n",
+          "raw_log_sha256": "5294c8c90b727337a1db05d85b5a1d1d1727329b46289a115de91153fe95d718"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "526a13d919c62f478de9526c6b0e6648e8fd31190d6dd5096eb8ec734ba2e0e0",
+      "source_receipt_sha256": "cd4283a9adf4fb7e24f7a0532c7fc9f39d18a4e44a4b52c01f4a848ca24dcf35",
+      "current_source_sha256": "4d3e6d1d53f42a962c01141b9b92e49742dff84d64d48115c8e977746ca50cc5",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "publication-disk-bypass",
+      "head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+      "path": "src/standby/generation_store/shape_pin.rs",
+      "original_sha256": "437353788862abd577393afc34cac0ab60cde7e7ddc0d06d20bf2aa5adb640cb",
+      "mutant_sha256": "81a400d5cfa1ae96e361a51175e1be861af4836940dee1460f22d0e34e29a848",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_v1_exact95_full_keeps94_while_unknown96_refuses",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_v1_exact95_full_keeps94_while_unknown96_refuses stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_v1_exact95_full_keeps94_while_unknown96_refuses' (2774659) panicked at src/standby/generation_store/receiver_shape_tests.rs:300:10:\ncalled `Result::unwrap_err()` on an `Ok` value: InstalledGeneration { id: \"c7519ee5ec52349f798d460bb43095c50327a456dbfc88dafe8d31d8c5aef77b\", snapshot_path: \"/fixtures/replica-temp/replica/accepted/generations/c7519ee5ec52349f798d460bb43095c50327a456dbfc88dafe8d31d8c5aef77b/snapshot.db\", manifest: StandbySnapshotManifest { contract: \"native.standby-snapshot-manifest.v1\", version: 1, hosted_route_database_id: \"route-1\", origin_database_id: \"ndb_ffd4df5b8ca9a2a25fb3662f0595053f\", captured_at: \"2026-11-15T03:09:13.152Z\", snapshot_completed_at: \"2026-11-15T03:09:13.412Z\", engine: StandbySnapshotEngineIdentity { name: \"native-ce\", source_sha: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", schema_version: 95, ddl_sha256: \"a122164c9e26ac98db3e04f3769a3edcc60ce25f78ecc2305c7aa5037afdc30f\" }, consumer: StandbyConsumerIdentity { kernel_v2_reader: KernelV2Reader { schema_sha256: \"0295db140abe29a6c4c2dce429e325eb37d1235031a6d1068d2df561e8618da7\", reader_format: 1 }, contract: \"native.standby-consumer.v1\", version: 1, platform: LinuxX8664, source_sha: \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", artifact_sha256: \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", engine_schema_version: 94, ddl_sha256: \"e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5\" }, frontier: CanonicalFrontierV1 { contract: \"native.canonical-frontier.v1\", version: 1, content_event_seq: 13, policy_event_seq: 4, awareness_event_seq: 0, notification_candidate_event_seq: 0, binding_audit_seq: 1, database_identity_audit_seq: 1, meta_event_seq: 85, control_event_seq: 19, derivation_event_seq: 0, relationship_event_seq: 0, authorization_revision_epoch: 36, storage_portability_policy_revision: 0 }, head_act: Some(17), materialization: Snapshot, kernel_v2: None, snapshot: StandbySnapshotBytes { media_type: \"application/vnd.sqlite3\", size_bytes: 2748416, sha256: \"d3a2e9ff7df310a18034377774f6dad079dea7eda1cc7e51c1767f16d90db04c\" } } }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_v1_exact95_full_keeps94_while_unknown96_refuses\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 3.85s\n\n",
+          "raw_log_sha256": "f7fbf0c57d5254bc889fcb5e1396758371c343da1d61f5219c2134621c604f79"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "b2a313c5a942bd913edb7dd1da41aa13314a5fa7a1b696c929692dce68af3666",
+      "source_receipt_sha256": "8e44cd4d678f43aac1a62b5731524d1d6a1d51e3a6e1e08b863ee874f6a3552a",
+      "current_source_sha256": "437353788862abd577393afc34cac0ab60cde7e7ddc0d06d20bf2aa5adb640cb",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "route-origin-bypass",
+      "head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+      "path": "src/standby/generation_store.rs",
+      "original_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "mutant_sha256": "fa070dc49c28a46f817020b0846361601c524cbd8b1be62300e59d4d9d17ed23",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced' (2793066) panicked at src/standby/generation_store/receiver_shape_tests.rs:860:14:\ncalled `Result::unwrap_err()` on an `Ok` value: InstalledGeneration { id: \"49647fffff707f37cf1edf43bf4c4ec2a21864416d9493863f87bc2abf5a8463\", snapshot_path: \"/fixtures/route-temp/route-1/accepted/generations/49647fffff707f37cf1edf43bf4c4ec2a21864416d9493863f87bc2abf5a8463/snapshot.db\", manifest: StandbySnapshotManifest { contract: \"native.standby-snapshot-manifest.kernel-v2.v1\", version: 1, hosted_route_database_id: \"route-1\", origin_database_id: \"ndb_5e012dc42d9e4161a15f6bcf8be14979\", captured_at: \"2026-11-15T03:12:42.463Z\", snapshot_completed_at: \"2026-11-15T03:12:42.482Z\", engine: StandbySnapshotEngineIdentity { name: \"native-kernel-v2\", source_sha: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", schema_version: 0, ddl_sha256: \"770fb261b350ed747bb12db56f6b40cccc33c39ab01baaef2b2298d9b6b3ad90\" }, consumer: StandbyConsumerIdentity { kernel_v2_reader: KernelV2Reader { schema_sha256: \"0295db140abe29a6c4c2dce429e325eb37d1235031a6d1068d2df561e8618da7\", reader_format: 1 }, contract: \"native.standby-consumer.v1\", version: 1, platform: LinuxX8664, source_sha: \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", artifact_sha256: \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", engine_schema_version: 94, ddl_sha256: \"e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5\" }, frontier: CanonicalFrontierV1 { contract: \"native.canonical-frontier.v1\", version: 1, content_event_seq: 0, policy_event_seq: 0, awareness_event_seq: 0, notification_candidate_event_seq: 0, binding_audit_seq: 0, database_identity_audit_seq: 0, meta_event_seq: 0, control_event_seq: 0, derivation_event_seq: 0, relationship_event_seq: 0, authorization_revision_epoch: 0, storage_portability_policy_revision: 0 }, head_act: Some(1), materialization: Snapshot, kernel_v2: Some(KernelGeneration { reader_format: 1, application_id: 1313560114, genesis_even\n[Middle omitted; full raw log SHA256 recorded.]\nations\", \"kernel_record_bodies\", \"kernel_record_fields\", \"kernel_record_metadata\", \"kernel_records\", \"kernel_root_bootstrap\", \"kernel_roots\", \"kernel_runs\", \"kernel_saved_tab_operations\", \"kernel_saved_tabs\", \"kernel_search_fts\", \"kernel_search_fts_config\", \"kernel_search_fts_content\", \"kernel_search_fts_data\", \"kernel_search_fts_docsize\", \"kernel_search_fts_idx\", \"kernel_search_meta\", \"kernel_slot_lineage\", \"kernel_slots\", \"kernel_v1_state\", \"package_artifacts\", \"rule_installations\"], blob_count: 0 }), snapshot: StandbySnapshotBytes { media_type: \"application/vnd.sqlite3\", size_bytes: 1110016, sha256: \"a8f568d9ec175cc0b03139aecf006c10e4cbd87f6196ada9d1a866faa0a6f54f\" } } }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.13s\n\n",
+          "raw_log_sha256": "dce316dfe4448e1882f465e0c061af0dadf74cbc8a215a870b8101cce7e3df60"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "d42943bd896e996badc9b1e19aabc3e712e31225735b1c807b5581d1ede25d34",
+      "source_receipt_sha256": "e772e0ebdee55dbb43ee252cd00df5f1b1e025c58cd0c6a69c54cc2941f2897d",
+      "current_source_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "serving-pools-writable",
+      "head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+      "path": "src/db.rs",
+      "original_sha256": "f242e3e6bfa4b7e8d4b874f15dbfddfaf46c771ca8fc458239658c072f890143",
+      "mutant_sha256": "1fb0c58fb918c7993a8ac2d79430f471b848726fd33cd0ac868446e929a1d82c",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced' (2811130) panicked at src/standby/generation_store/receiver_shape_tests.rs:881:9:\nno user write may reach a95 serving handle\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.19s\n\n",
+          "raw_log_sha256": "8dffd87affb4d5a176caa4314d64dd00b9b48269ee250d255861f8e9a9040a2f"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "e351118322b73deb6c9e02a595c294abceaa5aff8ebc043f207586dc09038b3d",
+      "source_receipt_sha256": "86bf7a37b3dec8d12663b0257fb3bbda2c6754fbc1297ed910f8830297a86fab",
+      "current_source_sha256": "f242e3e6bfa4b7e8d4b874f15dbfddfaf46c771ca8fc458239658c072f890143",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "unknown-v2-digest-bypass",
+      "head": "d044a43c252d2a7784514fc720f079dc3be8d2da",
+      "path": "src/standby/shapes.rs",
+      "original_sha256": "16433666aabce400dfe559058349ac511580bdf1df4b269aea95a5c5d31b30a1",
+      "mutant_sha256": "2d5e9d3cb8b0b4cca9b75ddf4bd563a9dfe5b6ddafacd1917222b50da5f71748",
+      "tests": [
+        {
+          "test": "standby::refresh::tests::kernel_v2_refresh::receiver_unknown_owned_shape_goes_full_without_opening_local_writer",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::tests::kernel_v2_refresh::receiver_unknown_owned_shape_goes_full_without_opening_local_writer stdout ----\nnative-standby-refresh: refresh failed attempt=e80255aa-55c6-40a5-a6da-04e7bd973672 cause=Scheduled phase=Following class=LocalIo safe=local standby refresh storage failed detail=unclassified check=unclassified fallback=None\n\nthread 'standby::refresh::tests::kernel_v2_refresh::receiver_unknown_owned_shape_goes_full_without_opening_local_writer' (2821374) panicked at src/standby/refresh/tests/kernel_v2_refresh.rs:998:5:\nunknown shape must request a FULL\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::kernel_v2_refresh::receiver_unknown_owned_shape_goes_full_without_opening_local_writer\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.23s\n\n",
+          "raw_log_sha256": "7630ca8ff866023a40391ad535876eb9d2a055cb850e00218440041f19508551"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "f227f5f236fdd6d6a578450202afdb192c5a41a707471716a028c150aea6fc4f",
+      "source_receipt_sha256": "72975759c48d4d8f78a49305bd9659cd41e17a1777d01be22fa64fe67f00315e",
+      "current_source_sha256": "a8c6e9a1e1f91028fcf7f54d1a920514cceff64cb4f486db806056fdb7ef1eea",
+      "capture_source_still_identical": false
+    },
+    {
+      "mutation": "node-probe-selection-bypass",
+      "head": "3792546d010bee777debe99ce57d6a35b7162b6b",
+      "path": "src/node/failover.rs",
+      "original_sha256": "9e548810e4b8bf5a89ace142968a4e7a677d005f294cc204230ad14e9be579ef",
+      "mutant_sha256": "272792454ab70b1675b4595ef0cf4334ff3d58df44fba269c3b09b8d06ebda45",
+      "tests": [
+        {
+          "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries stdout ----\n\nthread 'node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries' (2866033) panicked at src/node/failover/tests.rs:4528:9:\nassertion `left == right` failed\n  left: Reachable\n right: ProtocolFailed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.90s\n\n",
+          "raw_log_sha256": "3d09112d52d73f08784119b538127a0523416e66952697ed5859a5989a2b83e1"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "418c2e9355da00262d7686fb54228f82bee59deb47dbcd2d404ab235cb7a7c6e",
+      "source_receipt_sha256": "274974c2e5aa41297811893ce60e2db15a7e0c2e5434ff610a0f70ec523c13ee",
+      "current_source_sha256": "9e548810e4b8bf5a89ace142968a4e7a677d005f294cc204230ad14e9be579ef",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "node-probe-maintenance-bypass",
+      "head": "dbb30b94b46a0cb565610442161c2d6cf1e1310a",
+      "path": "src/node/failover.rs",
+      "original_sha256": "9e548810e4b8bf5a89ace142968a4e7a677d005f294cc204230ad14e9be579ef",
+      "mutant_sha256": "689e24f91dce8d91da33e5c241404c1d1c3d287cd5505b581cc51bf10649d905",
+      "tests": [
+        {
+          "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries stdout ----\n\nthread 'node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries' (2952276) panicked at src/node/failover/tests.rs:4558:5:\nassertion `left == right` failed\n  left: Reachable\n right: ProtocolFailed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 2.79s\n\n",
+          "raw_log_sha256": "2f8ad2972c39851bfac9a46af01529c8a51b9a7d059760c08477d249a910ef71"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "d87bf299ce8ee89197fdf8209fd1fed9bd023964b367aa0fd518b1b5a7638679",
+      "source_receipt_sha256": "e1a3aaf4e5e61c9449a8507a485c1d69deb23c0822348ec0b76f2ccd0c2c1cba",
+      "current_source_sha256": "9e548810e4b8bf5a89ace142968a4e7a677d005f294cc204230ad14e9be579ef",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "working-suffix-bypass",
+      "head": "3792546d010bee777debe99ce57d6a35b7162b6b",
+      "path": "src/projector/mod.rs",
+      "original_sha256": "c8bcde82a88472a9f9efe9e33e126c309e6c8e003fcfc236aee095814e5f416d",
+      "mutant_sha256": "ea11389a5e6652ce0bbd93c8799f0e9b7426fbe3a2a6cd61dd37583d0d35a766",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl' (2897826) panicked at src/standby/generation_store/receiver_shape_tests.rs:608:6:\ncalled `Result::unwrap_err()` on an `Ok` value: KernelGeneration { reader_format: 1, application_id: 1313560114, genesis_event_id: \"da422825-1244-4ede-bae7-9bf883884c4a\", content_event_seq: 85, meta_event_seq: 10, head_act: 58, schema_sha256: \"770fb261b350ed747bb12db56f6b40cccc33c39ab01baaef2b2298d9b6b3ad90\", projection_tables: [\"canvas_batches\", \"canvas_objects\", \"consumer_requirements\", \"content_event_heads\", \"definition_adoptions\", \"definition_artifacts\", \"kernel_account_configs\", \"kernel_adoptions\", \"kernel_app_actions\", \"kernel_app_consent_revocations\", \"kernel_app_install_outcomes\", \"kernel_app_installs\", \"kernel_app_package_sources\", \"kernel_app_state\", \"kernel_artifact_closures\", \"kernel_attachment_blobs\", \"kernel_blob_handles\", \"kernel_canvas_activations\", \"kernel_canvas_source_events\", \"kernel_comment_anchors\", \"kernel_facet_time_invalid\", \"kernel_facet_time_meta\", \"kernel_facet_time_rows\", \"kernel_facets\", \"kernel_generic_links\", \"kernel_hcp_audit\", \"kernel_hcp_disclosures\", \"kernel_hcp_entries\", \"kernel_hcp_resolutions\", \"kernel_identity_bindings\", \"kernel_import_tombstones\", \"kernel_instruction_bindings\", \"kernel_legacy_history\", \"kernel_legacy_sql_events\", \"kernel_legacy_sql_progress\", \"kernel_legacy_subjects\", \"kernel_lifecycle\", \"kernel_link4_edges\", \"kernel_links\", \"kernel_mcp_write_receipts\", \"kernel_message_candidate_events\", \"kernel_message_candidate_import_frontiers\", \"kernel_message_candidates\", \"kernel_message_destinations\", \"kernel_message_interactions\", \"kernel_message_people\", \"kernel_message_receipts\", \"kernel_messages\", \"kernel_notification_preferences\", \"kernel_package_selections\", \"kernel_personas\", \"kernel_policies\", \"kernel_policy_entries\", \"kernel_principals\", \"kernel_provider_link_heads\", \"kernel_provider_link_meta\", \"kernel_provider_link_rows\", \"kernel_provider_receipts\", \"kernel_provider_state\", \"kernel_provider_subjects\", \"kernel_publication_receipts\", \"kernel_publications\", \"kernel_record_bodies\", \"kernel_record_fields\", \"kernel_record_metadata\", \"kernel_records\", \"kernel_root_bootstrap\", \"kernel_roots\", \"kernel_runs\", \"kernel_saved_tab_operations\", \"kernel_saved_tabs\", \"kernel_search_fts\", \"kernel_search_fts_config\", \"kernel_search_fts_content\", \"kernel_search_fts_data\", \"kernel_search_fts_docsize\", \"kernel_search_fts_idx\", \"kernel_search_meta\", \"kernel_slot_lineage\", \"kernel_slots\", \"kernel_v1_state\", \"package_artifacts\", \"rule_installations\"], blob_count: 0 }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.30s\n\n",
+          "raw_log_sha256": "48a516cf7e6b011faaeb1ae36efe71e3a1890662d930072a1719be76e338dc03"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "f7a0ac43d79c525d27a2818e533f7ddb509d0d74f5fc41061cb8f5f0b0585c2b",
+      "source_receipt_sha256": "f2a0beb5f3496289c097ec1c769903f36f020f5a4b8244fb87edfaafea802eda",
+      "current_source_sha256": "c8bcde82a88472a9f9efe9e33e126c309e6c8e003fcfc236aee095814e5f416d",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "closed95-decoder-disabled",
+      "head": "3792546d010bee777debe99ce57d6a35b7162b6b",
+      "path": "src/kernel/app_installs/consent/actions.rs",
+      "original_sha256": "4fb79c4b7c06b2dce518a8311f788daaf455ad76fdba25b47cb1151ad1e7182f",
+      "mutant_sha256": "3e952c457f74b912683321c0e41d9bf8c25f599cc0d3978d464b0f32eb899f83",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source' (2910490) panicked at src/standby/generation_store/receiver_shape_tests.rs:798:54:\ncalled `Result::unwrap()` on an `Err` value: Engine(\"native app activation: app action ordinal is not in this receiver shape\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.16s\n\n",
+          "raw_log_sha256": "994bf094b259122550a161ef9528b1aa88e73183891e84baad1a01893af02029"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "5991f34df21429291f26833204e5f26e2e71003b52e5337178877fd38e3c7e98",
+      "source_receipt_sha256": "f0a030116cdbe814b8794cd307a89ef20adc83d7ac53f321258739b22a93f052",
+      "current_source_sha256": "4fb79c4b7c06b2dce518a8311f788daaf455ad76fdba25b47cb1151ad1e7182f",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "local-receipt-disclosure-bypass",
+      "head": "dbb30b94b46a0cb565610442161c2d6cf1e1310a",
+      "path": "src/standby/shapes.rs",
+      "original_sha256": "a8c6e9a1e1f91028fcf7f54d1a920514cceff64cb4f486db806056fdb7ef1eea",
+      "mutant_sha256": "3f88548aeab3faf110663060dd1dcf8d37e9939bc6322be1bdde931eb0ebf917",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source' (2961466) panicked at src/standby/generation_store/receiver_shape_tests.rs:754:17:\nlocal95 history must hide caller_write_ordinal\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.03s\n\n",
+          "raw_log_sha256": "6daca57e1eb37a7460aef64d3ba191e0729c8b6dbad4b89fc9716d1e6e055fe0"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "b17fbec86be2060e14035cd26a2ec364915de563980dff8bb816674f54441d7e",
+      "source_receipt_sha256": "88690a101666eb6104e7d0274db8f89fe3c8ef1947c1196b11e3c33120451075",
+      "current_source_sha256": "a8c6e9a1e1f91028fcf7f54d1a920514cceff64cb4f486db806056fdb7ef1eea",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "rebind-primary-equality",
+      "head": "dbb30b94b46a0cb565610442161c2d6cf1e1310a",
+      "path": "src/standby/generation_store/consumer_rebind.rs",
+      "original_sha256": "30988f40e9d9e0a2a8242f3fd7bde85920da537b855d24b70a379b135f0d9479",
+      "mutant_sha256": "133db3aa22a26553a185394d409dfb77d95f5a064a29d0ab947bda1872d3a3ef",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin' (2980008) panicked at src/standby/generation_store/receiver_shape_tests.rs:201:60:\ncalled `Result::unwrap()` on an `Err` value: Engine(\"accepting executable has an unknown primary format\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.53s\n\n",
+          "raw_log_sha256": "309312a7a3ba20f9052f0c3ff88bc4b0c746986ee1f003a807443dabb1744a05"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "6c50a0d650c06df0b0aaa97ae26edd1fc6c2296f55c0a3ce69e8e553fddb6f61",
+      "source_receipt_sha256": "0ac6102828371fa47b2ef8f4d1118735621edd536b85b9e0d04bc7367119ac0c",
+      "current_source_sha256": "30988f40e9d9e0a2a8242f3fd7bde85920da537b855d24b70a379b135f0d9479",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "pin-delete-bypass",
+      "head": "dbb30b94b46a0cb565610442161c2d6cf1e1310a",
+      "path": "src/standby/generation_store.rs",
+      "original_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "mutant_sha256": "deb9dfd60c1fc95e9f6e7ceaf1a57dfb24a55e6b813723a6d3aeb5dc2fccde92",
+      "tests": [
+        {
+          "test": "standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin stdout ----\n\nthread 'standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin' (2988652) panicked at src/standby/generation_store/receiver_shape_tests.rs:134:5:\nassertion failed: store.remove_published_generation(&old.id).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 1.76s\n\n",
+          "raw_log_sha256": "0110af576d732c5a5fac9a601fb51cdac902b39b202280d62a937edf17b84d3e"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "20a937eabd53b751a3f2d9759b52884091947c4975b63868a53e5e4e887344c6",
+      "source_receipt_sha256": "a58e89f7d4990a019f25dfe2ad73e6060c2fd492f0219bff413cdb10f544d204",
+      "current_source_sha256": "6c8ec327fe59aa6c835905f904a1a89c1e457bd927d06c0dccc4813058f83b9f",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "stale-episode-cooldown-bypass",
+      "head": "58b80d26fe99b5788b0a150db0699a61b2d5cc8f",
+      "path": "src/standby/refresh.rs",
+      "original_sha256": "a5556212f07485e1d112cb0b1d3699419c14beb991d9ca182f07f3c9d0b5bdbe",
+      "mutant_sha256": "9afd92a65bebed47e7a2d0ef61a3631d88e2e69fc3aa1c32ff9adaaf117342e7",
+      "tests": [
+        {
+          "test": "standby::refresh::tests::kernel_v2_refresh::receiver_stale_episode_cannot_waive_an_unrelated_full_cooldown",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::tests::kernel_v2_refresh::receiver_stale_episode_cannot_waive_an_unrelated_full_cooldown stdout ----\nnative-standby-refresh: refresh failed attempt=3123da66-6bf1-4945-bd81-0d86fdcab9b0 cause=Scheduled phase=Full class=Network safe=injected refresh failure detail=unclassified check=unclassified fallback=Some(HeadCompatibility)\n\nthread 'standby::refresh::tests::kernel_v2_refresh::receiver_stale_episode_cannot_waive_an_unrelated_full_cooldown' (3013572) panicked at src/standby/refresh/tests/kernel_v2_refresh.rs:948:10:\ncalled `Result::unwrap()` on an `Err` value: Engine(\"injected refresh failure\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::kernel_v2_refresh::receiver_stale_episode_cannot_waive_an_unrelated_full_cooldown\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 1.17s\n\n",
+          "raw_log_sha256": "1e367a72d20006ac07cccc15df0b9eaa90677d72fe8c973976af6c8dfdfd6988"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "5a2c6be06c99ece0cac84f4257f76c99a10b9bdc27a5012515c8bf1f99c7ddf8",
+      "source_receipt_sha256": "8a72b2e2da76880608f00e93eb5e3363af9e75970afcb9ce75ee31dce20c5bd0",
+      "current_source_sha256": "a5556212f07485e1d112cb0b1d3699419c14beb991d9ca182f07f3c9d0b5bdbe",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "transition-cap-bypass",
+      "head": "58b80d26fe99b5788b0a150db0699a61b2d5cc8f",
+      "path": "src/standby/refresh/shape_transition.rs",
+      "original_sha256": "4d3e6d1d53f42a962c01141b9b92e49742dff84d64d48115c8e977746ca50cc5",
+      "mutant_sha256": "8d5982cd61f83c1c27b4315e762c473ea1fda2bd9b2ee0456f8e0f12c6ef4f30",
+      "tests": [
+        {
+          "test": "standby::refresh::shape_transition::tests::transition_budget_survives_head_changes_and_caps_retries",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::shape_transition::tests::transition_budget_survives_head_changes_and_caps_retries stdout ----\n\nthread 'standby::refresh::shape_transition::tests::transition_budget_survives_head_changes_and_caps_retries' (3035416) panicked at src/standby/refresh/shape_transition.rs:226:13:\nassertion `left == right` failed\n  left: 661000\n right: 21601000\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::shape_transition::tests::transition_budget_survives_head_changes_and_caps_retries\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.00s\n\n",
+          "raw_log_sha256": "360b6519a5797fb7214162bb3f6c3d25ee255c554e54cd46afec2fb9a027d983"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "810d89f66169aae0fcfd0a73014685ef55b0fc0c01a5691343b1e1516d8c856a",
+      "source_receipt_sha256": "4d09fb3dcb821ed3c7ee2715dbaf437c821ba80a84ba499bb2b365f3010cae27",
+      "current_source_sha256": "4d3e6d1d53f42a962c01141b9b92e49742dff84d64d48115c8e977746ca50cc5",
+      "capture_source_still_identical": true
+    },
+    {
+      "mutation": "compiled-emission95",
+      "head": "58b80d26fe99b5788b0a150db0699a61b2d5cc8f",
+      "path": "src/db.rs",
+      "original_sha256": "f242e3e6bfa4b7e8d4b874f15dbfddfaf46c771ca8fc458239658c072f890143",
+      "mutant_sha256": "b66d78c750346cdabe39de8cff1777ef24b559981f9ba286eb959513f3e6e362",
+      "tests": [
+        {
+          "test": "standby::shapes::tests::compiled_emission_is_an_exact_registry_member",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::shapes::tests::compiled_emission_is_an_exact_registry_member stdout ----\n\nthread 'standby::shapes::tests::compiled_emission_is_an_exact_registry_member' (3047618) panicked at src/standby/shapes.rs:493:9:\nassertion failed: v1(crate::CURRENT_ENGINE_SCHEMA_VERSION,\n        crate::schema::FROZEN_DDL_SHA256).is_some()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::shapes::tests::compiled_emission_is_an_exact_registry_member\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.00s\n\n",
+          "raw_log_sha256": "d28432fd6812f418eba1c22c6c38d98de82f1fc166758e4ac3f69b41e3b835a1"
+        }
+      ],
+      "result": "bypass fails",
+      "compile_metadata_sha256": "52bb87a8440f04d6e59e2fb35e877f5f73a12e7ca18643905314b252d1fe03aa",
+      "source_receipt_sha256": "d12ef51bfa4b07ab8754675697aa7f2a623aa3065923657b3ec4a611c5e2ff18",
+      "current_source_sha256": "f242e3e6bfa4b7e8d4b874f15dbfddfaf46c771ca8fc458239658c072f890143",
+      "capture_source_still_identical": true
+    }
+  ],
+  "remaining_delivery": [
+    "Clean positive build after mutants",
+    "Verified incoming M1 ScopeAccess CI resolution and any required base integration",
+    "Required green CI on final reviewed head",
+    "Reconcile uncertain Native checkpoint only after canonical confirmation"
+  ],
+  "holds": [
+    "Authentic old-journal/hosted95/A restart/drain/retry/one-effect remains PARTIAL and a blocking B rollout prerequisite",
+    "B activation requires Richard go; A2 remains separate; worker does not merge"
+  ]
+}

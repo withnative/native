@@ -17,8 +17,16 @@ enum Fault {
     ApplyThenDrop,
     /// Apply, then sit on the reply past the attempt timeout.
     ApplyThenStall(Duration),
+    /// Keep a server-side write alive after the node's attempt times out.
+    ParkBeforeApply(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ),
     /// Answer with this status and body without applying.
     Http(u16, &'static str),
+    /// An owned MCP tool result, allowing full-size merge recovery receipts.
+    ToolReply(Value),
     /// Send a status line and a body shorter than its content-length, then
     /// close: a reply lost mid-body.
     Truncated(u16),
@@ -42,6 +50,8 @@ enum Fault {
 #[derive(Default)]
 struct HostedState {
     store: StdMutex<HashMap<String, Value>>,
+    outcomes: StdMutex<HashMap<String, Value>>,
+    status_reads: StdMutex<Vec<Value>>,
     created: AtomicUsize,
     unkeyed_applied: AtomicUsize,
     requests: StdMutex<Vec<Value>>,
@@ -109,7 +119,18 @@ impl HostedState {
                     .pointer("/params/arguments/arguments/id")
                     .and_then(Value::as_str)
                     .filter(|_| self.honour_ids.load(Ordering::SeqCst));
-                let record = json!({"record_id": given.map_or(format!("rec-{n}"), str::to_owned)});
+                let record = if operation == "merge_body" {
+                    let args = &request["params"]["arguments"]["arguments"];
+                    json!({
+                        "outcome":"merged", "applied":true,
+                        "record_id":args["record_id"], "idempotency_key":key,
+                        "base":{"version":args["base_version"],"verified":true},
+                        "result":{"version":format!("rec:{n}"),"body":args["my_text"]},
+                        "act":n, "changed":true
+                    })
+                } else {
+                    json!({"record_id": given.map_or(format!("rec-{n}"), str::to_owned)})
+                };
                 if !key.is_empty() {
                     store.insert(key, record.clone());
                 }
@@ -124,6 +145,7 @@ impl HostedState {
 
 fn schema_for(operation: &str) -> Value {
     match operation {
+        "merge_body" => crate::mcp::tools::merge_body::input_schema(),
         "create_record" | "create_many" | "manage_links.add" | "attach_text" | "update_record" => {
             json!({"type":"object","properties":{"type":{"type":"string"},"idempotency_key":{"type":"string"}},"additionalProperties":false})
         }
@@ -158,6 +180,10 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Value> {
         buffer.extend_from_slice(&chunk[..n]);
         if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+            assert!(
+                head.contains("native-client-identity:"),
+                "node must send its build identity"
+            );
             let length = head
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:"))
@@ -248,6 +274,29 @@ async fn serve_hosted(state: Arc<HostedState>, mut socket: tokio::net::TcpStream
         let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{"content":[],"structuredContent":{"rows":rows},"isError":false}});
         return respond(&mut socket, 200, "application/json", &reply.to_string()).await;
     }
+    if name == "system_read"
+        && request
+            .pointer("/params/arguments/operation")
+            .and_then(Value::as_str)
+            == Some("outbox_status")
+    {
+        state.status_reads.lock().unwrap().push(request.clone());
+        let handle = request
+            .pointer("/params/arguments/arguments/journal_entry")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let result = state
+            .outcomes
+            .lock()
+            .unwrap()
+            .get(handle)
+            .cloned()
+            .unwrap_or_else(
+                || json!({"isError":false,"structuredContent":{"entries":[]},"content":[]}),
+            );
+        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+        return respond(&mut socket, 200, "application/json", &reply.to_string()).await;
+    }
     state.requests.lock().unwrap().push(request.clone());
     let fault = state
         .script
@@ -256,6 +305,16 @@ async fn serve_hosted(state: Arc<HostedState>, mut socket: tokio::net::TcpStream
         .pop_front()
         .or_else(|| state.always.lock().unwrap().clone());
     match fault {
+        Some(Fault::ToolReply(result)) => {
+            let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+            respond(&mut socket, 200, "application/json", &reply.to_string()).await;
+        }
+        Some(Fault::ParkBeforeApply(started, release, done)) => {
+            started.notify_one();
+            release.notified().await;
+            state.apply(&request);
+            done.notify_one();
+        }
         Some(Fault::DropBeforeApply) => {}
         Some(Fault::ApplyThenDrop) => {
             state.apply(&request);
@@ -344,6 +403,7 @@ async fn serve_hosted(state: Arc<HostedState>, mut socket: tokio::net::TcpStream
 fn fast() -> GateConfig {
     GateConfig {
         budget: Duration::from_secs(4),
+        merge_short_budget: Duration::from_millis(200),
         attempt_timeout: Duration::from_millis(300),
         min_attempt: Duration::from_millis(50),
         backoff_start: Duration::from_millis(20),
@@ -357,8 +417,15 @@ fn fast() -> GateConfig {
         refusal_retention: Duration::from_secs(3600),
         disk_floor_bytes: 0,
         record_url_base: Some("https://hosted.example".into()),
+        account_binding: None,
     }
 }
+
+#[path = "body_merge_acceptance.rs"]
+mod body_merge_acceptance;
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "body_merge_real_home_tests.rs"]
+mod body_merge_real_home_tests;
 
 fn seed_hosted_contracts(gate: &WriteGate) {
     let contracts = crate::mcp::executor_prototype::NodeOperationContracts::local().unwrap();
@@ -406,6 +473,7 @@ impl Rig {
             }
         });
         let config = NodeConfig {
+            working_note_appends: false,
             markdown_folder: None,
             hosted_base_url: format!("http://{address}"),
             home_id: "test-home".into(),
@@ -413,10 +481,18 @@ impl Rig {
             credential_file: token,
             socket_directory,
             oauth_auth_file: None,
+            node_install_key_file: None,
+            node_install_id: None,
             standby_config: None,
             account_id: None,
             refresh_config: None,
             disk_floor_bytes: None,
+            online_local_reads: None,
+            local_reads_by_default: false,
+            desktop_app_proof_transport: false,
+            desktop_app_proof_resource_origin: None,
+            pending_fork_reads: false,
+            hosted_kernel_v2: false,
         };
         *state.token_path.lock().unwrap() = Some(config.credential_file.clone());
         let gate = Arc::new(WriteGate::open(&config.socket_directory, gate_config).unwrap());
@@ -445,6 +521,7 @@ impl Rig {
             upstream,
             None,
             Some(gate),
+            None,
             admission,
         ));
         let (read, write) = client.into_split();
@@ -612,6 +689,72 @@ async fn missing_key_and_record_id_are_minted_once_and_nothing_else_is_touched()
     assert!(saved[0]["received_at"].is_string());
 }
 
+/// 960f47f: a routerless (hosted-only) node cannot observe the hosted engine.
+/// Against kernel-v2 hosted it must not derive a create `id`, which v2 refuses
+/// ("id is only supported for messaging sends"). `serve` obtains its gate only
+/// from `open_gate`, which applies the operator's declaration before returning
+/// it, so no request can reach an undeclared gate. Status reports the basis
+/// (`declared`, never `observed`), and a router observation replaces it.
+/// Without the declaration, v1 semantics are unchanged (see the test above).
+#[tokio::test]
+async fn routerless_kernel_v2_declaration_creates_without_a_derived_id() {
+    let mut rig = Rig::new(fast()).await;
+    let mut config = rig.config.clone();
+    config.hosted_kernel_v2 = true;
+    // The gate exactly as `serve` opens it.
+    rig.gate = crate::node::open_gate(&config).unwrap();
+    seed_hosted_contracts(&rig.gate);
+    assert!(rig.gate.kernel_v2_upstream(), "declared before first use");
+    let holding = rig.gate.status(&Default::default())["holding"].clone();
+    assert_eq!(holding["basis"], "declared", "{holding}");
+    assert_eq!(holding["supported"], false);
+    assert_eq!(holding["reason"], "kernel_v2_upstream_drain_first");
+
+    let mut client = rig.connect();
+    let sent = create(None, "hello");
+    let reply = client.call(1, sent.clone()).await;
+    assert_eq!(receipt(&reply)["record_id"], "rec-1", "{reply}");
+    let forwarded = rig.state().writes()[0]
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap();
+    assert!(forwarded["arguments"].get("id").is_none(), "{forwarded}");
+    let key = forwarded["arguments"]["idempotency_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(key.starts_with("node-"));
+    let mut expected = sent;
+    expected["arguments"]["idempotency_key"] = json!(key);
+    assert_eq!(forwarded, expected, "only the key was added");
+    drop(client);
+
+    // A router observation replaces the declaration and is reported as such.
+    rig.gate.set_kernel_v2_upstream(true);
+    assert_eq!(
+        rig.gate.status(&Default::default())["holding"]["basis"],
+        "observed"
+    );
+    rig.gate.set_kernel_v2_upstream(false);
+    assert_eq!(
+        rig.gate.status(&Default::default())["holding"]["basis"],
+        "not_observed"
+    );
+
+    // Absent declaration: the gate `serve` opens keeps v1 semantics.
+    let mut undeclared = rig.config.clone();
+    undeclared.hosted_kernel_v2 = false;
+    rig.gate = crate::node::open_gate(&undeclared).unwrap();
+    assert!(
+        !rig.gate.kernel_v2_upstream(),
+        "absent declaration keeps v1"
+    );
+    assert_eq!(
+        rig.gate.status(&Default::default())["holding"]["basis"],
+        "not_observed"
+    );
+}
+
 #[tokio::test]
 async fn timeout_then_in_call_retry_creates_exactly_one_record() {
     let rig = Rig::new(fast()).await;
@@ -694,7 +837,7 @@ async fn gateway_errors_are_retried_and_other_answers_are_not() {
 }
 
 #[tokio::test]
-async fn engine_refusals_in_a_tool_result_pass_through_byte_for_byte() {
+async fn engine_refusals_preserve_hosted_fields_and_annotate_uncertainty() {
     // Hosted reports "replay bound exceeded" as an isError tool result, not an
     // HTTP error. (DEPLOYMENT_READ_ONLY arrives the same way and is held
     // instead: see the hold tests.)
@@ -714,7 +857,20 @@ async fn engine_refusals_in_a_tool_result_pass_through_byte_for_byte() {
             .await;
         let mut line = String::new();
         client.reader.read_line(&mut line).await.unwrap();
-        assert_eq!(line.trim_end(), raw);
+        if id == 1 {
+            assert_eq!(line.trim_end(), raw);
+        } else {
+            let mut annotated: Value = serde_json::from_str(&line).unwrap();
+            let note = annotated["result"]["structuredContent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("node_journal")
+                .unwrap();
+            assert_eq!(note["outcome"], "uncertain");
+            assert_eq!(note["idempotency_key"], "k2");
+            annotated["result"]["content"].as_array_mut().unwrap().pop();
+            assert_eq!(annotated, serde_json::from_str::<Value>(raw).unwrap());
+        }
         assert_eq!(rig.state().writes().len(), before + 1);
     }
     let saved = entries(&rig);
@@ -895,6 +1051,7 @@ async fn restart_between_save_and_send_leaves_an_honest_uncertain_entry_and_no_d
             tool: "call_executor".into(),
             run_key: Some("run-xyz".into()),
             client_info: None,
+            app_identity: None,
             idempotency_key: Some("k-saved".into()),
             key_origin: Some(KeyOrigin::Caller),
             arguments: json!({"type":"Document","idempotency_key":"k-saved"}),
@@ -3078,12 +3235,21 @@ async fn bootstrap_reports_held_writes_for_the_run_and_for_the_runs_it_started()
             .is_empty()
     );
 
-    // A run with nothing held hears nothing; hosted's reply is untouched.
+    // A fresh run still hears about the account's unresolved backlog.
     client.send(bootstrap("someone-else")).await;
     let other = client.recv().await.unwrap();
-    assert!(other["result"]["structuredContent"]
-        .get("node_held_writes")
-        .is_none());
+    assert_eq!(
+        other["result"]["structuredContent"]["node_held_writes"]["account"]["waiting"],
+        2
+    );
+    client.send(tool_call(10, "bootstrap", json!({}))).await;
+    let fresh = client.recv().await.unwrap();
+    assert_eq!(
+        fresh["result"]["structuredContent"]["node_held_writes"]["account"]["counts"]["pending"],
+        2
+    );
+    assert!(!fresh.to_string().contains("Child note"));
+    assert!(!fresh.to_string().contains("Lead note"));
 }
 
 #[tokio::test]
@@ -4125,7 +4291,7 @@ async fn node_built_tool_replies_follow_the_callers_protocol_era() {
         let entry = rig
             .gate
             .journal
-            .settled_held_with_key("records_write", "create_record", key)
+            .settled_held_with_key("records_write", "create_record", key, None)
             .unwrap();
         rig.gate
             .journal
@@ -4191,6 +4357,113 @@ async fn forward_no_hold(rig: &Rig, arguments: Value, outage: Option<&dyn Outage
         )
         .await;
     serde_json::from_str(&report.reply.expect("a reply")).unwrap()
+}
+
+const HTTP_MAINTENANCE: &str = r#"{"error":"this Native deployment is temporarily read-only","error_code":"DEPLOYMENT_READ_ONLY","applied":false,"retryable":true,"retry_after_secs":30,"recovery":"This write was not applied or queued"}"#;
+
+#[tokio::test]
+async fn http_maintenance_without_holding_preserves_refusal_and_prior_uncertainty() {
+    for earlier_attempt in [false, true] {
+        let rig = Rig::new(fast()).await;
+        if earlier_attempt {
+            rig.state().script([Fault::ApplyThenDrop]);
+        }
+        rig.state().script([Fault::Http(503, HTTP_MAINTENANCE)]);
+        let reply = forward_no_hold(&rig, create(Some("maintenance-key"), "step"), None).await;
+        let data = &reply["error"]["data"];
+        assert_eq!(data["outcome"], "refused");
+        assert_eq!(data["applied"], false);
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["retry_after_secs"], 30);
+        assert_eq!(
+            data["upstream_body"],
+            serde_json::from_str::<Value>(HTTP_MAINTENANCE).unwrap()
+        );
+        assert_eq!(
+            rig.state().writes().len(),
+            if earlier_attempt { 2 } else { 1 }
+        );
+        assert_eq!(
+            rig.state().created.load(Ordering::SeqCst),
+            usize::from(earlier_attempt)
+        );
+        assert_eq!(
+            entries(&rig)[0]["state"],
+            if earlier_attempt {
+                "uncertain"
+            } else {
+                "confirmed"
+            }
+        );
+        assert_eq!(rig.gate.status(&Default::default())["queue"]["pending"], 0);
+        if earlier_attempt {
+            assert_eq!(data["node_journal"]["outcome"], "uncertain");
+            assert_eq!(data["node_journal"]["idempotency_key"], "maintenance-key");
+        } else {
+            assert!(data.get("node_journal").is_none());
+        }
+        let verdict = super::super::session_writer::GateVerdict {
+            auth_refused: false,
+            attempt: super::super::session_writer::AttemptClass::Answered,
+            reply: Some(reply.to_string()),
+            http_status: Some(503),
+        };
+        assert_eq!(
+            super::super::session_writer::classify_send(&verdict),
+            if earlier_attempt {
+                super::super::session_writer::SendClass::Uncertain
+            } else {
+                super::super::session_writer::SendClass::NotSent
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_http_maintenance_bodies_stay_uncertain_without_holding() {
+    for body in [
+        r#"{"error":"transient","retryable":true}"#,
+        r#"{"error_code":"DEPLOYMENT_READ_ONLY","applied":"partial","retryable":true}"#,
+        r#"{"error_code":"DEPLOYMENT_READ_ONLY","outcome":"unknown","retryable":true}"#,
+        r#"{"error_code":"DEPLOYMENT_READ_ONLY","applied":false,"partial":true}"#,
+        r#"{"applied":false,"error":{"error_code":"DEPLOYMENT_READ_ONLY","outcome":"unknown"}}"#,
+        r#"{"partial":true,"error":{"code":"DEPLOYMENT_READ_ONLY","applied":false}}"#,
+        r#"{"applied":true,"error":{"code":"DEPLOYMENT_READ_ONLY","applied":false}}"#,
+        r#"{"outcome":"refused","applied":true,"error":{"code":"DEPLOYMENT_READ_ONLY","applied":false}}"#,
+    ] {
+        let rig = Rig::new(fast()).await;
+        rig.state().script([Fault::Http(503, body)]);
+        let reply =
+            forward_no_hold(&rig, create(Some("ambiguous-maintenance"), "step"), None).await;
+        assert_eq!(entries(&rig)[0]["state"], "uncertain", "{body}: {reply}");
+        assert_eq!(
+            reply["error"]["data"]["node_journal"]["outcome"], "uncertain",
+            "{body}: {reply}"
+        );
+        let verdict = super::super::session_writer::GateVerdict {
+            auth_refused: false,
+            attempt: super::super::session_writer::AttemptClass::Answered,
+            reply: Some(reply.to_string()),
+            http_status: Some(503),
+        };
+        assert_eq!(
+            super::super::session_writer::classify_send(&verdict),
+            super::super::session_writer::SendClass::Uncertain,
+            "{body}: {reply}"
+        );
+        assert!(
+            !reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not applied or queued"),
+            "{body}: {reply}"
+        );
+        assert_eq!(
+            reply["error"]["data"]["upstream_body"],
+            serde_json::from_str::<Value>(body).unwrap()
+        );
+        assert_eq!(rig.gate.status(&Default::default())["queue"]["pending"], 0);
+    }
 }
 
 #[tokio::test]
@@ -4373,4 +4646,1582 @@ fn duplicate_gate_engine_error_settles_as_refused_never_a_receipt() {
         "structuredContent":{"error":detail.to_string()},
         "content":[{"type":"text", "text":detail.to_string()}]}});
     assert_eq!(answer_of(Some(&reply.to_string())), Answer::Refused);
+}
+
+// ---- Hosted custody settlement ----
+
+fn hosted_status(rig: &Rig, key: &str, phase: &str, ancestor: Option<&str>) -> Value {
+    let entry = by_key(rig, key);
+    json!({"isError":false,"content":[],"structuredContent":{"entries":[{
+        "journal_entry":entry["hosted_journal_entry"],"idempotency_key":key,
+        "run_key":entry["run_key"],"status":phase,
+        "terminal_at":if matches!(phase,"applied"|"refused"|"dependency_failed") {json!(123)} else {Value::Null},
+        "refusal":matches!(phase,"refused"|"dependency_failed"),
+        "outcome_reason":"safe hosted reason","dependency_failed_because":ancestor
+    }]}})
+}
+
+async fn hosted_create(rig: &Rig, key: &str, handle: &str) {
+    rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+    forward_with(rig, create(Some(key), "kept draft"), None).await;
+    let id = entry_id(rig, key);
+    rig.gate
+        .journal
+        .hosted_pending(&id, Some(handle.into()))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_settlement_four_trial_outcomes_survive_restart_without_replaying_writes() {
+    let mut rig = Rig::new(fast()).await;
+    for (key, handle) in [
+        ("expired", "hosted-a"),
+        ("refused", "hosted-b"),
+        ("dependent", "hosted-c"),
+        ("applied-b", "hosted-d"),
+    ] {
+        hosted_create(&rig, key, handle).await;
+    }
+    for (key, handle, phase, ancestor) in [
+        ("expired", "hosted-a", "refused", None),
+        ("refused", "hosted-b", "refused", None),
+        (
+            "dependent",
+            "hosted-c",
+            "dependency_failed",
+            Some("hosted-b"),
+        ),
+        ("applied-b", "hosted-d", "applied", None),
+    ] {
+        rig.state()
+            .outcomes
+            .lock()
+            .unwrap()
+            .insert(handle.into(), hosted_status(&rig, key, phase, ancestor));
+    }
+    let before = rig.state().writes().len();
+    rig.restart(fast());
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(
+        rig.state().writes().len(),
+        before,
+        "background only reads status"
+    );
+    assert_eq!(rig.state().status_reads.lock().unwrap().len(), 4);
+    {
+        let entry = by_key(&rig, "applied-b");
+        assert_eq!(entry["state"], "confirmed");
+        assert_eq!(entry["answer"], "receipt");
+        assert!(entry["arguments"].is_null());
+        assert!(
+            entry["reply"].is_null(),
+            "status is not the original operation receipt"
+        );
+    }
+    for key in ["expired", "refused", "dependent"] {
+        let entry = by_key(&rig, key);
+        assert_eq!(entry["answer"], "refused");
+        assert_eq!(entry["arguments"]["body"], "kept draft");
+    }
+    assert_eq!(
+        by_key(&rig, "dependent")["refused_because"],
+        by_key(&rig, "refused")["id"]
+    );
+    let status = rig.gate.status(&Default::default());
+    assert_eq!(status["held_writes"]["counts"]["sent"], 1);
+    assert_eq!(status["held_writes"]["counts"]["refused"], 3);
+    assert!(!status.to_string().contains("kept draft"));
+    rig.restart(fast());
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(
+        rig.state().status_reads.lock().unwrap().len(),
+        4,
+        "settled entries stop polling"
+    );
+    assert_eq!(by_key(&rig, "dependent")["answer"], "refused");
+}
+
+#[tokio::test]
+async fn hosted_settlement_failed_or_mismatched_status_never_loses_custody() {
+    let rig = Rig::new(fast()).await;
+    hosted_create(&rig, "status-check", "hosted-status").await;
+    let correct = hosted_status(&rig, "status-check", "applied", None);
+    let mut bad = Vec::new();
+    bad.push(json!({"isError":true,"structuredContent":{"entries":correct["structuredContent"]["entries"]}}));
+    bad.push(json!({"isError":false,"structuredContent":{"entries":[]}}));
+    for (field, value) in [
+        ("journal_entry", json!("wrong")),
+        ("idempotency_key", json!("wrong")),
+        ("run_key", json!("other-run")),
+        ("status", json!("unknown")),
+        ("terminal_at", Value::Null),
+        ("refusal", json!(true)),
+    ] {
+        let mut result = correct.clone();
+        result["structuredContent"]["entries"][0][field] = value;
+        bad.push(result);
+    }
+    for phase in ["pending", "sending", "uncertain"] {
+        bad.push(hosted_status(&rig, "status-check", phase, None));
+    }
+    for status in bad {
+        rig.state()
+            .outcomes
+            .lock()
+            .unwrap()
+            .insert("hosted-status".into(), status);
+        rig.gate.settle_hosted_batch(&rig.upstream).await;
+        let entry = by_key(&rig, "status-check");
+        assert_eq!(entry["state"], "hosted_pending");
+        assert!(entry["arguments"].is_object());
+    }
+    // Legacy text-only success is also an explicit status response.
+    rig.state().outcomes.lock().unwrap().insert("hosted-status".into(),json!({"isError":false,"content":[{"type":"text","text":correct["structuredContent"].to_string()}]}));
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(by_key(&rig, "status-check")["answer"], "receipt");
+}
+
+#[tokio::test]
+async fn hosted_settlement_same_key_pending_checks_reuse_one_entry_and_original_arguments() {
+    let rig = Rig::new(fast()).await;
+    hosted_create(&rig, "repeat-custody", "hosted-repeat").await;
+    let original = by_key(&rig, "repeat-custody");
+    for _ in 0..3 {
+        rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+        let response = forward_with(&rig, create(Some("repeat-custody"), "kept draft"), None).await;
+        assert_eq!(response["result"]["structuredContent"]["canonical"], false);
+        assert_eq!(entries(&rig).len(), 1);
+        assert_eq!(
+            by_key(&rig, "repeat-custody")["arguments"],
+            original["arguments"]
+        );
+    }
+    receipt(&forward_with(&rig, create(Some("repeat-custody"), "kept draft"), None).await);
+    assert_eq!(entries(&rig).len(), 1);
+    assert_eq!(by_key(&rig, "repeat-custody")["answer"], "receipt");
+    for request in rig.state().writes() {
+        assert_eq!(
+            request["params"]["arguments"]["arguments"],
+            original["arguments"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosted_settlement_same_key_refusal_is_checked_and_saved_in_original_slot() {
+    let rig = Rig::new(fast()).await;
+    hosted_create(&rig, "repeat-refusal", "hosted-refusal").await;
+    rig.state().outcomes.lock().unwrap().insert(
+        "hosted-refusal".into(),
+        hosted_status(&rig, "repeat-refusal", "refused", None),
+    );
+    rig.state().script([Fault::Http(200, OUTBOX_NOT_READY)]);
+    let reply = forward_with(&rig, create(Some("repeat-refusal"), "kept draft"), None).await;
+    assert_eq!(reply["result"]["structuredContent"]["needs_you"], true);
+    assert_eq!(entries(&rig).len(), 1);
+    assert_eq!(by_key(&rig, "repeat-refusal")["answer"], "refused");
+    let before = rig.state().writes().len();
+    let repeated = forward_with(&rig, create(Some("repeat-refusal"), "kept draft"), None).await;
+    assert_eq!(repeated["result"]["isError"], true);
+    assert_eq!(rig.state().writes().len(), before);
+}
+
+#[tokio::test]
+async fn hosted_settlement_releases_or_refuses_queued_dependants_from_hosted_create() {
+    for phase in ["applied", "refused"] {
+        let rig = Rig::new(fast()).await;
+        let record = hold_create(&rig, "parent", "kept draft").await["record_id"].clone();
+        let child = json!({"executor":"records_write","operation":"update_record","run_key":"run-xyz","arguments":{"id":record,"body_append":"tail","reason":"test","idempotency_key":"child"}});
+        rig.state().script([Fault::Http(200, READ_ONLY)]);
+        pending(&forward_with(&rig, child, None).await);
+        rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+        assert_eq!(drain(&rig).await, Halt::ReadOnly);
+        rig.state().outcomes.lock().unwrap().insert(
+            "hosted-entry".into(),
+            hosted_status(&rig, "parent", phase, None),
+        );
+        let before = rig.state().writes().len();
+        rig.gate.settle_hosted_batch(&rig.upstream).await;
+        assert_eq!(drain(&rig).await, Halt::Empty);
+        let child = by_key(&rig, "child");
+        if phase == "applied" {
+            assert_eq!(child["answer"], "receipt");
+            assert_eq!(rig.state().writes().len(), before + 1);
+        } else {
+            assert_eq!(child["answer"], "refused");
+            assert_eq!(child["refused_because"], by_key(&rig, "parent")["id"]);
+            assert_eq!(rig.state().writes().len(), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn hosted_settlement_journal_failure_retains_request_and_retries_after_repair() {
+    let rig = Rig::new(fast()).await;
+    hosted_create(&rig, "disk-failure", "hosted-disk").await;
+    rig.state().outcomes.lock().unwrap().insert(
+        "hosted-disk".into(),
+        hosted_status(&rig, "disk-failure", "applied", None),
+    );
+    rig.gate.journal.fail_after.store(0, Ordering::SeqCst);
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(by_key(&rig, "disk-failure")["state"], "hosted_pending");
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(by_key(&rig, "disk-failure")["answer"], "receipt");
+}
+
+#[tokio::test]
+async fn hosted_settlement_background_loop_runs_with_empty_node_queue() {
+    let rig = Rig::new(fast()).await;
+    hosted_create(&rig, "background", "hosted-background").await;
+    rig.state().outcomes.lock().unwrap().insert(
+        "hosted-background".into(),
+        hosted_status(&rig, "background", "applied", None),
+    );
+    let task = rig.gate.spawn_queue(rig.upstream.clone(), None);
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        while by_key(&rig, "background")["state"] != "confirmed" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    task.abort();
+    result.unwrap();
+    assert_eq!(rig.state().writes().len(), 1);
+}
+
+#[tokio::test]
+async fn hosted_settlement_rotates_bounded_sweeps_past_unresolved_entries() {
+    let rig = Rig::new(fast()).await;
+    for n in 0..35 {
+        hosted_create(&rig, &format!("rotate-{n}"), &format!("handle-{n}")).await;
+    }
+    rig.state().outcomes.lock().unwrap().insert(
+        "handle-34".into(),
+        hosted_status(&rig, "rotate-34", "applied", None),
+    );
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(rig.state().status_reads.lock().unwrap().len(), 32);
+    assert_eq!(by_key(&rig, "rotate-34")["state"], "hosted_pending");
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    assert_eq!(by_key(&rig, "rotate-34")["answer"], "receipt");
+    assert_eq!(rig.state().writes().len(), 35);
+}
+
+#[tokio::test]
+async fn hosted_settlement_same_key_checks_cover_non_node_holdable_updates_and_legacy_envelopes() {
+    let rig = Rig::new(fast()).await;
+    let call = json!({"executor":"records_write","operation":"update_record","run_key":"run-xyz",
+        "arguments":{"id":"record-id","name":"new title","reason":"test rename","idempotency_key":"rename"}});
+    rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+    forward_with(&rig, call.clone(), None).await;
+    let id = entry_id(&rig, "rename");
+    // Older builds left both absent on writes outside the node's hold allowlist.
+    rig.gate
+        .journal
+        .update(&id, |e| {
+            e.envelope = None;
+            e.intent_digest = None;
+        })
+        .unwrap();
+    rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+    forward_with(&rig, call.clone(), None).await;
+    assert_eq!(entries(&rig).len(), 1);
+    receipt(&forward_with(&rig, call, None).await);
+    assert_eq!(entries(&rig).len(), 1);
+    assert_eq!(by_key(&rig, "rename")["answer"], "receipt");
+}
+
+#[tokio::test]
+async fn hosted_settlement_same_key_check_can_recover_a_missing_hosted_handle() {
+    let rig = Rig::new(fast()).await;
+    hosted_create(&rig, "missing-handle", "unused").await;
+    let id = entry_id(&rig, "missing-handle");
+    rig.gate
+        .journal
+        .update(&id, |e| e.hosted_journal_entry = None)
+        .unwrap();
+    rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+    forward_with(&rig, create(Some("missing-handle"), "kept draft"), None).await;
+    assert_eq!(entries(&rig).len(), 1);
+    assert_eq!(
+        by_key(&rig, "missing-handle")["hosted_journal_entry"],
+        "hosted-entry"
+    );
+}
+
+fn batch(key: Value) -> Value {
+    let mut call = listed_writes()
+        .into_iter()
+        .find(|(name, _)| *name == "create_many")
+        .unwrap()
+        .1;
+    call["arguments"]["idempotency_key"] = key;
+    call
+}
+
+#[tokio::test]
+async fn keyed_batch_timeout_does_not_overlap_a_server_side_write_still_running() {
+    let rig = Rig::new(fast()).await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let done = Arc::new(tokio::sync::Notify::new());
+    rig.state().script([Fault::ParkBeforeApply(
+        started.clone(),
+        release.clone(),
+        done.clone(),
+    )]);
+    let mut client = rig.connect();
+    client.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_executor","arguments":batch(json!("batch-timeout"))}})).await;
+    started.notified().await;
+    let reply = client.recv().await.unwrap();
+    assert_eq!(reply["error"]["data"]["outcome"], "uncertain");
+    assert!(reply["error"]["data"]["retry"]
+        .as_str()
+        .unwrap()
+        .contains("reconcile"));
+    assert_eq!(
+        rig.state().writes().len(),
+        1,
+        "no overlapping second attempt"
+    );
+    assert_eq!(
+        rig.state().created.load(Ordering::SeqCst),
+        0,
+        "server still working after timeout"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), done.notified())
+        .await
+        .unwrap();
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 1);
+    assert_eq!(entries(&rig)[0]["state"], "uncertain");
+    assert_eq!(entries(&rig)[0]["attempts"], 1);
+    assert_eq!(entries(&rig)[0]["maybe_applied"], true);
+    assert!(rig.gate.status(&Default::default())["how_to_settle"]
+        .as_str()
+        .unwrap()
+        .contains("create_many"));
+}
+
+#[tokio::test]
+async fn lost_keyless_batch_response_is_never_retried() {
+    let rig = Rig::new(fast()).await;
+    rig.state().script([Fault::ApplyThenDrop]);
+    let mut client = rig.connect();
+    let reply = client.call(1, batch(Value::Null)).await;
+    assert_eq!(reply["error"]["data"]["outcome"], "unknown");
+    assert_eq!(rig.state().writes().len(), 1);
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 1);
+    assert_eq!(entries(&rig)[0]["state"], "uncertain");
+}
+
+#[tokio::test]
+async fn batch_queue_lost_reply_and_recovered_in_flight_marker_stop_replay() {
+    for crash in [false, true] {
+        let mut rig = Rig::new(fast()).await;
+        rig.state().script([Fault::Http(200, READ_ONLY)]);
+        let held = forward_with(&rig, batch(json!("batch-queue")), None).await;
+        let entry_id = pending(&held)["journal_entry"].as_str().unwrap().to_owned();
+        if crash {
+            rig.gate.journal.begin_queue_send(&entry_id).unwrap();
+            rig.restart(fast());
+        } else {
+            rig.state().script([Fault::ApplyThenDrop]);
+        }
+        let before = rig.state().writes().len();
+        assert_eq!(drain(&rig).await, Halt::Empty);
+        assert_eq!(rig.state().writes().len(), before + usize::from(!crash));
+        assert_eq!(
+            rig.gate.journal.get(&entry_id).unwrap().state,
+            EntryState::Uncertain
+        );
+        assert!(rig.gate.journal.get(&entry_id).unwrap().arguments.is_some());
+        assert!(rig.gate.journal.get(&entry_id).unwrap().maybe_applied);
+        let after = rig.state().writes().len();
+        assert_eq!(drain(&rig).await, Halt::Empty);
+        assert_eq!(rig.state().writes().len(), after, "no recovery resend");
+    }
+}
+
+#[tokio::test]
+async fn operator_withdrawal_refuses_repeat_and_dependants_without_dispatch() {
+    let rig = Rig::new(fast()).await;
+    let root = hold_create(&rig, "withdraw-root", "recoverable body").await;
+    let record_id = root["record_id"].as_str().unwrap();
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    let append = json!({"executor":"records_write","operation":"update_record","run_key":"run-xyz","arguments":{
+        "id":record_id,"body_append":"dependent text","reason":"r","idempotency_key":"withdraw-child"}});
+    pending(&forward_with(&rig, append, None).await);
+    let before = rig.state().writes().len();
+    let root_id = root["journal_entry"].as_str().unwrap();
+    let mut client = rig.connect();
+    client.send(json!({"jsonrpc":"2.0","id":10,"method":"node/journal/withdraw","params":{"entry_id":root_id,"reason":"operator no longer wants this work"}})).await;
+    let decision = client.recv().await.unwrap();
+    assert_eq!(decision["result"]["state"], "confirmed");
+    assert_eq!(decision["result"]["operator_audit"]["uid"], owner_uid());
+    assert_eq!(by_key(&rig, "withdraw-child")["answer"], "refused");
+    assert_eq!(by_key(&rig, "withdraw-child")["refused_because"], root_id);
+    let repeat = client
+        .call(11, create(Some("withdraw-root"), "recoverable body"))
+        .await;
+    assert_eq!(repeat["error"]["data"]["reason"], "operator_withdrawn");
+    let changed = client
+        .call(12, create(Some("withdraw-root"), "changed body"))
+        .await;
+    assert!(changed.to_string().contains("conflict"));
+    assert_eq!(drain(&rig).await, Halt::Empty);
+    assert_eq!(rig.state().writes().len(), before);
+    assert_eq!(
+        by_key(&rig, "withdraw-root")["arguments"]["body"],
+        "recoverable body"
+    );
+
+    // An append can cease to be holdable when its repeat adds an edit. That
+    // shape change must still hit the withdrawn key's local conflict.
+    let mut append = json!({"executor":"records_write","operation":"update_record","run_key":"run-xyz","arguments":{
+        "id":"70110000-0000-4000-8000-0000000000ee", "body_append":"text", "reason":"r", "idempotency_key":"withdraw-append"}});
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    let held_append = forward_with(&rig, append.clone(), None).await;
+    let append_id = pending(&held_append)["journal_entry"].as_str().unwrap();
+    rig.gate
+        .operator_decision(append_id, None, "withdraw append", None)
+        .await
+        .unwrap();
+    let before_changed_shape = rig.state().writes().len();
+    append["arguments"]["name"] = json!("edit changes eligibility");
+    let conflict = client.call(13, append).await;
+    assert!(conflict.to_string().contains("conflict"));
+    assert_eq!(rig.state().writes().len(), before_changed_shape);
+}
+
+#[tokio::test]
+async fn operator_decision_refuses_active_gates_and_acknowledges_hosted_custody_locally() {
+    let rig = Rig::new(fast()).await;
+    let held = hold_create(&rig, "ack-hosted", "retained body").await;
+    let id = held["journal_entry"].as_str().unwrap();
+    rig.gate
+        .journal
+        .hosted_pending(id, Some("hosted-handle".into()))
+        .unwrap();
+    let before = rig.state().writes().len();
+    {
+        let _turn = rig.gate.drain_lock.write().await;
+        assert!(rig
+            .gate
+            .operator_decision(id, Some("landed"), "canonical history checked", None)
+            .await
+            .is_err());
+    }
+    {
+        let _turn = rig.gate.hosted_check.lock().await;
+        assert!(rig
+            .gate
+            .operator_decision(id, Some("landed"), "canonical history checked", None)
+            .await
+            .is_err());
+    }
+    let mut client = rig.connect();
+    // Notifications are ignored and never mutate the journal.
+    client.send(json!({"jsonrpc":"2.0","method":"node/journal/acknowledge","params":{"entry_id":id,"outcome":"landed","reason":"must be ignored"}})).await;
+    client.send(json!({"jsonrpc":"2.0","id":1,"method":"node/journal/acknowledge","params":{"entry_id":id,"outcome":"landed","reason":"canonical history checked"}})).await;
+    let reply = client.recv().await.unwrap();
+    assert_eq!(reply["result"]["state"], "acknowledged");
+    assert_eq!(reply["result"]["canonical"], false);
+    assert_eq!(
+        reply["result"]["operator_audit"]["reason"],
+        "canonical history checked"
+    );
+    assert_eq!(rig.state().writes().len(), before);
+    assert_eq!(rig.gate.status(&Default::default())["outstanding_count"], 0);
+}
+
+#[tokio::test]
+async fn keyed_batch_retries_connect_failures_known_not_sent() {
+    let mut config = fast();
+    config.backoff_start = Duration::from_millis(100);
+    let mut rig = Rig::new(config).await;
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    let held = forward_with(&rig, batch(json!("batch-not-sent")), None).await;
+    let entry_id = pending(&held)["journal_entry"].as_str().unwrap();
+    let entry = rig.gate.journal.get(entry_id).unwrap();
+    rig.hosted.task.abort();
+    let _ = (&mut rig.hosted.task).await;
+    let address = rig
+        .config
+        .hosted_base_url
+        .strip_prefix("http://")
+        .unwrap()
+        .to_owned();
+    let mut call = batch(json!("batch-not-sent"));
+    call["arguments"] = entry.arguments.clone().unwrap();
+    let message = tool_call(88, "call_executor", call);
+    let body = message.to_string();
+    let caller = Caller::new(None, Cancel::new());
+    let request = WriteRequest {
+        body: &body,
+        message: &message,
+        revision: None,
+        caller: &caller,
+        outage: None,
+        no_hold: true,
+    };
+    let restore = async {
+        // Two new attempts started, so the first connect refusal has already
+        // passed the retry policy. Bind only then: no possibly-applied send.
+        eventually(|| rig.gate.journal.get(entry_id).unwrap().attempts >= entry.attempts + 2).await;
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        serve_hosted(rig.hosted.state.clone(), socket).await;
+    };
+    let (result, _) = tokio::join!(
+        rig.gate
+            .send_with_retry(&rig.upstream, &request, &message, &body, &entry, false),
+        restore
+    );
+    assert_eq!(result.0.attempt, Attempt::Answered);
+    assert!(!result.1);
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rig.state().writes().len(),
+        2,
+        "initial non-applying refusal and one actual send"
+    );
+}
+
+#[tokio::test]
+async fn journal_cli_routes_acknowledgement_and_rejects_incomplete_flags() {
+    let rig = Rig::new(fast()).await;
+    let held = hold_create(&rig, "cli-ack", "body").await;
+    let id = held["journal_entry"].as_str().unwrap();
+    rig.gate
+        .journal
+        .hosted_pending(id, Some("hosted-entry".into()))
+        .unwrap();
+    let socket = rig.config.socket_directory.join("cli-test.sock");
+    let args = |tail: &[&str]| {
+        [
+            vec![
+                "journal".to_owned(),
+                "--socket".into(),
+                socket.to_str().unwrap().into(),
+            ],
+            tail.iter().map(|s| (*s).to_owned()).collect(),
+        ]
+        .concat()
+    };
+    assert!(run_cli(&args(&["acknowledge", id, "--reason"]))
+        .await
+        .is_err());
+    let listener = UnixListener::bind(&socket).unwrap();
+    let gate = rig.gate.clone();
+    let upstream = rig.upstream.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        serve_routed_connection(
+            stream,
+            upstream,
+            None,
+            Some(gate),
+            None,
+            Arc::new(Admission::new()),
+        )
+        .await
+        .unwrap();
+    });
+    let before = rig.state().writes().len();
+    run_cli(&args(&[
+        "acknowledge",
+        id,
+        "--reason",
+        "matched canonical history",
+        "--outcome",
+        "landed",
+    ]))
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        rig.gate.journal.get(id).unwrap().state,
+        EntryState::Acknowledged
+    );
+    assert_eq!(rig.state().writes().len(), before);
+}
+
+#[tokio::test]
+async fn hosted_retry_with_stale_custody_snapshot_reports_operator_audit_without_resending() {
+    for outcome in ["not_applied", "landed", "superseded"] {
+        let rig = Rig::new(fast()).await;
+        let call = create(Some("ack-wins-hosted-check"), "preserved body");
+        rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+        forward_with(&rig, call.clone(), None).await;
+        let id = entry_id(&rig, "ack-wins-hosted-check");
+        // Model a caller that captured hosted custody before the operator won
+        // hosted_check. Pass that stale snapshot after the operator releases it.
+        let stale = rig.gate.journal.get(&id).unwrap();
+        assert_eq!(stale.state, EntryState::HostedPending);
+        rig.gate
+            .operator_decision(&id, Some(outcome), "checked canonical history", None)
+            .await
+            .unwrap();
+        let acknowledged = rig.gate.journal.get(&id).unwrap();
+        let before = rig.state().writes().len();
+        let message = tool_call(99, "call_executor", call);
+        let body = message.to_string();
+        let caller = Caller::new(None, Cancel::new());
+        let request = WriteRequest {
+            body: &body,
+            message: &message,
+            revision: None,
+            caller: &caller,
+            outage: None,
+            no_hold: false,
+        };
+        let report = rig.gate.repeat_hosted(&rig.upstream, &request, stale).await;
+        assert_eq!(report.attempt, Attempt::Answered);
+        let reply: Value = serde_json::from_str(&report.reply.unwrap()).unwrap();
+        let content = &reply["result"]["structuredContent"];
+        assert_eq!(content["outcome"], "acknowledged");
+        assert_eq!(content["canonical"], false);
+        assert_eq!(content["receipt_available"], false);
+        assert!(
+            content.get("applied").is_none(),
+            "even landed is an operator assertion"
+        );
+        assert_eq!(
+            content["operator_audit"],
+            serde_json::to_value(acknowledged.operator_audit).unwrap()
+        );
+        assert_eq!(content["operator_audit"]["outcome"], outcome);
+        assert_eq!(content["node_journal_entry"], id);
+        assert_eq!(
+            rig.state().writes().len(),
+            before,
+            "no resend after acknowledgement"
+        );
+        assert_eq!(
+            rig.gate.journal.get(&id).unwrap().state,
+            EntryState::Acknowledged
+        );
+        assert_eq!(
+            rig.gate.journal.get(&id).unwrap().arguments,
+            acknowledged.arguments
+        );
+    }
+}
+
+async fn app_rig() -> (Rig, super::super::app_proof::Connection) {
+    let mut rig = Rig::new(fast()).await;
+    rig.config.desktop_app_proof_transport = true;
+    rig.config.desktop_app_proof_resource_origin = Some("https://plugin.test".into());
+    rig.config.account_id = Some("acct_owner".into());
+    rig.upstream = Arc::new(Upstream::new(rig.config.clone(), Duration::from_secs(30)).unwrap());
+    let connection =
+        super::super::app_proof::Connection::new(Some(super::super::app_proof::Binding {
+            account_id: "acct_owner".into(),
+            hosted_db_id: rig.config.db_id.clone(),
+            origin_database_id: "ndb_origin".into(),
+            resource_origin: "https://plugin.test".into(),
+            forwarding_origin: rig.upstream.endpoint.origin().ascii_serialization(),
+        }));
+    let reply=connection.dispatch(&rig.config,&json!({"jsonrpc":"2.0","id":0,"method":"native/app-proof/install","params":{
+        "account_id":"acct_owner","hosted_db_id":rig.config.db_id,"origin_database_id":"ndb_origin",
+        "resource_origin":"https://plugin.test","forwarding_origin":rig.upstream.endpoint.origin().ascii_serialization(),"app":"docs@1; install=evt",
+        "proof":"opaque-test-proof","expires_in_ms":60000}})).unwrap();
+    assert!(reply.contains("ready"));
+    (rig, connection)
+}
+async fn forward_app(
+    rig: &Rig,
+    connection: &super::super::app_proof::Connection,
+    arguments: Value,
+    outage: Option<&dyn Outage>,
+) -> Value {
+    let mut message = tool_call(8, "call_executor", arguments);
+    message["params"]["_meta"] = json!({"native/app":"docs@1; install=evt"});
+    let body = message.to_string();
+    let mut caller = Caller::new(None, Cancel::new());
+    caller.context = connection.context();
+    let report = rig
+        .gate
+        .forward(
+            &rig.upstream,
+            &WriteRequest {
+                body: &body,
+                message: &message,
+                revision: None,
+                caller: &caller,
+                outage,
+                // Defence in depth: app attribution alone must prevent custody even
+                // if a future caller forgets the production buildsite no_hold flag.
+                no_hold: false,
+            },
+            true,
+        )
+        .await;
+    serde_json::from_str(&report.reply.unwrap()).unwrap()
+}
+#[tokio::test]
+async fn app_writes_never_hold_or_automatically_replay_across_failures() {
+    for fault in [
+        Fault::Http(200, READ_ONLY),
+        Fault::ApplyThenDrop,
+        Fault::Http(503, "unavailable"),
+        Fault::RefuseKey,
+    ] {
+        let (rig, connection) = app_rig().await;
+        *rig.state().always.lock().unwrap() = Some(fault);
+        let reply = forward_app(&rig, &connection, create(None, "app step"), None).await;
+        assert_ne!(
+            reply.pointer("/result/structuredContent/outcome"),
+            Some(&json!("accepted_pending")),
+            "{reply}"
+        );
+        let persisted = entries(&rig);
+        assert!(!persisted.is_empty());
+        assert!(persisted
+            .iter()
+            .all(|e| e["state"] != "pending" && e["app_identity"] == "docs@1; install=evt"));
+        assert!(
+            rig.state().keys_sent().iter().all(Option::is_some),
+            "no keyless resend"
+        );
+        let sends = rig.state().writes().len();
+        *rig.state().always.lock().unwrap() = None;
+        rig.gate.drain(&rig.upstream, None, None, None).await;
+        rig.gate.settle_hosted_batch(&rig.upstream).await;
+        assert_eq!(
+            rig.state().writes().len(),
+            sends,
+            "recovery must not replay app calls"
+        );
+        let reopened =
+            super::super::journal::Journal::open(&rig.config.socket_directory, CONFIRMED_RETENTION)
+                .unwrap();
+        assert_eq!(reopened.pending_count(), 0);
+        let files = fs::read_dir(rig.config.socket_directory.join("journal")).unwrap();
+        for file in files {
+            let file = file.unwrap();
+            if file.path().extension().is_some_and(|e| e == "json") {
+                assert!(!fs::read_to_string(file.path())
+                    .unwrap()
+                    .contains("opaque-test-proof"));
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn app_missing_proof_offline_and_backlog_refuse_before_mutation_or_journal() {
+    let (rig, connection) = app_rig().await;
+    let absent = super::super::app_proof::Connection::default();
+    let missing = forward_app(&rig, &absent, create(Some("caller-key"), "app"), None).await;
+    assert_eq!(missing["error"]["data"]["outcome"], "not_sent");
+    assert!(entries(&rig).is_empty());
+    assert!(rig.state().writes().is_empty());
+    let down = FakeOutage::new(true);
+    down.known.store(true, Ordering::SeqCst);
+    let offline = forward_app(
+        &rig,
+        &connection,
+        create(Some("caller-key"), "app"),
+        Some(&down),
+    )
+    .await;
+    assert_eq!(offline["error"]["data"]["outcome"], "not_sent");
+    assert!(entries(&rig).is_empty());
+    assert!(rig.state().writes().is_empty());
+    let entry = rig
+        .gate
+        .journal
+        .begin(super::NewEntry {
+            executor: "records_write".into(),
+            operation: "create_record".into(),
+            tool: "call_executor".into(),
+            run_key: None,
+            client_info: None,
+            app_identity: None,
+            idempotency_key: Some("ordinary".into()),
+            key_origin: Some(KeyOrigin::Caller),
+            arguments: json!({"type":"Document"}),
+            parent_key: None,
+            title: None,
+            record_id: None,
+            record_ids: vec![],
+            envelope: None,
+            intent_digest: None,
+        })
+        .unwrap();
+    rig.gate
+        .journal
+        .hold(
+            &entry.id,
+            HoldReason::DeploymentReadOnly,
+            "read-only".into(),
+            false,
+        )
+        .unwrap();
+    let backlog = forward_app(&rig, &connection, create(Some("caller-key"), "app"), None).await;
+    assert_eq!(backlog["error"]["data"]["outcome"], "not_sent");
+    assert_eq!(entries(&rig).len(), 1);
+    assert!(rig.state().writes().is_empty());
+}
+#[tokio::test]
+async fn app_caller_key_survives_and_hosted_custody_never_replays() {
+    let (rig, connection) = app_rig().await;
+    rig.state().script([Fault::Http(200, HOSTED_PENDING)]);
+    let arguments = create(Some("caller-app-key"), "app custody");
+    let first = forward_app(&rig, &connection, arguments.clone(), None).await;
+    assert_eq!(
+        first["result"]["structuredContent"]["outcome"],
+        "accepted_pending"
+    );
+    assert_eq!(rig.state().keys_sent(), vec![Some("caller-app-key".into())]);
+    let entry = entries(&rig).pop().unwrap();
+    assert_eq!(entry["state"], "hosted_pending");
+    rig.gate.settle_hosted_batch(&rig.upstream).await;
+    let mut arguments = arguments;
+    arguments["arguments"]["response_mode"] = json!("compact");
+    let repeat = forward_app(&rig, &connection, arguments, None).await;
+    assert_eq!(
+        repeat["result"]["structuredContent"]["outcome"],
+        "accepted_pending"
+    );
+    assert_eq!(
+        rig.state().writes().len(),
+        1,
+        "even an explicit custody check must not reconstruct an app mutation"
+    );
+    assert!(rig.state().status_reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn app_after_possible_send_credential_refusal_stays_uncertain() {
+    let (rig, connection) = app_rig().await;
+    rig.state().script([Fault::ApplyDropThenRevokeCredentials]);
+    let reply = forward_app(
+        &rig,
+        &connection,
+        create(Some("app-uncertain"), "possibly applied"),
+        None,
+    )
+    .await;
+    assert_eq!(reply["error"]["data"]["outcome"], "uncertain", "{reply}");
+    let entry = entries(&rig).pop().unwrap();
+    assert_eq!(entry["state"], "uncertain");
+    assert_eq!(entry["app_identity"], "docs@1; install=evt");
+    assert_eq!(
+        rig.gate.status(&Default::default())["app_outstanding_count"],
+        1
+    );
+    assert_eq!(rig.state().writes().len(), 1);
+    assert_eq!(rig.gate.journal.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn app_proof_clear_after_possible_send_preserves_uncertainty_without_rest_or_keyless_replay()
+{
+    let (mut rig, connection) = app_rig().await;
+    Arc::get_mut(&mut rig.gate).unwrap().config.backoff_start = Duration::from_millis(250);
+    rig.state().script([Fault::ApplyThenDrop]);
+    let forwarded = forward_app(
+        &rig,
+        &connection,
+        create(Some("proof-expired-after-send"), "app"),
+        None,
+    );
+    let revoke = async {
+        eventually(|| rig.state().created.load(Ordering::SeqCst) == 1).await;
+        connection.context().clear();
+    };
+    let (reply, ()) = tokio::join!(forwarded, revoke);
+    assert_eq!(reply["error"]["data"]["outcome"], "uncertain", "{reply}");
+    assert_eq!(rig.state().writes().len(), 1);
+    assert_eq!(entries(&rig)[0]["state"], "uncertain");
+    assert_eq!(rig.gate.journal.pending_count(), 0);
+}
+
+#[path = "body_merge_lineage_fault_tests.rs"]
+mod body_merge_lineage_fault_tests;
+
+#[tokio::test]
+async fn fork_payloads_leave_every_terminal_settlement_and_disable_restores_pruning() {
+    let mut config = fast();
+    config.retention = Duration::ZERO;
+    let rig = Rig::new(config).await;
+    rig.gate.enable_pending_fork();
+    for (index, state) in [
+        EntryState::Confirmed,
+        EntryState::NotSent,
+        EntryState::Uncertain,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let held = hold_create(
+            &rig,
+            &format!("terminal-{index}"),
+            "private preview payload",
+        )
+        .await;
+        let id = held["journal_entry"].as_str().unwrap();
+        assert!(rig.gate.journal.get(id).unwrap().fork_arguments.is_some());
+        let settled = rig
+            .gate
+            .journal
+            .settle(id, state, Some("receipt"), None)
+            .unwrap();
+        assert!(settled.fork_arguments.is_none());
+        assert!(settled.fork_run_key.is_none());
+        assert!(settled.fork_accepted_act.is_none());
+    }
+    let held = hold_create(&rig, "operator-terminal", "operator preview payload").await;
+    let id = held["journal_entry"].as_str().unwrap();
+    rig.gate
+        .operator_decision(id, None, "withdraw preview", None)
+        .await
+        .unwrap();
+    assert!(rig.gate.journal.get(id).unwrap().fork_arguments.is_none());
+    let held = hold_create(&rig, "disable-terminal", "retained preview payload").await;
+    let id = held["journal_entry"].as_str().unwrap();
+    let accepted = rig
+        .gate
+        .journal
+        .update(id, |e| {
+            e.state = EntryState::Confirmed;
+            e.answer = Some("receipt".into());
+            e.fork_accepted_act = Some(999);
+        })
+        .unwrap();
+    assert!(accepted.fork_arguments.is_some());
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    rig.gate.disable_pending_fork();
+    assert!(
+        rig.gate.journal.get(id).is_none(),
+        "disabled preview metadata cannot block ordinary pruning"
+    );
+}
+
+#[tokio::test]
+async fn preview_retention_does_not_change_hosted_replay() {
+    let rig = Rig::new(fast()).await;
+    rig.gate.enable_pending_fork();
+    // This gate has no serving generation, the same state as failed preparation.
+    let held = hold_create(&rig, "preview-replay", "durable replay payload").await;
+    let id = held["journal_entry"].as_str().unwrap();
+    assert!(rig.gate.journal.get(id).unwrap().fork_arguments.is_some());
+    assert_eq!(drain(&rig).await, Halt::Empty);
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 1);
+    assert_eq!(by_key(&rig, "preview-replay")["answer"], "receipt");
+    assert_eq!(drain(&rig).await, Halt::Empty);
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 1);
+}
+
+struct DescriptionCompatibilityOutage {
+    evidence: Option<NodeHoldingContract>,
+}
+impl Outage for DescriptionCompatibilityOutage {
+    fn contract_digest<'a>(
+        &'a self,
+        _executor: &'a str,
+        _operation: &'a str,
+        _protocol: Option<&'a str>,
+    ) -> Ready<'a, Option<String>> {
+        Box::pin(async { Some("different-hosted-digest".into()) })
+    }
+    fn holding_contract<'a>(
+        &'a self,
+        _executor: &'a str,
+        _operation: &'a str,
+        _protocol: Option<&'a str>,
+    ) -> Ready<'a, Option<NodeHoldingContract>> {
+        Box::pin(async { self.evidence.clone() })
+    }
+    fn confirm_down(&self) -> Ready<'_, bool> {
+        Box::pin(async { false })
+    }
+}
+
+#[tokio::test]
+async fn holding_contract_description_only_custody_survives_restart_without_preview() {
+    let mut rig = Rig::new(fast()).await;
+    let mut evidence = rig
+        .gate
+        .local_contracts
+        .holding_contract("records_write", "create_record")
+        .unwrap();
+    evidence.description["source"]["tool_description"] = json!("Updated source guidance");
+    evidence.description["contract_digest"] = json!("different-hosted-digest");
+    let outage = DescriptionCompatibilityOutage {
+        evidence: Some(evidence),
+    };
+    rig.gate.enable_pending_fork();
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    let asked = create(Some("description-key"), "durable pending");
+    let reply = forward_with(&rig, asked.clone(), Some(&outage)).await;
+    assert_eq!(
+        reply["result"]["structuredContent"]["outcome"], "accepted_pending",
+        "{reply}"
+    );
+    assert_eq!(
+        reply["result"]["structuredContent"]["contract_compatibility"],
+        "source_description_only"
+    );
+    assert_eq!(
+        reply["result"]["structuredContent"]["preview_available"],
+        false
+    );
+    let entry = rig.gate.journal.oldest_pending().unwrap();
+    assert!(entry.custody_compatibility.is_some());
+    assert_eq!(
+        entry.version,
+        super::super::journal::DESCRIPTION_CUSTODY_VERSION
+    );
+    assert!(!super::super::pending_fork::previewable(&entry));
+    assert!(entry.fork_arguments.is_none());
+    let original = entry.arguments.clone();
+    // This is the previous reader's exact version guard: ignoring the new
+    // optional marker cannot make the saved format replayable or previewable.
+    let saved_path = rig
+        .config
+        .socket_directory
+        .join("journal")
+        .join(format!("{}.json", entry.id));
+    let mut old_shape: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
+    old_shape
+        .as_object_mut()
+        .unwrap()
+        .remove("custody_compatibility");
+    let old_reader: Entry = serde_json::from_value(old_shape).unwrap();
+    assert!(
+        old_reader.version > super::super::journal::ENTRY_VERSION
+            && !(old_reader.version == 2
+                && old_reader.is_merge()
+                && (old_reader.prepared || old_reader.lineage_required))
+    );
+    rig.restart(fast());
+    let entry = rig.gate.journal.oldest_pending().unwrap();
+    assert!(entry.custody_compatibility.is_some());
+    assert_eq!(entry.arguments, original);
+    assert!(!super::super::pending_fork::previewable(&entry));
+    // Replay uses the retained bytes and hosted admission, not local execution.
+    rig.gate.drain(&rig.upstream, None, None, None).await;
+    assert_eq!(rig.state().writes().len(), 2);
+    assert_eq!(
+        rig.state().writes()[0]["params"]["arguments"],
+        rig.state().writes()[1]["params"]["arguments"]
+    );
+    assert_eq!(rig.gate.status(&Default::default())["queue"]["pending"], 0);
+    let settled_id = entry.id;
+    rig.restart(fast());
+    assert_eq!(rig.gate.status(&Default::default())["unreadable_files"], 0);
+    let settled = rig.gate.journal.get(&settled_id).unwrap();
+    assert_eq!(settled.answer.as_deref(), Some("receipt"));
+    assert!(settled.arguments.is_none());
+    assert!(!super::super::pending_fork::previewable(&settled));
+}
+
+#[tokio::test]
+async fn holding_contract_malformed_custody_format_is_preserved_unreadable() {
+    let mut rig = Rig::new(fast()).await;
+    let mut evidence = rig
+        .gate
+        .local_contracts
+        .holding_contract("records_write", "create_record")
+        .unwrap();
+    evidence.description["source"]["tool_description"] = json!("Changed explanation");
+    let outage = DescriptionCompatibilityOutage {
+        evidence: Some(evidence),
+    };
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    forward_with(
+        &rig,
+        create(Some("malformed-format-key"), "retain this draft"),
+        Some(&outage),
+    )
+    .await;
+    let entry = rig.gate.journal.oldest_pending().unwrap();
+    let path = rig
+        .config
+        .socket_directory
+        .join("journal")
+        .join(format!("{}.json", entry.id));
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["custody_compatibility"] = Value::Null;
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+    rig.restart(fast());
+    assert!(rig.gate.journal.oldest_pending().is_none());
+    assert_eq!(rig.gate.status(&Default::default())["unreadable_files"], 1);
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn holding_contract_incompatible_or_missing_evidence_never_takes_custody() {
+    for variant in [
+        "missing",
+        "schema",
+        "selector",
+        "plan",
+        "access",
+        "acceptance",
+        "malformed",
+    ] {
+        let rig = Rig::new(fast()).await;
+        let mut evidence = rig
+            .gate
+            .local_contracts
+            .holding_contract("records_write", "create_record")
+            .unwrap();
+        evidence.description["source"]["tool_description"] = json!("Updated guidance");
+        match variant {
+            "schema" => {
+                evidence.description["input_schema"]["properties"]["future_optional"] =
+                    json!({"type":"string"})
+            }
+            "selector" => {
+                evidence.description["source"]["selector"] =
+                    json!({"field":"action","value":"different"})
+            }
+            "plan" => evidence.description["prototype"]["plan_required"] = json!(true),
+            "access" => evidence.catalog["access"] = json!("read"),
+            "acceptance" => evidence.catalog["requires_acceptance"] = json!(true),
+            "malformed" => evidence.description = json!({}),
+            _ => (),
+        }
+        let outage = DescriptionCompatibilityOutage {
+            evidence: (variant != "missing").then_some(evidence),
+        };
+        rig.state().script([Fault::Http(200, READ_ONLY)]);
+        let reply = forward_with(&rig, create(None, "must stay with caller"), Some(&outage)).await;
+        assert_eq!(
+            reply["error"]["data"]["outcome"], "not_sent",
+            "{variant}: {reply}"
+        );
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(if variant == "missing" {
+                "missing or malformed"
+            } else {
+                "incompatible"
+            }),
+            "{variant}: {reply}"
+        );
+        assert_eq!(rig.gate.status(&Default::default())["queue"]["pending"], 0);
+    }
+}
+
+#[tokio::test]
+async fn holding_contract_replay_refusal_retains_content_and_custody_format() {
+    let mut rig = Rig::new(fast()).await;
+    let evidence = rig
+        .gate
+        .local_contracts
+        .holding_contract("records_write", "create_record")
+        .unwrap();
+    let outage = DescriptionCompatibilityOutage {
+        evidence: Some(evidence),
+    };
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    forward_with(
+        &rig,
+        create(Some("description-refusal"), "draft must survive rejection"),
+        Some(&outage),
+    )
+    .await;
+    let entry = rig.gate.journal.oldest_pending().unwrap();
+    let original = entry.arguments.clone();
+    rig.state().script([Fault::ToolReply(json!({"isError":true,"content":[],"structuredContent":{"error_code":"validation_failure","applied":false}}))]);
+    rig.gate.drain(&rig.upstream, None, None, None).await;
+    rig.restart(fast());
+    let refused = rig.gate.journal.get(&entry.id).unwrap();
+    assert_eq!(refused.answer.as_deref(), Some("refused"));
+    assert_eq!(refused.arguments, original);
+    assert_eq!(
+        refused.version,
+        super::super::journal::DESCRIPTION_CUSTODY_VERSION
+    );
+    assert!(!super::super::pending_fork::previewable(&refused));
+    assert_eq!(rig.gate.status(&Default::default())["unreadable_files"], 0);
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn holding_contract_possibly_applied_attempt_never_grants_exact_preview() {
+    for variant in ["description", "missing", "schema"] {
+        let mut rig = Rig::new(fast()).await;
+        let mut evidence = rig
+            .gate
+            .local_contracts
+            .holding_contract("records_write", "create_record")
+            .unwrap();
+        evidence.description["source"]["tool_description"] = json!("Changed hosted explanation");
+        if variant == "schema" {
+            evidence.description["input_schema"]["properties"]["future_optional"] =
+                json!({"type":"string"});
+        }
+        let outage = DescriptionCompatibilityOutage {
+            evidence: (variant != "missing").then_some(evidence),
+        };
+        rig.gate.enable_pending_fork();
+        rig.state()
+            .script([Fault::ApplyThenDrop, Fault::Http(200, READ_ONLY)]);
+        let reply = forward_with(
+            &rig,
+            create(
+                Some("possibly-applied-description-key"),
+                "keep uncertain draft",
+            ),
+            Some(&outage),
+        )
+        .await;
+        let expected = if variant == "description" {
+            "source_description_only"
+        } else {
+            "prior_attempt_unverified"
+        };
+        assert_eq!(
+            reply["result"]["structuredContent"]["outcome"], "accepted_pending",
+            "{variant}: {reply}"
+        );
+        assert_eq!(
+            reply["result"]["structuredContent"]["may_already_be_applied"],
+            true
+        );
+        assert_eq!(
+            reply["result"]["structuredContent"]["contract_compatibility"],
+            expected
+        );
+        assert_eq!(
+            reply["result"]["structuredContent"]["preview_available"],
+            false
+        );
+        let held = rig.gate.journal.oldest_pending().unwrap();
+        assert_eq!(
+            held.version,
+            super::super::journal::DESCRIPTION_CUSTODY_VERSION
+        );
+        assert!(!super::super::pending_fork::previewable(&held));
+        rig.restart(fast());
+        let reloaded = rig.gate.journal.oldest_pending().unwrap();
+        assert_eq!(reloaded.arguments, held.arguments);
+        assert!(reloaded.maybe_applied);
+        assert!(!super::super::pending_fork::previewable(&reloaded));
+    }
+}
+
+#[tokio::test]
+async fn holding_contract_custody_format_mutations_are_atomic_and_rejected() {
+    let rig = Rig::new(fast()).await;
+    let evidence = rig
+        .gate
+        .local_contracts
+        .holding_contract("records_write", "create_record")
+        .unwrap();
+    let outage = DescriptionCompatibilityOutage {
+        evidence: Some(evidence),
+    };
+    rig.state().script([Fault::Http(200, READ_ONLY)]);
+    forward_with(
+        &rig,
+        create(Some("immutable-custody-key"), "immutable held content"),
+        Some(&outage),
+    )
+    .await;
+    let held = rig.gate.journal.oldest_pending().unwrap();
+    let path = rig
+        .config
+        .socket_directory
+        .join("journal")
+        .join(format!("{}.json", held.id));
+    let before = fs::read(&path).unwrap();
+    for mutation in [
+        "marker",
+        "version",
+        "fork",
+        "key",
+        "arguments",
+        "retire_pending",
+    ] {
+        let result = rig.gate.journal.update(&held.id, |entry| match mutation {
+            "marker" => entry.custody_compatibility = None,
+            "version" => entry.version = 1,
+            "fork" => entry.fork_arguments = entry.arguments.clone(),
+            "key" => entry.idempotency_key = Some("different-key".into()),
+            "arguments" => entry.arguments.as_mut().unwrap()["body"] = json!("different draft"),
+            "retire_pending" => {
+                entry.arguments = None;
+                entry.envelope = None;
+            }
+            _ => unreachable!(),
+        });
+        assert!(result.is_err(), "{mutation}");
+        assert_eq!(fs::read(&path).unwrap(), before, "{mutation}");
+        assert_eq!(
+            serde_json::to_value(rig.gate.journal.get(&held.id).unwrap()).unwrap(),
+            serde_json::to_value(&held).unwrap()
+        );
+    }
+}
+
+fn seed_forwarded_uncertainty(rig: &Rig) {
+    let entry = rig
+        .gate
+        .journal
+        .begin(NewEntry {
+            executor: "records_write".into(),
+            operation: "create_record".into(),
+            tool: "call_executor".into(),
+            run_key: Some("old-run".into()),
+            client_info: None,
+            app_identity: None,
+            idempotency_key: None,
+            key_origin: None,
+            arguments: json!({"body":"private original"}),
+            parent_key: None,
+            title: Some("private title".into()),
+            record_id: None,
+            record_ids: vec![],
+            envelope: None,
+            intent_digest: None,
+        })
+        .unwrap();
+    rig.gate
+        .journal
+        .settle(
+            &entry.id,
+            EntryState::Uncertain,
+            None,
+            Some("reply lost".into()),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_combines_legacy_and_scoped_backlogs_without_record_contents() {
+    let legacy = Rig::new(fast()).await;
+    seed_forwarded_uncertainty(&legacy);
+    let scoped = Rig::new(fast()).await;
+    hold_call(
+        &scoped,
+        create_in("old-run", None, "scoped-key", "Scoped private title"),
+    )
+    .await;
+    let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"canonical bootstrap"}],"structuredContent":{}}}"#;
+    let combined =
+        WriteGate::note_held_writes_across(&[&legacy.gate, &scoped.gate], reply, "new-run");
+    let value: Value = serde_json::from_str(&combined).unwrap();
+    let note = &value["result"]["structuredContent"]["node_held_writes"];
+    assert_eq!(note["account"]["waiting"], 2);
+    assert_eq!(
+        note["account"]["counts"],
+        json!({"pending":1,"uncertain":1})
+    );
+    assert!(note["account"]["oldest_accepted_at"].is_string());
+    assert_eq!(value["result"]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(value["result"]["content"][0]["text"], "canonical bootstrap");
+    assert!(combined.contains("This account: 2"));
+    assert!(!combined.contains("private title") && !combined.contains("private original"));
+    assert!(
+        legacy.state().writes().is_empty(),
+        "disclosure never replays the forward"
+    );
+    assert_eq!(legacy.gate.journal.waiting_summary()["waiting"], 1);
+}
+
+/// 7e99834: a text-format bootstrap carries no structuredContent. With held
+/// writes waiting, the node must not create one holding only its note: clients
+/// that prefer structuredContent would then hide bootstrap's text, run key and
+/// the note itself. Both journals' totals still reach the visible text.
+#[tokio::test]
+async fn text_format_bootstrap_with_held_writes_keeps_the_hosted_text_visible() {
+    let legacy = Rig::new(fast()).await;
+    seed_forwarded_uncertainty(&legacy);
+    let scoped = Rig::new(fast()).await;
+    hold_call(
+        &scoped,
+        create_in("old-run", None, "scoped-key", "Scoped private title"),
+    )
+    .await;
+    let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"bootstrap text run_key=calm-otter-abc123"}],"isError":false}}"#;
+    let noted = WriteGate::note_held_writes_across(&[&legacy.gate, &scoped.gate], reply, "new-run");
+    let value: Value = serde_json::from_str(&noted).unwrap();
+    assert!(
+        value["result"].get("structuredContent").is_none(),
+        "{noted}"
+    );
+    let content = value["result"]["content"].as_array().unwrap();
+    assert_eq!(
+        content[0]["text"],
+        "bootstrap text run_key=calm-otter-abc123"
+    );
+    let note = content[1]["text"].as_str().unwrap();
+    assert!(note.contains("This account: 2 ("), "{note}");
+    assert!(
+        note.contains("1 pending") && note.contains("1 uncertain"),
+        "{note}"
+    );
+    assert!(!noted.contains("private title"), "{noted}");
+}
+
+/// 7e99834, the same shape on the uncertain-write note: a text-format reply
+/// to a write whose outcome is uncertain keeps hosted's text visible, with the
+/// retry key in a text line rather than a structured payload the node made up.
+#[test]
+fn an_uncertain_note_on_a_text_reply_does_not_create_structured_content() {
+    let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hosted receipt"}],"isError":false}}"#;
+    let noted = annotate_hosted_reply(reply, json!({"outcome":"uncertain"}), "retry-key");
+    let value: Value = serde_json::from_str(&noted).unwrap();
+    assert!(
+        value["result"].get("structuredContent").is_none(),
+        "{noted}"
+    );
+    assert_eq!(value["result"]["content"][0]["text"], "hosted receipt");
+    assert!(value["result"]["content"][1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("idempotency_key=retry-key"));
+    // Still machine-readable, so the CLI and session writer classify it.
+    assert_eq!(
+        value["result"]["_meta"]["node_journal"]["outcome"],
+        "uncertain"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_preserves_the_response_without_disclosing_a_previous_accounts_backlog() {
+    let mut config = fast();
+    config.account_binding = Some(json!({"account_id":"first"}));
+    let mut rig = Rig::new(config.clone()).await;
+    seed_forwarded_uncertainty(&rig);
+    config.account_binding = Some(json!({"account_id":"second"}));
+    rig.restart(config);
+    let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[],"structuredContent":{}}}"#;
+    assert_eq!(rig.gate.note_held_writes(reply, "new-run"), reply);
+}
+
+const CLIENT_UPDATE: &str =
+    r#"{"error_code":"client_update_required","outcome":"refused","applied":false}"#;
+
+#[tokio::test]
+async fn update_required_holds_new_write_and_preserves_queue_originals_without_cascade() {
+    let rig = Rig::new(fast()).await;
+    rig.state().script([Fault::Http(426, CLIENT_UPDATE)]);
+    let reply = forward_with(&rig, create(Some("update-original"), "original body"), None).await;
+    pending(&reply);
+    let original = rig
+        .gate
+        .journal
+        .get(by_key(&rig, "update-original")["id"].as_str().unwrap())
+        .unwrap();
+    let before = serde_json::to_value(&original).unwrap();
+    // A later refusal is update demand, never a terminal business verdict.
+    rig.state().script([Fault::Http(426, CLIENT_UPDATE)]);
+    assert_eq!(drain(&rig).await, Halt::ClientUpdateRequired);
+    let after = serde_json::to_value(rig.gate.journal.get(&original.id).unwrap()).unwrap();
+    for key in [
+        "arguments",
+        "idempotency_key",
+        "envelope",
+        "key_origin",
+        "contract",
+        "kernel_v2_custody",
+    ] {
+        assert_eq!(before[key], after[key], "{key}");
+    }
+    assert_eq!(after["state"], "pending");
+    assert!(after["answer"].is_null());
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.upstream.compatibility.status()["status"],
+        "demand_recorded"
+    );
+    assert_eq!(drain(&rig).await, Halt::Empty);
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rig.state().keys_sent(),
+        vec![Some("update-original".into()); 3]
+    );
+}
+
+#[tokio::test]
+async fn update_required_preserves_earlier_uncertainty_and_never_finalizes_original() {
+    let rig = Rig::new(fast()).await;
+    hold_create(&rig, "update-uncertain", "body").await;
+    let id = by_key(&rig, "update-uncertain")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    rig.gate
+        .journal
+        .update(&id, |e| {
+            e.maybe_applied = true;
+        })
+        .unwrap();
+    rig.state().script([Fault::Http(426, CLIENT_UPDATE)]);
+    assert_eq!(drain(&rig).await, Halt::ClientUpdateRequired);
+    let entry = rig.gate.journal.get(&id).unwrap();
+    assert!(entry.maybe_applied);
+    assert_eq!(entry.state, EntryState::Pending);
+    assert!(entry.answer.is_none());
+    assert!(entry.envelope.is_some());
+    assert_eq!(entry.idempotency_key.as_deref(), Some("update-uncertain"));
+}
+
+#[tokio::test]
+async fn contradictory_update_refusal_keeps_original_uncertain_instead_of_confirming_refusal() {
+    let rig = Rig::new(fast()).await;
+    rig.state().script([Fault::Http(
+        426,
+        r#"{"error_code":"client_update_required","outcome":"refused","applied":true}"#,
+    )]);
+    let _ = forward_with(&rig, create(Some("update-contradiction"), "body"), None).await;
+    let entry = by_key(&rig, "update-contradiction");
+    assert!(entry["answer"].is_null(), "{entry}");
+    assert_ne!(entry["state"], "confirmed", "{entry}");
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn update_required_nonholdable_call_is_honestly_unapplied_without_terminal_refusal() {
+    let rig = Rig::new(fast()).await;
+    rig.state().script([Fault::Http(426, CLIENT_UPDATE)]);
+    let reply = forward_with(&rig,json!({"executor":"coordination_write","operation":"set_intent","arguments":{"intent":"new intent"}}),None).await;
+    assert_eq!(
+        reply["error"]["data"]["error_code"], "client_update_required",
+        "{reply}"
+    );
+    assert_eq!(reply["error"]["data"]["applied"], false);
+    assert_eq!(reply["error"]["data"]["updater"], "unavailable");
+    assert_eq!(rig.state().unkeyed_applied.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.gate.journal.pending_count(), 0);
+    for entry in entries(&rig) {
+        assert_eq!(entry["state"], "not_sent", "{entry}");
+        assert!(entry["answer"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn update_required_backlog_keeps_compatibility_reason_and_queued_dependant() {
+    let rig = Rig::new(fast()).await;
+    let first = hold_create(&rig, "update-parent", "base").await;
+    rig.state().script([Fault::Http(426, CLIENT_UPDATE)]);
+    let reply = forward_with(&rig,json!({"executor":"records_write","operation":"update_record","arguments":{
+        "id":first["record_id"],"body_append":"later","reason":"r","idempotency_key":"update-child"
+    }}),None).await;
+    assert_eq!(
+        pending(&reply)["reason"],
+        "client_update_required",
+        "{reply}"
+    );
+    rig.state().script([Fault::Http(426, CLIENT_UPDATE)]);
+    assert_eq!(drain(&rig).await, Halt::ClientUpdateRequired);
+    assert_eq!(rig.gate.journal.pending_count(), 2);
+    for key in ["update-parent", "update-child"] {
+        let entry = by_key(&rig, key);
+        assert_eq!(entry["state"], "pending", "{entry}");
+        assert_eq!(entry["hold_reason"], "client_update_required", "{entry}");
+        assert!(entry["answer"].is_null());
+        assert!(!entry["arguments"].is_null());
+    }
+    assert_eq!(rig.state().created.load(Ordering::SeqCst), 0);
 }

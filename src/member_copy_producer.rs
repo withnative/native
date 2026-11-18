@@ -208,7 +208,7 @@ fn native_id_pattern() -> &'static Regex {
 /// `visible ∪ engine-owned`? Only exact canonical UUIDs and `native:` ids are
 /// matched; short references and `wiki_name` forms are opaque authored text
 /// and never resolved (N1).
-fn exact_id_gate_withholds(text: &str, visible: &HashSet<String>) -> bool {
+pub(crate) fn exact_id_gate_withholds(text: &str, visible: &HashSet<String>) -> bool {
     let engine_owned = engine_owned_ids();
     canonical_uuid_pattern()
         .find_iter(text)
@@ -342,13 +342,13 @@ fn table_source(table: &str) -> (String, &'static str, bool) {
 
 /// Where a withheld schema row applies (§3.3 rule 6): `None` means global.
 #[derive(Default)]
-struct SchemaGate {
+pub(crate) struct SchemaGate {
     global: bool,
     collections: BTreeSet<String>,
 }
 
 impl SchemaGate {
-    fn record(&mut self, applies_to: Option<&str>) {
+    pub(crate) fn record(&mut self, applies_to: Option<&str>) {
         match applies_to {
             Some(collection) => {
                 self.collections.insert(collection.to_owned());
@@ -357,7 +357,7 @@ impl SchemaGate {
         }
     }
 
-    fn into_incomplete_for(self) -> Vec<String> {
+    pub(crate) fn into_incomplete_for(self) -> Vec<String> {
         if self.global {
             vec!["global".to_owned()]
         } else {
@@ -726,6 +726,7 @@ mod tests {
 
     fn consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,

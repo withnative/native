@@ -448,14 +448,18 @@ Manually activating a new consumer onto the *same* generation an old consumer
 is still serving can let a delta land before the swap; the supported scheduler
 path holds one lock across activation and deltas, which avoids this.
 
-A changed binary can locally re-admit the same generation when platform,
-engine schema, frozen DDL and native interchange revision match. Startup and
-delta run the existing device verification: generation identity, route/origin,
-manifest and exact checkpoint bytes for an unadvanced copy; a consistent
-private copy with engine/frontier and SQLite checks for an advanced copy.
-Exhaustive conformance replay remains an explicit audit. No download or hosted
-capture is needed. Format mismatches or failed re-admission retain the whole
-snapshot fallback (`consumer_changed`). The live-reader gate above still applies.
+A changed binary can locally re-admit the same generation when its platform and
+engine's readable format match. For v1, engine schema, frozen DDL and native
+interchange revision must match, as before. For kernel v2, the explicit reader-format version and owned kernel schema digest
+must match both the copy and this build. Changes only to the binary's v1 schema
+or DDL do not require downloading a new v2 copy. Source and artifact hashes
+still identify the newly accepted binary. Startup and delta run the existing
+device verification: generation identity, route/origin, manifest and exact
+checkpoint bytes for an unadvanced copy; a consistent private copy with
+engine/frontier and SQLite checks for an advanced copy. Exhaustive conformance
+replay remains an explicit audit. No download or hosted capture is needed.
+Format mismatches or failed re-admission retain the whole snapshot fallback
+(`consumer_changed`). The live-reader gate above still applies.
 
 Re-admission preserves `manifest.json` and `heads/<generation>.json`. It atomically
 records the original consumer, newly observed consumer, revision, acceptance time
@@ -476,19 +480,59 @@ original consumer; response context includes `serving_consumer_rebound_at`.
 Re-binding alone is not a degraded state.
 
 Rollback to the exact original manifest consumer remains supported, including
-after the replacement applies deltas: identical schema, DDL and interchange
-revision preserve the readable format, and the older consumer repeats its normal
-checks. It ignores the sidecar. The exact DDL hash fences on-disk compatibility.
-The frozen release
+after the replacement applies deltas, provided the engine's readable format
+still matches. The older consumer repeats its normal checks and ignores the
+sidecar. For v1, identical schema, DDL and interchange revision preserve that
+format; the exact DDL hash fences on-disk compatibility. The frozen v1 release
 schema-to-revision mapping is an additional build compatibility assertion, not
 revision evidence from the original copy: the manifest has no revision field;
-unknown mappings or disagreement with this build refuse re-binding. Incompatible
-format changes must update a format coordinate. The immutable-reader delta gate
-relies on no pre-delta build sharing the current schema/DDL/revision format;
-future reader-semantics changes must change a format coordinate. Re-binding is
-safe to do locally because the manifest's consumer is the client's own
-declaration: hosted validates only its structure and schema/DDL compatibility,
-never the artifact hash.
+unknown mappings or disagreement with this build refuse v1 re-binding.
+Incompatible format changes must update a format coordinate. The
+immutable-reader delta gate relies on no pre-delta build sharing the current
+schema/DDL/revision format; future reader-semantics changes must change a
+format coordinate. For v2, bump `KERNEL_V2_READER_FORMAT` when read semantics
+become incompatible, without changing the manifest contract. V2 manifests carry
+`kernel_v2.reader_format`; consumer declarations and the accepted consumer in
+rebind receipts carry `kernel_v2_reader` (reader format and owned schema digest).
+The node checks these coordinates when admitting or rebinding a copy and when
+publishing a derived manifest. An incompatible retained copy requests a FULL;
+it cannot gain acceptance through a rebind receipt.
+
+Hosted chooses compatibility from the authorized route's catalog engine, and
+requires the exported file's engine marker to agree. A v2 FULL requires the
+consumer's v2 reader format and kernel schema digest to match hosted and the
+export. Its v1 schema version and DDL hash remain identity metadata and may
+differ from hosted's. V1 FULLs still require the same v1 schema and DDL as
+hosted and omit the v2 reader declaration entirely. Platform and installed executable identity checks, database identity,
+byte integrity, owned-schema verification and copy checks still apply; hosted
+validates the declaration but does not attest the consumer's artifact hash.
+
+A missing v2 reader declaration means the fixed initial reader format (1) and
+initial kernel schema digest, never whichever format a future binary happens
+to compile. A missing manifest reader format also means 1. Initial coordinates
+are omitted when serializing, preserving historical generation IDs, receipt
+checksums and payloads accepted by older readers that reject unknown fields.
+This lets new nodes rebind old copies, old nodes obtain FULLs from new hosted,
+and current new nodes continue talking to old hosted when its existing v1
+compatibility checks pass. This default does not make nodes built before the
+initial kernel schema compatible: they are still refused by their node's owned-schema check,
+as before. An unreadable older retained copy can still be replaced by a FULL
+that passes route, origin, genesis and act-order checks. Explicit initial values
+are accepted and normalized to omission. Future schema changes must update the
+compiled reader schema digest while leaving the initial default fixed; an
+incompatible reader change must bump the compiled reader format. Those later
+formats deliberately refuse initial copies and consumers.
+
+Roll out hosted support first, then update nodes (the order required by
+`docs/local-node.md`). This change introduces format 1 without invalidating
+current copies. Hosted accepts only its own compiled v2 reader version. A
+later bump therefore creates a deliberate break whichever side goes first:
+after hosted ships format 2, old nodes cannot obtain v2 FULLs until they update,
+although they keep serving their readable retained copy. A node updated first
+is refused by old hosted. Keep the hosted-first order, then update nodes;
+supporting both N and N+1 during a transition is a possible follow-up, not part
+of this change.
+
 
 If a serving read holds the database past the writer's 60-second wait, the delta
 commit fails as SQLite busy or locked. That rolls back, writes nothing, and is
@@ -678,6 +722,34 @@ head probe that found the copy current, or that led to the delta which made it
 so) is the conservative RPO boundary. `snapshot_completed_at` reports later
 SQLite snapshot verification completion and must not make an old capture
 appear fresher.
+
+These are observation ages, not measured content lag. An unchanged authenticated
+head advances `synced_at` and `refresh.last_success_at` without materializing new
+data. The legacy `last_refresh_success_at` response field also includes such
+successful no-change checks. `freshness.age_basis` makes this distinction explicit;
+its existing state and recovery threshold remain operational check-age measures.
+
+`sync_observation` separates the conservative `last_matching_hosted_check_at`
+(or snapshot capture) from `last_local_materialization_at`. The latter is the
+local snapshot publication or a separately recorded local delta completion for the
+exact serving head. It stays unchanged on no-change checks and is unknown for
+older copies without a completion observation. The diagnostic sidecar
+is not custody or admission evidence; missing diagnostics never prevent reads.
+`last_data_change_at` is unknown: the head/export protocol supplies no source
+change timestamp, and neither capture nor local apply time is a substitute.
+
+The node's `revision_comparison` reports a comparison with its latest known
+comparable hosted head, the known difference in act positions (not seconds or
+record count), and the last successful hosted head-check time when recorded.
+The head-check time is sampled before the request and retained across failures
+in the current node process. After a restart it is unknown until another
+successful probe; the version-pinned saved-state schema is unchanged.
+Matching the latest known head does
+not prove that hosted has remained unchanged since that check. Current lag and
+time lag remain unknown, particularly while hosted is unavailable. A known
+newer hosted revision is evidence of missing revisions; an old timestamp alone
+is not. Readable last-known context continues to be served under the existing
+account, access and write-admission rules.
 
 ## Milestone 1 MCP surface
 
@@ -1246,6 +1318,37 @@ the audit is left to the operator.
 - Relying on tool discovery or filesystem mode alone: exact dispatch and an
   already-open writable connection remain bypasses.
 
+## Preparing existing keyed receipts for recovery
+
+Before exporting an existing canonical workspace with this build, stop its
+workspace server and prepare legacy keyed receipts using an account binding
+with Manage on the workspace root:
+
+```sh
+native maintenance keyed-receipts --db /path/to/canonical.db --as acct_CANONICAL_ACCOUNT
+```
+
+Use a binary built with `v2-kernel-probe` for this command, including when
+preparing a v1 file. This explicit offline command accepts an existing current v1 or marked v2
+canonical file, checks account/root authority before changes, and records
+missing receipt references atomically. It is safe to rerun and prints a small
+JSON readiness result. Run it on the canonical database only; never run it on a
+node's read-only local generation, and never substitute a raw recovery copy.
+Hosted canonical state remains authoritative.
+
+The v2 profile requires the ledger table even when it is empty. Head
+observations check both directions of key-identity coverage through metadata
+indexes; they do not certify request or response payload bytes. Delta cuts,
+FULL manifests and full integrity audits retain exact payload checks. A missing
+receipt index with existing facts requires explicit maintenance; head reads
+never create it or backfill missing outcomes.
+
+After upgrading the authority and node to the new receipt coverage profile,
+reseed the node with a fresh verified FULL snapshot using the existing FULL
+acquisition procedure. The v2 certified projection inventory now includes the
+keyed receipt ledger; an older snapshot or delta cursor alone does not establish
+that coverage. Do not alter service flags to bypass admission.
+
 ## Kernel v2 generations (HQ cutover N1)
 
 The standby artifact workflow includes `v2-kernel-probe`; local builds must
@@ -1266,6 +1369,9 @@ and the compiled owned schema digest and projection inventory. Imported HQ
 keeps the unambiguous source origin recorded in its retained v1 snapshot
 provenance; a native v2 workspace derives its origin from its genesis UUID.
 The v1 frontier is empty in a v2 manifest and has no v2 continuity meaning.
+Consumer rebind uses this v2 format, not the consumer's v1 schema/DDL metadata.
+A delta checkpoint published after rebind records the newly accepted binary's
+full consumer identity, preserving the original base manifest and receipt.
 Catalog engine and file marker must agree. Both reader and refresh writer refuse
 an incompatible marker or owned schema; read opens never stamp, repair or migrate.
 
@@ -1369,8 +1475,8 @@ after comparison.
 
 ### Disposable VM cache/pressure rehearsal (20 October 2026)
 
-[Sanitized counts and timings](https://github.com/withnative/native-ce/blob/9a01a15d184054da464aa9a93e43e4edc8b7db4d/docs/standby-v2-vm-qualification-2026-10-20.json)
-record a separate release-profile rehearsal on this VM. A fresh private v1
+A separate release-profile rehearsal on this VM recorded the counts and
+timings below. A fresh private v1
 snapshot **copy** was imported with `--all --history` at merged N1 `2a410a331`
 (4,195.2 seconds; capture complete; zero mismatches, refusals or review entries),
 then explicitly prepared and exercised at `6607aa3cf` after merging main.
@@ -1444,16 +1550,272 @@ fixtures pass. Composed read staging has a two-second deadline. This rehearsal
 does not qualify ordinary HQ-sized outage MCP reads or identify the commit
 that introduced the scale limitation. Do not bypass its authorization or
 deadline checks to claim qualification. The vault's separate unbounded internal
-collector result is recorded in [N2 delivery qualification](https://github.com/withnative/native-ce/blob/9a01a15d184054da464aa9a93e43e4edc8b7db4d/docs/v2-continuity-n2-n3.md).
+collector result is recorded in the N2 delivery qualification.
 All private snapshot/generation/vault copies and disposable package homes were
 deleted after retaining the sanitized evidence.
 
 One attempt lock covers copy through publication; concurrent requests are skipped/coalesced with `refresh_in_progress`
 or the normal accepted/coalesced response. After an attempt the node rests for
-at least 60 seconds and at least the preceding update's wall time, persisted
-across restarts. `kernel_v2_replay_cooldown` is disclosed while waiting; manual
-requests cannot bypass this delta rest. FULL capture cooldown semantics are
+at least the preceding update's wall time, persisted across restarts, and for
+at least 60 seconds unless the attempt applied a SMALL delta to completion. A
+delta is small when it carries at most 256 content+meta event rows, spans at
+most 128 whole acts and adds at most 4 MiB of new blob bytes
+(`SMALL_DELTA_MAX_*` in `src/standby/kernel_v2_delta.rs`); those bounds do not
+grow with the size of the database. A failed or refused attempt, and any large
+delta, keep the 60-second floor. `refresh/kernel-replay.json` records the last
+attempt's `last_wall_millis`, `last_outcome` (`completed_small`,
+`completed_large` or `failed`), `last_rest_millis` and the ordered
+`last_phases` (`{phase, millis}`), which sum to the attempt's wall time.
+`kernel_v2_replay_cooldown` is disclosed while waiting; manual requests cannot
+bypass this delta rest. FULL capture cooldown semantics are
 unchanged. A deliberate deep audit also uses scratch.
+
+**In-place small deltas (opt-in, off by default; epic c15a932).** Setting
+`"kernel_in_place_deltas": true` in the refresh config lets a SMALL delta (the
+bounds above) be applied to the serving kernel-v2 database itself instead of
+copying, re-verifying and republishing the whole file. The existing fold and
+the full projection-digest check run inside ONE write transaction on a WAL
+database, which rolls back untouched on any mismatch. The commit is durable
+(`synchronous=FULL`) before the head record `heads/<id>.json` is written, so
+the head never overstates what readers see: after a crash it can lag the
+database, never lead it, and the next tick heals it from the database's own
+head. Serving readers are already `read_only` and not `immutable`, so they
+take WAL snapshots: a reader that began before the commit keeps seeing the old
+head and is never blocked by it. The first in-place apply to a generation
+converts its file from rollback-journal to WAL mode, which needs one moment
+with no read transaction open (it defers as `database_busy` and retries);
+every later apply never waits on readers.
+
+Integrity of a copy that no longer matches its checkpoint digest comes from
+the database itself. In the SAME transaction as each fold, the copy records an
+apply receipt in `kernel_standby_apply_receipts` (an exempt local table with
+exact compiled DDL, outside the projection digest and the schema coordinates):
+the authenticated delta digest, the projection digest it certified, a digest of
+the canonical event rows it added, and a link in a hash chain. A `base` receipt
+anchors the chain to the checkpoint's file hash, which is re-verified
+immediately before the first in-place write. Because the receipt commits with
+the data, data never advances without it. The `heads/<id>.json` sidecar is
+only a cache: the tick and startup verification repair a lagging head from the
+database, never the reverse, and a head ahead of its database, a missing or
+inconsistent receipt chain, a database the receipts do not continue (for
+example one restored to an older state) or any mismatch refuses in-place
+serving and asks for a whole snapshot. Nothing is repaired by hashing
+unverified local state. Every admission path (startup, consumer rebinding,
+predecessor re-check, audit) runs the check; the tick and predecessor re-check
+run the O(1) form, and startup, rebinding and audit run the full form: the
+receipt chain, every segment of canonical event rows (including the checkpoint's)
+against its receipt, every blob row against its own content-addressed key and
+size, and the whole-database projection digest against the last certified one.
+The staged path stays the fallback and the re-checkpoint: it is taken for
+large deltas, gaps, identity or schema changes, a copy not served by this build
+(`reader_not_upgraded`: only a live process of the same build is known to open
+the file without `immutable`), and after 2048 in-place deltas or 24 hours.
+Those limits are evaluated on every tick, so a copy that has reached one is
+re-checkpointed even when nothing new has arrived. A digest mismatch asks for a
+whole snapshot, as on the staged path. `kernel-replay.json` records `last_path`
+(`in_place` or `staged`) and `last_in_place_skip`.
+
+Local v2 MCP operations are validated at their single dispatch choke point: the
+copy's version stamp (head act and last receipt ordinal, both moved by every
+in-place commit) is read before and after each tool call, and the call is
+re-run, up to three times, if it moved, so a composed read (scoped search,
+placement hydration, SQL) never returns a mixture of two heads. If it moves
+every time the caller gets a retryable error rather than a mixed result.
+
+Tables the projection digest excludes are covered too: the two cutover tables
+(`act_cutover`, `content_event_causal_cutover`) are digested in every receipt
+and must equal the base receipt's at every check depth (the successor fence
+already requires them preserved exactly, and a fold never changes them);
+`act_state`, `content_event_heads` and `kernel_legacy_sql_progress`, which do
+move with deltas, are digested per receipt and checked against the last one on
+the full check. Events, causal frontier and blobs are covered as above, the
+adapter write ledger is not part of a standby copy, and the FTS shadow tables
+are physical index layout of a projection the digest does include.
+
+The in-place apply does not scan foreign keys per delta. No foreign key in the
+kernel schema is `DEFERRABLE`, nothing on the fold path turns enforcement off or
+defers it, and the writer asserts inside the transaction that
+`PRAGMA foreign_keys` is on (refusing otherwise), so the fold cannot introduce a
+violation that hosted lacks. A violation hosted also has (or one present before
+the fold and untouched by it) can therefore be served until the next full check:
+startup, consumer rebinding and audit already run a whole-database
+`pragma_foreign_key_check` on their consistent copy, once, before the receipt
+check; the staged re-checkpoint's pre-verification of an advanced base is the
+path that did not, and now runs it first and refuses on a violation (whole
+snapshot required). A staged delta's candidate is also checked at publication
+(`verify_snapshot_database`); a violation there is handled like an apply
+failure (a whole snapshot is requested, subject to the FULL cooldown, nothing is
+published or served, and the attempt keeps the one-minute rest). `kernel-replay.json` also records
+`last_digest_tables`: the cost of digesting each projection table, slowest
+first (a diagnostic).
+
+**Second receipts DDL and the accumulator cache (set-digest proof).** A node
+that also proves the projection by set digest writes a second receipts DDL:
+`kind` adds `delta-set`, `projection_sha256` is nullable beside a nullable
+`projection_set_sha256` (at least one present), and chain links bind the format
+tag `apply-receipts.v2`, the kind and both digests (`-` for NULL). It may also
+keep `kernel_standby_projection_set` (`name` PK, `schema_sha256`, `rows`,
+`value`, `ordinal`), a cache of per-table accumulators. This node accepts both
+DDLs and the cache table in its schema inventory and excludes the cache from the
+projection digest; it verifies chains in both link formats and creates the new
+shapes only on the set path described below. The staged re-checkpoint drops both
+tables. The full
+check recomputes both digests in one pass and compares EVERY non-null digest the
+last receipt certifies (a receipt with a NULL set digest is checked on v1
+only); a mismatch is receipt-versus-rows and refuses. If a populated cache
+disagrees with the rows, sits at another ordinal, or sits behind a receipt with
+no set digest, that is cache-versus-rows: the copy passes and
+`heads/<id>.accumulator-invalid` is written for whoever maintains the cache.
+Generations with the first DDL are unchanged.
+The accumulator rows are untrusted input: a row of the wrong type, blob length
+or shape counts as an invalid cache, never a refusal. The marker is advisory and
+self-healing: every full check (admission and audit) writes it on `Invalid` and
+removes it when the cache is `Absent` (an empty cache is absent) or `Valid`, and
+an in-place apply removes it because that apply empties the cache. In the second
+link format presence is explicit (a tag byte, then a length-framed value), a
+chain cannot mix link formats, and every digest a receipt stores must be exactly
+64 lowercase hex characters.
+
+**The set path (N2).** Behind the in-place flag, and only when hosted offers
+version-2 deltas (`kernel_delta_versions` contains 2; hosted's flag is off in
+production), an in-place apply proves the projection by set digest instead of
+scanning the whole database. With a valid accumulator (every row at the last
+receipt's ordinal, and the digest the rows compose to equal to the set digest
+that receipt certifies) the fold runs with the preupdate hook armed on the
+writer; each touched table's accumulator is multiplied by its captured delta,
+each touched table's schema is compared with hosted's, and the composed whole
+digest with `head.projection_set.sha256`. A match commits a `delta-set` receipt
+that certifies only the set digest, together with the new accumulator. A capture
+anomaly or a set mismatch runs exactly one full dual scan in the same
+transaction: if it reproduces hosted's digests the apply commits a `delta`
+receipt recording both digests and reseeds the accumulator, otherwise it
+refuses with `kernel_v2_projection_divergence` (whole snapshot). Every
+full-scan path reseeds: the base receipt (second DDL when the generation's first
+delta is version 2; a first-DDL generation is re-linked to the second DDL, after
+its old chain verifies, on its first version-2 delta), a version-1 delta on a
+second-DDL generation (hosted downgraded), and an absent or invalid
+accumulator. After two `mismatch_reseeded` results in one generation the set
+path is off for that generation until it is re-checkpointed.
+`kernel-replay.json` records `last_set_path` (`fast`, `anomaly:<reason>`,
+`mismatch_reseeded:<table>`, `divergence`, or `skipped:<cause>` when a full scan
+proved the apply without the fast path being attempted), the generation's
+counters and the capture's sizes.
+
+What the fast path does and does not prove: damage in rows whose content the
+delta does not change, whether untouched or touched without net change (a
+rehome to the current home, A to B to A within one delta), commits on the fast
+path and is caught by the next Full check or audit. A delta that changes a
+damaged row is refused: the damaged base image makes the composed digest differ
+from hosted's, and the one full scan then sees the damage too.
+
+**The required audit and the serving deadline.** An in-place apply proves each
+delta, and the fast path never reads rows a delta does not change, so a quiet
+workspace needs something that re-reads. When `kernel_in_place_deltas` is on,
+the refresh controller audits the current in-place-advanced kernel-v2
+generation every N seconds (`kernel_audit_interval_seconds`, default 21,600,
+that is six hours, bounds 60 to 86,400), on its own schedule beside the daemon's tick: a download,
+a delta, a disk-space deferral or a cooldown never delays it. The audit opens
+a read-only WAL snapshot, writes nothing to the database, and runs the Full
+check: the receipt chain, the canonical event rows and blobs, and the rows'
+projection against every digest the last receipt certifies. A receipt-versus-
+rows mismatch is a failure (the generation is flagged for a whole snapshot,
+exactly as today's Full-failure handling); a cache-versus-rows mismatch passes
+and leaves the invalid-cache marker. An infrastructure error (busy, I/O) is
+retried with backoff (10 s doubling, capped at five minutes and at N) and
+records nothing, so the deadline keeps running.
+
+`audits/<generation_id>.json` holds `{generation_id, ordinal,
+snapshot_acquired_at, outcome}`: the last verdict, with the time the audit's
+read snapshot was acquired (taken right after the first read that pinned it).
+Verdicts are published under one lock and ordered by `snapshot_acquired_at`: a
+verdict replaces the existing one only if its snapshot was acquired strictly
+later, or at the same instant and it is a failure, so a verifier that pinned
+clean rows and finished late cannot erase a newer failure. An infrastructure
+error never touches the record. A Full check (startup, rebinding), a base receipt and any
+full-scan apply also write it, but only after their transaction commits, so an
+aborted transaction cannot refresh serving eligibility. A missing, unreadable
+or foreign record counts as unaudited, and a new generation is unaudited until
+its base receipt.
+
+The serving gate: `serving_context()` carries `serving_audit` (`state`:
+`current`, `overdue`, `unaudited` or `failed`; `age_seconds`;
+`interval_seconds`) for an in-place-advanced copy while audits are required,
+read afresh on every request, and the full status carries the same field.
+The legacy fresh preference (`online_local_reads`) forwards to hosted
+whenever the state is not `current`: the last successful audit is older than
+2N, the copy was never audited, the last audit failed, or the copy is flagged
+for a whole snapshot. "Current" needs a success this process observed, timed on
+the monotonic clock (a startup Full check counts), as well as a wall-clock age
+within 2N, so setting the clock back cannot restore online eligibility; a
+record whose time is in the future is ignored. The wall-clock record still
+drives the disclosed age. The 2N bound governs only that legacy preference.
+
+The accepted-only `local_reads_by_default` policy instead serves an otherwise
+verified copy with overdue/unaudited standing and exact age disclosed. It never
+blocks a read (Richard, 10 Nov 2026; Native task 3f3120c): a failed audit,
+unknown age or other integrity failure means the copy is not shown, so hosted
+answers when reachable; with hosted unreachable and no verified copy to show,
+the node returns an error carrying a plain next step, and nothing else is
+refused. Failed audits are still never reduced to freshness warnings. A copy
+behind the reader's own acknowledged writes, or one whose act lineage differs
+from the write floor's, is likewise answered by hosted when it can be, and
+otherwise served and disclosed as behind (`node_routing.behind_known_write`,
+`freshness.state` never `fresh`). See "Accepted-only local-by-default reads" in
+`docs/local-node.md`.
+
+Under the legacy policy, the following caller-owned behaviour is unchanged:
+An explicit `native/route: local` and an offline read are caller-owned and are
+SERVED, with the audit state and age in the standby disclosure as machine fields
+and a degraded reason (`audit_overdue`, `audit_unaudited` or `audit_failed`) for
+the caller to weigh; no outcome word is shown to a user. The snapshot's
+acquisition time is taken immediately after one dedicated first read, before
+any other work. With the flag off the field is absent and nothing changes.
+
+A copy marked advanced without a base receipt is unproved whatever its
+coordinates, and is refused (whole snapshot). The base receipt carries the real
+projection digest of the verified checkpoint, so projection corruption is
+caught even before the first delta. A staged re-checkpoint of an advanced copy
+first runs the full check on its consistent copy and refuses, requiring a
+hosted whole snapshot, rather than hashing inherited corruption into a fresh
+checkpoint. A version stamp that cannot be read is never treated as unchanged.
+On the 2.1 GB / 100,000-event synthetic base (debug profile) the full check took
+6.6 s and a consumer rebinding 15.3 s (it also makes a consistent copy and runs
+`quick_check`); the first in-place apply took 9.7 s (it hashes the checkpoint
+and digests the base projection once), later applies 2.8 s.
+
+`journal_size_limit` on the in-place writer is a target, not a hard bound: a
+long-running reader pins the WAL and prevents it being reset and truncated
+until that reader finishes, so the `-wal` file can exceed the limit meanwhile.
+
+**Delta wire version 2 (set-digest projection proof).** The hosted
+`authority_act_delta` tool and the chunked delta start request both accept an
+optional `kernel_delta_version` (1 or 2; absent is 1), and the tool schema shows
+it unconditionally. Version 2 support itself is flag-gated and off by default
+(`NATIVE_CE_STANDBY_KERNEL_DELTA_V2`): with the flag off, a request naming
+version 2 is answered with version 1, the head probe does not advertise
+`kernel_delta_versions`, and every cut is byte-identical to before. A node asks
+for version 2 only when the head advertised it, and retries once without the
+field (staying at version 1 for that tick) if the request is refused.
+
+Measured on this VM (4 Nov 2026, debug profile, shared host at load average
+about 25 on 32 threads, so absolute figures are noisy): a synthetic 2.43 GB
+kernel-v2 base of 300,000 records / 300,005 content events and 1.9 GB of
+unbound blobs, with the qualification workload (ten records and one unbound
+4 KiB blob per delta) applied in lockstep to two identical replica roots.
+The staged path's replay took 46.2 to 47.5 s per delta (the HQ qualification
+above: 46.8 s warm): 22 to 26 s in the successor fence, 3.6 to 4.3 s verifying
+the candidate, 1.6 s hashing, 2 to 3 s copying, 5 to 10 s committing and
+3.9 to 9.2 s in the projection digest. The in-place path's replay took 5.8 to
+8.3 s, of which the projection digest was 3.9 to 6.9 s and the whole-database
+foreign-key check 1.0 to 1.5 s; folding the events and committing took under
+0.1 s. The remaining cost is therefore the two whole-database scans, not the
+delta. The 5 to 7 s `fetch_delta` in these runs is the in-process loopback
+source cutting the delta (it computes its own projection digest) and is not
+local work. Scaling the delta on a 20,000-record base put the fold plus commit
+at roughly 1 to 2 ms per record (about 0.1 to 0.3 s at the small-delta cap).
+Re-run with the ignored test
+`measure_staged_vs_in_place_on_a_large_base` (`C15A932_RECORDS`,
+`C15A932_BLOB_MIB`, `C15A932_ROUNDS`, `C15A932_DELTA_RECORDS`, `TMPDIR`).
 
 Run v2 probes locally with `RUST_MIN_STACK=67108864`, including
 `kernel_v2_switch_fetches_fresh_generation_and_retains_v1_for_rollback`.
@@ -1491,3 +1853,36 @@ respect the selected engine, so retained v2 files cannot undo this explicit
 rollback. It never deletes a generation
 or replays a v1 journal into v2. To release retention protection without changing
 the selected engine after the rollback window ends, omit `--switch-back`.
+
+### Diagnosing intermittent delta transport failures
+
+The node and connected standby emit payload-free warnings on stderr under
+`native_ce::standby::transport` when the authority HTTP client fails. Each
+warning identifies the fixed request kind (`mcp_head`, `mcp_delta`, `delta_start`,
+`delta_poll`, `delta_bytes` or `delta_cancel`), request/response-body phase,
+elapsed milliseconds, reqwest timeout/connect/body flags, safe I/O kind and
+numeric OS error when available, bounded source-chain depth, build and platform.
+HTTP refusal warnings include the status and maintenance marker. Credentials,
+URLs, headers, request/response bodies and raw error prose are never logged.
+DNS and TLS categories ending in `_hint` come from known connector wording;
+they are clues for correlation, not a complete network diagnosis. Unknown
+causes stay explicit as `connect_other`, `body_other` or `request_other`.
+
+Correlate warnings with the refresh attempt's timestamp and receipt. The receipt
+carries the same closed error category; existing network classification and
+retry/backoff remain unchanged, and authentication refusal stays distinct.
+A later successful refresh can clear current status fields, so preserve the
+bounded journal window when investigating. These warnings do not add persistent
+diagnostic history or establish that a whole host was offline. Compare hosted
+requests from the same host and route around the failure; another successful
+request does not prove that the failed connection worked.
+
+`export_in_progress` means the authenticated delta-start route returned HTTP409
+with that exact wire code. The hosted coordinator allows one active delta export
+per account and database, including its ready transfer lifetime. A second node
+for the same account can contend for that slot. This is a reachable hosted
+response, not evidence of lost connectivity. It retains the historical coarse
+`Network` class and recovery cadence for compatibility, but the safe message
+and receipt detail identify the contention. A generic409 or expired handle stays
+`capture_unavailable`; unrelated HTTP failures retain their status category.
+Neither code establishes which client owns the conflicting handle.

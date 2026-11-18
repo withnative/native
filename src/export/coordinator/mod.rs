@@ -222,19 +222,24 @@ impl ExportCoordinator {
     {
         let coordinator = self.clone();
         let (send, receive) = tokio::sync::oneshot::channel();
+        let diagnostics = crate::write_diagnostics::Context::background("snapshot_export");
         tokio::spawn(async move {
-            let result = match export_id {
-                Some(export_id) => {
-                    coordinator
-                        .read_tool_page(&principal, &export_id, offset, length)
-                        .await
-                }
-                None => {
-                    coordinator
-                        .start_tool_export(principal, offset, length, create)
-                        .await
-                }
-            };
+            let result = diagnostics
+                .scope(async move {
+                    match export_id {
+                        Some(export_id) => {
+                            coordinator
+                                .read_tool_page(&principal, &export_id, offset, length)
+                                .await
+                        }
+                        None => {
+                            coordinator
+                                .start_tool_export(principal, offset, length, create)
+                                .await
+                        }
+                    }
+                })
+                .await;
             let _ = send.send(result);
         });
         receive.await.map_err(|_| {
@@ -1209,6 +1214,7 @@ mod tests {
             STANDBY_CONSUMER_CONTRACT,
         };
         let consumer = StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,

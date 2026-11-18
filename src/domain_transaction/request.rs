@@ -342,7 +342,7 @@ fn add_run_context_arguments_inner(schema: &mut Value, kind: Option<ToolKind>, d
     let run_key_schema = if describe {
         serde_json::json!({
             "type": "string",
-            "description": "Bootstrap run correlation handle; same key every call, reads included. Mint \"new\" or \"new:<agent_key>\"; coordination guide."
+            "description": "Reuse bootstrap run_key; mint \"new\"/\"new:<agent_key>\". See coordination guide."
         })
     } else {
         serde_json::json!({"type": "string"})
@@ -350,7 +350,7 @@ fn add_run_context_arguments_inner(schema: &mut Value, kind: Option<ToolKind>, d
     let parent_key_schema = if describe {
         serde_json::json!({
             "type": "string",
-            "description": "Spawning run_key; unverified lineage, no mint sentinels; coordination guide."
+            "description": "Spawning run_key; unverified lineage; no mint sentinels."
         })
     } else {
         serde_json::json!({"type": "string"})
@@ -376,7 +376,7 @@ fn run_context_values(arguments: &Value) -> (Option<&Value>, Option<&Value>) {
     (object.get(RUN_KEY_ARG), object.get(PARENT_KEY_ARG))
 }
 
-fn strip_run_context(arguments: &mut Value) {
+pub(crate) fn strip_run_context(arguments: &mut Value) {
     if let Some(object) = arguments.as_object_mut() {
         object.remove(RUN_KEY_ARG);
         object.remove(PARENT_KEY_ARG);
@@ -387,6 +387,37 @@ pub(crate) struct ResolvedRunContext {
     pub caller: Caller,
     pub echo: Value,
     pub intent: Option<String>,
+}
+
+/// Correlation-only form of the suppressed member request stage. Keep the
+/// ordinary validators, suppressed issuance-sentinel behavior and diagnostic
+/// echo; this has no lifecycle port, storage, identity or run authority.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn member_correlation_context(
+    caller: Caller,
+    arguments: &Value,
+) -> Result<ResolvedRunContext> {
+    if !caller.is_member_copy() {
+        return Err(Error::copy_unavailable());
+    }
+    let (raw_run, raw_parent) = run_context_values(arguments);
+    let run = match crate::runkey::validate_run_key_value(raw_run) {
+        crate::runkey::KeyOutcome::Requested { .. } => crate::runkey::KeyOutcome::Absent,
+        outcome => outcome,
+    };
+    let parent = crate::runkey::validate_parent_key_value(raw_parent);
+    let caller = caller
+        .with_run_context(
+            run.stored().map(str::to_owned),
+            parent.stored().map(str::to_owned),
+        )
+        .with_intent(None);
+    let echo = run_context_echo(&caller, &run, &parent, None, None, None);
+    Ok(ResolvedRunContext {
+        caller,
+        echo,
+        intent: None,
+    })
 }
 
 pub(crate) async fn resolve_run_context<P: RequestLifecyclePort + ?Sized>(
@@ -960,35 +991,13 @@ where
     trace.record(GovernedRequestOperation::RealtimeWakeup, realtime_stage);
 
     if kind.is_some_and(ToolKind::issues_run_key) {
-        let mut bootstrap_size_error = None;
         if let (Ok(result), Some(exposure)) = (&mut outcome, bootstrap_exposure) {
-            if let Some(payload) = result.structured.as_object_mut() {
-                let exposure_bytes = serde_json::to_vec(&exposure)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(usize::MAX);
-                if exposure_bytes
-                    > crate::mcp::tools::orientation::MAX_BOOTSTRAP_TOOL_EXPOSURE_BYTES
-                {
-                    bootstrap_size_error = Some(format!(
-                        "bootstrap tool-exposure component is {exposure_bytes} bytes; limit is {} bytes",
-                        crate::mcp::tools::orientation::MAX_BOOTSTRAP_TOOL_EXPOSURE_BYTES
-                    ));
-                } else {
-                    payload.insert("tool_exposure".into(), exposure);
-                    let total_bytes = serde_json::to_vec(payload)
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(usize::MAX);
-                    if total_bytes > crate::mcp::tools::orientation::MAX_BOOTSTRAP_TOTAL_BYTES {
-                        bootstrap_size_error = Some(format!(
-                            "bootstrap payload is {total_bytes} bytes after tool exposure; compositional transport limit is {} bytes",
-                            crate::mcp::tools::orientation::MAX_BOOTSTRAP_TOTAL_BYTES
-                        ));
-                    }
-                }
+            if let Err(error) = crate::mcp::tools::orientation::attach_member_bootstrap_exposure(
+                &mut result.structured,
+                exposure,
+            ) {
+                outcome = Err(error);
             }
-        }
-        if let Some(message) = bootstrap_size_error {
-            outcome = Err(Error::engine(message));
         }
         // First-call durability for the newly issued key: bootstrap's handler
         // stays read-only (its zero-write body test is untouched); the wrapper

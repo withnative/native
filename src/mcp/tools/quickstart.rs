@@ -116,6 +116,10 @@ Do not duplicate Bootstrap's orientation or standing instructions in your respon
 struct QuickstartArgs {}
 
 async fn quickstart(_db: Db, _caller: Caller, arguments: Value) -> Result<Value> {
+    quickstart_value(arguments)
+}
+
+pub(crate) fn quickstart_value(arguments: Value) -> Result<Value> {
     let _args: QuickstartArgs = parse_args("quickstart", arguments)?;
     Ok(json!({
         "contract": {

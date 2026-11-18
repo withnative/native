@@ -10,7 +10,11 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 /// The canonical event types the projector folds into projections.
-pub const EVENT_TYPES: [&str; 50] = [
+pub const EVENT_TYPES: [&str; 54] = [
+    "webhook.configured.v1",
+    "webhook.revoked.v1",
+    "webhook.accepted.v1",
+    "webhook.diagnostic.v1",
     "record.created",
     "record.updated",
     "record.type_corrected.v1",
@@ -63,7 +67,6 @@ pub const EVENT_TYPES: [&str; 50] = [
     "canvas.batch.committed.v1",
 ];
 
-#[cfg(any(test, feature = "v2-kernel-probe"))]
 /// Experimental bare-kernel identity. The root id deliberately avoids the
 /// `native:` prefix (reserved for engine-owned records) and the UUID shape
 /// (caller-supplied record rule): it is a fixed kernel constant, not a

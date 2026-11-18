@@ -4,11 +4,19 @@ use crate::{
 };
 use sqlx::{Row, SqliteConnection};
 
+/// The refresh's two scratch tables. `IF NOT EXISTS`, and the refresh only ever
+/// empties them with `DELETE`, never drops or alters them: a projection
+/// capture creates them with exactly this DDL before arming, so that no TEMP
+/// schema change is ever needed (or tolerated) while it is armed.
+pub(crate) const TEMP_SCRATCH_DDL: &str = "CREATE TEMP TABLE IF NOT EXISTS _facet_time_refresh_targets(id TEXT PRIMARY KEY); \
+    CREATE TEMP TABLE IF NOT EXISTS _facet_time_snapshots(record_id TEXT PRIMARY KEY,payload TEXT);";
+
 async fn refresh_on(conn: &mut SqliteConnection, record: Option<&str>) -> Result<()> {
-    sqlx::query("CREATE TEMP TABLE IF NOT EXISTS _facet_time_refresh_targets(id TEXT PRIMARY KEY);
-        CREATE TEMP TABLE IF NOT EXISTS _facet_time_snapshots(record_id TEXT PRIMARY KEY,payload TEXT);
-        DELETE FROM temp._facet_time_refresh_targets; DELETE FROM temp._facet_time_snapshots;")
-        .execute(&mut *conn).await?;
+    sqlx::query(&format!(
+        "{TEMP_SCRATCH_DDL} DELETE FROM temp._facet_time_refresh_targets; DELETE FROM temp._facet_time_snapshots;"
+    ))
+    .execute(&mut *conn)
+    .await?;
     if let Some(record) = record {
         sqlx::query("INSERT INTO temp._facet_time_refresh_targets SELECT id FROM main.kernel_records WHERE id=?")
             .bind(record).execute(&mut *conn).await?;

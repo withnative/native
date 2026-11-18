@@ -143,6 +143,23 @@ async fn named_view_export_attention_subset_and_unsupported_shapes_are_honest() 
         "attention_kind":{"values":["decision","review","unblock","input"],"required":true},
         "options":{"type":"object","json_schema":{"type":"object"}}
     }}}}).to_string(),"applies_to_collection_id":KERNEL_ROOT_ID,"version_lineage":"attention-v1","created_at":"2026-10-27T00:00:00Z"}))).await;
+    // The ordinary authenticated frontdoor uses exactly this retained declaration.
+    let selector = |key: &str| {
+        json!({"action":"propose_view","id":f.anchor,
+        "record_type":"WorkItem","kind":"attention","home":"native:root",
+        "selection":{"kind":"keys","keys":[key]}})
+    };
+    let proposed = super::super::gate::testing(false, generated_operation(&f, selector("ask")))
+        .await
+        .unwrap();
+    assert_eq!(proposed["format"], "native.named-view-proposal.v1");
+    for key in ["due", "snoozed_until", "attention_kind", "options"] {
+        let error = generated_operation(&f, selector(key))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Unsupported"), "{key}: {error}");
+    }
     let path = export_copy(&f, "attention.db").await;
     let bytes = super::super::export::export_file(
         &path,
@@ -191,6 +208,11 @@ async fn named_view_export_attention_subset_and_unsupported_shapes_are_honest() 
     // Same real global declaration, no invented H governance: refuse honestly.
     f.import("schema_config", "attention", None).await;
     f.import("schema_config","attention-global",Some(json!({"id":"attention-global","layer":"user","name":null,"data":json!({"shapes":{"WorkItem:attention":{"facets":{"ask":{"required":true}}}}}).to_string(),"applies_to_collection_id":null,"version_lineage":"attention-v1","created_at":"2026-10-27T00:00:00Z"}))).await;
+    assert!(generated_operation(&f, selector("ask"))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("home has no governing declaration"));
     let global = export_copy(&f, "global.db").await;
     let error =
         super::super::export::export_file(&global, export_request(&f, "attention", &["ask"]))
@@ -952,7 +974,9 @@ async fn declared(f: &Fixture, home: &str) {
         ("maybe", "maybe", "proposed", None),
         ("alias", "urgent", "active", Some("high")),
     ] {
-        f.import("vocabulary_values",id,Some(json!({"id":id,"vocabulary_id":"priority","value":token,"status":status,"alias_of":alias}))).await;
+        // Real imported rows carry the required source DDL terminality column;
+        // native facet admission also reads these through LifecycleInterpreter.
+        f.import("vocabulary_values",id,Some(json!({"id":id,"vocabulary_id":"priority","value":token,"status":status,"terminality":"open","alias_of":alias}))).await;
     }
 }
 async fn candidate(
@@ -1581,7 +1605,7 @@ async fn checkpoint_read(
             &mut tx,
             &f.actor,
             &p.name,
-            &validated.definition.common(),
+            &validated.definition,
             outer,
             limit,
         )
@@ -2318,7 +2342,7 @@ async fn named_view_source_proof_retained_restart_snapshot_frozen_a1_and_explici
     let checked = checked.unwrap();
     assert_eq!(calls, 0);
     assert!(checked.drift == Drift::Unchanged);
-    f.import("vocabulary_values","new-value",Some(json!({"id":"new-value","vocabulary_id":"priority","value":"brand-new","status":"active","alias_of":null}))).await;
+    f.import("vocabulary_values","new-value",Some(json!({"id":"new-value","vocabulary_id":"priority","value":"brand-new","status":"active","terminality":"open","alias_of":null}))).await;
     kernel::observe_facet_as(
         &f.db,
         &f.actor,
@@ -3710,14 +3734,16 @@ async fn named_view_generated_real_executor_guard_carries_proof_and_detects_impo
         } else {
             wrapper("schema_config","guard-override",Some(json!({"id":"guard-override","layer":"user","name":null,"data":json!({"shapes":{"WorkItem:task":{"facets":{"area":{"description":"Concurrent override"}}}}}).to_string(),"applies_to_collection_id":home,"version_lineage":"guard-H","created_at":"2026-10-27T01:00:00Z"})))
         });
-        crate::mcp::executor_prototype::named_views::tests::generated_publication_guard_fixture(
-            &f.db,
-            f._dir.path(),
-            &f.actor,
-            &f.anchor,
-            &home,
-            (p.revision.definition, &p.name),
-            interference,
+        Box::pin(
+            crate::mcp::executor_prototype::named_views::tests::generated_publication_guard_fixture(
+                &f.db,
+                f._dir.path(),
+                &f.actor,
+                &f.anchor,
+                &home,
+                (p.revision.definition, &p.name),
+                interference,
+            ),
         )
         .await;
     }
@@ -3754,6 +3780,13 @@ async fn named_view_generated_preflight_refuses_new_overrides_and_aliases_before
             .fetch_one(f.db.pool())
             .await
             .unwrap();
+        let receipts_before: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT principal_id,operation,operation_key,request_json,receipt_json FROM main.kernel_mcp_write_receipts ORDER BY principal_id,operation,operation_key"
+        ).fetch_all(f.db.pool()).await.unwrap();
+        let schema_before: i64 = sqlx::query_scalar("PRAGMA main.schema_version")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
         let error = super::super::gate::testing(
             true,
             crate::mcp::kernel_v2::writes::named_views::with_prevalidated(
@@ -3776,7 +3809,21 @@ async fn named_view_generated_preflight_refuses_new_overrides_and_aliases_before
                 .await
                 .unwrap()
         );
-        assert!(!sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name='kernel_mcp_write_receipts')").fetch_one(f.db.pool()).await.unwrap());
+        let receipts_after: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT principal_id,operation,operation_key,request_json,receipt_json FROM main.kernel_mcp_write_receipts ORDER BY principal_id,operation,operation_key"
+        ).fetch_all(f.db.pool()).await.unwrap();
+        assert_eq!(
+            receipts_after, receipts_before,
+            "refused preflight must preserve all receipt identities, requests and responses"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA main.schema_version")
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap(),
+            schema_before,
+            "refused preflight must not create or alter receipt schema"
+        );
     }
 }
 
@@ -4492,3 +4539,200 @@ async fn named_view_generated_shared_scan_deadline_is_not_advisory_unknown() {
     );
     assert!(result.err().unwrap().to_string().contains("deadline"));
 }
+
+#[tokio::test]
+async fn named_view_proposal_is_view_only_closed_deterministic_and_never_admission() {
+    let (f, home) = checkpoint_world().await;
+    let selector = json!({"action":"propose_view","id":f.anchor,"record_type":"WorkItem",
+        "kind":"task","home":home,"selection":{"kind":"keys","keys":["priority","area"]}});
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let first = super::super::gate::testing(false, generated_operation(&f, selector.clone()))
+        .await
+        .unwrap();
+    let mut reordered = selector.clone();
+    reordered["selection"]["keys"] = json!(["area", "priority"]);
+    let second = super::super::gate::testing(false, generated_operation(&f, reordered))
+        .await
+        .unwrap();
+    assert_eq!(
+        native_artifact_runtime::mdx_v2::canonical_json_bytes(&first),
+        native_artifact_runtime::mdx_v2::canonical_json_bytes(&second)
+    );
+    for forbidden in ["sql", "actor", "workspace", "definition", "evidence"] {
+        let mut bad = selector.clone();
+        bad[forbidden] = json!("untrusted");
+        assert!(generated_operation(&f, bad).await.is_err(), "{forbidden}");
+    }
+    for keys in [
+        json!([]),
+        json!(["area", "area"]),
+        json!((0..19).map(|n| format!("k{n}")).collect::<Vec<_>>()),
+    ] {
+        let mut bad = selector.clone();
+        bad["selection"]["keys"] = keys;
+        assert!(generated_operation(&f, bad).await.is_err());
+    }
+    let mut missing = selector.clone();
+    missing["id"] = json!("absent-bearer");
+    let absent = generated_operation(&f, missing)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        before,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap()
+    );
+    // A principal with no View must receive the same missing diagnostic.
+    let viewer =
+        kernel::create_principal(&f.db, "account", "Viewer", "acct:proposal-viewer", &f.actor)
+            .await
+            .unwrap();
+    use crate::mcp::registry::{Caller, EngineHandle, ToolRegistry};
+    let mut registry = ToolRegistry::new();
+    crate::mcp::register_builtin_tools(&mut registry).unwrap();
+    crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+    crate::mcp::kernel_v2::register_kernel_v2_tools(&mut registry).unwrap();
+    let boot = registry
+        .call_engine(
+            EngineHandle::KernelV2(f.db.clone()),
+            Caller::authenticated("acct:proof"),
+            "bootstrap",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let key = boot["run"]["run_key"].as_str().unwrap();
+    // Model the resolved header after verification without invoking the
+    // production authority setter. Registry tests separately cover defensive
+    // refusal of allocation sentinels in an invalid header context.
+    let header = Caller::authenticated("acct:proof")
+        .with_hosting_context("proof", "workspace")
+        .with_test_deferred_run(key);
+    let before_header: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let from_header = registry
+        .call_engine(
+            EngineHandle::KernelV2(f.db.clone()),
+            header,
+            "manage_named_views",
+            selector.clone(),
+        )
+        .await
+        .unwrap();
+    // Compare canonical proposal content, not deliberately different run
+    // envelopes: this call reuses bootstrap, while `first` had no run.
+    for field in ["format", "name", "definition_sha256", "definition"] {
+        assert_eq!(from_header[field], first[field], "{field}");
+    }
+    assert_eq!(from_header["run_context"]["run_key"], key);
+    assert_eq!(
+        before_header,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap()
+    );
+    let caller =
+        Caller::authenticated("acct:proposal-viewer").with_hosting_context("viewer", "workspace");
+    let hidden = registry
+        .call_engine(
+            EngineHandle::KernelV2(f.db.clone()),
+            caller.clone(),
+            "manage_named_views",
+            selector.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(hidden, absent);
+    let bearer_home = kernel::read_record_as(&f.db, &f.actor, &f.anchor)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    for scope in [&bearer_home, &home] {
+        kernel::replace_home_policy(
+            &f.db,
+            &f.actor,
+            scope,
+            &[(&f.actor, "manage"), (&viewer, "view")],
+        )
+        .await
+        .unwrap();
+    }
+    let after_acl: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let visible = super::super::gate::testing(
+        false,
+        registry.call_engine(
+            EngineHandle::KernelV2(f.db.clone()),
+            caller.clone(),
+            "manage_named_views",
+            selector,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(visible["definition"], first["definition"]);
+    let app = caller.clone().with_host_asserted_app(
+        crate::mcp::app_attribution::AppAttribution::new("test.app", "1.0.0", "missing-install")
+            .unwrap(),
+    );
+    assert!(registry.call_engine(EngineHandle::KernelV2(f.db.clone()),app,"manage_named_views",
+        json!({"action":"propose_view","id":f.anchor,"record_type":"WorkItem","kind":"task","home":home,"selection":{"kind":"keys","keys":["area","priority"]}})).await.is_err());
+    let refused = super::super::gate::testing(true, registry.call_engine(
+        EngineHandle::KernelV2(f.db.clone()), caller, "manage_named_views",
+        json!({"action":"record_view_revision","id":f.anchor,"definition":visible["definition"],"idempotency_key":"view-is-not-edit"}),
+    )).await.unwrap_err();
+    assert!(!refused.to_string().contains("disabled"), "{refused}");
+    let off = super::super::gate::testing(false, generated_operation(&f,json!({"action":"record_view_revision","id":f.anchor,"definition":first["definition"],"idempotency_key":"proposal-off"}))).await.unwrap_err();
+    assert!(off.to_string().contains("disabled"));
+    // No events before deliberate ACL changes; proposal neither drafts nor mints.
+    assert_eq!(
+        after_acl,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap()
+    );
+    for section in ["override", "alias"] {
+        if section == "override" {
+            f.import("schema_config","proposal-override",Some(json!({"id":"proposal-override","layer":"user","name":null,
+                "data":json!({"shapes":{"WorkItem:task":{"facets":{"area":{"description":"Changed selected meaning"}}}}}).to_string(),
+                "applies_to_collection_id":home,"version_lineage":"proposal-H2","created_at":"2026-10-27T00:00:01Z"}))).await;
+        } else {
+            f.import(
+                "vocabulary_values",
+                "proposal-alias",
+                Some(json!({"id":"proposal-alias","vocabulary_id":"priority",
+                "value":"proposal-new-token","status":"active","alias_of":"high"})),
+            )
+            .await;
+        }
+        let stale = super::super::gate::testing(true, generated_operation(&f,json!({"action":"record_view_revision","id":f.anchor,
+            "definition":first["definition"],"idempotency_key":format!("stale-proposal-{section}")}))).await.unwrap_err();
+        assert!(stale.to_string().contains("view_source_changed"), "{stale}");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events WHERE type IN (?,?)")
+            .bind(super::super::REVISION)
+            .bind(super::super::TRANSITION)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[path = "global_tests.rs"]
+mod global_tests;

@@ -18,6 +18,8 @@ pub(super) const SQL_PROGRESS_DDL: &str = "CREATE TABLE kernel_legacy_sql_progre
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), scanned_seq INTEGER NOT NULL, gap_free INTEGER NOT NULL DEFAULT 1, provenance_headers INTEGER NOT NULL DEFAULT 1)";
 pub(super) const SUBJECTS_DDL: &str = "CREATE TABLE kernel_legacy_subjects(subject_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(subject_id,seq))";
 
+const SQL_FRONTIER_CHECK: &str = "WITH head AS (SELECT coalesce(max(seq),0) AS seq FROM main.content_events WHERE type IN ('kernel.legacy_recorded.v1','kernel.import_state.v1','kernel.import_state_delta.v1','kernel.facet_observed.v1') AND type='kernel.legacy_recorded.v1') SELECT CASE WHEN EXISTS(SELECT 1 FROM main.kernel_legacy_sql_progress) THEN EXISTS(SELECT 1 FROM main.kernel_legacy_sql_progress WHERE singleton=1 AND gap_free=1 AND provenance_headers=1 AND scanned_seq=(SELECT seq FROM head)) ELSE (SELECT seq FROM head)=0 END";
+
 /// A stale projected header can change placement and disclosure. Check the
 /// canonical retained frontier in the same snapshot as every consumer.
 pub(crate) async fn require_sql_frontier_on(conn: &mut SqliteConnection) -> Result<()> {
@@ -25,8 +27,15 @@ pub(crate) async fn require_sql_frontier_on(conn: &mut SqliteConnection) -> Resu
     if read_cache::get::<()>(&key).is_some() {
         return Ok(());
     }
-    let current: bool = sqlx::query_scalar("WITH head AS (SELECT coalesce(max(seq),0) AS seq FROM main.content_events WHERE type='kernel.legacy_recorded.v1') SELECT CASE WHEN EXISTS(SELECT 1 FROM main.kernel_legacy_sql_progress) THEN EXISTS(SELECT 1 FROM main.kernel_legacy_sql_progress WHERE singleton=1 AND gap_free=1 AND provenance_headers=1 AND scanned_seq=(SELECT seq FROM head)) ELSE (SELECT seq FROM head)=0 END")
-        .fetch_one(&mut *conn).await?;
+    // The redundant `type IN (...)` lets SQLite answer max(seq) from the
+    // partial index idx_kernel_facet_time_frontier (same predicate) instead of
+    // scanning back from the head through every post-cutover event: every
+    // legacy_recorded event predates the cutover, so that scan grew with each
+    // write (~8 ms on a 15:28 HQ copy; ~1 ms with the index). Where the index is
+    // absent the result is identical, just unindexed.
+    let current: bool = sqlx::query_scalar(SQL_FRONTIER_CHECK)
+        .fetch_one(&mut *conn)
+        .await?;
     if !current {
         return Err(Error::engine("v2 database is not ready: legacy SQL projection needs catchup; run explicit v2 preparation before serving"));
     }
@@ -101,7 +110,7 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
             .await?
             .unwrap_or(0);
     let head: i64 = sqlx::query_scalar(
-        "SELECT coalesce(max(seq),0) FROM content_events WHERE type='kernel.legacy_recorded.v1'",
+        "SELECT coalesce(max(seq),0) FROM content_events WHERE type IN ('kernel.legacy_recorded.v1','kernel.import_state.v1','kernel.import_state_delta.v1','kernel.facet_observed.v1') AND type='kernel.legacy_recorded.v1'",
     )
     .fetch_one(&mut *conn)
     .await?;
@@ -109,6 +118,10 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
         return Err(Error::engine(
             "legacy SQL projection frontier exceeds canonical history",
         ));
+    }
+    if rebuild || after < head {
+        super::sql_event_projection::reset_on(conn, 0).await?;
+        super::sql_record_projection::reset_on(conn).await?;
     }
     while after < head {
         let rows: Vec<(i64,String)> = sqlx::query_as("SELECT seq,json_extract(payload,'$.legacy') FROM content_events WHERE seq>? AND seq<=? AND type='kernel.legacy_recorded.v1' ORDER BY seq LIMIT 128")
@@ -334,7 +347,7 @@ async fn project_sql_header(
     // Native event numbers need not be adjacent. Every earlier *legacy*
     // envelope must already be scanned before this position can advance.
     // A newer writer therefore cannot jump over an older writer's gap.
-    let prior: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events WHERE type='kernel.legacy_recorded.v1' AND seq<?")
+    let prior: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events WHERE type IN ('kernel.legacy_recorded.v1','kernel.import_state.v1','kernel.import_state_delta.v1','kernel.facet_observed.v1') AND type='kernel.legacy_recorded.v1' AND seq<?")
         .bind(seq).fetch_one(&mut *conn).await?;
     sqlx::query("INSERT INTO kernel_legacy_sql_progress(singleton,scanned_seq,gap_free,provenance_headers) VALUES(1,CASE WHEN ?2=0 THEN ?1 ELSE 0 END,1,1) ON CONFLICT(singleton) DO UPDATE SET scanned_seq=CASE WHEN gap_free=1 AND scanned_seq>=?2 THEN max(scanned_seq,?1) ELSE scanned_seq END")
         .bind(seq).bind(prior).execute(conn).await?;
@@ -468,4 +481,58 @@ async fn comment_history_visible(
         current = bearer.clone();
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod frontier_tests {
+    use super::*;
+    use sqlx::Connection;
+
+    #[tokio::test]
+    async fn kernel_v2_sql_event_legacy_frontier_uses_optional_facet_time_index() {
+        let mut conn = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE content_events(seq INTEGER PRIMARY KEY,type TEXT NOT NULL); CREATE TABLE kernel_legacy_sql_progress(singleton INTEGER PRIMARY KEY,scanned_seq INTEGER,gap_free INTEGER,provenance_headers INTEGER); INSERT INTO content_events(seq,type) VALUES(1,'kernel.legacy_recorded.v1'),(3,'kernel.legacy_recorded.v1'),(4,'kernel.import_state.v1'),(5,'kernel.record_revised.v1'); INSERT INTO kernel_legacy_sql_progress VALUES(1,3,1,1)")
+            .execute(&mut conn).await.unwrap();
+        for indexed in [false, true, false] {
+            if indexed {
+                facet_time_reads::ensure_schema_on(&mut conn).await.unwrap();
+            } else {
+                sqlx::query("DROP INDEX IF EXISTS idx_kernel_facet_time_frontier")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {SQL_FRONTIER_CHECK}"))
+                    // EXPLAIN itself can retain its old plan in SQLite's
+                    // prepared-statement cache after DROP INDEX.
+                    .persistent(false)
+                    .fetch_all(&mut conn)
+                    .await
+                    .unwrap();
+            eprintln!("LEGACY_FRONTIER_PLAN indexed={indexed}: {plan:?}");
+            assert_eq!(
+                indexed,
+                plan.iter()
+                    .any(|row| row.3.contains("idx_kernel_facet_time_frontier"))
+            );
+            for (scanned, gap_free, provenance, expected) in [
+                (3, 1, 1, true),
+                (5, 1, 1, false),
+                (1, 1, 1, false),
+                (3, 0, 1, false),
+                (3, 1, 0, false),
+            ] {
+                sqlx::query("UPDATE kernel_legacy_sql_progress SET scanned_seq=?,gap_free=?,provenance_headers=?")
+                    .bind(scanned).bind(gap_free).bind(provenance).execute(&mut conn).await.unwrap();
+                assert_eq!(
+                    expected,
+                    sqlx::query_scalar::<_, bool>(SQL_FRONTIER_CHECK)
+                        .fetch_one(&mut conn)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+    }
 }

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent sessions</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem;color:#243047;max-width:52rem}input,textarea,button{font:inherit;padding:.5rem}textarea{width:95%;min-height:4rem}li{margin:.6rem 0}.kit-error{color:#9c2630}button:disabled{opacity:.6}small{color:#5b6677}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+// Lists Paseo agent sessions, chooses a folder on a machine, starts a session and replies to one. Needs core kit 1.3.0 and Native Desktop.
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact?.useAgentSessions) root.textContent = 'Open in Native with core kit 1.3.0.';
+else {
+  const { html, render, useState, useEffect, useAgentSessions, FeedNotice, WriteStatus, Loading, Empty } = kit.preact;
+  const key = s => s.hostId + '|' + s.hostEpoch + '|' + s.id;
+  function App() {
+    const s = useAgentSessions();
+    const [catalog, setCatalog] = useState(null);
+    const [folder, setFolder] = useState(null);      // { hostId, hostEpoch, folder } from the chooser
+    const [note, setNote] = useState('');
+    const [prompt, setPrompt] = useState('');
+    const [reply, setReply] = useState({});          // draft per session
+    // Buttons that start something must call the host inside the click, so load the choices before the click.
+    const ready = s.status === 'ready';
+    useEffect(() => { if (ready && !catalog) s.catalog().then(r => r.ok && setCatalog(r.value)); }, [ready]);
+    if (s.status === 'unsupported') return html`<p role="alert">Agent sessions are available in Native Desktop only.</p>`;
+    const host = s.hosts.find(h => h.status === 'reachable' && h.epoch && h.capabilities?.create);
+    const where = catalog?.hosts.find(h => h.hostId === host?.id && h.hostEpoch === host?.epoch);
+    const provider = where?.providers.find(p => p.available && p.models.length);
+    const model = provider?.models.find(m => m.isDefault) || provider?.models[0];
+    const chosen = folder && s.isCurrent(folder) ? folder.folder : null;
+    const workspace = chosen || where?.workspaces.find(w => w.kind === 'ordinary') || where?.workspaces[0];
+    async function chooseFolder() {
+      // Called straight from the click: Desktop needs the gesture.
+      const result = await s.chooseFolder({ hostId: host.id, hostEpoch: host.epoch });
+      if (result.status === 'chosen') { setFolder(result); setNote(''); }
+      else setNote(result.status === 'cancelled' ? '' : result.message);
+    }
+    const start = () => {
+      s.create.submit({ hostId: host.id, hostEpoch: host.epoch, provider: provider.id, model: model.id, workspaceId: workspace.id, initialPrompt: prompt });
+      setPrompt('');
+    };
+    return html`<section><h1>Agent sessions</h1>
+      <${FeedNotice} feed=${s} />
+      ${s.status === 'loading' && html`<${Loading} what="sessions" />`}
+      ${s.status !== 'loading' && !s.sessions.length && s.notice === 'none' && html`<${Empty}>No sessions yet.<//>`}
+      <ul>${s.sessions.map(x => html`<li key=${key(x)}><strong>${x.title ?? 'Untitled'}</strong> <small>${x.hostLabel} · ${x.status}</small>
+        <div><input aria-label=${'Reply to ' + (x.title ?? 'session')} value=${reply[key(x)] ?? ''} onInput=${e => setReply({ ...reply, [key(x)]: e.currentTarget.value })} />
+          <button disabled=${!(reply[key(x)] ?? '').trim() || !s.isCurrent(x)} onClick=${() => { s.send.submit({ hostId: x.hostId, hostEpoch: x.hostEpoch, sessionId: x.id, text: reply[key(x)] }); setReply({ ...reply, [key(x)]: '' }); }}>Reply</button></div></li>`)}</ul>
+      ${s.send.entries.map(e => html`<${WriteStatus} key=${e.id} entry=${e} onRetry=${() => s.send.retry(e.id)} onDiscard=${() => s.send.discard(e.id)} />`)}
+      <h2>Start a conversation</h2>
+      <p>${host ? html`On ${host.label}, in ${workspace ? workspace.name : 'a folder'}.` : 'No machine is ready to start sessions.'}</p>
+      <button id="choose-folder" disabled=${!host?.capabilities?.chooseFolder} onClick=${chooseFolder}>Choose a folder…</button>
+      ${note && html`<p role="status">${note}</p>`}
+      <p><textarea id="prompt" aria-label="First message" value=${prompt} onInput=${e => setPrompt(e.currentTarget.value)} /></p>
+      <button id="start" disabled=${!prompt.trim() || !provider || !model || !workspace} onClick=${start}>Start</button>
+      ${s.create.entries.map(e => html`<${WriteStatus} key=${e.id} entry=${e} onRetry=${() => s.create.retry(e.id)} onDiscard=${() => s.create.discard(e.id)} />`)}
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>

@@ -429,6 +429,7 @@ mod tests {
 
     const HTML_SHAPE: (&str, &str, Option<&str>) = ("Document", "artifact", Some("native.html.v1"));
 
+    // The name predates the 2 MiB package limit; the test follows PACKAGE_BODY_LIMIT.
     #[test]
     fn package_marker_raises_the_decoded_limit_to_one_mebibyte_and_no_further() {
         let plain = json!(PACKAGE_FACET_VALUE);
@@ -460,7 +461,8 @@ mod tests {
                     Some(marker.clone()),
                 ));
                 assert!(
-                    text.contains("body_encoding_too_large") && text.contains("1048576"),
+                    text.contains("body_encoding_too_large")
+                        && text.contains(&PACKAGE_BODY_LIMIT.to_string()),
                     "{text}"
                 );
             }

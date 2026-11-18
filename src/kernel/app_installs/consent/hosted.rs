@@ -12,6 +12,11 @@ pub(crate) struct AdoptRequest {
     pub receipt_id: String,
     pub nonce: String,
     pub preview_session: String,
+    /// Optional folder grant applied atomically with adoption. Absent
+    /// stays absent on the wire so pre-scope persisted requests remain
+    /// byte-identical for idempotent-retry matching and replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -153,22 +158,29 @@ async fn source_for_member(
             "manage_alpha_tabs: authenticated account mismatch",
         ));
     }
-    let record = read_record_on(conn, principal, &pin.artifact_id)
-        .await?
-        .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
-    if !is_artifact_on(conn, &record).await? {
-        return Err(Error::engine(HIDDEN_OR_MISSING));
-    }
-    let runtime: Option<String> =
-        sqlx::query_scalar("SELECT value FROM kernel_facets WHERE record_id=? AND key='runtime'")
-            .bind(&pin.artifact_id)
-            .fetch_optional(&mut *conn)
+    // A workspace shelf source is the release-built bytes the shelf add
+    // retained, verified from that evidence. Whoever later edits, archives or
+    // re-homes the shared record, a member's consented pin neither changes nor
+    // goes blank; the shelf (not record visibility) decides if it may run.
+    if !shelf::is_source_on(conn, &pin.artifact_id, &pin.source_revision).await? {
+        let record = read_record_admission_on(conn, principal, &pin.artifact_id)
             .await?
-            .flatten();
-    if runtime.as_deref() != Some("native.html.v1") {
-        return Err(Error::engine(
-            "manage_alpha_tabs: source is not renderable native HTML",
-        ));
+            .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
+        if !is_artifact_on(conn, &record).await? {
+            return Err(Error::engine(HIDDEN_OR_MISSING));
+        }
+        let runtime: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM kernel_facets WHERE record_id=? AND key='runtime'",
+        )
+        .bind(&pin.artifact_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
+        if runtime.as_deref() != Some("native.html.v1") {
+            return Err(Error::engine(
+                "manage_alpha_tabs: source is not renderable native HTML",
+            ));
+        }
     }
     source_on(conn, pin).await
 }
@@ -194,11 +206,36 @@ async fn current_install(
 ) -> Result<(String, Value)> {
     let row: Option<(String, String, String, i64)> = sqlx::query_as(
         "SELECT generation,status,row_json,event_seq FROM kernel_app_installs WHERE principal=? AND package=?",
-    ).bind(principal).bind(&pin.package).fetch_optional(conn).await?;
+    ).bind(principal).bind(&pin.package).fetch_optional(&mut *conn).await?;
     let Some((generation, status, raw, seq)) = row else {
         return Err(Error::engine("manage_alpha_tabs: installation required"));
     };
-    let row: Value = serde_json::from_str(&raw)?;
+    let mut row: Value = serde_json::from_str(&raw)?;
+    let mut generation = generation;
+    let mut seq = seq;
+    // Resolve review against the staged generation while the active row keeps
+    // serving the old pin. Every lookup rechecks its active predecessor.
+    if row["digest"] != pin.digest
+        || row["consented_source_revision"] != pin.source_revision
+        || row["version"] != pin.version
+    {
+        if let Some((id, pending, pending_seq)) =
+            pending_before_on(conn, principal, &pin.package, before).await?
+        {
+            generation = id;
+            row = pending;
+            seq = pending_seq;
+            sources::require_update_owner_before_on(
+                conn,
+                principal,
+                &pin.artifact_id,
+                Some(&pin.package),
+                &pin.source_revision,
+                before,
+            )
+            .await?;
+        }
+    }
     let declaration: Value = serde_json::from_str(string(&row, "consented_declaration")?)?;
     if status != "installed"
         || seq >= before
@@ -219,11 +256,14 @@ async fn preview_binding(
     scope: HostedScope,
     generation: String,
 ) -> Result<preview::Binding> {
+    // A database with no frozen apps may never have been activated; its
+    // receipts bind to that fact, so a later activation still voids them.
     let activation_event: String =
         sqlx::query_scalar("SELECT id FROM main.content_events WHERE type=? ORDER BY seq LIMIT 1")
             .bind(ACTIVATED)
-            .fetch_one(&mut *conn)
-            .await?;
+            .fetch_optional(&mut *conn)
+            .await?
+            .unwrap_or_else(|| "unactivated".to_owned());
     Ok(preview::Binding {
         database: scope.database,
         hosting_session: scope.session,
@@ -243,8 +283,21 @@ pub(crate) async fn preview_as(
     let scope = hosted_scope(caller, &pin, false)?;
     let mut tx = db.write_pool().begin().await?;
     require_hosted_account_on(&mut tx, principal, caller).await?;
+    if sources::is_native_on(&mut tx, &pin.artifact_id, &pin.source_revision).await? {
+        sources::require_update_footing_on(&mut tx, caller, &pin.artifact_id, &pin.source_revision)
+            .await?;
+        sources::require_update_owner_on(
+            &mut tx,
+            principal,
+            &pin.artifact_id,
+            Some(&pin.package),
+            &pin.source_revision,
+        )
+        .await?;
+    }
     let source = source_for_member(&mut tx, principal, &scope.account, &pin).await?;
-    let (generation, _) = current_install(&mut tx, principal, &pin, i64::MAX).await?;
+    let (generation, row) = current_install(&mut tx, principal, &pin, i64::MAX).await?;
+    shelf::require_not_removed_on(&mut tx, &row, &pin.package).await?;
     let account = scope.account.clone();
     let binding = preview_binding(&mut tx, principal, scope, generation).await?;
     let body_limit = body_limit_on(&mut tx, &pin.artifact_id).await?;
@@ -284,6 +337,7 @@ pub(crate) async fn adopt_as(
 ) -> Result<ManagementOutcome> {
     normalize(&mut request.pin)?;
     let scope = hosted_scope(caller, &request.pin, true)?;
+
     let expected = request
         .pin
         .expected_install_event_id
@@ -303,8 +357,32 @@ pub(crate) async fn adopt_as(
     let request_json = serde_json::to_string(&request)?;
     let mut tx = begin_write(db.write_pool()).await?;
     require_hosted_account_on(&mut tx, principal, caller).await?;
+    if sources::is_native_on(
+        &mut tx,
+        &request.pin.artifact_id,
+        &request.pin.source_revision,
+    )
+    .await?
+    {
+        sources::require_update_footing_on(
+            &mut tx,
+            caller,
+            &request.pin.artifact_id,
+            &request.pin.source_revision,
+        )
+        .await?;
+        sources::require_update_owner_on(
+            &mut tx,
+            principal,
+            &request.pin.artifact_id,
+            Some(&request.pin.package),
+            &request.pin.source_revision,
+        )
+        .await?;
+    }
     let source = source_for_member(&mut tx, principal, &scope.account, &request.pin).await?;
-    let (generation, _) = current_install(&mut tx, principal, &request.pin, i64::MAX).await?;
+    let (generation, row) = current_install(&mut tx, principal, &request.pin, i64::MAX).await?;
+    shelf::require_not_removed_on(&mut tx, &row, &request.pin.package).await?;
     let revocation_seq = revocation_on(&mut tx, principal, i64::MAX).await?;
     let prior: Option<(String, String, String)> = sqlx::query_as(
         "SELECT operation,request_json,event_id FROM kernel_app_install_outcomes WHERE principal=? AND operation_key=?",
@@ -350,10 +428,21 @@ pub(crate) async fn adopt_as(
         expected_install_event_id: expected,
         current_event_id: generation,
     };
+    // Scope validation is an authority check too: it precedes spending.
+    let adopt_scope = request
+        .scope
+        .as_ref()
+        .map(AppScope::from_json)
+        .transpose()?;
+    if let Some(scope) = &adopt_scope {
+        scope::validate_folders_on(&mut tx, principal, scope).await?;
+    }
     // All authority/CAS checks precede spending. An uncertain commit leaves the
     // receipt spent; an accepted keyed retry reads its durable outcome instead.
     preview::consume(&confirm, &binding, chrono::Utc::now().timestamp())?;
     let package = request.pin.package.clone();
+    // Adoption and its scope are one write: they share one act.
+    let mut acts = crate::act::ActAllocation::new();
     let outcome = append_in(
         db,
         &mut tx,
@@ -369,9 +458,12 @@ pub(crate) async fn adopt_as(
                 revocation_seq,
             })?,
         },
-        &mut crate::act::ActAllocation::new(),
+        &mut acts,
     )
     .await?;
+    if let Some(scope) = &adopt_scope {
+        scope::apply_adopt_scope_in(db, &mut tx, principal, &package, scope, &mut acts).await?;
+    }
     let result = management::outcome_on(&mut tx, principal, &package, outcome.id, true).await?;
     db.commit_kernel_content(tx).await?;
     Ok(result)
@@ -379,6 +471,7 @@ pub(crate) async fn adopt_as(
 
 /// Current, snapshot-local facts. The native write lane obtains these again
 /// inside its mutation transaction; callers must not cache them as authority.
+#[derive(Clone)]
 pub(crate) struct AppSourceAdmission {
     pub principal: String,
     pub account: String,
@@ -391,6 +484,9 @@ pub(crate) struct AppSourceAdmission {
     pub pin: Value,
     pub body: String,
     pub body_limit: usize,
+    /// The person's folder grant for this package on this snapshot.
+    /// `All` preserves pre-scope behaviour exactly.
+    pub scope: AppScope,
 }
 
 struct CurrentSource {
@@ -404,6 +500,7 @@ struct CurrentSource {
     source: Source,
     epoch: i64,
     body_limit: usize,
+    scope: AppScope,
 }
 
 impl CurrentSource {
@@ -413,13 +510,34 @@ impl CurrentSource {
             || !self.row["adoption"].as_str().is_some_and(verified_adoption)
             || self.row["consent_revocation_seq"].as_i64().unwrap_or(0) != self.epoch
         {
-            return Err(Error::engine("native app consent is not executable"));
+            return Err(Error::engine(
+                "native app consent is not executable [app_consent_not_executable]",
+            ));
         }
         Ok(())
     }
 }
 
-async fn current_source_on(
+#[inline(never)]
+fn current_source_on<'a>(
+    conn: &'a mut SqliteConnection,
+    principal: &'a str,
+    package: &'a str,
+    expected_generation: &'a str,
+    expected_digest: Option<&'a str>,
+    retained_review: bool,
+) -> futures::future::BoxFuture<'a, Result<CurrentSource>> {
+    Box::pin(current_source_admission_on(
+        conn,
+        principal,
+        package,
+        expected_generation,
+        expected_digest,
+        retained_review,
+    ))
+}
+
+async fn current_source_admission_on(
     conn: &mut SqliteConnection,
     principal: &str,
     package: &str,
@@ -427,21 +545,58 @@ async fn current_source_on(
     expected_digest: Option<&str>,
     retained_review: bool,
 ) -> Result<CurrentSource> {
-    require_activated_on(conn).await?;
+    require_apps_open_on(conn).await?;
     let account = require_member(conn, principal, i64::MAX).await?;
     let stored: Option<(String, String, String, bool, Option<String>, i64)> = sqlx::query_as(
         "SELECT row_json,generation,status,executable,refusal,event_seq FROM kernel_app_installs WHERE principal=? AND package=?",
     ).bind(principal).bind(package).fetch_optional(&mut *conn).await?;
+    let stored = if retained_review
+        && stored
+            .as_ref()
+            .is_some_and(|(_, g, _, _, _, _)| g != expected_generation)
+    {
+        match pending_on(conn, principal, package).await? {
+            Some((id, row, seq)) if id == expected_generation => {
+                sources::require_update_owner_on(
+                    conn,
+                    principal,
+                    string(&row, "artifact_id")?,
+                    Some(package),
+                    string(&row, "consented_source_revision")?,
+                )
+                .await?;
+                Some((
+                    row.to_string(),
+                    id,
+                    "installed".into(),
+                    false,
+                    Some("adoption_required".into()),
+                    seq,
+                ))
+            }
+            _ => stored,
+        }
+    } else {
+        stored
+    };
     let Some((raw, generation, status, executable, refusal, install_event_seq)) = stored else {
-        return Err(Error::engine("native app installation not found"));
+        return Err(Error::engine(
+            "native app installation not found [missing_install]",
+        ));
     };
     if status != "installed" || generation != expected_generation {
-        return Err(Error::engine("native app installation changed"));
+        return Err(Error::engine(
+            "native app installation changed [cas_mismatch]",
+        ));
     }
     let row: Value = serde_json::from_str(&raw)?;
     if expected_digest.is_some_and(|digest| row["digest"] != digest) {
         return Err(Error::engine("native app source digest changed"));
     }
+    // Removal from the workspace ends a shelf-origin app for everyone at their
+    // next confirmed check. Nothing is deleted, and rows with no shelf origin
+    // are never touched.
+    shelf::require_not_removed_on(conn, &row, package).await?;
     if let Some(code @ (NOT_YET_AVAILABLE | UNSUPPORTED_WITNESS)) = refusal.as_deref() {
         let declaration: Value = serde_json::from_str(string(&row, "consented_declaration")?)?;
         if !retained_review
@@ -473,6 +628,7 @@ async fn current_source_on(
     manifest
         .require_available_kit()
         .map_err(|error| Error::engine(format!("native app source refused [{}]", error.code)))?;
+    let scope = scope::scope_on(conn, principal, package).await?;
     Ok(CurrentSource {
         account,
         generation,
@@ -484,6 +640,7 @@ async fn current_source_on(
         source,
         epoch,
         body_limit,
+        scope,
     })
 }
 
@@ -527,6 +684,7 @@ pub(crate) async fn admit_install_on(
         pin: current.source.pin,
         body: current.source.body,
         body_limit: current.body_limit,
+        scope: current.scope,
     })
 }
 
@@ -563,6 +721,7 @@ pub(crate) async fn launch_source_on(
         pin: current.source.pin,
         body: current.source.body,
         body_limit: current.body_limit,
+        scope: current.scope,
     })
 }
 
@@ -676,8 +835,15 @@ pub(in crate::kernel::app_installs) async fn project_adopted(
     row["event_id"] = json!(event.id);
     row["updated_at"] = json!(event.created_at);
     row["consent_revocation_seq"] = json!(p.revocation_seq);
+    let running: String = sqlx::query_scalar(
+        "SELECT generation FROM kernel_app_installs WHERE principal=? AND package=?",
+    )
+    .bind(actor)
+    .bind(&p.request.pin.package)
+    .fetch_one(&mut *conn)
+    .await?;
     sqlx::query("UPDATE kernel_app_installs SET row_json=?,source_body=?,generation=?,previous_generation=?,event_seq=?,executable=1,refusal=NULL WHERE principal=? AND package=?")
-        .bind(row.to_string()).bind(&source.body).bind(&event.id).bind(generation).bind(event.local_seq)
+        .bind(row.to_string()).bind(&source.body).bind(&event.id).bind(running).bind(event.local_seq)
         .bind(actor).bind(&p.request.pin.package).execute(conn).await?;
     Ok(())
 }
@@ -758,5 +924,30 @@ mod frozen_declaration_tests {
                 assert_eq!(scope.database, "fixture-database");
             }
         }
+    }
+
+    #[test]
+    fn unscoped_adopt_request_serialises_as_before() {
+        // Retry identity compares stored request JSON byte for byte. A request
+        // that predates app scopes (no `scope` key) must still match a freshly
+        // serialised unscoped request.
+        const STORED: &str = concat!(
+            r#"{"pin":{"package":"net.native.frozen","version":"1","digest":"a","#,
+            r#""artifact_id":"b","source_revision":"c","declaration":{},"reason":"r","#,
+            r#""request":null,"idempotency_key":null,"expected_install_event_id":null},"#,
+            r#""receipt_id":"rc","nonce":"n","preview_session":"ps"}"#
+        );
+        let stored: AdoptRequest = serde_json::from_str(STORED).unwrap();
+        assert!(stored.scope.is_none());
+        assert_eq!(serde_json::to_string(&stored).unwrap(), STORED);
+        let scoped: AdoptRequest = serde_json::from_str(&format!(
+            "{},\"scope\":{{\"kind\":\"all\"}}}}",
+            &STORED[..STORED.len() - 1]
+        ))
+        .unwrap();
+        assert!(scoped.scope.is_some());
+        assert!(serde_json::to_string(&scoped)
+            .unwrap()
+            .contains(r#""scope":{"kind":"all"}"#));
     }
 }

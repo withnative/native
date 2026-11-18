@@ -427,7 +427,9 @@ async fn text_rendering_reads_each_link_as_title_and_reference() {
         .find(|line| line.contains("→ relates_to"))
         .unwrap_or_else(|| panic!("no outgoing link line: {text}"));
     assert!(
-        out_line.contains(&format!("Old charter ({old_ref} · {old})")),
+        // The server-minted short reference is the address; the full id is
+        // not repeated where a short reference resolves.
+        out_line.contains(&format!("Old charter ({old_ref})")) && !out_line.contains(&old),
         "{out_line}"
     );
     assert!(out_line.contains("Document/note"), "{out_line}");
@@ -441,7 +443,7 @@ async fn text_rendering_reads_each_link_as_title_and_reference() {
         .find(|line| line.contains("← blocks"))
         .unwrap_or_else(|| panic!("no incoming link line: {text}"));
     assert!(
-        in_line.contains(&format!("Ship the thing ({task_ref} · {task})")),
+        in_line.contains(&format!("Ship the thing ({task_ref})")) && !in_line.contains(&task),
         "{in_line}"
     );
     assert!(in_line.contains("WorkItem/task · in_progress"), "{in_line}");

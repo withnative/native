@@ -1,6 +1,6 @@
 {
   "format": "native.backend-contract-classifications.v1",
-  "revision": 23,
+  "revision": 26,
   "profiles": [
     {
       "id": "sqlite-local",
@@ -333,6 +333,20 @@
       }
     },
     {
+      "id": "merge_body",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Body merge is implemented only on KernelV2: its keyed receipts live in kernel_mcp_write_receipts. The SQLite engine registers the descriptor with a refusing handler. The v2-kernel-probe CI lane exercises it (mcp::kernel_v2::merge_body_tests); the ordinary sqlite-reference-ci suite does not enable that feature, so this operation makes no backend-portability full-proof claim."
+    },
+    {
       "id": "claim_unowned_record",
       "kind": "tool",
       "surface": "primary",
@@ -527,6 +541,20 @@
         "turso-embedded-sync": "N",
         "libsql-embedded-replica": "U"
       }
+    },
+    {
+      "id": "manage_saved_tabs",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "N",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Private saved tabs require kernel_v2 and exact package adoption. The v2-kernel-probe CI lane exercises scoped creation, CAS/idempotency, privacy guards, replay and explicit maintenance upgrade. The ordinary sqlite-reference-ci suite does not enable that feature, so this operation makes no backend-portability full-proof claim."
     },
     {
       "id": "manage_instructions",
@@ -744,6 +772,19 @@
       "surface": "primary",
       "profiles": {
         "sqlite-local": "F|sqlite-reference-ci:manage_alpha_tabs",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "read_app_bundle",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:read_app_bundle",
         "postgres-server": "N",
         "turso-local": "N",
         "turso-remote": "N",
@@ -1582,6 +1623,18 @@
         "libsql-embedded-replica": "U"
       },
       "notes": "Fleet migration status currently scans managed SQLite database files only."
+    },
+    {
+      "id": "operator.paired-recovery.inspect",
+      "kind": "operator",
+      "profiles": {
+        "sqlite-local": "F|sqlite-paired-recovery-ci:operator.paired-recovery.inspect",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
     },
     {
       "id": "operator.rekey-db",

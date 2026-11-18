@@ -233,16 +233,92 @@ async fn kernel_v2_coordination_registry_roundtrip_and_restart() {
         boot["instructions"]["entries"][1]["content"],
         "Admin personal instructions"
     );
-    assert_eq!(boot["pending_obligations"]["status"], "read_only");
+    assert!(boot.get("pending_obligations").is_none());
+    assert_eq!(boot["bootstrap_readiness"]["status"], "complete");
+    assert_eq!(
+        boot["bootstrap_readiness"]["contract"],
+        crate::instructions::BOOTSTRAP_CONTRACT
+    );
     let rendered = crate::mcp::render::render("bootstrap", &boot).unwrap();
     assert!(rendered.contains("Workspace instructions from body lane"));
     assert!(rendered.contains("Admin personal instructions"));
-    assert!(rendered.contains("Onboarding programmes and member state are imported read-only"));
+    assert!(!rendered.contains("Onboarding programmes"));
+    for rule in [
+        "Present outcomes, not machinery",
+        "Separate evidence",
+        "sources",
+        "before their named actions",
+        "rendered-artifacts",
+        "bootstrap-reference",
+        "host worker notifications",
+    ] {
+        assert!(rendered.contains(rule), "missing core rule: {rule}");
+    }
+    let full =
+        crate::mcp::guides::read_guide_value(json!({"topic":"bootstrap-reference"})).unwrap();
+    assert!(full["markdown"]
+        .as_str()
+        .unwrap()
+        .contains(crate::instructions::ENGINE_ORIENTATION));
+    let artifacts =
+        crate::mcp::guides::read_guide_value(json!({"topic":"rendered-artifacts"})).unwrap();
+    assert!(artifacts["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("never reuse paths/coordinates across renders"));
+    let mut former = boot.clone();
+    former["orientation"]["content"] = json!(crate::instructions::ENGINE_ORIENTATION);
+    let former_text = crate::mcp::render::render("bootstrap", &former).unwrap();
+    assert!(rendered.len() < former_text.len());
+    println!(
+        "bootstrap text fixture: compact={} full_reference={} saved={}; compact JSON payload={}",
+        rendered.len(),
+        former_text.len(),
+        former_text.len() - rendered.len(),
+        boot.to_string().len()
+    );
     assert!(rendered.contains("Bootstrap opens a durable run"));
     assert!(!rendered.contains("bootstrap does not allocate a durable run"));
     assert!(!rendered.contains("native:unfiled"));
     let key = boot["run"]["run_key"].as_str().unwrap().to_owned();
     assert_eq!(boot["session"]["run_key"], key);
+    // A client's head/tail truncation must retain the continuation key even
+    // when exact standing instructions make the response very long.
+    let mut large_boot = boot.clone();
+    let long_policy = "Exact standing policy. ".repeat(4_000);
+    large_boot["instructions"]["entries"][0]["content"] = json!(long_policy);
+    let large_text = crate::mcp::render::render("bootstrap", &large_boot).unwrap();
+    assert!(large_text.starts_with(&format!("Run key: `{key}`")));
+    assert!(large_text.contains(&long_policy));
+    let serialized = large_boot.to_string();
+    for output in [&large_text, &serialized] {
+        assert!(output.len() > 64_000);
+        let head = output.chars().take(256).collect::<String>();
+        let tail = output
+            .chars()
+            .rev()
+            .take(256)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        let head_tail = format!("{head}…{tail}");
+        assert!(head_tail.contains(&key));
+    }
+    assert!(serialized.starts_with("{\"run\":"));
+    let observational = registry()
+        .call_engine(
+            EngineHandle::KernelV2(db.clone()),
+            Caller::authenticated("acct:admin").with_suppressed_request_persistence(),
+            "bootstrap",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let observational_text = crate::mcp::render::render("bootstrap", &observational).unwrap();
+    assert!(observational_text.starts_with("Run key: none issued (read-only bootstrap)"));
+    assert!(observational_text.contains("creates or updates no run"));
+    assert!(!observational_text.contains("Bootstrap opens a durable run"));
     let other_boot = call(&db, "acct:other", "bootstrap", json!({}))
         .await
         .unwrap();
@@ -418,7 +494,26 @@ async fn kernel_v2_coordination_registry_roundtrip_and_restart() {
     let closed_text = crate::mcp::render::render("bootstrap", &closed_boot).unwrap();
     assert!(closed_text.contains("This run is closed"));
     assert!(closed_text.contains("run_closed"));
-    assert!(!closed_text.contains("continues the same open run"));
+    assert!(closed_text.contains("set_intent with run_key='new'"));
+    let recovered = call(
+        &db,
+        "acct:admin",
+        "set_intent",
+        json!({"run_key":"new","intent":"Continue after handback"}),
+    )
+    .await
+    .unwrap();
+    let recovered_key = recovered["run_context"]["run_key"].as_str().unwrap();
+    assert_ne!(recovered_key, key);
+    let handed_back = call(
+        &db,
+        "acct:admin",
+        "close_run",
+        json!({"run_key":recovered_key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(handed_back["closed"], true);
     assert_eq!(
         call(&db, "acct:admin", "start_work", retry_args)
             .await
@@ -680,6 +775,7 @@ async fn kernel_v2_instruction_bindings_order_visibility_provenance_and_faults()
         .await
         .unwrap();
     assert_eq!(partial["instructions"]["status"], "partial");
+    assert_eq!(partial["bootstrap_readiness"]["status"], "partial");
     assert_eq!(
         partial["instructions"]["diagnostics"]
             .as_array()
@@ -873,4 +969,216 @@ async fn kernel_v2_instruction_bindings_order_visibility_provenance_and_faults()
         storage_error.to_string().contains("no such table"),
         "{storage_error}"
     );
+}
+
+/// 960f47f item E (slice 1): the run and principal resolution every keyed
+/// call performs before its handler must not need a writer slot. On hosted the
+/// write pool has five connections; when writes hold them, every keyed call
+/// used to queue here, and `open_run_as` took the serialised writer just to
+/// read an existing run. Bootstrap's root preview and ordinary record reads
+/// still use write-pool snapshots (`sql::in_snapshot`, `read_record_as`); that
+/// is slice 2.
+#[tokio::test]
+async fn kernel_v2_keyed_call_run_resolution_needs_no_writer_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("writer-free.db");
+    let (db, admin) =
+        kernel::create_v2_database(path.to_str().unwrap(), "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+    kernel::replace_home_policy(&db, &admin, KERNEL_ROOT_ID, &[(&admin, "manage")])
+        .await
+        .unwrap();
+    let boot = call(&db, "acct:admin", "bootstrap", json!({}))
+        .await
+        .unwrap();
+    let key = boot["run"]["run_key"].as_str().unwrap().to_owned();
+    call(
+        &db,
+        "acct:admin",
+        "set_intent",
+        json!({"intent":"Hold every writer","run_key":key}),
+    )
+    .await
+    .unwrap();
+    let caller = Caller::authenticated("acct:admin").with_run_context(Some(key.clone()), None);
+
+    let writers = db.write_pool().options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..writers {
+        held.push(db.write_pool().acquire().await.unwrap());
+    }
+    let within = std::time::Duration::from_secs(10);
+    let principal = tokio::time::timeout(within, crate::mcp::kernel_v2::principal(&db, &caller))
+        .await
+        .expect("principal resolution waited for a writer slot")
+        .unwrap();
+    assert_eq!(principal, admin);
+    let existing = tokio::time::timeout(
+        within,
+        crate::mcp::kernel_v2::coordination::existing_run(&db, &admin, &key),
+    )
+    .await
+    .expect("existing run lookup waited for a writer slot")
+    .unwrap()
+    .expect("run exists");
+    let intent = tokio::time::timeout(within, kernel::run_ledger::run_intent_as(&db, &existing))
+        .await
+        .expect("reading run intent waited for a writer slot")
+        .unwrap();
+    assert_eq!(intent.as_deref(), Some("Hold every writer"));
+    let opened = tokio::time::timeout(within, kernel::open_run_as(&db, &admin, &key))
+        .await
+        .expect("open_run_as took the writer for an existing run")
+        .unwrap();
+    assert_eq!(opened.run_id(), existing.run_id());
+    let witness = tokio::time::timeout(within, kernel::run_witness_as(&db, &opened))
+        .await
+        .expect("run witness waited for a writer slot")
+        .unwrap();
+    assert!(!witness.closed);
+    drop(held);
+    // Another principal still cannot open this run, and creation still works.
+    let other = kernel::create_principal(&db, "account", "Other", "acct:other", &admin)
+        .await
+        .unwrap();
+    let refused = kernel::open_run_as(&db, &other, &key).await.unwrap_err();
+    assert!(
+        refused.to_string().contains(kernel::HIDDEN_OR_MISSING),
+        "{refused}"
+    );
+    let fresh = call(&db, "acct:admin", "bootstrap", json!({}))
+        .await
+        .unwrap();
+    assert_ne!(fresh["run"]["run_key"], key);
+    let resumed = call(&db, "acct:admin", "bootstrap", json!({"run_key":key}))
+        .await
+        .unwrap();
+    assert_eq!(resumed["run"]["run_key"], key);
+    assert_eq!(resumed["run"]["status"], "open");
+}
+
+/// 960f47f item E (slice 2): with every writer held, an agent can still
+/// resume its run with bootstrap and read records. Ordinary reads used to open
+/// their snapshot on the write pool (`sql::in_snapshot`, `read_record_as`).
+#[tokio::test]
+async fn kernel_v2_bootstrap_and_record_reads_need_no_writer_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reads-writer-free.db");
+    let (db, admin) =
+        kernel::create_v2_database(path.to_str().unwrap(), "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+    kernel::replace_home_policy(&db, &admin, KERNEL_ROOT_ID, &[(&admin, "manage")])
+        .await
+        .unwrap();
+    adopt(&db, &admin, &crate::v2_standard::v1_compat::package()).await;
+    let target = kernel::create_record_as(&db, &admin, KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    let boot = call(&db, "acct:admin", "bootstrap", json!({}))
+        .await
+        .unwrap();
+    let key = boot["run"]["run_key"].as_str().unwrap().to_owned();
+
+    let writers = db.write_pool().options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..writers {
+        held.push(db.write_pool().acquire().await.unwrap());
+    }
+    let within = std::time::Duration::from_secs(10);
+    let resumed = tokio::time::timeout(
+        within,
+        call(&db, "acct:admin", "bootstrap", json!({"run_key":key})),
+    )
+    .await
+    .expect("bootstrap with an existing run waited for a writer slot")
+    .unwrap();
+    assert_eq!(resumed["run"]["run_key"], key);
+    assert_eq!(resumed["roots"]["total"], 1, "{resumed}");
+    let read = tokio::time::timeout(
+        within,
+        call(
+            &db,
+            "acct:admin",
+            "get_record",
+            json!({"ids":[target],"run_key":key}),
+        ),
+    )
+    .await
+    .expect("get_record waited for a writer slot")
+    .unwrap();
+    assert_eq!(read["records"][0]["id"], target, "{read}");
+    drop(held);
+}
+
+/// 960f47f item D (run-key option B): a node issues the run key and hosted
+/// creates the run on first use. Pin hosted's half: a never-seen valid key on
+/// `set_intent` creates that run for the caller, and an ordinary keyed read
+/// before that does not need the run to exist.
+#[tokio::test]
+async fn kernel_v2_unseen_node_issued_key_is_created_on_first_set_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node-issued.db");
+    let (db, admin) =
+        kernel::create_v2_database(path.to_str().unwrap(), "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+    kernel::replace_home_policy(&db, &admin, KERNEL_ROOT_ID, &[(&admin, "manage")])
+        .await
+        .unwrap();
+    adopt(&db, &admin, &crate::v2_standard::v1_compat::package()).await;
+    let target = kernel::create_record_as(&db, &admin, KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    let key = crate::runkey::mint_fresh_agent_run(&Default::default()).unwrap();
+    assert!(
+        crate::mcp::kernel_v2::coordination::existing_run(&db, &admin, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let read = call(
+        &db,
+        "acct:admin",
+        "get_record",
+        json!({"ids":[target],"run_key":key}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["records"][0]["id"], target, "{read}");
+    call(
+        &db,
+        "acct:admin",
+        "set_intent",
+        json!({"intent":"Started from a node-issued key","run_key":key}),
+    )
+    .await
+    .unwrap();
+    let run = crate::mcp::kernel_v2::coordination::existing_run(&db, &admin, &key)
+        .await
+        .unwrap()
+        .expect("first set_intent created the run");
+    let intent = kernel::run_ledger::run_intent_as(&db, &run).await.unwrap();
+    assert_eq!(intent.as_deref(), Some("Started from a node-issued key"));
+    // Another principal cannot take the key over.
+    let other = kernel::create_principal(&db, "account", "Other", "acct:other", &admin)
+        .await
+        .unwrap();
+    kernel::replace_home_policy(
+        &db,
+        &admin,
+        KERNEL_ROOT_ID,
+        &[(&admin, "manage"), (&other, "edit")],
+    )
+    .await
+    .unwrap();
+    assert!(call(
+        &db,
+        "acct:other",
+        "set_intent",
+        json!({"intent":"hijack","run_key":key}),
+    )
+    .await
+    .is_err());
 }

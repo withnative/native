@@ -53,6 +53,24 @@ pub struct StandbySessionConfig {
     pub refresh_available: bool,
 }
 
+/// Quiet retries of the post-restart recheck after an infrastructure error.
+const STARTUP_RECHECK_RETRIES: u32 = 2;
+const STARTUP_RECHECK_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Handoff hint retry backoff: first retry after 2 s, doubling to a 5 min
+/// cap. Same family as the retention backoff, shorter because a handoff is
+/// the serving path. Attempts per unchanged hint are unbounded but
+/// backoff-gated, so a bad orphan backs off instead of spinning (or giving
+/// up after three tries) while another successor is tried meanwhile.
+const HANDOFF_BACKOFF_FIRST: Duration = Duration::from_secs(2);
+const HANDOFF_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
+fn handoff_retry_delay(failures: u32) -> Duration {
+    HANDOFF_BACKOFF_FIRST
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(10))
+        .min(HANDOFF_BACKOFF_CAP)
+}
+
 #[derive(Default)]
 struct Retirements {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -233,10 +251,19 @@ impl StandbySupervisor {
                             .retirements
                             .own_runtime(runtime.handle().clone());
                         runtime.block_on(async {
-                            if recover_startup && worker_session.recover_startup().await.is_err() {
+                            if recover_startup
+                                && crate::async_diagnostics::track(
+                                    "node.startup_verification",
+                                    worker_session.recover_startup(),
+                                )
+                                .await
+                                .is_err()
+                            {
                                 tracing::warn!(target: "native_ce::standby::verification",
                                     "standby startup recovery failed; retaining status-only");
                             }
+                            #[cfg(feature = "v2-kernel-probe")]
+                            worker_session.finish_working_startup();
                             if let Some(startup_ready) = startup_ready {
                                 let _ = startup_ready.send(());
                             }
@@ -299,7 +326,267 @@ pub struct StandbyDispatcher {
     session: Arc<StandbyStdioSession>,
 }
 
+/// Pins the catalogue and dispatcher to one authorised serving generation.
+#[cfg(feature = "mcp-executor-prototype")]
+pub(crate) struct StandbyLocalDispatcher {
+    session: Arc<StandbyStdioSession>,
+    served: Arc<ServedGeneration>,
+}
+
+#[cfg(feature = "mcp-executor-prototype")]
+impl StandbyLocalDispatcher {
+    pub(crate) fn operation_rows(&self) -> &[Value] {
+        &self.served.operation_rows
+    }
+
+    /// The response context of exactly the generation this dispatcher pins,
+    /// for callers whose result does not carry `standby_context` (bootstrap).
+    pub(crate) fn serving_context(&self) -> crate::standby::StandbyResponseContext {
+        self.served.status.response_context()
+    }
+
+    pub(crate) fn act_lineage(&self) -> Option<String> {
+        self.served.status.act_lineage().map(str::to_owned)
+    }
+
+    pub(crate) async fn handle_message(&self, message: Value) -> Option<Value> {
+        self.handle_message_with_outage(message, false).await
+    }
+
+    pub(crate) async fn handle_outage_bootstrap(&self, message: Value) -> Option<Value> {
+        self.handle_message_with_outage(message, true).await
+    }
+
+    async fn handle_message_with_outage(&self, message: Value, outage: bool) -> Option<Value> {
+        self.session
+            .handle_captured_message(
+                SessionSnapshot::Serving(self.served.clone()),
+                message,
+                outage,
+            )
+            .await
+    }
+}
+
+/// Lease the serving pool and reader lock while a disposable node fork copies it.
+pub(crate) struct PendingForkBase {
+    pub db: crate::Db,
+    pub account: String,
+    pub context: crate::standby::StandbyResponseContext,
+    _lease: Arc<ServedGeneration>,
+}
+
+/// Opaque v2 serving-generation lease for installed working enrollment.
+/// Only the verified serving session can issue this; no message arguments can
+/// manufacture its native caller, origin, lineage or sequence coordinates.
+#[cfg(feature = "v2-kernel-probe")]
+#[derive(Clone)]
+pub(crate) struct WorkingBaseLease {
+    served: Arc<ServedGeneration>,
+    store: GenerationStore,
+    binding: crate::fork::working_v2::WorkingBinding,
+}
+
+/// The real serving owner verified this source cut on its retained read
+/// transaction. No tool arguments or on-disk working metadata can mint it.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) struct PinnedWorkingSource {
+    lease: WorkingBaseLease,
+    snapshot: sqlx::Transaction<'static, sqlx::Sqlite>,
+    checkpoint: std::fs::File,
+    native: crate::standby::kernel_v2::KernelGeneration,
+    origin: String,
+    caller: Caller,
+    principal: String,
+}
+#[cfg(feature = "v2-kernel-probe")]
+impl PinnedWorkingSource {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        WorkingBaseLease,
+        sqlx::Transaction<'static, sqlx::Sqlite>,
+        std::fs::File,
+        crate::standby::kernel_v2::KernelGeneration,
+        String,
+        Caller,
+        String,
+    ) {
+        (
+            self.lease,
+            self.snapshot,
+            self.checkpoint,
+            self.native,
+            self.origin,
+            self.caller,
+            self.principal,
+        )
+    }
+}
+#[cfg(feature = "v2-kernel-probe")]
+impl WorkingBaseLease {
+    pub(crate) fn context(&self) -> crate::standby::StandbyResponseContext {
+        self.served.status.response_context()
+    }
+    pub(crate) fn db(&self) -> crate::Db {
+        self.served.resources.db.clone()
+    }
+    pub(crate) fn caller(&self) -> Caller {
+        standby_owner_caller(self.served.account.clone())
+    }
+    pub(crate) fn generation_id(&self) -> &str {
+        &self.served.resources.active.generation.id
+    }
+    pub(crate) fn matches_binding(
+        &self,
+        binding: &crate::fork::working_v2::WorkingBinding,
+    ) -> bool {
+        &self.binding == binding
+    }
+    pub(crate) async fn pin_current_source(&self) -> Result<PinnedWorkingSource> {
+        let generation = &self.served.resources.active.generation;
+        // First-transition setup must finish before sampling its sidecar.
+        // The same guard follows the snapshot to its existing rollback point.
+        let checkpoint = self.store.working_source_checkpoint(&generation.id).await?;
+        // Sidecar first, database snapshot second. The existing verifier treats
+        // this independent head as a lower bound; never use current as expected.
+        let head = self.store.generation_head(&generation.id)?;
+        let db = self.db();
+        if db.open_mode() != crate::db::DatabaseOpenMode::StandbyReadOnly {
+            return Err(Error::engine("working source is not physically read-only"));
+        }
+        let mut snapshot = db.pool().begin().await?;
+        sqlx::query("SELECT 1 FROM main.sqlite_schema LIMIT 1")
+            .fetch_optional(&mut *snapshot)
+            .await?;
+        let native = crate::standby::generation_store::kernel_in_place::verify_working_source_on(
+            &mut snapshot,
+            generation,
+            head.as_ref(),
+        )
+        .await?;
+        let origin = crate::standby::kernel_v2::origin(&mut snapshot, &native).await?;
+        let caller = self.caller();
+        let principal = crate::mcp::kernel_v2::principal_on(&mut snapshot, &caller).await?;
+        Ok(PinnedWorkingSource {
+            lease: self.clone(),
+            snapshot,
+            checkpoint,
+            native,
+            origin,
+            caller,
+            principal,
+        })
+    }
+}
+
 impl StandbyDispatcher {
+    #[cfg(feature = "mcp-executor-prototype")]
+    pub(crate) fn local_dispatcher(&self) -> Option<StandbyLocalDispatcher> {
+        match self.session.capture() {
+            SessionSnapshot::Serving(served) => Some(StandbyLocalDispatcher {
+                session: self.session.clone(),
+                served,
+            }),
+            SessionSnapshot::StatusOnly(_) => None,
+        }
+    }
+
+    pub(crate) fn pending_fork_base(&self) -> Option<PendingForkBase> {
+        match self.session.capture() {
+            SessionSnapshot::Serving(served)
+                if served
+                    .resources
+                    .active
+                    .generation
+                    .manifest
+                    .kernel_v2
+                    .is_none() =>
+            {
+                Some(PendingForkBase {
+                    db: served.resources.db.clone(),
+                    account: served.account.clone(),
+                    context: served.status.response_context(),
+                    _lease: served,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn working_base(
+        &self,
+        binding: &crate::fork::working_v2::WorkingBinding,
+    ) -> Option<WorkingBaseLease> {
+        Self::working_base_from_snapshot(
+            self.session.capture(),
+            binding,
+            &self.session.config.store,
+        )
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    fn working_base_from_snapshot(
+        snapshot: SessionSnapshot,
+        binding: &crate::fork::working_v2::WorkingBinding,
+        store: &GenerationStore,
+    ) -> Option<WorkingBaseLease> {
+        let SessionSnapshot::Serving(served) = snapshot else {
+            return None;
+        };
+        let manifest = &served.resources.active.generation.manifest;
+        let kernel = manifest.kernel_v2.as_ref()?;
+        if served.account != binding.account_id
+            || manifest.hosted_route_database_id != binding.database_id
+            || manifest.origin_database_id != binding.origin_database_id
+            || binding.history_lineage
+                != format!(
+                    "v2:{}:{}",
+                    binding.origin_database_id, kernel.genesis_event_id
+                )
+        {
+            return None;
+        }
+        Some(WorkingBaseLease {
+            served,
+            store: store.clone(),
+            binding: binding.clone(),
+        })
+    }
+
+    /// Account/catalogue witnesses do not imply an authorised serving lease.
+    /// Await only initial worker publication; this request never verifies or
+    /// publishes a generation and never falls back to an accepted-only view.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) async fn initial_working_base(
+        &self,
+        binding: &crate::fork::working_v2::WorkingBinding,
+        deadline: std::time::Instant,
+    ) -> Result<WorkingBaseLease> {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            loop {
+                // Register BEFORE sampling. A publication between capture and
+                // await must not be lost, including multiple waiting clients.
+                let changed = self.session.working_ready.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let snapshot = self.session.capture();
+                if matches!(&snapshot, SessionSnapshot::Serving(_)) {
+                    return Self::working_base_from_snapshot(snapshot, binding, &self.session.config.store)
+                        .ok_or_else(|| Error::engine("verified serving generation does not match working binding"));
+                }
+                if self.session.working_startup_done.load(std::sync::atomic::Ordering::Acquire) {
+                    // Completion can race the preceding StatusOnly sample.
+                    // Resample through the SAME strict issuer before refusing.
+                    return self.working_base(binding).ok_or_else(|| Error::engine(
+                        "initial standby recovery completed without a verified working serving lease"));
+                }
+                changed.await;
+            }
+        }).await.map_err(|_| Error::engine("request budget expired awaiting verified initial working serving lease"))?
+    }
+
     pub(crate) fn serving_kernel_v2(&self) -> bool {
         match self.session.capture() {
             SessionSnapshot::Serving(served) => served
@@ -310,6 +597,22 @@ impl StandbyDispatcher {
                 .kernel_v2
                 .is_some(),
             SessionSnapshot::StatusOnly(_) => false,
+        }
+    }
+    /// The serving generation's response context as of now (act, freshness,
+    /// degradation), or `None` when no copy is serving. Read before a local
+    /// query: the copy only advances, so this is a lower bound for it.
+    /// The generation store this session serves from (tests hold a recheck
+    /// open on it).
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn session_store(&self) -> GenerationStore {
+        self.session.config.store.clone()
+    }
+
+    pub(crate) fn serving_context(&self) -> Option<crate::standby::StandbyResponseContext> {
+        match self.session.capture() {
+            SessionSnapshot::Serving(served) => Some(served.status.response_context()),
+            SessionSnapshot::StatusOnly(_) => None,
         }
     }
     pub async fn handle_message(&self, message: Value) -> Option<Value> {
@@ -374,6 +677,8 @@ struct ServedGeneration {
     account: String,
     dispatcher: ServedDispatcher,
     status: StandbyStatusProvider,
+    #[cfg(feature = "mcp-executor-prototype")]
+    operation_rows: Arc<Vec<Value>>,
     /// Shared `.reader.lock`, held while this generation is served so that
     /// deltas can tell the build marker belongs to a live reader.
     reader_lock: Option<std::fs::File>,
@@ -390,6 +695,43 @@ impl ServedGeneration {
                 resume.notified().await;
             }
         }
+        // A kernel-v2 copy may be advanced in place while an operation reads
+        // it through several pool connections. One operation, one state.
+        #[cfg(feature = "v2-kernel-probe")]
+        if self
+            .resources
+            .active
+            .generation
+            .manifest
+            .kernel_v2
+            .is_some()
+            && protocol::method_and_name(&message).0 == Some("tools/call")
+        {
+            return match crate::standby::stable_read::stable(&self.resources.db, || {
+                self.dispatch_once(message.clone(), outage_bootstrap)
+            })
+            .await
+            {
+                Ok(reply) => reply,
+                // Moved on every attempt, or a stamp could not be read: the
+                // result cannot be vouched for as one state. Retryable.
+                Err(error) => {
+                    if let crate::standby::stable_read::StableReadError::Unstamped(cause) = &error {
+                        tracing::warn!(target: "native_ce::standby::read", error = %cause, "standby copy version stamp unreadable");
+                    }
+                    message.get("id").cloned().map(|id| {
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code": -32603,
+                        "message": "the standby copy could not be read as one consistent state; retry"
+                    }})
+                })
+                }
+            };
+        }
+        self.dispatch_once(message, outage_bootstrap).await
+    }
+
+    async fn dispatch_once(&self, message: Value, outage_bootstrap: bool) -> Option<Value> {
         let outage_bootstrap = outage_bootstrap
             && protocol::method_and_name(&message) == (Some("tools/call"), Some("bootstrap"));
         match &self.dispatcher {
@@ -458,6 +800,10 @@ pub struct StandbyStdioSession {
     #[cfg(all(test, unix))]
     vault_tick_interval: Duration,
     state: Mutex<SessionSnapshot>,
+    #[cfg(feature = "v2-kernel-probe")]
+    working_ready: tokio::sync::Notify,
+    #[cfg(feature = "v2-kernel-probe")]
+    working_startup_done: std::sync::atomic::AtomicBool,
     retirements: Arc<Retirements>,
     catalogue: Vec<Value>,
     #[cfg(feature = "mcp-executor-prototype")]
@@ -624,6 +970,29 @@ impl StandbyStdioSession {
     /// interrupted promotion and selects an accepted generation before open
     /// and authorised-read readiness. No request can see an unchecked reader.
     pub async fn recover_startup(&self) -> Result<()> {
+        // Continuity over freshness (a10e004): the generation this node was
+        // already serving is served again as soon as the cheap boundary checks
+        // pass (identity, route, consumer compatibility, and the account
+        // binding that publication enforces). The heavy integrity phases then
+        // run behind it. Refresh readiness is signalled only after this
+        // returns, and refresh admission needs a completed verification, so
+        // no delta can land on a generation still being re-checked.
+        if let Ok(Some(active)) = self
+            .config
+            .store
+            .activate_for_startup_fast(&self.config.observed)
+            .await
+        {
+            let recheck = self.config.store.begin_startup_recheck();
+            let early_id = active.generation.id.clone();
+            if self.install_startup_early(active).await.is_ok() {
+                return self.finish_startup_recheck(recheck, &early_id).await;
+            }
+            drop(recheck);
+            // The early install was refused (another account's data, an
+            // unreadable copy): nothing was served. The full path below gives
+            // the authoritative verdict.
+        }
         match self
             .config
             .store
@@ -642,6 +1011,83 @@ impl StandbyStdioSession {
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// Run the heavy integrity phases behind an already-serving accepted
+    /// generation. Success only clears the disclosure; a verdict against the
+    /// generation stops serving it at that moment and follows the same
+    /// failure path as a cold start.
+    async fn finish_startup_recheck(
+        &self,
+        recheck: crate::standby::generation_store::StartupRecheckGuard,
+        early_id: &str,
+    ) -> Result<()> {
+        // An infrastructure error (a lock or directory read failing) is not a
+        // verdict on the copy: retry quietly a few times before giving up.
+        let mut retries = 0u32;
+        let outcome = loop {
+            let result = self
+                .config
+                .store
+                .activate_for_startup_watched(&self.config.observed, &|| {
+                    self.publish_startup_status(StandbyStatusOnly {
+                        reason: "no_usable_generation".into(),
+                        candidate_count: 0,
+                        unusable_candidate_count: 0,
+                    })
+                })
+                .await;
+            if result.is_err()
+                && retries < STARTUP_RECHECK_RETRIES
+                && crate::standby::generation_store::check_verification_cancellation().is_ok()
+            {
+                retries += 1;
+                tokio::time::sleep(STARTUP_RECHECK_RETRY_DELAY * retries).await;
+                continue;
+            }
+            break result;
+        };
+        drop(recheck);
+        match outcome {
+            Ok(StandbyStartupOutcome::Serving(full))
+                if full.startup_reason.is_none()
+                    && self.serving_generation_id() == Some(early_id.to_string())
+                    && full.generation.id == early_id =>
+            {
+                // The same copy passed: it is already serving, so only the
+                // disclosure changes. Retention runs now that a verdict exists.
+                if !full.retention_warnings.is_empty() {
+                    tracing::warn!(target: "native_ce::standby::verification",
+                        "standby retention warnings present");
+                }
+                drop(full);
+                self.config
+                    .store
+                    .schedule_maintenance(&self.config.observed);
+                Ok(())
+            }
+            Ok(other) => {
+                // A fallback successor, or status-only: the existing outcome
+                // path publishes whichever applies.
+                self.install_startup_outcome(other).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.publish_startup_status(StandbyStatusOnly {
+                    reason: "startup_recovery_failed".into(),
+                    candidate_count: 0,
+                    unusable_candidate_count: 0,
+                });
+                Err(error)
+            }
+        }
+    }
+
+    fn serving_generation_id(&self) -> Option<String> {
+        match self.capture() {
+            SessionSnapshot::Serving(served) => Some(served.resources.active.generation.id.clone()),
+            SessionSnapshot::StatusOnly(_) => None,
         }
     }
 
@@ -688,12 +1134,23 @@ impl StandbyStdioSession {
         .with_connected_handoff();
         *self.state.lock().expect("standby state lock") =
             SessionSnapshot::StatusOnly(Arc::new(StatusOnlyStdioServer::with_provider(provider)));
+        #[cfg(feature = "v2-kernel-probe")]
+        self.working_ready.notify_waiters();
     }
 
     #[cfg(feature = "mcp-executor-prototype")]
     pub(crate) fn operation_rows(&self, provider: StandbyStatusProvider) -> Result<Value> {
+        self.operation_rows_for_engine(provider, super::registry::EngineKind::Sqlite)
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    pub(crate) fn operation_rows_for_engine(
+        &self,
+        provider: StandbyStatusProvider,
+        engine_kind: super::registry::EngineKind,
+    ) -> Result<Value> {
         let registry = Self::registry(&self.config, provider)?;
-        super::executor_prototype::standby_operation_rows(&registry)
+        super::executor_prototype::standby_operation_rows(&registry, engine_kind)
     }
     pub fn new(mut config: StandbySessionConfig, provider: StandbyStatusProvider) -> Result<Self> {
         // The standby read-only projection is unchanged by the lean surface:
@@ -760,6 +1217,10 @@ impl StandbyStdioSession {
             state: Mutex::new(SessionSnapshot::StatusOnly(Arc::new(
                 StatusOnlyStdioServer::with_provider(provider.with_connected_handoff()),
             ))),
+            #[cfg(feature = "v2-kernel-probe")]
+            working_ready: tokio::sync::Notify::new(),
+            #[cfg(feature = "v2-kernel-probe")]
+            working_startup_done: std::sync::atomic::AtomicBool::new(false),
             retirements: Arc::new(Retirements::default()),
             catalogue,
             #[cfg(feature = "mcp-executor-prototype")]
@@ -792,6 +1253,21 @@ impl StandbyStdioSession {
         super::register_standby_status_tool(&mut registry, provider)?;
         registry.validate_profile_budgets()?;
         Ok(Arc::new(registry))
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    fn finish_working_startup(&self) {
+        self.working_startup_done
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.working_ready.notify_waiters();
+    }
+
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn working_readiness_hook_for_test(
+        &self,
+        hook: impl Fn() -> Result<Option<Arc<tokio::sync::Notify>>> + Send + Sync + 'static,
+    ) {
+        *self.warmup_hook.lock().unwrap() = Some(Arc::new(hook));
     }
 
     fn capture(&self) -> SessionSnapshot {
@@ -895,6 +1371,16 @@ impl StandbyStdioSession {
         )
         .with_connected_handoff();
         let registry = Self::registry(&self.config, provider.clone())?;
+        #[cfg(feature = "mcp-executor-prototype")]
+        let operation_rows = Arc::new(
+            super::executor_prototype::standby_operation_rows(
+                &registry,
+                resources.engine().kind(),
+            )?
+            .as_array()
+            .cloned()
+            .ok_or_else(|| Error::engine("invalid local operation catalogue"))?,
+        );
         let caller = standby_owner_caller(account.clone());
         let dispatcher = match self.config.surface {
             McpSurfaceMode::Legacy => ServedDispatcher::Legacy { registry, caller },
@@ -927,6 +1413,8 @@ impl StandbyStdioSession {
             account,
             dispatcher,
             status: provider,
+            #[cfg(feature = "mcp-executor-prototype")]
+            operation_rows,
             reader_lock: None,
             #[cfg(test)]
             dispatch_pause: self.dispatch_pause.lock().unwrap().clone(),
@@ -986,7 +1474,20 @@ impl StandbyStdioSession {
         self.publish(prepared)
     }
 
-    fn publish(&self, mut prepared: ServedGeneration) -> Result<()> {
+    /// Install the generation chosen by the cheap restart checks. Retention
+    /// is not scheduled: it waits for the full verification's verdict.
+    async fn install_startup_early(&self, active: ActivatedGeneration) -> Result<()> {
+        let prepared = self
+            .prepare(active, self.config.selected_account.as_deref())
+            .await?;
+        self.publish_with(prepared, false)
+    }
+
+    fn publish(&self, prepared: ServedGeneration) -> Result<()> {
+        self.publish_with(prepared, true)
+    }
+
+    fn publish_with(&self, mut prepared: ServedGeneration, schedule_retention: bool) -> Result<()> {
         // Deltas are refused until this build is serving the generation: an
         // older build would read the file as immutable while deltas rewrite
         // it. The lock is taken before the swap and the marker written after
@@ -1012,9 +1513,13 @@ impl StandbyStdioSession {
         // Dropping outside the request lock may enqueue pool retirement, but
         // never closes the shared pool of an in-flight captured generation.
         drop(old);
-        self.config
-            .store
-            .schedule_maintenance(&self.config.observed);
+        #[cfg(feature = "v2-kernel-probe")]
+        self.working_ready.notify_waiters();
+        if schedule_retention {
+            self.config
+                .store
+                .schedule_maintenance(&self.config.observed);
+        }
         Ok(())
     }
 
@@ -1027,7 +1532,16 @@ impl StandbyStdioSession {
         message: Value,
         outage_bootstrap: bool,
     ) -> Option<Value> {
-        let snapshot = self.capture();
+        self.handle_captured_message(self.capture(), message, outage_bootstrap)
+            .await
+    }
+
+    async fn handle_captured_message(
+        &self,
+        snapshot: SessionSnapshot,
+        message: Value,
+        outage_bootstrap: bool,
+    ) -> Option<Value> {
         let listing = message["method"] == "tools/list";
         let orientation = matches!(
             message["method"].as_str(),
@@ -1094,6 +1608,9 @@ impl StandbyStdioSession {
         >::new();
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Heavy checks a cheap handoff deferred, running off this task so the
+        // next generation is followed without waiting for them.
+        let mut deferred_runs: Vec<crate::standby::DeferredHandoffRun> = Vec::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
@@ -1102,6 +1619,7 @@ impl StandbyStdioSession {
             if crate::standby::generation_store::check_verification_cancellation().is_err() {
                 return;
             }
+            self.settle_deferred_handoff_checks(&mut deferred_runs);
             let snapshot = self.capture();
             let serving = match &snapshot {
                 SessionSnapshot::Serving(served) => Some(served),
@@ -1118,44 +1636,85 @@ impl StandbyStdioSession {
                     served.resources.active.generation.id != hint.generation_id()
                 }) && retries
                     .get(hint.generation_id())
-                    .is_none_or(|(_, attempts, retry_at)| *attempts < 3 && now >= *retry_at)
+                    .is_none_or(|(_, _, retry_at)| now >= *retry_at)
             }) {
                 Some(hint) => hint,
                 None => continue,
             };
-            // Three attempts per unchanged hint, coalesced independently. A bad
-            // orphan must not hide another full-verifiable durable successor.
+            // Growing backoff per unchanged hint, coalesced independently. A
+            // bad orphan backs off instead of hiding another full-verifiable
+            // durable successor, which is tried on its own backoff meanwhile.
             let retry =
                 retries
                     .entry(hint.generation_id().to_owned())
                     .or_insert((hint.clone(), 0, now));
             retry.1 += 1;
-            let attempt = retry.1;
+            let failures = retry.1;
             let predecessor = serving.map(|served| served.resources.active.as_ref());
             let account = serving
                 .map(|served| served.account.as_str())
                 .or(self.config.selected_account.as_deref());
             let result = async {
-                let active = self
+                let (active, deferred) = self
                     .config
                     .store
-                    .activate_accepted(&hint, &self.config.observed, predecessor)
+                    .activate_accepted_fast(&hint, &self.config.observed, predecessor)
                     .await?;
                 let prepared = self.prepare(active, account).await?;
                 crate::standby::generation_store::check_verification_cancellation()?;
                 self.config
                     .store
                     .confirm_handoff(&prepared.resources.active)?;
-                self.publish(prepared)
+                self.publish(prepared)?;
+                Ok::<_, Error>(deferred)
             }
             .await;
             let ready = result.is_ok();
-            tracing::info!(target: "native_ce::standby::verification", ready, attempt,
+            if let Ok(deferred) = result {
+                // Whatever was running for the generation just replaced no
+                // longer decides what is served.
+                for run in &deferred_runs {
+                    run.supersede();
+                }
+                if let Some(deferred) = deferred {
+                    deferred_runs.push(deferred.start_background());
+                }
+            }
+            // The logged field stays `attempt`: it is a fixed diagnostic
+            // contract (the tools tests wait for `attempt=1`). The value is
+            // the per-hint attempt count.
+            tracing::info!(target: "native_ce::standby::verification", ready, attempt = failures,
                 "standby connected handoff finished");
-            if let Some(retry) = retries.get_mut(hint.generation_id()) {
-                retry.2 = tokio::time::Instant::now() + Duration::from_secs(1 << attempt);
+            if ready {
+                // A served hint starts fresh if it ever fails again.
+                retries.remove(hint.generation_id());
+            } else if let Some(retry) = retries.get_mut(hint.generation_id()) {
+                retry.2 = tokio::time::Instant::now() + handoff_retry_delay(failures);
             }
         }
+    }
+
+    /// Act on finished deferred handoff checks. A definite verdict against
+    /// the generation being served stops serving it at once, exactly as the
+    /// restart recheck does; anything else changes nothing.
+    fn settle_deferred_handoff_checks(&self, runs: &mut Vec<crate::standby::DeferredHandoffRun>) {
+        use crate::standby::DeferredHandoffVerdict;
+        runs.retain_mut(|run| match run.try_verdict() {
+            None => true,
+            Some(DeferredHandoffVerdict::Failed) => {
+                if self.serving_generation_id().as_deref() == Some(run.generation_id()) {
+                    tracing::warn!(target: "native_ce::standby::verification",
+                        "standby deferred handoff verification failed; no longer serving it");
+                    self.publish_startup_status(StandbyStatusOnly {
+                        reason: "no_usable_generation".into(),
+                        candidate_count: 0,
+                        unusable_candidate_count: 0,
+                    });
+                }
+                false
+            }
+            Some(_) => false,
+        });
     }
 
     pub async fn serve_stdio(self: &Arc<Self>) -> Result<()> {
@@ -1351,7 +1910,11 @@ mod tests {
                     if let Some(found) = find(&path, needle) {
                         return Some(found);
                     }
-                } else if std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle)) {
+                // Observe published Markdown, not retained base text in the
+                // private JSON ledger (which also contains the note body).
+                } else if path.extension().is_some_and(|extension| extension == "md")
+                    && std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+                {
                     return Some(path);
                 }
             }
@@ -1409,6 +1972,71 @@ mod tests {
         assert!(served_db.pool().is_closed());
         // Shutdown released the publisher lock as well as the engine bundle.
         drop(crate::markdown_vault::Publisher::open(&vault).unwrap());
+    }
+
+    async fn until(what: &str, check: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    #[tokio::test]
+    async fn fresh_handoff_serves_before_the_heavy_checks_and_a_failing_one_stops_serving() {
+        let (dir, db, session) = fixture().await;
+        accept(&session, &db, "handoff-first").await;
+        session
+            .install_startup(activate(&session).await)
+            .await
+            .unwrap();
+        let supervisor = StandbySupervisor::start(session.clone()).unwrap();
+        // The next full verification pauses, so the heavy phases of the
+        // handoff are demonstrably still outstanding while it serves.
+        let (entered, resume) = session.config.store.pause_next_verification();
+        crate::store::update_record(&db, RECORD, json!({"name":"second"}))
+            .await
+            .unwrap();
+        let second = accept(&session, &db, "handoff-second").await;
+        until("the cheap handoff to publish", || {
+            session.serving_generation_id().as_deref() == Some(second.as_str())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(60), entered.notified())
+            .await
+            .expect("the heavy verification starts behind the serving generation");
+        let reply = session.handle_message(read(1)).await.unwrap();
+        assert_ne!(
+            reply["result"]["isError"], true,
+            "reads flow meanwhile: {reply}"
+        );
+
+        // Damage the copy while its deferred verification is held.
+        let snapshot = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("replica/accepted/generations")
+            .join(&second)
+            .join("snapshot.db");
+        let mut bytes = std::fs::read(&snapshot).unwrap();
+        for byte in &mut bytes[4096..8192] {
+            *byte ^= 0xff;
+        }
+        let mut permissions = std::fs::metadata(&snapshot).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+        std::fs::set_permissions(&snapshot, permissions).unwrap();
+        std::fs::write(&snapshot, bytes).unwrap();
+        resume.notify_one();
+
+        until("a failing background check to stop serving", || {
+            session.serving_generation_id().is_none()
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     async fn fixture() -> (tempfile::TempDir, crate::Db, Arc<StandbyStdioSession>) {
@@ -1515,10 +2143,7 @@ mod tests {
     }
 
     async fn install_app(db: &crate::Db, account: &str) -> String {
-        use crate::control::{
-            append_control_event, AlphaTabAdoptPayload, AlphaTabStatePayload, ControlEventPayload,
-            NewControlEvent,
-        };
+        use crate::control::AlphaTabStatePayload;
         let declaration = json!({"contract":"native.app.v2","needs":[],"effects":[]});
         let pin = AlphaTabStatePayload {
             account_id: account.into(),
@@ -1535,6 +2160,17 @@ mod tests {
             adoption: "caller_asserted".into(),
             request: None,
             previous_event_id: None,
+        };
+        install_app_pin(db, account, pin).await
+    }
+
+    async fn install_app_pin(
+        db: &crate::Db,
+        account: &str,
+        pin: crate::control::AlphaTabStatePayload,
+    ) -> String {
+        use crate::control::{
+            append_control_event, AlphaTabAdoptPayload, ControlEventPayload, NewControlEvent,
         };
         let installed = append_control_event(
             db,
@@ -1582,6 +2218,152 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_app_bundle_is_served_physically_read_only_and_requires_generation() {
+        use crate::mcp::tools::alpha_tabs::{
+            alpha_tab_bundle_digest, alpha_tab_declaration_digest, alpha_tab_digest,
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut surfaces = vec![McpSurfaceMode::Legacy];
+        #[cfg(feature = "mcp-executor-prototype")]
+        surfaces.push(McpSurfaceMode::Executor);
+        for surface in surfaces {
+            let (_dir, db, session) = fixture_for_surface(surface).await;
+            let account = crate::identity::resolve_stdio_account_identity(&db, None)
+                .await
+                .unwrap();
+            let body = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline</title></head><body>Offline app</body></html>"#.replace("Offline app", &format!("Offline app{}", "x".repeat(400_000)));
+            let body = body.as_str();
+            let artifact = "e0000000-0000-4000-8000-000000000001";
+            crate::store::create_record_as(&db, json!({"id":artifact,"type":"Document","kind":"artifact","name":"Offline bundle","body":body,"facets":{"runtime":"native.html.v1"}}), Some(&account)).await.unwrap();
+            crate::store::set_facet(
+                &db,
+                artifact,
+                serde_json::from_value(json!({"key":"runtime","value":"native.html.v1"})).unwrap(),
+            )
+            .await
+            .unwrap();
+            let source: String = sqlx::query_scalar("SELECT id FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1").bind(artifact).fetch_one(db.pool()).await.unwrap();
+            let declaration = json!({"contract":"native.app.v2","needs":[],"effects":[]});
+            let declaration_digest = alpha_tab_declaration_digest(&declaration).unwrap();
+            let event = install_app_pin(
+                &db,
+                &account,
+                crate::control::AlphaTabStatePayload {
+                    account_id: account.clone(),
+                    package: "offline.test".into(),
+                    version: "1".into(),
+                    digest: alpha_tab_digest(
+                        &alpha_tab_bundle_digest(body),
+                        &declaration_digest,
+                        "native.html.v1",
+                    ),
+                    artifact_id: artifact.into(),
+                    consented_source_revision: source,
+                    declaration_digest,
+                    consented_declaration: declaration,
+                    adoption: "caller_asserted".into(),
+                    request: None,
+                    previous_event_id: None,
+                },
+            )
+            .await;
+            let args = json!({"package":"offline.test","expected_install_event_id":event,"parent_origin":"native-ui://app"});
+            let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":if surface == McpSurfaceMode::Legacy { "read_app_bundle" } else { "artifacts_read" },
+                "arguments":if surface == McpSurfaceMode::Legacy { args.clone() } else { json!({"operation":"read_app_bundle","arguments":args,"format":"json"}) }
+            }});
+            let unavailable = session.handle_message(request.clone()).await.unwrap();
+            assert!(
+                unavailable.to_string().contains("STANDBY_STATUS_ONLY"),
+                "{unavailable}"
+            );
+            accept(&session, &db, "bundle").await;
+            session
+                .install_startup(activate(&session).await)
+                .await
+                .unwrap();
+            let served = match session.capture() {
+                SessionSnapshot::Serving(served) => served,
+                _ => panic!("serving"),
+            };
+            let tables_before: Vec<(String, i64)> = {
+                let mut counts = Vec::new();
+                for table in [
+                    "content_events",
+                    "control_events",
+                    "read_log_calls",
+                    "read_log_touches",
+                ] {
+                    let count =
+                        sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}"))
+                            .fetch_one(served.resources.db.pool())
+                            .await
+                            .unwrap();
+                    counts.push((table.to_string(), count));
+                }
+                counts
+            };
+            // Exercise actual newline-framed transport, including the executor
+            // envelope's text + structuredContent duplication and backpressure.
+            let (client, server) = tokio::io::duplex(65536);
+            let (receive, mut send) = tokio::io::split(client);
+            let (reader, writer) = tokio::io::split(server);
+            let live = session.clone();
+            let transport =
+                tokio::spawn(async move { live.serve(BufReader::new(reader), writer).await });
+            send.write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let line = BufReader::new(receive)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                line.len() < 1_500_000,
+                "bounded duplicated envelope: {}",
+                line.len()
+            );
+            eprintln!("bundle max page {surface:?}: {} response bytes", line.len());
+            let response: Value = serde_json::from_str(&line).unwrap();
+            send.shutdown().await.unwrap();
+
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let value = &response["result"]["structuredContent"];
+            assert_eq!(
+                value["source_sha256"],
+                alpha_tab_bundle_digest(body),
+                "{response}"
+            );
+            assert_eq!(value["length"], 524288);
+            assert_eq!(value["next_offset"], 524288);
+            let page = STANDARD.decode(value["content"].as_str().unwrap()).unwrap();
+            assert_eq!(page.len(), 524288);
+            let expected = crate::artifact_html::compose_bundle_delivery(
+                body,
+                "native-ui://app",
+                crate::artifact_html::BODY_LIMIT,
+            )
+            .unwrap();
+            assert_eq!(page, expected.as_bytes()[..524288]);
+            assert!(sqlx::query("CREATE TABLE forbidden_write(x)")
+                .execute(served.resources.db.pool())
+                .await
+                .is_err());
+            for (table, before) in tables_before {
+                let after: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                    .fetch_one(served.resources.db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(before, after, "{table}");
+            }
+            drop(served);
+            transport.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1694,6 +2476,11 @@ mod tests {
                     json!({"action":"list"}),
                     "app_operation_refused",
                 ),
+                (
+                    "read_app_bundle",
+                    json!({"package":"offline.test","expected_install_event_id":install,"parent_origin":"native-ui://app"}),
+                    "app_operation_refused",
+                ),
             ] {
                 let mut request = attributed.clone();
                 if surface == McpSurfaceMode::Legacy {
@@ -1705,7 +2492,7 @@ mod tests {
                     } else {
                         "artifacts_read"
                     });
-                    request["params"]["arguments"] = json!({"operation":if tool == "create_record" { "create_record" } else { "manage_alpha_tabs.list" },"arguments":if tool == "create_record" { args } else { json!({}) }});
+                    request["params"]["arguments"] = json!({"operation":if tool == "manage_alpha_tabs" { "manage_alpha_tabs.list" } else { tool },"arguments":if tool == "manage_alpha_tabs" { json!({}) } else { args }});
                 }
                 let refused = session.handle_message(request).await.unwrap();
                 assert_eq!(refused["result"]["isError"], true, "{refused}");
@@ -2750,6 +3537,259 @@ mod tests {
         fs2::FileExt::try_lock_exclusive(&lease).unwrap();
         fs2::FileExt::unlock(&lease).unwrap();
         session.retirements.drain().await;
+        db.close().await;
+    }
+
+    fn pending_reasons(response: &Value) -> Vec<String> {
+        response["result"]["structuredContent"]["standby_context"]["degraded_reasons"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|reason| reason.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Restart continuity (a10e004): the accepted copy serves reads after
+    /// the cheap boundary checks, while the heavy integrity phases are still
+    /// running, with an honest recheck disclosure carrying the actual age.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_serves_accepted_copy_before_heavy_phases_complete() {
+        let (_dir, db, session) = fixture().await;
+        let id = accept(&session, &db, "first").await;
+        let (entered, resume) = session.config.store.pause_next_verification();
+        let recovering = tokio::spawn({
+            let session = session.clone();
+            async move { session.recover_startup().await }
+        });
+        // The cheap boundary pass serves before the held heavy phases run.
+        let response = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(reply) = session.handle_message(read(1)).await {
+                    if reply["result"]["isError"] == false && generation(&reply) == id {
+                        return reply;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fast startup serves the accepted copy");
+        let reasons = pending_reasons(&response);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "restart_recheck_pending"),
+            "serving copy must disclose its background recheck: {response}"
+        );
+        let context = &response["result"]["structuredContent"]["standby_context"];
+        assert_eq!(context["mode"], "standby");
+        assert!(
+            context["freshness"]["age_seconds"].as_u64().is_some(),
+            "disclosure keeps the actual age: {response}"
+        );
+        // The diagnostic tool names the same neutral reason.
+        let status = session
+            .handle_message(json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+                "params":{"name":"standby_status","arguments":{"format":"json"}}}))
+            .await
+            .unwrap();
+        assert!(
+            status["result"]["structuredContent"]["degraded_reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|r| r == "restart_recheck_pending")),
+            "standby_status discloses the recheck: {status}"
+        );
+        for word in ["unverified", "stale"] {
+            assert!(
+                !response.to_string().contains(word),
+                "user-facing disclosure must stay neutral: {response}"
+            );
+        }
+        // The background pass reaches its heavy phases while the copy is
+        // already serving: the disclosure above is honest.
+        tokio::time::timeout(Duration::from_secs(30), entered.notified())
+            .await
+            .expect("background verification reaches its heavy phases");
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(60), recovering)
+            .await
+            .expect("background verification finishes")
+            .unwrap()
+            .unwrap();
+        // The background pass completed: the same copy serves and the
+        // recheck disclosure clears with nothing else changing.
+        let response = session.handle_message(read(2)).await.unwrap();
+        assert_eq!(generation(&response), id);
+        assert!(
+            !pending_reasons(&response)
+                .iter()
+                .any(|reason| reason == "restart_recheck_pending"),
+            "completed recheck clears its disclosure: {response}"
+        );
+        db.close().await;
+    }
+
+    /// Damage the accepted copy's bytes in a way that still opens as a
+    /// working database: the cheap boundary checks cannot see it, only the
+    /// byte-level integrity phases can.
+    #[cfg(unix)]
+    fn damage_snapshot_bytes(session: &StandbyStdioSession, id: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let snapshot = session
+            .config
+            .runtime
+            .replica_root
+            .join("accepted/generations")
+            .join(id)
+            .join("snapshot.db");
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&snapshot)
+            .unwrap();
+        file.write_all(&[0u8; 7]).unwrap();
+        drop(file);
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+
+    async fn wait_for_local_read(session: &StandbyStdioSession, id: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(reply) = session.handle_message(read(1)).await {
+                    if reply["result"]["isError"] == false && generation(&reply) == id {
+                        return reply;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the accepted copy serves")
+    }
+
+    /// A heavy-phase failure after early serving stops that copy and leaves
+    /// the node status-only, so reads fall back to hosted (or report
+    /// unavailable when hosted is unreachable too).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_heavy_failure_stops_serving() {
+        let (_dir, db, session) = fixture().await;
+        let id = accept(&session, &db, "first").await;
+        damage_snapshot_bytes(&session, &id);
+        let (entered, resume) = session.config.store.pause_next_verification();
+        let recovering = tokio::spawn({
+            let session = session.clone();
+            async move { session.recover_startup().await }
+        });
+        // The damage is invisible to the cheap checks: it serves first.
+        let served = wait_for_local_read(&session, &id).await;
+        assert!(
+            pending_reasons(&served)
+                .iter()
+                .any(|reason| reason == "restart_recheck_pending"),
+            "{served}"
+        );
+        entered.notified().await;
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(60), recovering)
+            .await
+            .expect("background verification finishes")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(session.capture(), SessionSnapshot::StatusOnly(_)),
+            "a failed recheck must stop serving the generation"
+        );
+        let refused = session.handle_message(read(2)).await.unwrap();
+        assert!(
+            refused.to_string().contains("STANDBY_STATUS_ONLY"),
+            "{refused}"
+        );
+        db.close().await;
+    }
+
+    /// The failing copy stops serving the moment its verdict is known, not
+    /// after the pass has gone on to examine fallback candidates.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_failed_copy_stops_before_fallbacks_are_examined() {
+        let (_dir, db, session) = fixture().await;
+        let first = accept(&session, &db, "first").await;
+        let second = accept(&session, &db, "second").await;
+        assert_ne!(first, second);
+        damage_snapshot_bytes(&session, &second);
+        let (entered, resume) = session.config.store.pause_next_verification();
+        let recovering = tokio::spawn({
+            let session = session.clone();
+            async move { session.recover_startup().await }
+        });
+        wait_for_local_read(&session, &second).await;
+        entered.notified().await;
+        // Hold the next verification, which is the fallback candidate's.
+        let (fallback_entered, fallback_resume) = session.config.store.pause_next_verification();
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(60), fallback_entered.notified())
+            .await
+            .expect("the pass moves on to the fallback candidate");
+        assert!(
+            matches!(session.capture(), SessionSnapshot::StatusOnly(_)),
+            "the failed copy must already have stopped serving"
+        );
+        fallback_resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(60), recovering)
+            .await
+            .expect("background verification finishes")
+            .unwrap()
+            .unwrap();
+        // The existing fallback path then serves the older good copy.
+        let reply = session.handle_message(read(3)).await.unwrap();
+        assert_eq!(generation(&reply), first, "{reply}");
+        db.close().await;
+    }
+
+    /// An account mismatch still refuses: the fast path may select the
+    /// copy, but preparation rejects another account's data before it can
+    /// ever be served, and recovery ends status-only.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_account_mismatch_refuses_before_serving() {
+        let (_dir, db, session) = fixture().await;
+        accept(&session, &db, "first").await;
+        let wrong = StandbySessionConfig {
+            runtime: session.config.runtime.clone(),
+            store: session.config.store.clone(),
+            observed: session.config.observed.clone(),
+            surface: session.config.surface,
+            profile: session.config.profile,
+            experimental: session.config.experimental.clone(),
+            selected_account: Some("acct_00000000000000000000000000000000".into()),
+            refresh_configured: false,
+            refresh_available: false,
+        };
+        let provider = StandbyStatusProvider::for_status_only_reason(
+            wrong.runtime.clone(),
+            wrong.store.clone(),
+            Some(observed()),
+            StandbyStatusOnly {
+                reason: "no_usable_generation".into(),
+                candidate_count: 0,
+                unusable_candidate_count: 0,
+            },
+            false,
+            false,
+        );
+        let foreign = Arc::new(StandbyStdioSession::new(wrong, provider).unwrap());
+        foreign.recover_startup().await.unwrap();
+        assert!(
+            matches!(foreign.capture(), SessionSnapshot::StatusOnly(_)),
+            "another account's copy must never serve"
+        );
+        let refused = foreign.handle_message(read(1)).await.unwrap();
+        assert!(
+            refused.to_string().contains("STANDBY_STATUS_ONLY"),
+            "{refused}"
+        );
         db.close().await;
     }
 }

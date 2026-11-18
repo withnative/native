@@ -3841,20 +3841,43 @@ pub(crate) async fn adopted_package_with_declaration_as(
     package: &str,
     declaration: Value,
 ) -> String {
-    let source_revision = preview_source_revision(db, ARTIFACT_A).await;
+    adopted_package_over_artifact_as(
+        registry,
+        db,
+        account,
+        package,
+        ARTIFACT_A,
+        PREVIEW_BODY,
+        declaration,
+    )
+    .await
+}
+
+/// [`adopted_package_with_declaration_as`] over any existing artifact whose
+/// latest body is `body`.
+pub(crate) async fn adopted_package_over_artifact_as(
+    registry: &ToolRegistry,
+    db: &Db,
+    account: &str,
+    package: &str,
+    artifact_id: &str,
+    body: &str,
+    declaration: Value,
+) -> String {
+    let source_revision = preview_source_revision(db, artifact_id).await;
     let digest = {
         use native_ce::mcp::tools::alpha_tabs::{
             alpha_tab_bundle_digest, alpha_tab_declaration_digest, alpha_tab_digest,
         };
         alpha_tab_digest(
-            &alpha_tab_bundle_digest(PREVIEW_BODY),
+            &alpha_tab_bundle_digest(body),
             &alpha_tab_declaration_digest(&declaration).unwrap(),
             "native.html.v1",
         )
     };
     let pin = json!({
         "package": package, "version": "0.1.0", "digest": digest,
-        "artifact_id": ARTIFACT_A, "source_revision": source_revision,
+        "artifact_id": artifact_id, "source_revision": source_revision,
         "declaration": declaration,
     });
     let with = |action: &str, reason: &str| {
@@ -13416,12 +13439,15 @@ const GOLDEN_PREBRIDGE_BOOTSTRAP_SHA: &str =
 const GOLDEN_REVEAL_INCREMENT_BOOTSTRAP_SHA: &str =
     "0f8b6ecf4b68028210412cd488c61c44565a957bc7cd26ffd0165b446c9295da";
 /// Golden current delivery evidence (Body attempt, app calls, multi-host agent sessions v2,
-/// floating-chat presentation, bounded session unread/request/detail projections,
-/// supplied core kit, draft-aware close reporting, host-injected app skins, and the optional
-/// adopted-app folder chooser), hardcoded so a silent bytes change fails the test.
+/// floating-chat presentation, bounded session unread/request/detail projections, the startedBy
+/// origin mark and its host capability, supplied core kit, draft-aware close reporting, host-injected
+/// app skins, the optional adopted-app folder chooser, typed/generated message framing, acknowledged device app state,
+/// explicit session message/history cutoff metadata, bounded frame-error reconciliation
+/// receipts, and the optional record observation port),
+/// hardcoded so a silent bytes change fails the test.
 /// No byte count is quoted: it goes stale.
 const GOLDEN_NEW_BOOTSTRAP_SHA: &str =
-    "949dd85a45308648b938ba716f39a0c72c545a78a3c617390c04015639f5d1fa";
+    "c5ccf6011615a0590cec7429de93bee6ab214e09cd08955d4e7f9c80bcfc79d1";
 /// Fixed c851-baseline install pin digest for the fixture below.
 /// Provenance, two independent derivations that agree:
 /// - Rust: executing the pin formula (`alpha_tab_digest` over
@@ -15904,3 +15930,671 @@ async fn v1_declarations_keep_their_shape_and_carry_no_contract() {
 
 #[path = "alpha_tabs_prepare_install.rs"]
 mod prepare_install_tests;
+
+// `list` cost on repeat calls (task `5635fe9`).
+
+/// `count` verified installs, each over its own artifact with a body of about
+/// `body_len` bytes, all for ALICE. Returns `(package, artifact, event)`.
+async fn many_verified_installs(
+    registry: &ToolRegistry,
+    db: &Db,
+    count: usize,
+    body_len: usize,
+) -> Vec<(String, String, String)> {
+    configure_preview_launch();
+    let padding = "x".repeat(body_len);
+    let body = PREVIEW_BODY.replacen("</main>", &format!("<!--{padding}--></main>"), 1);
+    let mut installs = Vec::new();
+    for index in 0..count {
+        let artifact_id = format!("a1d00000-0000-4000-8000-0000000{:05}", 100 + index);
+        let package = format!("agent.bench-{index}");
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": artifact_id, "type": "Document", "kind": "artifact",
+                    "name": format!("Bench tab {index}"), "body": body,
+                    "facets": { "runtime": "native.html.v1" },
+                    "reason": "Fixture artifact for list cost."
+                }),
+            )
+            .await
+            .unwrap();
+        grant(db, &artifact_id, ALICE, Capability::View).await;
+        let declaration = json!({"needs": [
+            "attention.query.v1",
+            SEARCH_NEEDS[0],
+            sql_need("lane.count", "Count", "SELECT count(*) AS n FROM records WHERE deleted_at IS NULL"),
+            sql_need("lane.names", "Names", "SELECT id, name FROM records WHERE deleted_at IS NULL ORDER BY 1, 2 LIMIT 50"),
+        ], "effects": []});
+        let event = adopted_package_over_artifact_as(
+            registry,
+            db,
+            ALICE,
+            &package,
+            &artifact_id,
+            &body,
+            declaration,
+        )
+        .await;
+        installs.push((package, artifact_id, event));
+    }
+    installs
+}
+
+async fn list_as(registry: &ToolRegistry, db: &Db, account: &str, view: Option<&str>) -> Value {
+    let mut args = json!({"action": "list"});
+    if let Some(view) = view {
+        args["view"] = json!(view);
+    }
+    call_as(
+        registry,
+        db,
+        Caller::authenticated(account),
+        "manage_alpha_tabs",
+        args,
+    )
+    .await
+    .unwrap()
+}
+
+/// Timing for `list` over 20 verified installs, cold then repeat. It asserts
+/// only that repeat calls return what the cold call did; the numbers are for
+/// a person to read: run
+/// `cargo test --test tools list_cost_with_twenty_installs -- --nocapture`.
+#[tokio::test]
+async fn list_cost_with_twenty_installs() {
+    use std::time::Instant;
+
+    let (db, registry) = fixture().await;
+    let installs = many_verified_installs(&registry, &db, 20, 50_000).await;
+    let ms = |elapsed: std::time::Duration| elapsed.as_secs_f64() * 1000.0;
+
+    let started = Instant::now();
+    let cold = list_as(&registry, &db, ALICE, None).await;
+    let cold_ms = ms(started.elapsed());
+    assert_eq!(cold["installs"].as_array().unwrap().len(), installs.len());
+    let bytes = serde_json::to_vec(&cold).unwrap().len();
+
+    let mut repeat = Vec::new();
+    for _ in 0..30 {
+        let started = Instant::now();
+        let again = list_as(&registry, &db, ALICE, None).await;
+        repeat.push(ms(started.elapsed()));
+        assert_eq!(again, cold);
+    }
+    repeat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut summary = Vec::new();
+    for _ in 0..30 {
+        let started = Instant::now();
+        list_as(&registry, &db, ALICE, Some("summary")).await;
+        summary.push(ms(started.elapsed()));
+    }
+    summary.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "list/20 installs, {bytes} B full view: cold {cold_ms:.2} ms; repeat median {:.2} ms, p90 {:.2} ms; summary view median {:.2} ms",
+        repeat[repeat.len() / 2],
+        repeat[repeat.len() * 9 / 10],
+        summary[summary.len() / 2],
+    );
+}
+
+fn listed<'a>(list: &'a Value, package: &str) -> &'a Value {
+    list["installs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["package"] == package)
+        .unwrap_or_else(|| panic!("{package} is not listed"))
+}
+
+fn verdict(list: &Value, package: &str) -> String {
+    listed(list, package)["launch_binding"]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn inspect_as(registry: &ToolRegistry, db: &Db, account: &str, package: &str) -> Value {
+    call_as(
+        registry,
+        db,
+        Caller::authenticated(account),
+        "manage_alpha_tabs",
+        json!({"action": "inspect", "package": package}),
+    )
+    .await
+    .unwrap()["install"]
+        .clone()
+}
+
+/// A repeat `list` is answered from the gate cache and says exactly what the
+/// full chain said; `inspect`, which never uses the cache, agrees with it.
+#[tokio::test]
+async fn list_repeat_hits_the_gate_cache_with_identical_output() {
+    use native_ce::mcp::tools::alpha_tabs::{gate_cache_hits, gate_cache_holds};
+
+    let (db, registry) = fixture().await;
+    let installs = many_verified_installs(&registry, &db, 4, 2_000).await;
+    for (package, _, event) in &installs {
+        assert!(!gate_cache_holds(&db, ALICE, package, event));
+    }
+
+    let cold = list_as(&registry, &db, ALICE, None).await;
+    for (package, _, event) in &installs {
+        assert_eq!(verdict(&cold, package), "launch_request_required");
+        assert!(gate_cache_holds(&db, ALICE, package, event));
+        assert_eq!(gate_cache_hits(&db, ALICE, package, event), 0);
+    }
+    let first_repeat = list_as(&registry, &db, ALICE, None).await;
+    let second_repeat = list_as(&registry, &db, ALICE, None).await;
+    for (package, _, event) in &installs {
+        assert_eq!(gate_cache_hits(&db, ALICE, package, event), 2);
+    }
+    // Byte-identical, not merely equal as values.
+    let bytes = |value: &Value| serde_json::to_vec(value).unwrap();
+    assert_eq!(bytes(&cold), bytes(&first_repeat));
+    assert_eq!(bytes(&cold), bytes(&second_repeat));
+    // `inspect` runs the full chain every time and reports the same entry.
+    for (package, _, event) in &installs {
+        assert_eq!(
+            bytes(listed(&second_repeat, package)),
+            bytes(&inspect_as(&registry, &db, ALICE, package).await)
+        );
+        assert_eq!(gate_cache_hits(&db, ALICE, package, event), 2);
+    }
+    // The summary view shares the verdict work.
+    let summary = list_as(&registry, &db, ALICE, Some("summary")).await;
+    assert_eq!(
+        summary["installs"].as_array().unwrap().len(),
+        installs.len()
+    );
+    for (package, _, event) in &installs {
+        assert_eq!(gate_cache_hits(&db, ALICE, package, event), 3);
+    }
+    // Cold and warm summary bytes are identical too: a database whose first
+    // call is the summary view, then the same call again from the cache.
+    let (summary_db, summary_registry) = fixture().await;
+    let summary_installs = many_verified_installs(&summary_registry, &summary_db, 4, 2_000).await;
+    let cold_summary = list_as(&summary_registry, &summary_db, ALICE, Some("summary")).await;
+    for (package, _, event) in &summary_installs {
+        assert!(gate_cache_holds(&summary_db, ALICE, package, event));
+        assert_eq!(gate_cache_hits(&summary_db, ALICE, package, event), 0);
+    }
+    let warm_summary = list_as(&summary_registry, &summary_db, ALICE, Some("summary")).await;
+    for (package, _, event) in &summary_installs {
+        assert_eq!(gate_cache_hits(&summary_db, ALICE, package, event), 1);
+    }
+    assert_eq!(bytes(&cold_summary), bytes(&warm_summary));
+}
+
+/// An entry that `live_read` made serves `list`. The other order is
+/// `list_warmed_entry_serves_live_read_identically`.
+#[tokio::test]
+async fn live_read_warmed_entry_serves_list() {
+    use native_ce::mcp::tools::alpha_tabs::{gate_cache_hits, gate_cache_holds};
+
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(
+        &registry,
+        &db,
+        json!({"needs": [SEARCH_NEEDS[0]], "effects": []}),
+    )
+    .await;
+    declared_read(
+        &registry,
+        &db,
+        &event,
+        SEARCH_NEEDS[0],
+        json!({"query": "zebra"}),
+    )
+    .await
+    .unwrap();
+    assert!(gate_cache_holds(&db, ALICE, "agent.search", &event));
+    let before = gate_cache_hits(&db, ALICE, "agent.search", &event);
+    let list = list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(verdict(&list, "agent.search"), "launch_request_required");
+    assert_eq!(
+        gate_cache_hits(&db, ALICE, "agent.search", &event),
+        before + 1
+    );
+}
+
+/// The other order: `list` creates the entry on a fresh install, and a later
+/// `live_read` of an SQL need is served from it. Its bytes equal those of a
+/// read that found no entry.
+///
+/// The cold reference is Bea's install of the same package, pin and artifact
+/// in the same database, read before anything has verified it. The revision
+/// digest covers the pin, so a separate database with other event ids could
+/// not be compared byte for byte. Only the two install event ids differ.
+#[tokio::test]
+async fn list_warmed_entry_serves_live_read_identically() {
+    use native_ce::mcp::tools::alpha_tabs::{gate_cache_hits, gate_cache_holds};
+
+    let declaration = json!({"needs": [
+        sql_need("lane.count", "Count", "SELECT count(*) AS n FROM records WHERE deleted_at IS NULL"),
+        sql_need("lane.names", "Names", "SELECT id, name FROM records WHERE deleted_at IS NULL ORDER BY 1, 2 LIMIT 50"),
+    ], "effects": []});
+    let package = "agent.search";
+    let (db, registry) = fixture().await;
+    let alice = adopted_with_declaration(&registry, &db, declaration.clone()).await;
+    let bea = adopted_with_declaration_as(&registry, &db, BEA, declaration).await;
+    assert!(!gate_cache_holds(&db, ALICE, package, &alice));
+    assert!(!gate_cache_holds(&db, BEA, package, &bea));
+
+    // Alice: `list` first, so her read finds the entry `list` made.
+    let list = list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(verdict(&list, package), "launch_request_required");
+    assert!(gate_cache_holds(&db, ALICE, package, &alice));
+    assert_eq!(gate_cache_hits(&db, ALICE, package, &alice), 0);
+    let warm = sql_snapshot(&registry, &db, ALICE, package, &alice)
+        .await
+        .unwrap();
+    assert!(gate_cache_hits(&db, ALICE, package, &alice) > 0);
+    assert_eq!(warm["input"]["sql"]["lane.count"]["row_count"], 1);
+    assert_eq!(warm["input"]["sql"]["lane.names"]["row_count"], 3);
+
+    // Bea: no entry yet, so her read runs the full chain and makes one.
+    let cold = sql_snapshot(&registry, &db, BEA, package, &bea)
+        .await
+        .unwrap();
+    assert!(gate_cache_holds(&db, BEA, package, &bea));
+    let masked = |value: &Value, event: &str| {
+        serde_json::to_string(value)
+            .unwrap()
+            .replace(event, "<install-event>")
+    };
+    // `revision.revision_digest` hashes the pin including the install event
+    // id, so it is the one field that cannot match across the two installs.
+    // Everything it covers (rows, SQL results, pin) is compared below.
+    let without_revision_digest = |value: &Value, event: &str| {
+        let mut value = value.clone();
+        assert!(value["revision"]["revision_digest"].is_string());
+        value["revision"]["revision_digest"] = Value::Null;
+        masked(&value, event)
+    };
+    assert_eq!(
+        without_revision_digest(&warm, &alice),
+        without_revision_digest(&cold, &bea)
+    );
+    // The same install read cold and then warm agrees on the digest as well:
+    // Bea's second read finds the entry her first one made.
+    let hits = gate_cache_hits(&db, BEA, package, &bea);
+    let again = sql_snapshot(&registry, &db, BEA, package, &bea)
+        .await
+        .unwrap();
+    assert!(gate_cache_hits(&db, BEA, package, &bea) > hits);
+    assert_eq!(
+        serde_json::to_vec(&cold).unwrap(),
+        serde_json::to_vec(&again).unwrap()
+    );
+    // And Alice's reads agree with each other, whichever warmed the entry.
+    let alice_again = sql_snapshot(&registry, &db, ALICE, package, &alice)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&warm).unwrap(),
+        serde_json::to_vec(&alice_again).unwrap()
+    );
+}
+
+/// A warm entry never turns a refusal into a verified verdict: every input
+/// the verdict reads that is not part of the entry is read again, and every
+/// input that is part of it must still equal the row's.
+#[tokio::test]
+async fn list_never_serves_a_refusal_as_verified_from_the_cache() {
+    use native_ce::mcp::tools::alpha_tabs::{gate_cache_hits, gate_cache_holds};
+
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(
+        &registry,
+        &db,
+        json!({"needs": [SEARCH_NEEDS[0]], "effects": []}),
+    )
+    .await;
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let package = "agent.search";
+    let expect = |list: Value, reason: &str| {
+        assert_eq!(verdict(&list, package), reason);
+        assert_ne!(
+            listed(&list, package)["launch_binding"]["verdict"],
+            "verified"
+        );
+    };
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "launch_request_required",
+    );
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "launch_request_required",
+    );
+    let hits = gate_cache_hits(&db, ALICE, package, &event);
+    assert_eq!(hits, 1);
+
+    // Lost View, read again on every call.
+    grant(&db, ARTIFACT_A, BEA, Capability::View).await;
+    expect(list_as(&registry, &db, ALICE, None).await, "unauthorized");
+    grant(&db, ARTIFACT_A, ALICE, Capability::View).await;
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "launch_request_required",
+    );
+
+    // Runtime facet changed under the same install event.
+    sqlx::query("UPDATE facet_values SET value='native.html.artifact.v2' WHERE record_id=? AND key='runtime'")
+        .bind(ARTIFACT_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+    expect(list_as(&registry, &db, ALICE, None).await, "not_renderable");
+    sqlx::query(
+        "UPDATE facet_values SET value='native.html.v1' WHERE record_id=? AND key='runtime'",
+    )
+    .bind(ARTIFACT_A)
+    .execute(&pool)
+    .await
+    .unwrap();
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "launch_request_required",
+    );
+
+    // Pin inputs edited in place under the same install event: each one
+    // misses the entry, so the full chain runs and refuses. The entry itself
+    // survives, and is served again once the row is put back.
+    let hits = gate_cache_hits(&db, ALICE, package, &event);
+    let (digest, source, declaration_digest, declaration): (String, String, String, String) =
+        sqlx::query_as(
+            "SELECT digest, consented_source_revision, declaration_digest, consented_declaration
+               FROM alpha_tab_installs WHERE account_id=? AND package=?",
+        )
+        .bind(ALICE)
+        .bind(package)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let edit = |column: &'static str, value: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(&format!(
+                "UPDATE alpha_tab_installs SET {column}=? WHERE account_id=? AND package=?"
+            ))
+            .bind(value)
+            .bind(ALICE)
+            .bind(package)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    edit("digest", format!("sha256:{}", "0".repeat(64))).await;
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "digest_mismatch",
+    );
+    edit("digest", digest).await;
+    // The source pin names an event that does not exist, or a different
+    // artifact's event.
+    edit("consented_source_revision", "no-such-event".into()).await;
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "source_revision_unresolved",
+    );
+    edit("consented_source_revision", source).await;
+    // Consent changed: the declaration no longer matches its stored digest.
+    edit(
+        "consented_declaration",
+        r#"{"needs":["attention.query.v1"],"effects":[]}"#.into(),
+    )
+    .await;
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "digest_mismatch",
+    );
+    edit("consented_declaration", declaration.clone()).await;
+    // A stored digest that no longer matches the declaration.
+    edit("declaration_digest", "f".repeat(64)).await;
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "digest_mismatch",
+    );
+    edit("declaration_digest", declaration_digest).await;
+    assert_eq!(gate_cache_hits(&db, ALICE, package, &event), hits);
+    expect(
+        list_as(&registry, &db, ALICE, None).await,
+        "launch_request_required",
+    );
+    assert_eq!(gate_cache_hits(&db, ALICE, package, &event), hits + 1);
+    assert!(gate_cache_holds(&db, ALICE, package, &event));
+}
+
+/// Only a verdict that passed every source gate is remembered, so a refusal
+/// on a cold `list` leaves nothing behind to be served later.
+#[tokio::test]
+async fn list_remembers_nothing_for_a_refused_verdict() {
+    use native_ce::mcp::tools::alpha_tabs::gate_cache_holds;
+
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(
+        &registry,
+        &db,
+        json!({"needs": [SEARCH_NEEDS[0]], "effects": []}),
+    )
+    .await;
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let pinned: String = sqlx::query_scalar(
+        "SELECT digest FROM alpha_tab_installs WHERE account_id=? AND package=?",
+    )
+    .bind(ALICE)
+    .bind("agent.search")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE alpha_tab_installs SET digest=? WHERE account_id=? AND package=?")
+        .bind(format!("sha256:{}", "0".repeat(64)))
+        .bind(ALICE)
+        .bind("agent.search")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let list = list_as(&registry, &db, ALICE, None).await;
+        assert_eq!(verdict(&list, "agent.search"), "digest_mismatch");
+        assert!(!gate_cache_holds(&db, ALICE, "agent.search", &event));
+    }
+    sqlx::query("UPDATE alpha_tab_installs SET digest=? WHERE account_id=? AND package=?")
+        .bind(pinned)
+        .bind(ALICE)
+        .bind("agent.search")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let list = list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(verdict(&list, "agent.search"), "launch_request_required");
+    assert!(gate_cache_holds(&db, ALICE, "agent.search", &event));
+
+    // An unadopted install is refused before any source work and never
+    // remembered.
+    let unadopted = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        install_args("agent.unadopted", ARTIFACT_A, DIGEST_A),
+    )
+    .await
+    .unwrap()["install"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for _ in 0..2 {
+        let list = list_as(&registry, &db, ALICE, None).await;
+        assert_eq!(verdict(&list, "agent.unadopted"), "adoption_unverified");
+        assert!(!gate_cache_holds(&db, ALICE, "agent.unadopted", &unadopted));
+    }
+}
+
+/// Entries are scoped to a database, an account, a package and an install
+/// event: another account's or database's `list` never reads them, and a
+/// disable, remove or reinstall (each a new install event) never matches the
+/// old one.
+#[tokio::test]
+async fn list_cache_is_scoped_and_install_transitions_miss() {
+    use native_ce::mcp::tools::alpha_tabs::{gate_cache_hits, gate_cache_holds};
+
+    let declaration = json!({"needs": [SEARCH_NEEDS[0]], "effects": []});
+    let (db, registry) = fixture().await;
+    let alice = adopted_with_declaration(&registry, &db, declaration.clone()).await;
+    let bea = adopted_with_declaration_as(&registry, &db, BEA, declaration.clone()).await;
+    let package = "agent.search";
+    list_as(&registry, &db, ALICE, None).await;
+    list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(gate_cache_hits(&db, ALICE, package, &alice), 1);
+    // Bea's install has the same package, pin and artifact, and its own
+    // entry only once Bea's own `list` has verified it.
+    assert!(!gate_cache_holds(&db, BEA, package, &bea));
+    assert_eq!(gate_cache_hits(&db, BEA, package, &bea), 0);
+    let bea_list = list_as(&registry, &db, BEA, None).await;
+    assert_eq!(verdict(&bea_list, package), "launch_request_required");
+    assert_eq!(gate_cache_hits(&db, BEA, package, &bea), 0);
+    assert_eq!(gate_cache_hits(&db, ALICE, package, &alice), 1);
+    // Alice's entry is no use under Bea's account and vice versa.
+    assert!(!gate_cache_holds(&db, BEA, package, &alice));
+    assert!(!gate_cache_holds(&db, ALICE, package, &bea));
+
+    // Another database: its own handle, so it holds nothing of this one's.
+    let (other_db, other_registry) = fixture().await;
+    let other = adopted_with_declaration(&other_registry, &other_db, declaration.clone()).await;
+    assert!(!gate_cache_holds(&other_db, ALICE, package, &alice));
+    let other_list = list_as(&other_registry, &other_db, ALICE, None).await;
+    assert_eq!(verdict(&other_list, package), "launch_request_required");
+    assert_eq!(gate_cache_hits(&other_db, ALICE, package, &other), 0);
+    assert!(!gate_cache_holds(&other_db, ALICE, package, &alice));
+
+    // Disable and remove each write a new install event.
+    let transition = |action: &'static str, event: String| {
+        let (db, registry) = (db.clone(), &registry);
+        async move {
+            call_as(
+                registry,
+                &db,
+                Caller::authenticated(ALICE),
+                "manage_alpha_tabs",
+                json!({
+                    "action": action, "package": package,
+                    "expected_install_event_id": event, "reason": "Change the search tab.",
+                }),
+            )
+            .await
+            .unwrap()["install"]["event_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let disabled = transition("disable", alice.clone()).await;
+    let list = list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(verdict(&list, package), "disabled");
+    assert_eq!(listed(&list, package)["skip_reason"], "disabled");
+    assert_eq!(listed(&list, package)["target_skip_reason"], "disabled");
+    assert_eq!(listed(&list, package)["target_resolves"], false);
+    assert_eq!(listed(&list, package)["event_id"], disabled);
+    assert!(!gate_cache_holds(&db, ALICE, package, &disabled));
+    let removed = transition("remove", disabled.clone()).await;
+    let list = list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(verdict(&list, package), "removed");
+    assert_eq!(listed(&list, package)["target_skip_reason"], "removed");
+    assert_eq!(listed(&list, package)["target_resolves"], false);
+    assert!(!gate_cache_holds(&db, ALICE, package, &removed));
+    // Bea's tab is untouched.
+    assert_eq!(gate_cache_hits(&db, BEA, package, &bea), 0);
+    let bea_list = list_as(&registry, &db, BEA, None).await;
+    assert_eq!(verdict(&bea_list, package), "launch_request_required");
+    assert_eq!(gate_cache_hits(&db, BEA, package, &bea), 1);
+
+    // Reinstalled over the removed one with the same pin: a new event that
+    // needs fresh adoption, so it is refused before any source work and
+    // inherits nothing from the removed one's entry.
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let (digest, revision): (String, String) = sqlx::query_as(
+        "SELECT digest, consented_source_revision FROM alpha_tab_installs WHERE account_id=? AND package=?",
+    )
+    .bind(ALICE)
+    .bind(package)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let reinstalled = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({
+            "action": "install", "package": package, "version": "0.1.0",
+            "digest": digest, "artifact_id": ARTIFACT_A, "source_revision": revision,
+            "declaration": declaration, "expected_install_event_id": removed,
+            "reason": "Install the search tab again.",
+        }),
+    )
+    .await
+    .unwrap()["install"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(reinstalled, alice);
+    let list = list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(verdict(&list, package), "adoption_unverified");
+    assert_eq!(listed(&list, package)["event_id"], reinstalled);
+    assert!(!gate_cache_holds(&db, ALICE, package, &reinstalled));
+    assert_eq!(gate_cache_hits(&db, ALICE, package, &alice), 1);
+}
+
+/// A changed source pin is a new install event over another artifact and
+/// revision: it misses the old entry and is verified on its own body.
+#[tokio::test]
+async fn list_cache_misses_after_the_source_pin_changes() {
+    use native_ce::mcp::tools::alpha_tabs::{gate_cache_hits, gate_cache_holds};
+
+    let (db, registry) = fixture().await;
+    let root = adopted_with_declaration(&registry, &db, preview_declaration()).await;
+    list_as(&registry, &db, ALICE, None).await;
+    list_as(&registry, &db, ALICE, None).await;
+    assert_eq!(gate_cache_hits(&db, ALICE, "agent.search", &root), 1);
+
+    let (revision, body) = update_new_source(&registry, &db).await;
+    let updated = update_call(
+        &registry,
+        &db,
+        update_pin(
+            "agent.search",
+            &root,
+            ARTIFACT_B,
+            &revision,
+            &body,
+            preview_declaration(),
+        ),
+    )
+    .await
+    .unwrap();
+    let event = updated["install"]["event_id"].as_str().unwrap().to_string();
+    assert_ne!(event, root);
+    assert!(!gate_cache_holds(&db, ALICE, "agent.search", &event));
+    let list = list_as(&registry, &db, ALICE, None).await;
+    let entry = listed(&list, "agent.search");
+    assert_eq!(entry["event_id"], event);
+    assert_eq!(entry["artifact_id"], ARTIFACT_B);
+    assert_eq!(entry["consented_source_revision"], revision);
+    // Whether adoption carried or not, the old entry served nothing for it.
+    assert_eq!(gate_cache_hits(&db, ALICE, "agent.search", &event), 0);
+    assert_eq!(gate_cache_hits(&db, ALICE, "agent.search", &root), 1);
+    if updated["adoption_required"] == false {
+        assert_eq!(verdict(&list, "agent.search"), "launch_request_required");
+        assert!(gate_cache_holds(&db, ALICE, "agent.search", &event));
+    } else {
+        assert_eq!(verdict(&list, "agent.search"), "adoption_unverified");
+    }
+}

@@ -308,7 +308,7 @@ fn named_view_revision_contract_and_exact_pins_are_versioned() {
     assert!(serde_json::from_value::<contract::Definition>(value).is_err());
 }
 
-fn planned(
+pub(in crate::named_views) fn planned(
     record: &str,
     sql: &str,
     deps: BTreeMap<String, contract::Dependency>,
@@ -980,7 +980,7 @@ async fn named_view_exact_lookup_needs_no_index_on_large_log() {
 }
 
 #[cfg(feature = "v2-kernel-probe")]
-async fn insert_retained_definition(
+pub(in crate::named_views) async fn insert_retained_definition(
     conn: &mut SqliteConnection,
     pin: &Pin,
     def: &contract::Definition,

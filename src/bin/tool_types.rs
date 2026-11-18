@@ -213,11 +213,23 @@ fn drift_error() -> Error {
 }
 
 fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
-    let object = schema
-        .as_object()
-        .ok_or_else(|| Error::engine(format!("unsupported non-object JSON Schema at {context}")))?;
+    match schema {
+        Value::Bool(false) => return Ok("never".to_string()),
+        Value::Bool(true) => return Ok("unknown".to_string()),
+        Value::Object(_) => {}
+        _ => {
+            return Err(Error::engine(format!(
+                "unsupported non-object JSON Schema at {context}"
+            )))
+        }
+    }
+    let object = schema.as_object().expect("object schema");
 
-    for unsupported in ["$ref", "if", "then", "else", "patternProperties"] {
+    if object.contains_key("if") || object.contains_key("then") || object.contains_key("else") {
+        return conditional_schema(object, context);
+    }
+
+    for unsupported in ["$ref", "patternProperties"] {
         if object.contains_key(unsupported) {
             return Err(Error::engine(format!(
                 "unsupported JSON Schema keyword `{unsupported}` at {context}"
@@ -295,15 +307,30 @@ fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
         let branches = branches
             .as_array()
             .ok_or_else(|| Error::engine(format!("allOf is not an array at {context}")))?;
-        return branches
+        let intersection = branches
             .iter()
             .enumerate()
             .map(|(index, branch)| {
                 schema_to_ts(branch, &format!("{context}.allOf[{index}]"))
                     .map(|value| format!("({value})"))
             })
-            .collect::<Result<Vec<_>>>()
-            .map(|values| values.join(" & "));
+            .collect::<Result<Vec<_>>>()?
+            .join(" & ");
+        // Sibling fields apply alongside every allOf branch. Returning the
+        // branches alone drops the base object, which is how query_record lost
+        // steps, limit, and its other ordinary arguments.
+        let carries_base_object = object.contains_key("properties")
+            || object.contains_key("required")
+            || object.contains_key("additionalProperties");
+        if carries_base_object {
+            let mut base = object.clone();
+            base.remove("allOf");
+            return Ok(format!(
+                "({}) & ({intersection})",
+                schema_to_ts(&Value::Object(base), context)?
+            ));
+        }
+        return Ok(intersection);
     }
 
     match object.get("type") {
@@ -500,6 +527,47 @@ fn object_type(schema: &serde_json::Map<String, Value>, context: &str) -> Result
     Ok(format!("{base} & {}", constraints.join(" & ")))
 }
 
+/// JSON Schema `if`/`then`/`else` stays authoritative on the wire. TypeScript
+/// gets the condition intersected with `then`, or the `else` schema.
+fn conditional_schema(object: &serde_json::Map<String, Value>, context: &str) -> Result<String> {
+    let condition = object
+        .get("if")
+        .ok_or_else(|| Error::engine(format!("conditional schema has no if at {context}")))?;
+    let then_schema = object
+        .get("then")
+        .ok_or_else(|| Error::engine(format!("conditional schema has no then at {context}")))?;
+    let then_branch = format!(
+        "({}) & ({})",
+        schema_to_ts(condition, &format!("{context}.if"))?,
+        schema_to_ts(then_schema, &format!("{context}.then"))?
+    );
+    let conditional = match object.get("else") {
+        Some(else_schema) => format!(
+            "({then_branch}) | ({})",
+            schema_to_ts(else_schema, &format!("{context}.else"))?
+        ),
+        None => then_branch,
+    };
+    let mut rest = object.clone();
+    rest.remove("if");
+    rest.remove("then");
+    rest.remove("else");
+    if rest.is_empty()
+        || rest.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "description" | "minProperties" | "maxProperties" | "title" | "default"
+            )
+        })
+    {
+        return Ok(conditional);
+    }
+    Ok(format!(
+        "({}) & ({conditional})",
+        schema_to_ts(&Value::Object(rest), context)?
+    ))
+}
+
 fn literal(value: &Value, context: &str) -> Result<String> {
     match value {
         Value::String(value) => Ok(quoted(value)),
@@ -523,6 +591,73 @@ mod tests {
         let schema = serde_json::json!({"type":"object","properties":{"record_id":{"type":"string"},"body":{"type":"string"},"home_id":{"type":"string"}},"not":{"anyOf":[{"required":["record_id","body"]},{"required":["record_id","home_id"]}]}});
         let ts = schema_to_ts(&schema, "register").unwrap();
         assert!(ts.contains("({ \"record_id\"?: never } | { \"body\"?: never }) & ({ \"record_id\"?: never } | { \"home_id\"?: never })"),"{ts}");
+    }
+
+    #[test]
+    fn all_of_intersects_sibling_properties_with_the_conditional_branch() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "steps": {"type": "array", "items": {"type": "object"}},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"}
+            },
+            "allOf": [{
+                "if": {"properties": {"projection": {"const": "record_hook.v1"}}, "required": ["projection"]},
+                "then": {"properties": {"body_chars": {"type": "integer", "minimum": 1, "maximum": 262142}}},
+                "else": {"properties": {"body_chars": false}}
+            }]
+        });
+        let ts = schema_to_ts(&schema, "query_record").unwrap();
+        assert!(ts.contains("\"steps\"?: Array<{  }>"), "{ts}");
+        assert!(ts.contains("\"limit\"?: number"), "{ts}");
+        assert!(ts.contains("\"offset\"?: number"), "{ts}");
+        assert!(ts.contains("\"record_hook.v1\""), "{ts}");
+        assert!(ts.contains("\"body_chars\"?: number"), "{ts}");
+        assert!(ts.starts_with("({"), "{ts}");
+    }
+
+    #[test]
+    fn query_record_declaration_keeps_base_arguments_beside_the_hook_branch() {
+        let rendered = String::from_utf8(render().unwrap()).unwrap();
+        let declaration = rendered
+            .lines()
+            .find(|line| line.contains("\"query_record\":"))
+            .expect("query_record declaration");
+        for field in [
+            "\"steps\"",
+            "\"limit\"",
+            "\"offset\"",
+            "\"order\"",
+            "\"projection\"",
+        ] {
+            assert!(
+                declaration.contains(field),
+                "{field} missing from {declaration}"
+            );
+        }
+        assert!(declaration.contains("\"record_hook.v1\""), "{declaration}");
+        assert!(
+            declaration.contains("\"body_chars\"?: number"),
+            "{declaration}"
+        );
+        assert!(
+            declaration.contains("\"body_chars\"?: never"),
+            "{declaration}"
+        );
+    }
+
+    #[test]
+    fn conditional_schema_keeps_the_hook_prefix_beside_the_other_branch() {
+        let schema = serde_json::json!({
+            "if": {"properties": {"projection": {"const": "record_hook.v1"}}, "required": ["projection"]},
+            "then": {"properties": {"body_chars": {"type": "integer", "minimum": 1, "maximum": 262142}}},
+            "else": {"properties": {"body_chars": false}}
+        });
+        let ts = schema_to_ts(&schema, "query_record").unwrap();
+        assert!(ts.contains("\"record_hook.v1\""), "{ts}");
+        assert!(ts.contains("\"body_chars\"?: number"), "{ts}");
+        assert!(ts.contains("\"body_chars\"?: never"), "{ts}");
     }
 
     #[test]

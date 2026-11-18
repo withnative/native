@@ -1,0 +1,60 @@
+{
+  "source": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+  "method": "Each mutant compiled, then exactly the named functional test failed; source restored in finally. Custody tests qualify the contract/format component, not authentic installed95 drain.",
+  "cases": [
+    {
+      "mutation": "v1-prewriter-zero-writer-bypass",
+      "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+      "path": "src/standby/refresh.rs",
+      "original_sha256": "dd3ef6d417ce217c30bed078705e34a2088813f7860d8633a13ef12a3a7fb3f8",
+      "mutant_sha256": "98564e16beb4fcb266fe47a1a252fea936f7c063ca2f3fa0aa31998a4bf07efc",
+      "tests": [
+        {
+          "test": "standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94 stdout ----\n\nthread 'standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94' (2374502) panicked at src/standby/refresh/tests/receiver_shapes.rs:177:9:\nassertion `left == right` failed: refused dialect must not open a generation writer\n  left: 1\n right: 0\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 1.13s\n\n"
+        }
+      ],
+      "result": "bypass fails"
+    },
+    {
+      "mutation": "custody-pair-disabled",
+      "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+      "path": "src/node/gate/receiver_contracts.rs",
+      "original_sha256": "7351e0efeaa0c751618be6fc9b53d866596433b85a7190c10aff7c81ee3408ea",
+      "mutant_sha256": "35242c9d2173693ad66fd4b26fd31fde9d6d044c3ceab02a92f7d84911808510",
+      "tests": [
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery' (2388216) panicked at src/node/gate/v2_holding_tests.rs:2686:9:\n{\"jsonrpc\":\"2.0\",\"id\":11,\"error\":{\"code\":-32000,\"message\":\"Hosted v2 operation contract is incompatible; write was not held\",\"data\":{\"outcome\":\"not_sent\",\"held\":false}}}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.34s\n\n"
+        },
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery' (2388224) panicked at src/node/gate/v2_holding_tests.rs:2791:5:\nassertion `left == right` failed\n  left: \"base\"\n right: \"base!\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.36s\n\n"
+        }
+      ],
+      "result": "bypass fails"
+    },
+    {
+      "mutation": "custody-hosted-descriptor-bypass",
+      "head": "b27dad7dda67ab4166043e4d83728cb2c39c7a95",
+      "path": "src/node/gate/receiver_contracts.rs",
+      "original_sha256": "7351e0efeaa0c751618be6fc9b53d866596433b85a7190c10aff7c81ee3408ea",
+      "mutant_sha256": "ead079e61dc3aa5cff082dcb0dc76f1db82fcc88f4f20376919ba7f324c05137",
+      "tests": [
+        {
+          "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+          "exit": 101,
+          "result": "expected assertion failure",
+          "failure": "---- node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded stdout ----\n\nthread 'node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded' (2402067) panicked at src/node/gate/v2_holding_tests.rs:2638:13:\nupdate_record digest\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7897 filtered out; finished in 0.13s\n\n"
+        }
+      ],
+      "result": "bypass fails"
+    }
+  ]
+}

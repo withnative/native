@@ -160,7 +160,7 @@ pub fn register_batch_write_tool(registry: &mut ToolRegistry) -> Result<()> {
                                     "name": { "type": "string" },
                                     "summary": { "type": ["string", "null"] },
                                     "maturity": { "type": ["string", "null"] },
-                                    "home_id": { "type": "string" },
+                                    "home_id": { "type": "string", "description": "Explicit native:root filing redirects to Unfiled except for Collections, Messages and Annotations; disclosed per item." },
                                     "facets": { "type": "object", "additionalProperties": true },
                                     "if_facets": { "type": "object", "additionalProperties": true },
                                     "if_maturity": { "type": ["string", "null"] },
@@ -419,12 +419,16 @@ pub(crate) async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Res
     if !issues.is_empty() {
         return Err(batch_rejection(args.items.len(), issues));
     }
+    // The response describes governed outputs. Receipt-only recovery state
+    // advances the authority act without giving an unchanged batch an output.
+    let response_act = act_alloc.get();
     // The batch anchor: one output-less command attestation per keyed
     // batch, even an all-unchanged one, so every key leaves exactly one row
     // the key lookup finds. Per-item rows alone cannot do this — unchanged
     // items store none.
     if key.is_some() {
-        crate::provenance::issue_empty_command_attestation_in(&mut tx).await?;
+        crate::provenance::issue_empty_command_attestation_with_act_in(&mut tx, &mut act_alloc)
+            .await?;
     }
     // Each projected home change already refreshes its subtree. Repeat the
     // refreshes after the complete cohort has reached its final graph — same
@@ -446,7 +450,7 @@ pub(crate) async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Res
     if !state.warnings.is_empty() {
         receipt["warnings"] = Value::Array(state.warnings);
     }
-    receipt = echo_act(receipt, act_alloc.get())?;
+    receipt = echo_act(receipt, response_act)?;
     let mut receipt = receipt;
     attach_basis_feedback(
         &db,
@@ -855,6 +859,13 @@ async fn apply_update_item_in(
     let record_type: String = row
         .try_get("type")
         .map_err(|error| invalid(error.to_string()))?;
+    let redirected_home = super::redirects_root_filing(Some(&record_type), home_id.as_deref());
+    let applied_home = redirected_home.then(|| crate::schema::UNFILED_RECORD_ID.to_owned());
+    let home_id = if redirected_home {
+        &applied_home
+    } else {
+        home_id
+    };
     let kind: Option<String> = row
         .try_get("kind")
         .map_err(|error| invalid(error.to_string()))?;
@@ -1112,6 +1123,9 @@ async fn apply_update_item_in(
             "index": index, "op": "update", "id": id,
             "status": "unchanged", "previous_seq": previous_seq,
         }));
+        if redirected_home {
+            super::disclose_root_filing(state.results.last_mut().expect("item receipt"));
+        }
         return Ok(());
     }
     let previous_seq = previous_record_seq_in(tx, id)
@@ -1197,6 +1211,9 @@ async fn apply_update_item_in(
         "index": index, "op": "update", "id": id,
         "status": "changed", "previous_seq": previous_seq,
     }));
+    if redirected_home {
+        super::disclose_root_filing(state.results.last_mut().expect("item receipt"));
+    }
     Ok(())
 }
 
@@ -1463,6 +1480,15 @@ async fn rebuild_hit_receipt_in(
                 ..
             } => (source_id, Some(target_id)),
         };
+        let redirected_home = if let BatchItem::Update { home_id, .. } = item {
+            let typ: String = sqlx::query_scalar("SELECT type FROM records WHERE id=?")
+                .bind(primary)
+                .fetch_one(&mut **tx)
+                .await?;
+            super::redirects_root_filing(Some(&typ), home_id.as_deref())
+        } else {
+            false
+        };
         let attestation = hit
             .found
             .iter()
@@ -1511,6 +1537,9 @@ async fn rebuild_hit_receipt_in(
             });
             if let Some(target) = target_id {
                 outcome["target_id"] = json!(target);
+            }
+            if redirected_home {
+                super::disclose_root_filing(&mut outcome);
             }
             results.push(outcome);
             continue;
@@ -1592,6 +1621,9 @@ async fn rebuild_hit_receipt_in(
         });
         if let Some(target) = target_id {
             outcome["target_id"] = json!(target);
+        }
+        if redirected_home {
+            super::disclose_root_filing(&mut outcome);
         }
         results.push(outcome);
     }

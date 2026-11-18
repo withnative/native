@@ -347,7 +347,7 @@ pub const ARCHIVED_FACET_KEY: &str = "archived";
 /// (new hard-shaped data lands as a new substrate primitive, not a new top-level
 /// type) and still conform; conformance requires presence, never absence, of
 /// tables.
-pub const REQUIRED_TABLES: [&str; 139] = [
+pub const REQUIRED_TABLES: [&str; 140] = [
     // Substrate primitives
     "content_events",
     "content_event_causal_frontier",
@@ -363,6 +363,7 @@ pub const REQUIRED_TABLES: [&str; 139] = [
     "provenance_action_attestations",
     "sql_write_receipts",
     "provenance_local_attestation_authority",
+    "provenance_local_command_cancellations",
     "provenance_action_events",
     "provenance_action_outputs",
     "provenance_action_app_attributions",
@@ -795,8 +796,10 @@ pub const FROZEN_DDL_SHA256_PRE_92: &str =
 pub const FROZEN_DDL_SHA256_PRE_93: &str =
     "6c5d734cc76619d87feacf4f97d141e66c765127899b1bb4747cb01c0cef0f32";
 // Engine93 adds the partial unfiled-message owner index to the engine92 DDL.
-pub const FROZEN_DDL_SHA256: &str =
+pub const FROZEN_DDL_SHA256_PRE_94: &str =
     "4a818a9dd255d32f8f5c57fd49e9cfca7a2231d76a94f0bc7dbe24d192c00581";
+pub const FROZEN_DDL_SHA256: &str =
+    "e8975ea5ec8a281d7ed4f70ca3bf68d56f70f7038571e3f20109423bda348fe5";
 
 /// Engine89 before internal SQL batch receipts.
 pub const FROZEN_DDL_SHA256_PRE_90: &str =
@@ -928,6 +931,9 @@ pub const FROZEN_DDL_SHA256_PRE_66: &str =
 pub(crate) fn historical_ddl_for_test(version: i64) -> String {
     let mut statements = Vec::new();
     for statement in DDL_STATEMENTS {
+        if version < 94 && statement.contains("provenance_local_command_cancellations") {
+            continue;
+        }
         if version < 93 && statement.contains("idx_records_unfiled_message_owner") {
             continue;
         }
@@ -1168,6 +1174,7 @@ mod tests {
                 historical(90),
                 historical(91),
                 historical(92),
+                historical(93),
             ],
             [
                 "b418f5ea746c5e791df9ec07041dbb4fdd3a5098b828de3dc3e983a456a9c755",
@@ -1225,6 +1232,7 @@ mod tests {
                 FROZEN_DDL_SHA256_PRE_91,
                 FROZEN_DDL_SHA256_PRE_92,
                 FROZEN_DDL_SHA256_PRE_93,
+                FROZEN_DDL_SHA256_PRE_94,
             ]
         );
     }

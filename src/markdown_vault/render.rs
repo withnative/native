@@ -96,7 +96,7 @@ fn namespace(r: &SourceRecord, source: &SourceSnapshot) -> Option<String> {
             break;
         }
         match source.records.get(id) {
-            Some(parent) if !parent.included() => home = parent.home_id.clone(),
+            Some(parent) if !parent.included() || !parent.folder() => home = parent.home_id.clone(),
             _ => break,
         }
     }
@@ -247,7 +247,9 @@ fn folder_path(
         .records
         .get(id)
         .ok_or_else(|| Error::engine("vault home unavailable"))?;
-    if !record.included() {
+    // Attachments can belong to a note rather than a folder. Keep that
+    // relationship in the source, but place their files in its nearest folder.
+    if !record.included() || !record.folder() {
         let result = folder_path(
             record.home_id.as_deref().unwrap_or("native:root"),
             source,
@@ -256,9 +258,6 @@ fn folder_path(
         );
         visiting.remove(id);
         return result;
-    }
-    if !record.folder() {
-        return Err(Error::engine("vault home is not a folder"));
     }
     let own = &names[id].stem;
     let result = match record.home_id.as_deref() {
@@ -614,7 +613,7 @@ pub(super) fn render(
             },
         );
     }
-    files.insert("README.md".into(), Output {bytes:format!("# Native Markdown vault\n\nRead-only generated view. Hosted Native is canonical. Local edits are conflicts; access revocation removes generated content even if edited. See .native/STATUS.md. Renderer: {VERSION}. The node publishes this vault by default next to its local copy; to turn it off set \"markdown_folder\": false in node.json.\n").into_bytes(),contributors:BTreeSet::new()});
+    files.insert("README.md".into(), Output {bytes:format!("# Native Markdown vault\n\nRead-only generated view. Hosted Native is canonical. Local edits are conflicts; access revocation removes generated content even if edited. See .native/STATUS.md. To explain saved local edits, run `native vault status --vault .` from this folder (`--json` for tools). It sends nothing and changes no files. Do not chmod generated notes to bypass a save error; use Native MCP for writes. Run `native vault check --help` for the narrow preview grammar and exit codes. Renderer: {VERSION}. The node publishes this vault by default next to its local copy; to turn it off set \"markdown_folder\": false in node.json.\n").into_bytes(),contributors:BTreeSet::new()});
     Ok(Rendered {
         files,
         allocations: names,

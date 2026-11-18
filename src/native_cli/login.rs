@@ -42,11 +42,11 @@ pub const AUTH_FILE: &str = "native-auth.json";
 pub const CLIENT_FILE: &str = "oauth-client.json";
 
 const CLIENT_CONTRACT: &str = "native.cli-oauth-client.v1";
-const CALLBACK_PATH: &str = "/callback";
+pub(crate) const CALLBACK_PATH: &str = "/callback";
 const MAX_JSON_BYTES: usize = 65_536;
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_ID_LEN: usize = 4096;
+pub(crate) const MAX_ID_LEN: usize = 4096;
 
 /// How the authorization URL reaches the person.
 pub enum BrowserMode {
@@ -77,6 +77,12 @@ pub enum LoginErrorKind {
     TokenRefused,
     /// Interrupted (Ctrl-C or SIGTERM) before the grant was written.
     Interrupted,
+    /// `login-node` found grant files it must not overwrite: an existing
+    /// enrollment without `--force`, or a foreign/legacy grant.
+    AlreadyEnrolled,
+    /// Hosted refused the enrollment verification, or bound the grant to an
+    /// install id that is not this install's key.
+    EnrollmentRefused,
 }
 
 /// A failed login. The message carries categories and OAuth error codes only,
@@ -90,7 +96,7 @@ pub struct LoginError {
 }
 
 impl LoginError {
-    fn new(kind: LoginErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: LoginErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -187,6 +193,21 @@ pub fn default_config_dir() -> Option<PathBuf> {
 }
 
 pub async fn login(options: LoginOptions) -> std::result::Result<LoginOutcome, LoginError> {
+    login_with_allocator(options, |port| TcpListener::bind(("127.0.0.1", port))).await
+}
+
+/// The loopback allocator is injectable so tests can serve ports from
+/// test-held reserves instead of the shared OS allocator; production always
+/// passes the real OS bind. The saved-port reuse/fallback decision in
+/// [`bind_callback_listener_with`] runs unchanged either way.
+async fn login_with_allocator<A, Afut>(
+    options: LoginOptions,
+    alloc: A,
+) -> std::result::Result<LoginOutcome, LoginError>
+where
+    A: Fn(u16) -> Afut,
+    Afut: std::future::Future<Output = std::io::Result<TcpListener>> + Send,
+{
     let LoginOptions {
         hosted_origin,
         config_dir,
@@ -226,7 +247,7 @@ pub async fn login(options: LoginOptions) -> std::result::Result<LoginOutcome, L
     } else {
         load_saved_client(&client_path, &discovery.issuer)
     };
-    let (listener, saved) = bind_callback_listener(saved).await?;
+    let (listener, saved) = bind_callback_listener_with(saved, alloc).await?;
     let port = listener
         .local_addr()
         .map_err(|_| Error::engine("cannot read the callback listener address"))?
@@ -244,8 +265,14 @@ pub async fn login(options: LoginOptions) -> std::result::Result<LoginOutcome, L
     let verifier = random_urlsafe(32);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_urlsafe(32);
-    let authorize_url =
-        authorization_url(&discovery, &client_id, &redirect_uri, &state, &challenge)?;
+    let authorize_url = authorization_url(
+        &discovery,
+        &client_id,
+        &redirect_uri,
+        &state,
+        &challenge,
+        &discovery.resource,
+    )?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEvent>();
     let accept_task = tokio::spawn(accept_callbacks(listener, state.clone(), tx.clone()));
@@ -262,6 +289,10 @@ pub async fn login(options: LoginOptions) -> std::result::Result<LoginOutcome, L
     present_url(browser, &authorize_url, paste_task.is_some());
     let waited = tokio::time::timeout(timeout, rx.recv()).await;
     accept_task.abort();
+    // Abort schedules cancellation; joining ensures the listener is
+    // destroyed before return, including timeout/error paths with no
+    // later await.
+    let _ = accept_task.await;
     if let Some(task) = &paste_task {
         task.abort();
     }
@@ -288,10 +319,13 @@ pub async fn login(options: LoginOptions) -> std::result::Result<LoginOutcome, L
         &http,
         &discovery,
         &client_id,
-        &redirect_uri,
-        &code,
-        &verifier,
-        &client_path,
+        AuthorizationCode {
+            redirect_uri: &redirect_uri,
+            code: &code,
+            verifier: &verifier,
+        },
+        &discovery.resource,
+        Some(&client_path),
     )
     .await
     .map_err(|error| error.using_saved_registration(client_reused))?;
@@ -465,11 +499,11 @@ fn config_dir_problem(owner: u32, mode: u32, euid: u32) -> Option<&'static str> 
 // ---- discovery ----------------------------------------------------------
 
 #[derive(Debug)]
-struct Discovery {
-    resource: String,
-    issuer: String,
-    authorization_endpoint: Url,
-    token_endpoint: String,
+pub(crate) struct Discovery {
+    pub(crate) resource: String,
+    pub(crate) issuer: String,
+    pub(crate) authorization_endpoint: Url,
+    pub(crate) token_endpoint: String,
     registration_endpoint: Option<Url>,
 }
 
@@ -491,11 +525,11 @@ pub(crate) fn parse_hosted_origin(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn is_http_loopback(url: &Url) -> bool {
+pub(crate) fn is_http_loopback(url: &Url) -> bool {
     url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
 }
 
-fn same_origin(a: &Url, b: &Url) -> bool {
+pub(crate) fn same_origin(a: &Url, b: &Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
         && a.port_or_known_default() == b.port_or_known_default()
@@ -547,7 +581,7 @@ fn str_field<'a>(doc: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
-async fn discover(
+pub(crate) async fn discover(
     http: &reqwest::Client,
     origin: &Url,
     insecure_loopback_ok: bool,
@@ -704,15 +738,20 @@ fn save_client(path: &Path, issuer: &str, client_id: &str, redirect_uri: &str) -
 /// Bind the one-shot listener. A saved registration pins the callback port, so
 /// try that port first; if it is taken, fall back to an ephemeral port and
 /// register afresh (the saved registration no longer matches).
-async fn bind_callback_listener(
+async fn bind_callback_listener_with<A, Afut>(
     saved: Option<SavedClient>,
-) -> Result<(TcpListener, Option<SavedClient>)> {
+    alloc: A,
+) -> Result<(TcpListener, Option<SavedClient>)>
+where
+    A: Fn(u16) -> Afut,
+    Afut: std::future::Future<Output = std::io::Result<TcpListener>> + Send,
+{
     if let Some(saved) = saved {
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", saved.port)).await {
+        if let Ok(listener) = alloc(saved.port).await {
             return Ok((listener, Some(saved)));
         }
     }
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+    let listener = alloc(0)
         .await
         .map_err(|_| Error::engine("cannot open a loopback port for the sign-in callback"))?;
     Ok((listener, None))
@@ -759,18 +798,19 @@ async fn register_client(
 
 // ---- authorization ------------------------------------------------------------
 
-fn random_urlsafe(bytes: usize) -> String {
+pub(crate) fn random_urlsafe(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
 }
 
-fn authorization_url(
+pub(crate) fn authorization_url(
     discovery: &Discovery,
     client_id: &str,
     redirect_uri: &str,
     state: &str,
     challenge: &str,
+    resource: &str,
 ) -> Result<Url> {
     let mut url = discovery.authorization_endpoint.clone();
     url.query_pairs_mut()
@@ -780,11 +820,11 @@ fn authorization_url(
         .append_pair("state", state)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("resource", &discovery.resource);
+        .append_pair("resource", resource);
     Ok(url)
 }
 
-fn present_url(browser: BrowserMode, url: &Url, pasteable: bool) {
+pub(crate) fn present_url(browser: BrowserMode, url: &Url, pasteable: bool) {
     match browser {
         BrowserMode::PrintOnly => {
             eprintln!("Open this address in a browser to sign in to Native:");
@@ -835,7 +875,7 @@ fn open_system_browser(url: &str) -> bool {
 
 // ---- callback handling ---------------------------------------------------------
 
-enum CallbackEvent {
+pub(crate) enum CallbackEvent {
     Code(String),
     Failed(LoginErrorKind, String),
 }
@@ -886,7 +926,7 @@ fn parse_callback_query(query: Option<&str>, expected_state: &str) -> Callback {
     })
 }
 
-async fn accept_callbacks(
+pub(crate) async fn accept_callbacks(
     listener: TcpListener,
     state: String,
     tx: tokio::sync::mpsc::UnboundedSender<CallbackEvent>,
@@ -1005,7 +1045,7 @@ async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
 /// `--no-browser`: lines pasted on stdin. A line must be the full callback URL
 /// (it is checked against the registered redirect). Other text is ignored with
 /// a hint, as is a callback whose `state` is not this attempt's.
-async fn read_pasted_callbacks(
+pub(crate) async fn read_pasted_callbacks(
     mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
     redirect: Url,
     state: String,
@@ -1044,20 +1084,29 @@ async fn read_pasted_callbacks(
 
 // ---- token exchange ------------------------------------------------------------
 
-struct Tokens {
-    access: String,
-    refresh: String,
-    lifetime_secs: i64,
+pub(crate) struct Tokens {
+    pub(crate) access: String,
+    pub(crate) refresh: String,
+    pub(crate) lifetime_secs: i64,
 }
 
-async fn exchange_code(
+pub(crate) struct AuthorizationCode<'a> {
+    pub(crate) redirect_uri: &'a str,
+    pub(crate) code: &'a str,
+    pub(crate) verifier: &'a str,
+}
+
+pub(crate) async fn exchange_code(
     http: &reqwest::Client,
     discovery: &Discovery,
     client_id: &str,
-    redirect_uri: &str,
-    code: &str,
-    verifier: &str,
-    client_path: &Path,
+    authorization: AuthorizationCode<'_>,
+    resource: &str,
+    // `Some` for the legacy login's saved client registration, which an
+    // `invalid_client` refusal discards so the next login registers afresh.
+    // Enrollment uses an operator-provisioned client and passes `None`: there
+    // is no saved registration to repair.
+    saved_client_path: Option<&Path>,
 ) -> std::result::Result<Tokens, LoginError> {
     let response = http
         .post(&discovery.token_endpoint)
@@ -1066,10 +1115,10 @@ async fn exchange_code(
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", client_id),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", verifier),
-            ("resource", discovery.resource.as_str()),
+            ("code", authorization.code),
+            ("redirect_uri", authorization.redirect_uri),
+            ("code_verifier", authorization.verifier),
+            ("resource", resource),
         ])
         .send()
         .await
@@ -1098,7 +1147,9 @@ async fn exchange_code(
         if code == "invalid_client" {
             // The saved registration is no longer accepted: drop it so the
             // next login registers afresh.
-            let _ = std::fs::remove_file(client_path);
+            if let Some(path) = saved_client_path {
+                let _ = std::fs::remove_file(path);
+            }
         }
         return Err(LoginError::new(
             LoginErrorKind::TokenRefused,
@@ -1561,17 +1612,157 @@ mod tests {
         }
     }
 
+    /// Test-held loopback ports: groups of pre-bound sockets served to the
+    /// allocator so saved ports are never released to the shared OS
+    /// allocator between sequential logins. The real saved-port
+    /// reuse/fallback decision still runs; only the socket source is fixed.
+    struct ReserveFixture {
+        state: Mutex<FixtureState>,
+    }
+
+    struct FixtureState {
+        groups: Vec<Vec<std::net::TcpListener>>,
+        requests: Vec<u16>,
+    }
+
+    impl ReserveFixture {
+        /// Bind one ephemeral port per group, holding `counts[i]` fds on
+        /// group `i`'s socket; returns the fixture and one port per group.
+        fn bind(counts: &[usize]) -> (Arc<Self>, Vec<u16>) {
+            let mut groups = Vec::with_capacity(counts.len());
+            let mut ports = Vec::with_capacity(counts.len());
+            for &n in counts {
+                // `from_std` registers the fd with the runtime: it must
+                // already be non-blocking, set before cloning so every
+                // reserve in the group inherits it.
+                let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                first.set_nonblocking(true).unwrap();
+                ports.push(first.local_addr().unwrap().port());
+                let mut group = Vec::with_capacity(n);
+                group.push(first);
+                for _ in 1..n {
+                    let spare = group[0].try_clone().unwrap();
+                    group.push(spare);
+                }
+                groups.push(group);
+            }
+            (
+                Arc::new(Self {
+                    state: Mutex::new(FixtureState {
+                        groups,
+                        requests: Vec::new(),
+                    }),
+                }),
+                ports,
+            )
+        }
+
+        /// Allocator for `login_with_allocator`: serves the next reserve in
+        /// turn, records the request, and validates a nonzero request
+        /// against the reserve's address.
+        fn allocate(&self, port: u16) -> std::future::Ready<std::io::Result<TcpListener>> {
+            let mut state = self.state.lock().unwrap();
+            state.requests.push(port);
+            let group = state
+                .groups
+                .iter_mut()
+                .find(|group| !group.is_empty())
+                .expect("reserve fixture ran out of sockets");
+            let std_listener = group.remove(0);
+            if port != 0 {
+                assert_eq!(
+                    std_listener.local_addr().unwrap().port(),
+                    port,
+                    "reserve matches the requested saved port",
+                );
+            }
+            std::future::ready(TcpListener::from_std(std_listener))
+        }
+
+        fn requests(&self) -> Vec<u16> {
+            self.state.lock().unwrap().requests.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_port_is_released_when_login_times_out() {
+        // Use a separate loopback address from the repository's
+        // 127.0.0.1 allocators. Prefer IPv6, with an IPv4 fallback;
+        // unavailable socket setup must fail rather than skip coverage.
+        let host = if TcpListener::bind("[::1]:0").await.is_ok() {
+            "::1"
+        } else {
+            TcpListener::bind("127.0.0.2:0")
+                .await
+                .expect("an isolated loopback address is available");
+            "127.0.0.2"
+        };
+        let fake = start_fake().await;
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let capture = seen.clone();
+        // Never approve: the browser hook only records the authorize URL,
+        // so the login must time out with its listener already released.
+        let mut opts = options(
+            &fake,
+            dir.path().join("native"),
+            Person::Walks,
+            Duration::from_millis(300),
+        );
+        opts.browser = BrowserMode::Hook(Box::new(move |url| {
+            *capture.lock().unwrap() = Some(url);
+        }));
+        let error = login_with_allocator(opts, |port| TcpListener::bind((host, port)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, LoginErrorKind::TimedOut, "{error}");
+        // This attempt's loopback port comes from the authorize URL's
+        // redirect; rebinding it at once — with no yield in between — must
+        // succeed, proving login() released it before returning.
+        let authorize = Url::parse(
+            seen.lock()
+                .unwrap()
+                .as_deref()
+                .expect("browser hook ran before the timeout"),
+        )
+        .unwrap();
+        let redirect = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorize URL carries the loopback redirect");
+        let port = Url::parse(&redirect).unwrap().port().unwrap();
+        TcpListener::bind((host, port))
+            .await
+            .expect("callback port released when the login timed out");
+    }
+
     #[tokio::test]
     async fn saved_registration_is_reused_on_the_next_login() {
         let fake = start_fake().await;
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("native");
-        let first = login(options(&fake, config.clone(), Person::Browser, WAIT))
-            .await
-            .unwrap();
-        let second = login(options(&fake, config.clone(), Person::Browser, WAIT))
-            .await
-            .unwrap();
+        // Serve both logins' callback ports from one test-held reserve
+        // group, so the saved port is never released to the shared OS
+        // allocator between the two logins.
+        let (fixture, ports) = ReserveFixture::bind(&[2]);
+        let alloc = {
+            let fixture = fixture.clone();
+            move |port: u16| fixture.allocate(port)
+        };
+        let first = login_with_allocator(
+            options(&fake, config.clone(), Person::Browser, WAIT),
+            alloc.clone(),
+        )
+        .await
+        .unwrap();
+        let second =
+            login_with_allocator(options(&fake, config.clone(), Person::Browser, WAIT), alloc)
+                .await
+                .unwrap();
+        // The first login asked for an ephemeral port; the second asked for
+        // exactly the saved one, proving correct saved-port selection.
+        assert_eq!(fixture.requests(), [0, ports[0]]);
         assert!(!first.client_reused);
         assert!(second.client_reused);
         assert_eq!(fake.registrations.load(Ordering::SeqCst), 1);
@@ -1586,6 +1777,48 @@ mod tests {
             std::fs::read_to_string(&second.credential_file).unwrap(),
             auth["access_token"].as_str().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn an_occupied_saved_port_registers_afresh_on_an_ephemeral_port() {
+        let fake = start_fake().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("native");
+        // Hold a loopback port for the whole login and pin a saved
+        // registration to it: the bind must fail deterministically, so the
+        // login falls back to an ephemeral port and registers afresh
+        // instead of reusing the saved client.
+        let guard = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = guard.local_addr().unwrap().port();
+        let occupied = format!("http://127.0.0.1:{port}/callback");
+        std::fs::create_dir_all(&config).unwrap();
+        save_client(
+            &config.join(CLIENT_FILE),
+            &fake.base(),
+            "client-9",
+            &occupied,
+        )
+        .unwrap();
+        // The saved registration is eligible before the login runs: it
+        // loads for this issuer with the guarded port.
+        assert_eq!(
+            load_saved_client(&config.join(CLIENT_FILE), &fake.base())
+                .unwrap()
+                .port,
+            port
+        );
+        let outcome = login(options(&fake, config.clone(), Person::Browser, WAIT))
+            .await
+            .unwrap();
+        assert!(!outcome.client_reused);
+        assert_eq!(fake.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.token_hits.load(Ordering::SeqCst), 1);
+        let saved = read_json(&outcome.client_file);
+        assert_eq!(saved["client_id"], "client-1");
+        let redirect = saved["redirect_uri"].as_str().unwrap();
+        assert!(redirect.starts_with("http://127.0.0.1:") && redirect.ends_with("/callback"));
+        assert_ne!(redirect, occupied);
+        assert_eq!(read_json(&outcome.auth_file)["client_id"], "client-1");
     }
 
     #[tokio::test]
@@ -1656,23 +1889,37 @@ mod tests {
         let fake = start_fake().await;
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("native");
-        login(options(&fake, config.clone(), Person::Browser, WAIT))
-            .await
-            .unwrap();
+        // Two reserves for the initial registration and its reuse, one for
+        // the fresh registration after the saved client is dropped.
+        let (fixture, ports) = ReserveFixture::bind(&[2, 1]);
+        let alloc = {
+            let fixture = fixture.clone();
+            move |port: u16| fixture.allocate(port)
+        };
+        login_with_allocator(
+            options(&fake, config.clone(), Person::Browser, WAIT),
+            alloc.clone(),
+        )
+        .await
+        .unwrap();
         *fake.token_error.lock().unwrap() = Some("invalid_client");
-        let error = login(options(&fake, config.clone(), Person::Browser, WAIT))
-            .await
-            .unwrap_err();
+        let error = login_with_allocator(
+            options(&fake, config.clone(), Person::Browser, WAIT),
+            alloc.clone(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.kind, LoginErrorKind::TokenRefused, "{error}");
         assert!(error.to_string().contains("invalid_client"), "{error}");
         assert!(error.reset_hint().is_some());
         assert!(!config.join(CLIENT_FILE).exists());
         *fake.token_error.lock().unwrap() = None;
-        let third = login(options(&fake, config, Person::Browser, WAIT))
+        let third = login_with_allocator(options(&fake, config, Person::Browser, WAIT), alloc)
             .await
             .unwrap();
         assert!(!third.client_reused);
         assert_eq!(fake.registrations.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.requests(), [0, ports[0], 0]);
     }
 
     #[test]
@@ -1724,9 +1971,19 @@ mod tests {
         let fake = start_fake().await;
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("native");
-        let first = login(options(&fake, config.clone(), Person::Browser, WAIT))
-            .await
-            .unwrap();
+        // Two reserves for the initial registration and its rejected
+        // reuse, two more for the reset registration and its reuse.
+        let (fixture, ports) = ReserveFixture::bind(&[2, 2]);
+        let alloc = {
+            let fixture = fixture.clone();
+            move |port: u16| fixture.allocate(port)
+        };
+        let first = login_with_allocator(
+            options(&fake, config.clone(), Person::Browser, WAIT),
+            alloc.clone(),
+        )
+        .await
+        .unwrap();
         assert!(!first.client_reused);
 
         // The authorization server now rejects that client at the authorize
@@ -1735,12 +1992,15 @@ mod tests {
             .lock()
             .unwrap()
             .push("client-1".into());
-        let error = login(options(
-            &fake,
-            config.clone(),
-            Person::Browser,
-            Duration::from_millis(600),
-        ))
+        let error = login_with_allocator(
+            options(
+                &fake,
+                config.clone(),
+                Person::Browser,
+                Duration::from_millis(600),
+            ),
+            alloc.clone(),
+        )
         .await
         .unwrap_err();
         assert_eq!(error.kind, LoginErrorKind::TimedOut, "{error}");
@@ -1753,18 +2013,19 @@ mod tests {
         // `--reset` discards the saved client and registers a new one.
         let mut reset = options(&fake, config.clone(), Person::Browser, WAIT);
         reset.reset = true;
-        let recovered = login(reset).await.unwrap();
+        let recovered = login_with_allocator(reset, alloc.clone()).await.unwrap();
         assert!(!recovered.client_reused);
         assert_eq!(fake.registrations.load(Ordering::SeqCst), 2);
         assert_eq!(read_json(&recovered.auth_file)["client_id"], "client-2");
         assert_eq!(read_json(&recovered.client_file)["client_id"], "client-2");
 
         // And the new registration is the one reused from now on.
-        let again = login(options(&fake, config, Person::Browser, WAIT))
+        let again = login_with_allocator(options(&fake, config, Person::Browser, WAIT), alloc)
             .await
             .unwrap();
         assert!(again.client_reused);
         assert_eq!(fake.registrations.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.requests(), [0, ports[0], 0, ports[1]]);
     }
 
     #[test]

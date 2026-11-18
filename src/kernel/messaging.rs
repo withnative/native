@@ -236,7 +236,15 @@ pub(crate) async fn logical_direct_home_on(
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) const STATE_EVENTS_SQL: &str = "('kernel.message_created.v1','kernel.message_state.v1','kernel.import_state.v1','kernel.import_state_delta.v1','kernel.v1_state_imported.v1')";
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) const STATE_JSON_SQL: &str = "CASE e.type WHEN 'kernel.import_state.v1' THEN json_extract(e.payload,'$.state.message') WHEN 'kernel.import_state_delta.v1' THEN json_extract(e.payload,'$.snapshot.state.message') WHEN 'kernel.v1_state_imported.v1' THEN json_extract(e.payload,'$.state.message') ELSE e.payload END";
+macro_rules! state_json_sql {
+    ($alias:literal) => {
+        concat!("CASE ", $alias, ".type WHEN 'kernel.import_state.v1' THEN json_extract(", $alias, ".payload,'$.state.message') WHEN 'kernel.import_state_delta.v1' THEN json_extract(", $alias, ".payload,'$.snapshot.state.message') WHEN 'kernel.v1_state_imported.v1' THEN json_extract(", $alias, ".payload,'$.state.message') ELSE ", $alias, ".payload END")
+    };
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) const STATE_JSON_SQL: &str = state_json_sql!("e");
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) const PREVIOUS_STATE_JSON_SQL: &str = state_json_sql!("p");
 
 /// Payload-free freshness for public reactions and the viewer's own private
 /// lane. Ordinary history still withholds every replacement payload. Compare
@@ -261,6 +269,7 @@ pub(crate) async fn change_on(
     if !hosted_identity::admitted(&mut *tx, principal).await? {
         return Ok(None);
     }
+    app_installs::admit_dispatched_on(&mut *tx, principal).await?;
     let row: Option<(String, String, Option<String>, String, String, String)> = sqlx::query_as(
         "SELECT record_id,payload,actor,created_at,id,causal_status FROM content_events WHERE seq=? AND type=?",
     )
@@ -307,6 +316,7 @@ pub(crate) async fn change_on(
         None
     };
     Ok(Some(KernelHistoryEvent {
+        native_body_version: None,
         retained_legacy: None,
         id,
         run_key: None,
@@ -440,6 +450,59 @@ pub(crate) async fn capability(
     Ok((maintenance || on(conn, id).await?.is_none()).then_some(Capability::None))
 }
 
+/// Whether `start`'s Annotation/Document `part_of` bearer closure reaches a
+/// sealed Message or an unsealed Message carrier, at any depth. The walk is
+/// unbounded; `UNION` over ids alone stops it on cycles, so its cost is
+/// bounded by the closure's size. It uses the guard's own edge and
+/// Message-identity predicates.
+///
+/// The single-record guard consults it only when its depth-[`GUARD_DEPTH`]
+/// walk overflows: a chain that reaches no Message is not the guard's
+/// business, whatever its depth (task 11ef0d8b), while a chain that does still
+/// fails closed. The bulk guard uses the equivalent shared set
+/// [`sql_message_bearing_ids`].
+fn sql_reaches_message(start: &str, type_index: &str) -> String {
+    format!(
+        r#"EXISTS(WITH RECURSIVE reach(id) AS (
+        SELECT {start} UNION
+        SELECT l.target_id FROM reach x
+        JOIN kernel_generic_links l ON l.source_id=x.id AND l.active=1 AND l.relationship='part_of'
+        JOIN kernel_record_fields f{type_index} ON f.record_id=x.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"'))
+      SELECT 1 FROM reach x WHERE
+        EXISTS(SELECT 1 FROM kernel_messages known WHERE known.message_id=x.id)
+        OR EXISTS(SELECT 1 FROM kernel_records carrier WHERE carrier.id=x.id AND
+          ((carrier.pin_family='native.v1.record' AND carrier.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields f{type_index} WHERE f.record_id=x.id AND f.name='v1_type' AND f.value_json='"Message"'))
+           OR (carrier.primary_type='Message' AND NOT coalesce(carrier.pin_family='native.v1.record' AND carrier.pin_version=1,0)))))"#
+    )
+}
+
+/// Every record whose Annotation/Document `part_of` bearer closure reaches a
+/// sealed Message or an unsealed Message carrier: exactly the records for
+/// which [`sql_reaches_message`] holds, computed in one walk *down* from the
+/// Messages instead of one walk up per record. A record joins when it is an
+/// Annotation/Document with an active `part_of` into the set, which is the
+/// guard's own edge rule read in the other direction. Uncorrelated, so SQLite
+/// materialises it at most once per statement; `UNION` stops it on cycles.
+fn sql_message_bearing_ids(type_index: &str) -> String {
+    format!(
+        r#"WITH RECURSIVE bearing(id) AS (
+        SELECT message_id FROM kernel_messages
+        UNION SELECT carrier.id FROM kernel_records carrier WHERE
+          (carrier.pin_family='native.v1.record' AND carrier.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields f{type_index} WHERE f.record_id=carrier.id AND f.name='v1_type' AND f.value_json='"Message"'))
+          OR (carrier.primary_type='Message' AND NOT coalesce(carrier.pin_family='native.v1.record' AND carrier.pin_version=1,0))
+        UNION SELECT l.source_id FROM bearing b
+        JOIN kernel_generic_links l ON l.target_id=b.id AND l.active=1 AND l.relationship='part_of'
+        JOIN kernel_record_fields f{type_index} ON f.record_id=l.source_id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"'))
+      SELECT id FROM bearing"#
+    )
+}
+
+/// Depth of the guard's per-row walk. Within it, every Message reached must be
+/// visible to the caller. A chain continuing past it fails closed only if its
+/// full closure reaches a Message ([`sql_reaches_message`],
+/// [`sql_message_bearing_ids`]).
+const GUARD_DEPTH: u32 = 8;
+
 /// Message/bearer guard over a caller's already evaluated home-policy snapshot.
 /// `homes` selects `id,view` for valid homes. This shares live hosted membership
 /// and imported member-policy evaluation with ordinary kernel authorization.
@@ -451,6 +514,9 @@ pub(crate) fn sql_guard(alias: &str, actor: &str, homes: &str, prepared_read: bo
     } else {
         ""
     };
+    // One shared set per statement: a per-row upward walk here costs
+    // O(depth) per overflowing row, quadratic over a long thread.
+    let bearing = sql_message_bearing_ids(type_index);
     format!(
         // Most records are neither Messages nor bearers. Avoid starting a
         // recursive VM for them, using exactly the recursive arm's identity
@@ -467,7 +533,7 @@ pub(crate) fn sql_guard(alias: &str, actor: &str, homes: &str, prepared_read: bo
         SELECT l.target_id,b.depth+1 FROM bearers b
         JOIN kernel_generic_links l ON l.source_id=b.id AND l.active=1 AND l.relationship='part_of'
         JOIN kernel_record_fields f{type_index} ON f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"')
-        WHERE b.depth<8)
+        WHERE b.depth<{GUARD_DEPTH})
       SELECT 1 FROM bearers b WHERE
         ((EXISTS(SELECT 1 FROM kernel_messages known WHERE known.message_id=b.id)
           OR EXISTS(SELECT 1 FROM kernel_records carrier WHERE carrier.id=b.id AND
@@ -480,10 +546,11 @@ pub(crate) fn sql_guard(alias: &str, actor: &str, homes: &str, prepared_read: bo
             AND (current_home.view OR mr.owner_id={actor})
             AND NOT EXISTS(SELECT 1 FROM kernel_principals service WHERE service.principal_id={actor} AND service.auth_binding='host:relates-to:transform')
             AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones tomb WHERE tomb.record_id=mr.id)))
-        OR (b.depth=8
+        OR CASE WHEN b.depth={GUARD_DEPTH}
           AND EXISTS(SELECT 1 FROM kernel_record_fields f{type_index} WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"'))
-          AND EXISTS(SELECT 1 FROM kernel_generic_links l WHERE l.source_id=b.id AND l.active=1 AND l.relationship='part_of'))
-    ) END"#
+          AND EXISTS(SELECT 1 FROM kernel_generic_links l WHERE l.source_id=b.id AND l.active=1 AND l.relationship='part_of')
+          THEN {alias}.id IN ({bearing}) ELSE 0 END
+    ) END"#,
     )
 }
 
@@ -495,15 +562,31 @@ pub(crate) async fn audience_allows(
     if !hosted_identity::admitted(conn, actor).await? {
         return Ok(false);
     }
-    let bearers: Vec<(String,bool)> = sqlx::query_as(r#"WITH RECURSIVE bearers(id,depth) AS (
+    let bearers: Vec<(String,bool)> = sqlx::query_as(&format!(r#"WITH RECURSIVE bearers(id,depth) AS (
         SELECT ?1,0 UNION ALL
         SELECT l.target_id,b.depth+1 FROM bearers b
         JOIN kernel_generic_links l ON l.source_id=b.id AND l.active=1 AND l.relationship='part_of'
-        JOIN kernel_record_fields f ON f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"') WHERE b.depth<8)
-        SELECT b.id,(b.depth=8 AND EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"')) AND EXISTS(SELECT 1 FROM kernel_generic_links l WHERE l.source_id=b.id AND l.active=1 AND l.relationship='part_of')) FROM bearers b"#).bind(id).fetch_all(&mut *conn).await?;
+        JOIN kernel_record_fields f ON f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"') WHERE b.depth<{GUARD_DEPTH})
+        SELECT b.id,(b.depth={GUARD_DEPTH} AND EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"')) AND EXISTS(SELECT 1 FROM kernel_generic_links l WHERE l.source_id=b.id AND l.active=1 AND l.relationship='part_of')) FROM bearers b"#)).bind(id).fetch_all(&mut *conn).await?;
+    // Same rule as `sql_guard`: overflow fails closed only for a chain whose
+    // closure reaches a Message. Evaluated at most once per record.
+    let mut reaches_message = None;
     for (bearer, overflow) in bearers {
         if overflow {
-            return Ok(false);
+            let reaches = match reaches_message {
+                Some(reaches) => reaches,
+                None => {
+                    let reaches: bool =
+                        sqlx::query_scalar(&format!("SELECT {}", sql_reaches_message("?1", "")))
+                            .bind(id)
+                            .fetch_one(&mut *conn)
+                            .await?;
+                    *reaches_message.insert(reaches)
+                }
+            };
+            if reaches {
+                return Ok(false);
+            }
         }
         if is_message_record(conn, &bearer).await?
             && (capability(conn, actor, &bearer).await? == Some(Capability::None)

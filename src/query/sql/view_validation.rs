@@ -12,9 +12,15 @@ pub(crate) struct Budget {
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
     interrupts: Arc<Mutex<Vec<rusqlite::InterruptHandle>>>,
+    #[cfg(test)]
+    test_control: Option<Arc<ValidationRunTestControl>>,
 }
 impl Budget {
     fn stopped(&self) -> bool {
+        #[cfg(test)]
+        if let Some(control) = &self.test_control {
+            return self.cancelled.load(Ordering::Acquire) || control.now() >= self.deadline;
+        }
         self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
     }
     pub(crate) fn check(&self) -> Result<()> {
@@ -52,7 +58,16 @@ pub(super) fn arm(conn: &rusqlite::Connection) -> Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(conn.get_interrupt_handle());
         let progress = budget.clone();
-        conn.progress_handler(100, Some(move || progress.stopped()));
+        conn.progress_handler(
+            100,
+            Some(move || {
+                #[cfg(test)]
+                if let Some(control) = &progress.test_control {
+                    control.observe_progress();
+                }
+                progress.stopped()
+            }),
+        );
         conn.authorizer(Some(move |_: AuthContext<'_>| {
             if budget.stopped() {
                 Authorization::Deny
@@ -76,6 +91,22 @@ pub(crate) async fn run<T: Send + 'static>(
     deadline: Instant,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    run_inner(
+        deadline,
+        work,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+// Shared body retains the original deadline, admission and retirement ordering.
+// Only the test entry can supply an owned, operation-local clock/observation.
+async fn run_inner<T: Send + 'static>(
+    deadline: Instant,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+    #[cfg(test)] test_control: Option<Arc<ValidationRunTestControl>>,
+) -> Result<T> {
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = SLOTS
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
@@ -84,12 +115,17 @@ pub(crate) async fn run<T: Send + 'static>(
         deadline,
         cancelled: Arc::new(AtomicBool::new(false)),
         interrupts: Arc::new(Mutex::new(Vec::new())),
+        #[cfg(test)]
+        test_control,
     };
     budget.check()?;
     let guard = CancelOnDrop(budget.clone());
     let until = tokio::time::Instant::from_std(deadline);
-    let permit = tokio::time::timeout_at(until, slots.acquire_owned())
-        .await
+    #[cfg(not(test))]
+    let permit = tokio::time::timeout_at(until, slots.acquire_owned()).await;
+    #[cfg(test)]
+    let permit = timeout_for_test(until, budget.test_control.as_ref(), slots.acquire_owned()).await;
+    let permit = permit
         .map_err(|_| {
             sql_contract::categorized_error(
                 QuerySqlErrorCategory::Timeout,
@@ -108,21 +144,36 @@ pub(crate) async fn run<T: Send + 'static>(
             }
         }
         let _reset = Reset;
+        #[cfg(test)]
+        if let Some(control) = &worker_budget.test_control {
+            control.wait_before_work();
+        }
         worker_budget.check()?;
         let result = work();
         worker_budget.check()?;
         result
     });
     let (send, recv) = tokio::sync::oneshot::channel();
+    #[cfg(test)]
+    let retiring_control = budget.test_control.clone();
     tokio::spawn(async move {
         let result = worker
             .await
             .map_err(|e| contract_violation(format!("validator worker: {e}")))
             .and_then(|r| r);
+        // Actual JoinHandle settlement precedes this observation: worker locals,
+        // connection, ACTIVE reset and original permit have all been dropped.
+        #[cfg(test)]
+        if let Some(control) = retiring_control {
+            control.retired.notify_one();
+        }
         let _ = send.send(result);
     });
-    let result = tokio::time::timeout_at(until, recv)
-        .await
+    #[cfg(not(test))]
+    let result = tokio::time::timeout_at(until, recv).await;
+    #[cfg(test)]
+    let result = timeout_for_test(until, budget.test_control.as_ref(), recv).await;
+    let result = result
         .map_err(|_| {
             sql_contract::categorized_error(
                 QuerySqlErrorCategory::Timeout,
@@ -132,6 +183,174 @@ pub(crate) async fn run<T: Send + 'static>(
         .map_err(|_| contract_violation("validator worker unavailable"))?;
     drop(guard);
     result
+}
+
+// Test controls own only clock/observation/gate state. They never retain a
+// Budget, connection, permit, worker, closure or future. Captures point one way.
+#[cfg(test)]
+pub(super) enum ValidationRunTestMode {
+    ObserveVm,
+    HoldBeforeWork,
+}
+
+#[cfg(test)]
+pub(super) struct ValidationRunTestControl {
+    origin: Instant,
+    deadline: Instant,
+    expired: AtomicBool,
+    expiry: tokio::sync::watch::Sender<bool>,
+    interested: AtomicBool,
+    validator_built: AtomicBool,
+    observed_vm: AtomicBool,
+    vm: tokio::sync::Notify,
+    before: tokio::sync::Notify,
+    retired: tokio::sync::Notify,
+    gate: Mutex<bool>,
+    gate_changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+pub(super) struct ValidationRunTestRelease(Arc<ValidationRunTestControl>);
+
+#[cfg(test)]
+impl Drop for ValidationRunTestRelease {
+    fn drop(&mut self) {
+        // Installed before dispatch; synchronous and unconditional on failure.
+        self.0.expire_at_deadline();
+        self.0.release_before_work();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn validation_run_test_control(
+    mode: ValidationRunTestMode,
+) -> (Arc<ValidationRunTestControl>, ValidationRunTestRelease) {
+    let origin = Instant::now();
+    let (expiry, _) = tokio::sync::watch::channel(false);
+    let control = Arc::new(ValidationRunTestControl {
+        origin,
+        deadline: origin + Duration::from_millis(100),
+        expired: AtomicBool::new(false),
+        expiry,
+        interested: AtomicBool::new(false),
+        validator_built: AtomicBool::new(false),
+        observed_vm: AtomicBool::new(false),
+        vm: tokio::sync::Notify::new(),
+        before: tokio::sync::Notify::new(),
+        retired: tokio::sync::Notify::new(),
+        gate: Mutex::new(matches!(mode, ValidationRunTestMode::ObserveVm)),
+        gate_changed: std::sync::Condvar::new(),
+    });
+    let release = ValidationRunTestRelease(control.clone());
+    (control, release)
+}
+
+#[cfg(test)]
+impl ValidationRunTestControl {
+    fn now(&self) -> Instant {
+        if self.expired.load(Ordering::Acquire) {
+            self.deadline
+        } else {
+            self.origin
+        }
+    }
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(super) fn observe_next_statement(&self) {
+        self.interested.store(true, Ordering::Release);
+    }
+    // Called by the worker only AFTER building its actual validator. Interest
+    // armed by the test thread cannot turn setup VM steps into query evidence.
+    pub(super) fn validator_built(&self) {
+        self.validator_built.store(true, Ordering::Release);
+    }
+    fn observe_progress(&self) {
+        if self.validator_built.load(Ordering::Acquire)
+            && self.interested.swap(false, Ordering::AcqRel)
+        {
+            self.observed_vm.store(true, Ordering::Release);
+            self.vm.notify_one();
+        }
+    }
+    pub(super) fn has_vm_started(&self) -> bool {
+        self.observed_vm.load(Ordering::Acquire)
+    }
+    pub(super) async fn vm_started(&self) {
+        self.vm.notified().await;
+    }
+    pub(super) async fn before_work(&self) {
+        self.before.notified().await;
+    }
+    pub(super) async fn worker_retired(&self) {
+        self.retired.notified().await;
+    }
+    pub(super) fn expire_at_deadline(&self) {
+        // Clock advance only. Cancellation and actual interrupt custody remain
+        // the original CancelOnDrop/Budget::cancel path, never a test substitute.
+        self.expired.store(true, Ordering::Release);
+        self.expiry.send_replace(true);
+    }
+    async fn deadline_expired(&self) {
+        let mut expiry = self.expiry.subscribe();
+        loop {
+            if *expiry.borrow_and_update() {
+                return;
+            }
+            expiry
+                .changed()
+                .await
+                .expect("control retains expiry sender");
+        }
+    }
+    fn wait_before_work(&self) {
+        let mut released = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*released {
+            // The worker already owns its original permit. This is a dispatch
+            // gate for ONE operation, not proof of eight-slot saturation.
+            self.before.notify_one();
+            while !*released {
+                released = self
+                    .gate_changed
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+    pub(super) fn release_before_work(&self) {
+        *self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.gate_changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+async fn timeout_for_test<F: std::future::Future>(
+    until: tokio::time::Instant,
+    control: Option<&Arc<ValidationRunTestControl>>,
+    work: F,
+) -> std::result::Result<F::Output, ()> {
+    let Some(control) = control else {
+        return tokio::time::timeout_at(until, work).await.map_err(|_| ());
+    };
+    tokio::select! {
+        biased;
+        result = work => Ok(result),
+        _ = control.deadline_expired() => Err(()),
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn run_controlled_for_test<T: Send + 'static>(
+    control: Arc<ValidationRunTestControl>,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    run_inner(control.deadline(), work, Some(control)).await
 }
 
 type Reads = BTreeSet<(String, String)>;

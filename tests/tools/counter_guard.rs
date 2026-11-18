@@ -95,6 +95,11 @@ const ERROR_PATH: &str = "<error text>";
 /// Today's known counters for a non-owner: (tool, normalised path, slice).
 /// `$` is the response; `.key` descends an object; `[]` any array element.
 const ALLOWLIST: &[(&str, &str, Slice)] = &[
+    // A real adopted bundle makes the legacy full install list non-empty.
+    // Its existing install-entry projection exposes this sequence; track the
+    // S6 debt precisely rather than exempting the new bundle read or hiding
+    // the list's populated response behind a different fixture principal.
+    ("manage_alpha_tabs", "$.installs[].event_seq", Slice::S6),
     ("archive_record", "$.previous_seq", Slice::S6),
     ("batch_write", "$.results[].previous_seq", Slice::S6),
     ("create_many", "$.results[].record.previous_seq", Slice::S6),
@@ -353,6 +358,10 @@ const NOT_EXERCISED: &[(&str, &str)] = &[
         "write: needs an artifact fixture",
     ),
     ("attach_from_url", "write: performs a network fetch"),
+    (
+        "merge_body",
+        "write: KernelV2 only and dark behind an account flag; exercised in src/mcp/kernel_v2/merge_body_tests.rs",
+    ),
     ("resolve_suggestions", "write: needs pending suggestions"),
     ("manage_citations", "write: needs an existing citation"),
     (
@@ -370,6 +379,7 @@ const NOT_EXERCISED: &[(&str, &str)] = &[
 /// Mutation tools the guard only ever drives to an error in this fixture, each
 /// with the reason. No read tool may appear here.
 const ERROR_ONLY: &[(&str, &str)] = &[
+    ("manage_saved_tabs", "all five valid actions explicitly refuse the unsupported ordinary SQLite profile without events or head disclosure; actual private v2 successes and every receipt outcome are scanned by saved_tabs_success_receipts_use_canonical_event_ids_without_workspace_counters in src/mcp/kernel_v2/saved_tabs_tests.rs"),
     ("claim_unowned_record", "host-owner authority is required"),
     (
         "correct_record_type",
@@ -382,7 +392,7 @@ const ERROR_ONLY: &[(&str, &str)] = &[
 /// `ERROR_ONLY`, with the fixture it would need. The coverage test fails if one
 /// starts succeeding, so the gap is deleted when it is closed (M4).
 const READ_SUCCESS_GAPS: &[(&str, &str)] = &[
-    ("manage_named_views", "all six actions refuse on this ordinary SQLite fixture; hosted-v2 successes and authority boundaries are tested in src/named_views/execution_tests.rs"),
+    ("manage_named_views", "all seven actions refuse on this ordinary SQLite fixture; hosted-v2 successes and authority boundaries are tested in src/named_views/execution_tests.rs"),
     ("manage_onboarding", "database owner host role required"),
     ("manage_mdx_modules", "no module fixture"),
     ("resolve_citation", "no citation fixture"),
@@ -472,6 +482,8 @@ const MDX_SOURCE: &str = r#"export const nativeArtifact = { schema: "native.mdx.
 
 <Metric label="Current" value={1} />"#;
 
+const BUNDLE_SOURCE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Guard bundle</title></head><body><main>Counter guard app</main></body></html>";
+
 /// Ids the call plan refers to.
 struct Ids {
     owner: String,
@@ -503,6 +515,8 @@ struct Ids {
     /// A visible `native.mdx.v2` artifact, so `render_artifact` reaches its
     /// success path (M2).
     mdx: String,
+    bundle: String,
+    bundle_install: String,
     /// Sealed HCP histories, interleaved across accounts; never fake facets.
     audit_entry: String,
     owner_audit_entry: String,
@@ -739,6 +753,32 @@ async fn fixture() -> (Fixture, Ids) {
         "facets": { "runtime": "native.mdx.v2" }
     }))
     .await;
+    // Exercise a successful bundle read as the non-owner through a real
+    // install, preview receipt and shell adoption, never a synthetic projection.
+    let bundle = create(json!({
+        "type": "Document", "kind": "artifact", "name": "Guard bundle",
+        "body": BUNDLE_SOURCE, "owner_id": owner,
+        "facets": { "runtime": "native.html.v1" }
+    }))
+    .await;
+    replace_explicit_policy(
+        &fx.db,
+        "test:policy",
+        &bundle,
+        vec![AllowEntry::account("acct:member", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let bundle_install = crate::alpha_tabs::adopted_package_over_artifact_as(
+        &fx.registry,
+        &fx.db,
+        "acct:member",
+        "guard.bundle",
+        &bundle,
+        BUNDLE_SOURCE,
+        json!({"contract":"native.app.v2", "needs":[], "effects":[]}),
+    )
+    .await;
     owner_call(
         &fx,
         "manage_canvas",
@@ -840,6 +880,8 @@ async fn fixture() -> (Fixture, Ids) {
         canvas,
         unowned,
         mdx,
+        bundle,
+        bundle_install,
     };
     (fx, ids)
 }
@@ -1124,6 +1166,14 @@ fn plan(ids: &Ids, too_far: i64) -> Vec<Call> {
         ),
         call("manage_alpha_tabs", json!({ "action": "list" })),
         call(
+            "read_app_bundle",
+            json!({
+                "package":"guard.bundle",
+                "expected_install_event_id":ids.bundle_install,
+                "parent_origin":"http://localhost:8080"
+            }),
+        ),
+        call(
             "manage_account_config",
             json!({"action":"inspect","kind":"focus_preferences"}),
         ),
@@ -1151,6 +1201,26 @@ fn plan(ids: &Ids, too_far: i64) -> Vec<Call> {
             json!({"action":"get_view_revision","view_id":"native.named-view:bearer","revision_id":"revision"}),
         ),
         call_err(
+            "manage_saved_tabs",
+            crate::authorization_contract::saved_tab_operation_arguments()[0].clone(),
+        ),
+        call_err(
+            "manage_saved_tabs",
+            crate::authorization_contract::saved_tab_operation_arguments()[1].clone(),
+        ),
+        call_err(
+            "manage_saved_tabs",
+            crate::authorization_contract::saved_tab_operation_arguments()[2].clone(),
+        ),
+        call_err(
+            "manage_saved_tabs",
+            crate::authorization_contract::saved_tab_operation_arguments()[3].clone(),
+        ),
+        call_err(
+            "manage_saved_tabs",
+            crate::authorization_contract::saved_tab_operation_arguments()[4].clone(),
+        ),
+        call_err(
             "manage_named_views",
             json!({"action":"list_view_revisions","view_id":"native.named-view:bearer"}),
         ),
@@ -1169,6 +1239,10 @@ fn plan(ids: &Ids, too_far: i64) -> Vec<Call> {
         call_err(
             "manage_named_views",
             json!({"action":"prepare_named_views"}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"propose_view","id":ids.shared,"record_type":"WorkItem","home":"native:root","selection":{"kind":"all"}}),
         ),
         call("query_change_summaries", json!({ "action": "list" })),
         call(
@@ -1480,6 +1554,27 @@ async fn run_plan() -> (
                 if planned.expected == Expected::Err {
                     call_problems.push(format!("{} expected Err but returned Ok", planned.tool));
                 }
+                if planned.tool == "read_app_bundle" {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    use sha2::{Digest, Sha256};
+                    assert_eq!(response["artifact_id"], ids.bundle);
+                    assert_eq!(
+                        response["source_sha256"],
+                        native_ce::mcp::tools::alpha_tabs::alpha_tab_bundle_digest(BUNDLE_SOURCE)
+                    );
+                    let document = STANDARD
+                        .decode(response["content"].as_str().unwrap())
+                        .unwrap();
+                    assert!(!document.is_empty());
+                    assert_eq!(response["total_bytes"], document.len());
+                    assert!(response["next_offset"].is_null());
+                    assert_eq!(
+                        response["document_sha256"],
+                        hex::encode(Sha256::digest(&document))
+                    );
+                    assert!(find_counters(&response).is_empty());
+                    assert_eq!(head_before, head_after);
+                }
                 if planned.tool == "read_hcp_audit" {
                     let events = response["events"].as_array().unwrap();
                     assert_eq!(events.len(), 2, "exercise non-empty success");
@@ -1543,6 +1638,18 @@ async fn run_plan() -> (
                     ));
                 }
                 let text = error.to_string();
+                if planned.tool == "manage_saved_tabs" {
+                    assert!(
+                        text.contains("manage_saved_tabs: unsupported engine; kernel_v2 required"),
+                        "{text}"
+                    );
+                    assert_eq!(
+                        head_before, head_after,
+                        "unsupported saved-tab calls append no events"
+                    );
+                    assert!(!text_names_head(&text, head_before));
+                    assert!(!text_names_head(&text, head_after));
+                }
                 if text_names_head(&text, head_before) || text_names_head(&text, head_after) {
                     observed.insert((planned.tool.to_string(), ERROR_PATH.to_string()));
                 }

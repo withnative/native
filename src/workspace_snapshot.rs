@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::query::QueryPrincipal;
-use crate::workspace_index::FilteredWorkspaceIndex;
+use crate::workspace_index::{Covered, FilteredWorkspaceIndex};
 
 /// V1 tokens held per database handle. Entries are LRU-evicted past this count
 /// or [`SNAPSHOT_MAX_BYTES`] total. V2 uses its own bounded handle budget below
@@ -97,6 +97,79 @@ pub struct SnapshotRecord {
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
+    /// Physical or governed `is_current` when coverage was read: 1, reserved 0,
+    /// or JSON null for SQL NULL. Omitted from the wire when coverage is absent.
+    #[serde(
+        default,
+        skip_serializing_if = "covered_is_absent",
+        serialize_with = "serialize_covered_option",
+        deserialize_with = "deserialize_covered_option"
+    )]
+    pub is_current: Covered<Option<i64>>,
+    /// Governed `updated_at_ms` when coverage was read. JSON null is an
+    /// expression failure. Omitted when the expression was not read.
+    #[serde(
+        default,
+        skip_serializing_if = "covered_is_absent",
+        serialize_with = "serialize_covered_option",
+        deserialize_with = "deserialize_covered_option"
+    )]
+    pub updated_at_ms: Covered<Option<i64>>,
+    /// Physical or governed `archived` when the column was read. Omitted when
+    /// it was not; absence is not archived 0.
+    #[serde(
+        default,
+        skip_serializing_if = "covered_is_absent",
+        serialize_with = "serialize_covered_i64",
+        deserialize_with = "deserialize_covered_i64"
+    )]
+    pub archived: Covered<i64>,
+}
+
+fn covered_is_absent<T>(value: &Covered<T>) -> bool {
+    value.is_absent()
+}
+
+fn serialize_covered_option<S>(
+    value: &Covered<Option<i64>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Covered::Present(inner) => inner.serialize(serializer),
+        Covered::Absent => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_covered_option<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Covered<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Covered::Present(Option::<i64>::deserialize(deserializer)?))
+}
+
+fn serialize_covered_i64<S>(
+    value: &Covered<i64>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Covered::Present(inner) => inner.serialize(serializer),
+        Covered::Absent => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_covered_i64<'de, D>(deserializer: D) -> std::result::Result<Covered<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Covered::Present(i64::deserialize(deserializer)?))
 }
 
 /// One `facet_values` row, exactly as the governed view serves it: `value_num`
@@ -153,6 +226,9 @@ impl SnapshotRecord {
             created_at: head.created_at.clone(),
             updated_at: head.updated_at.clone(),
             deleted_at: head.deleted_at.clone(),
+            is_current: head.is_current,
+            updated_at_ms: head.updated_at_ms,
+            archived: head.archived,
         }
     }
 }
@@ -1184,7 +1260,7 @@ pub enum CatchUpOutcome {
 pub const RESUME_MANIFEST_VERSION: u32 = 1;
 /// Pinned profile string: version and shape travel in the manifest so a
 /// future projection change restarts instead of miscomparing.
-pub const RESUME_MANIFEST_PROFILE: &str = "workspace-snapshot-resume/v1";
+pub const RESUME_MANIFEST_PROFILE: &str = "workspace-snapshot-resume/v2";
 /// Serialized manifest cap: 3.5 MiB, safely under the hosted 4 MiB MCP
 /// envelope (`MCP_REQUEST_BODY_LIMIT` in held/hosting/src/http.rs), leaving
 /// room for escaping expansion and MCP metadata. Above it the client takes
@@ -1201,7 +1277,7 @@ pub const RESUME_RESTART_OVER_CAP: &str = "manifest_over_cap";
 
 /// Digest domain tags: a section marker pinned into every digest so a record
 /// digest can never validate as a facet or link digest (type confusion).
-const RESUME_DIGEST_DOMAIN_RECORD: &[u8] = b"native.ws-resume/v1/record\x00";
+const RESUME_DIGEST_DOMAIN_RECORD: &[u8] = b"native.ws-resume/v2/record\x00";
 const RESUME_DIGEST_DOMAIN_FACET: &[u8] = b"native.ws-resume/v1/facet\x00";
 const RESUME_DIGEST_DOMAIN_LINK: &[u8] = b"native.ws-resume/v1/link\x00";
 
@@ -1235,9 +1311,36 @@ fn resume_digest_hex(domain: &[u8], fields: &[Option<&str>]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Canonical nullable text for a copied integer: decimal digits, or absent
+/// for SQL NULL. `0` stays `"0"`; this does not treat reserved currency 0 as
+/// null.
+fn canonical_resume_integer(value: Option<i64>) -> Option<String> {
+    value.map(|number| number.to_string())
+}
+
 /// Digest over exactly the cached record projection: the governed-minus-body
-/// public fields the demo-shell cache persists, in this fixed order.
+/// public fields the demo-shell cache persists, in this fixed order, then
+/// canonical text for `is_current`, `updated_at_ms`, and `archived`.
+fn present_option(cell: Covered<Option<i64>>) -> Option<i64> {
+    match cell {
+        Covered::Present(value) => value,
+        // Uncovered currency is not SQL NULL. The digest is only defined for
+        // a row whose coverage was actually read.
+        Covered::Absent => panic!("resume digest refuses uncovered currency"),
+    }
+}
+
+fn present_archived(cell: Covered<i64>) -> i64 {
+    match cell {
+        Covered::Present(value) => value,
+        Covered::Absent => panic!("resume digest refuses uncovered archived"),
+    }
+}
+
 pub(crate) fn record_resume_digest(row: &SnapshotRecord) -> String {
+    let is_current = canonical_resume_integer(present_option(row.is_current));
+    let updated_at_ms = canonical_resume_integer(present_option(row.updated_at_ms));
+    let archived = present_archived(row.archived).to_string();
     record_resume_digest_fields(&[
         Some(row.id.as_str()),
         row.record_type.as_deref(),
@@ -1252,15 +1355,19 @@ pub(crate) fn record_resume_digest(row: &SnapshotRecord) -> String {
         Some(row.created_at.as_str()),
         Some(row.updated_at.as_str()),
         row.deleted_at.as_deref(),
+        is_current.as_deref(),
+        updated_at_ms.as_deref(),
+        Some(archived.as_str()),
     ])
 }
 
-/// Field-level record digest: the 13 cached projection fields in pinned
+/// Field-level record digest: the 16 cached projection fields in pinned
 /// order. The struct wrapper above is what the server uses; vectors address
 /// this level so permutations (including nulls in required positions) stay
-/// expressible.
+/// expressible. The last three fields are canonical text: `is_current`
+/// `"1"`/`"0"`/absent, `updated_at_ms` decimal/absent, `archived` `"0"`/`"1"`.
 pub(crate) fn record_resume_digest_fields(fields: &[Option<&str>]) -> String {
-    assert_eq!(fields.len(), 13, "record digest pins 13 fields");
+    assert_eq!(fields.len(), 16, "record digest pins 16 fields");
     resume_digest_hex(RESUME_DIGEST_DOMAIN_RECORD, fields)
 }
 
@@ -2550,6 +2657,9 @@ mod tests {
                 created_at: "2026-09-23T00:00:00Z".to_string(),
                 updated_at: "2026-09-23T00:00:00Z".to_string(),
                 deleted_at: None,
+                is_current: Covered::Present(Some(1)),
+                updated_at_ms: Covered::Present(Some(1_756_080_000_000)),
+                archived: Covered::Present(0),
             },
         );
         let mut facets = BTreeMap::new();
@@ -3433,7 +3543,7 @@ mod tests {
             let present = |index: usize| fields[index].as_str();
             let computed = match domain {
                 "record" => {
-                    assert_eq!(fields.len(), 13, "{name} pins the 13-field record order");
+                    assert_eq!(fields.len(), 16, "{name} pins the 16-field record order");
                     let owned: Vec<Option<String>> = fields
                         .iter()
                         .map(|field| field.as_str().map(str::to_string))
@@ -3499,6 +3609,9 @@ mod tests {
                 created_at: ascii[10].as_str().unwrap().into(),
                 updated_at: ascii[11].as_str().unwrap().into(),
                 deleted_at: ascii_opt(12),
+                is_current: Covered::Present(ascii_opt(13).map(|text| text.parse().unwrap())),
+                updated_at_ms: Covered::Present(ascii_opt(14).map(|text| text.parse().unwrap())),
+                archived: Covered::Present(ascii[15].as_str().unwrap().parse().unwrap()),
             })
         );
         // Order, nullness, and domain separation are observable relations
@@ -4038,6 +4151,507 @@ mod tests {
         );
         assert!(delta.delete_record_ids.is_empty());
     }
+
+    fn json_i64(value: &serde_json::Value) -> Option<i64> {
+        if value.is_null() {
+            None
+        } else {
+            Some(value.as_i64().expect("currency cell is an integer"))
+        }
+    }
+
+    async fn sql_currency(
+        db: &crate::db::Db,
+        principal: QueryPrincipal,
+        id: &str,
+    ) -> (Option<i64>, Option<i64>, i64) {
+        let sql =
+            format!("SELECT is_current, updated_at_ms, archived FROM records WHERE id = '{id}'");
+        let result = crate::query::sql::query_sql(db, principal, &sql)
+            .await
+            .unwrap();
+        let row = result
+            .rows
+            .first()
+            .expect("same-principal SQL sees the record");
+        (
+            json_i64(&row["is_current"]),
+            json_i64(&row["updated_at_ms"]),
+            row["archived"].as_i64().expect("archived is an integer"),
+        )
+    }
+
+    fn assert_currency(record: &SnapshotRecord, sql: (Option<i64>, Option<i64>, i64)) {
+        assert_eq!(
+            (record.is_current, record.updated_at_ms, record.archived),
+            (
+                Covered::Present(sql.0),
+                Covered::Present(sql.1),
+                Covered::Present(sql.2),
+            ),
+            "snapshot copies the same-principal SQL currency cells"
+        );
+    }
+
+    fn expect_delta(outcome: CatchUpOutcome) -> Box<SnapshotDelta> {
+        match outcome {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("expected a currency delta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_currency_matches_sql_when_successor_is_hidden() {
+        let db = three_record_fixture().await;
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: None,
+                source_id: BEA_ONLY_ID.into(),
+                target_id: ALICE_COMMON_ID.into(),
+                relationship: "supersedes".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let opened = open_token(&db, alice()).await;
+        let rows = page_all_records(&db, alice(), &opened.token).await;
+        let record = &rows[ALICE_COMMON_ID];
+        assert_eq!(
+            record.is_current,
+            Covered::Present(None),
+            "a live hidden successor nulls currency"
+        );
+        assert_currency(record, sql_currency(&db, alice(), ALICE_COMMON_ID).await);
+        let links = page_all_section(&db, alice(), &opened.token, SnapshotSection::Links).await;
+        assert!(
+            links.iter().all(|row| row["source_id"] != BEA_ONLY_ID),
+            "the visible link page has no edge from the hidden successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_preserves_stored_currency_zero() {
+        let db = three_record_fixture().await;
+        sqlx::query("UPDATE records SET is_current = 0 WHERE id = ?")
+            .bind(ALICE_COMMON_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let opened = open_token(&db, alice()).await;
+        let page = db
+            .page_workspace_snapshot(alice(), &opened.token, SnapshotSection::Records, 500, None)
+            .await
+            .unwrap()
+            .expect("pin stays");
+        let raw = page
+            .rows
+            .iter()
+            .find(|row| row["id"] == ALICE_COMMON_ID)
+            .unwrap();
+        assert_eq!(raw["is_current"], json!(0));
+        assert!(raw["is_current"].is_number());
+        let record: SnapshotRecord = serde_json::from_value(raw.clone()).unwrap();
+        assert_currency(&record, sql_currency(&db, alice(), ALICE_COMMON_ID).await);
+        assert_eq!(record.is_current, Covered::Present(Some(0)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_timestamp_expression_null_on_noncanonical_updated_at() {
+        let db = three_record_fixture().await;
+        sqlx::query("UPDATE records SET updated_at = 'not-a-timestamp' WHERE id = ?")
+            .bind(ALICE_ONLY_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let opened = open_token(&db, alice()).await;
+        let rows = page_all_records(&db, alice(), &opened.token).await;
+        let record = &rows[ALICE_ONLY_ID];
+        assert_eq!(record.updated_at, "not-a-timestamp");
+        assert_eq!(record.updated_at_ms, Covered::Present(None));
+        assert_currency(record, sql_currency(&db, alice(), ALICE_ONLY_ID).await);
+    }
+
+    #[tokio::test]
+    async fn snapshot_archived_follows_physical_column_not_facet() {
+        let db = three_record_fixture().await;
+        crate::store::archive_record(&db, ALICE_ONLY_ID)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE records SET archived = 0 WHERE id = ?")
+            .bind(ALICE_ONLY_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let opened = open_token(&db, alice()).await;
+        let rows = page_all_records(&db, alice(), &opened.token).await;
+        let record = &rows[ALICE_ONLY_ID];
+        assert_eq!(record.archived, Covered::Present(0));
+        assert_currency(record, sql_currency(&db, alice(), ALICE_ONLY_ID).await);
+        let facets =
+            facet_map(page_all_section(&db, alice(), &opened.token, SnapshotSection::Facets).await);
+        let archived = facets
+            .values()
+            .find(|facet| facet.record_id == ALICE_ONLY_ID && facet.key == "archived")
+            .expect("the archived facet still says true");
+        assert_eq!(archived.value.as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_catch_up_upserts_supersedes_target_head() {
+        let db = three_record_fixture().await;
+        let opened = open_token(&db, alice()).await;
+        let before = page_all_records(&db, alice(), &opened.token).await;
+        let before = &before[ALICE_COMMON_ID];
+        assert_eq!(before.is_current, Covered::Present(Some(1)));
+        let updated_at = before.updated_at.clone();
+        let name = before.name.clone();
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: None,
+                source_id: BEA_ONLY_ID.into(),
+                target_id: ALICE_COMMON_ID.into(),
+                relationship: "supersedes".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let added = expect_delta(
+            db.catch_up_workspace_snapshot(alice(), &opened.token, false)
+                .await
+                .unwrap(),
+        );
+        let target = added
+            .upsert_records
+            .iter()
+            .find(|row| row.id == ALICE_COMMON_ID)
+            .expect("adding a hidden supersedes edge upserts the target");
+        assert_eq!(target.is_current, Covered::Present(None));
+        assert_eq!(target.updated_at, updated_at);
+        assert_eq!(target.name, name);
+        crate::store::remove_link(
+            &db,
+            crate::events::LinkRemovedPayload {
+                source_id: BEA_ONLY_ID.into(),
+                target_id: ALICE_COMMON_ID.into(),
+                relationship: "supersedes".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let removed = expect_delta(
+            db.catch_up_workspace_snapshot(alice(), &added.token, false)
+                .await
+                .unwrap(),
+        );
+        let target = removed
+            .upsert_records
+            .iter()
+            .find(|row| row.id == ALICE_COMMON_ID)
+            .expect("removing the supersedes edge upserts the target");
+        assert_eq!(target.is_current, Covered::Present(Some(1)));
+        assert_eq!(target.updated_at, updated_at);
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: None,
+                source_id: BEA_ONLY_ID.into(),
+                target_id: ALICE_COMMON_ID.into(),
+                relationship: "supersedes".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let relinked = expect_delta(
+            db.catch_up_workspace_snapshot(alice(), &removed.token, false)
+                .await
+                .unwrap(),
+        );
+        assert!(relinked
+            .upsert_records
+            .iter()
+            .any(|row| row.id == ALICE_COMMON_ID && row.is_current == Covered::Present(None)));
+        crate::store::delete_record(&db, BEA_ONLY_ID).await.unwrap();
+        let tombstone = expect_delta(
+            db.catch_up_workspace_snapshot(alice(), &relinked.token, true)
+                .await
+                .unwrap(),
+        );
+        let target = tombstone
+            .upsert_records
+            .iter()
+            .find(|row| row.id == ALICE_COMMON_ID)
+            .expect("a source tombstone upserts the target");
+        assert_eq!(target.is_current, Covered::Present(Some(1)));
+        assert_eq!(target.updated_at, updated_at);
+        assert_eq!(target.name, name);
+    }
+
+    #[tokio::test]
+    async fn snapshot_resume_upserts_currency_only_target_and_v1_profile_restarts() {
+        let db = three_record_fixture().await;
+        let manifest = exact_manifest(&db, alice()).await;
+        let mut stale = manifest.clone();
+        stale["profile"] = json!("workspace-snapshot-resume/v1");
+        match db.resume_workspace_snapshot(alice(), &stale).await.unwrap() {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, "manifest_profile_mismatch")
+            }
+            other => panic!("a v1 manifest restarts, got {other:?}"),
+        }
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: None,
+                source_id: BEA_ONLY_ID.into(),
+                target_id: ALICE_COMMON_ID.into(),
+                relationship: "supersedes".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resumed = expect_delta(
+            db.resume_workspace_snapshot(alice(), &manifest)
+                .await
+                .unwrap(),
+        );
+        let target = resumed
+            .upsert_records
+            .iter()
+            .find(|row| row.id == ALICE_COMMON_ID)
+            .expect("a currency-only target change repairs through the digest");
+        assert_eq!(target.is_current, Covered::Present(None));
+        let prior = manifest["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row[0] == ALICE_COMMON_ID)
+            .unwrap();
+        assert_ne!(prior[1], record_resume_digest(target));
+    }
+
+    #[test]
+    fn record_resume_digest_changes_when_only_currency_changes() {
+        let base = SnapshotRecord {
+            id: ALICE_COMMON_ID.into(),
+            record_type: Some("Document".into()),
+            kind: Some("note".into()),
+            name: "Common".into(),
+            home_id: Some(crate::schema::ROOT_RECORD_ID.into()),
+            lifecycle: None,
+            persistence: "enduring".into(),
+            maturity: None,
+            summary: None,
+            last_activity_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-06-01T12:00:00Z".into(),
+            deleted_at: None,
+            is_current: Covered::Present(Some(1)),
+            updated_at_ms: Covered::Present(Some(1_717_200_000_000)),
+            archived: Covered::Present(0),
+        };
+        let current = record_resume_digest(&base);
+        let mut hidden = base.clone();
+        hidden.is_current = Covered::Present(None);
+        assert_ne!(record_resume_digest(&hidden), current);
+        let mut reserved = base.clone();
+        reserved.is_current = Covered::Present(Some(0));
+        assert_ne!(record_resume_digest(&reserved), current);
+        assert_ne!(
+            record_resume_digest(&reserved),
+            record_resume_digest(&hidden)
+        );
+        let mut clock = base.clone();
+        clock.updated_at_ms = Covered::Present(None);
+        assert_ne!(record_resume_digest(&clock), current);
+        let mut archived = base;
+        archived.archived = Covered::Present(1);
+        assert_ne!(record_resume_digest(&archived), current);
+    }
+
+    #[tokio::test]
+    async fn member_snapshot_keeps_parent_restart_and_omits_absent_currency() {
+        let uncovered = crate::workspace_index::record_head_select(false, "ORDER BY id");
+        assert!(
+            !uncovered.contains("is_current"),
+            "a member head read must not name the dropped column: {uncovered}"
+        );
+        assert!(
+            !uncovered.contains("updated_at_ms"),
+            "unread currency is not a timestamp expression: {uncovered}"
+        );
+        assert!(
+            uncovered.contains("archived"),
+            "member copies ship archived"
+        );
+
+        let hosted = crate::create_database(":memory:").await.unwrap();
+        create_record(
+            &hosted,
+            json!({
+                "id": ALICE_ONLY_ID,
+                "type": "Document",
+                "kind": "note",
+                "name": "coverage",
+            }),
+        )
+        .await
+        .unwrap();
+        let row = sqlx::query(&uncovered)
+            .fetch_one(hosted.pool())
+            .await
+            .unwrap();
+        let head = crate::workspace_index::record_head_from_row(&row, false).unwrap();
+        assert!(head.is_current.is_absent());
+        assert!(head.updated_at_ms.is_absent());
+        let Covered::Present(archived) = head.archived else {
+            panic!("archived was selected");
+        };
+        let physical: i64 = sqlx::query_scalar("SELECT archived FROM records WHERE id = ?")
+            .bind(ALICE_ONLY_ID)
+            .fetch_one(hosted.pool())
+            .await
+            .unwrap();
+        assert_eq!(archived, physical);
+        let projected = serde_json::to_value(SnapshotRecord::from_head(&head)).unwrap();
+        assert!(projected.get("is_current").is_none());
+        assert!(projected.get("updated_at_ms").is_none());
+        assert_eq!(projected["archived"], json!(physical));
+
+        let mut absent = SnapshotRecord::from_head(&head);
+        absent.is_current = Covered::Absent;
+        absent.updated_at_ms = Covered::Absent;
+        absent.archived = Covered::Absent;
+        let omitted = serde_json::to_value(&absent).unwrap();
+        assert!(omitted.get("is_current").is_none());
+        assert!(omitted.get("updated_at_ms").is_none());
+        assert!(omitted.get("archived").is_none());
+        let wire = serde_json::to_string(&absent).unwrap();
+        assert!(!wire.contains("is_current"));
+        assert!(!wire.contains("\"archived\""));
+        let round_trip: SnapshotRecord = serde_json::from_value(omitted).unwrap();
+        assert!(round_trip.is_current.is_absent());
+        assert!(round_trip.updated_at_ms.is_absent());
+        assert!(round_trip.archived.is_absent());
+
+        let mut proven = absent;
+        proven.is_current = Covered::Present(None);
+        proven.updated_at_ms = Covered::Present(None);
+        proven.archived = Covered::Present(0);
+        let proven_json = serde_json::to_value(&proven).unwrap();
+        assert!(proven_json["is_current"].is_null());
+        assert!(proven_json["updated_at_ms"].is_null());
+        assert_eq!(proven_json["archived"], json!(0));
+        let proven_row: SnapshotRecord = serde_json::from_value(proven_json).unwrap();
+        assert_eq!(proven_row.is_current, Covered::Present(None));
+        assert_eq!(proven_row.updated_at_ms, Covered::Present(None));
+        assert_eq!(proven_row.archived, Covered::Present(0));
+        hosted.close().await;
+
+        let world = crate::member_offline_fixtures::two_caller::build().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.db");
+        crate::member_copy_producer::build_member_copy(
+            &world.db,
+            crate::member_copy_producer::MemberCopyRequest {
+                member_account: crate::member_offline_fixtures::ACCT_A.to_owned(),
+                scope_ref: "scope-currency".to_owned(),
+                hosted_route_database_id: "route-test".to_owned(),
+                ordinal: 1,
+                consumer: crate::standby_snapshot::StandbyConsumerIdentity {
+                    kernel_v2_reader: Default::default(),
+                    contract: crate::standby_snapshot::STANDBY_CONSUMER_CONTRACT.to_owned(),
+                    version: 1,
+                    platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,
+                    source_sha: "c".repeat(40),
+                    artifact_sha256: "d".repeat(64),
+                    engine_schema_version: crate::CURRENT_ENGINE_SCHEMA_VERSION,
+                    ddl_sha256: "e".repeat(64),
+                },
+                out_path: path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let member = crate::db::open_member_database_read_only(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('records')")
+                .fetch_all(member.pool())
+                .await
+                .unwrap();
+        assert!(
+            !names.iter().any(|name| name == "is_current"),
+            "member copies drop physical currency"
+        );
+        assert!(names.iter().any(|name| name == "archived"));
+        let named_dropped = sqlx::query("SELECT is_current FROM records")
+            .fetch_optional(member.pool())
+            .await;
+        assert!(named_dropped.is_err(), "the dropped column is not readable");
+        let principal = QueryPrincipal::authenticated(crate::member_offline_fixtures::ACCT_A, true);
+        match member.open_workspace_snapshot(principal.clone()).await {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("content_events")
+                        || message.contains("relationship_events")
+                        || message.contains("authorization_revision")
+                        || message.contains("semantic_units"),
+                    "member open fails at the parent log boundary, got {message}"
+                );
+                assert!(
+                    !message.contains("member_copy_currency"),
+                    "member open is not a currency gate, got {message}"
+                );
+            }
+            Ok(_) => panic!("member open fails before a snapshot pin"),
+        }
+        match member
+            .catch_up_workspace_snapshot(principal.clone(), "absent", false)
+            .await
+        {
+            Ok(CatchUpOutcome::Restart { reason }) => {
+                assert_eq!(reason, "token_expired_or_unknown");
+            }
+            other => panic!("unknown member catch-up restarts before the index, got {other:?}"),
+        }
+        match member
+            .resume_workspace_snapshot(
+                principal.clone(),
+                &json!({
+                    "version": 1,
+                    "profile": "workspace-snapshot-resume/v1",
+                    "records": [],
+                    "facets": [],
+                    "links": []
+                }),
+            )
+            .await
+        {
+            Ok(CatchUpOutcome::Restart { reason }) => {
+                assert_eq!(reason, "manifest_profile_mismatch");
+            }
+            other => panic!("a v1 member manifest restarts before the index, got {other:?}"),
+        }
+        match member
+            .resume_workspace_snapshot(principal, &json!("nope"))
+            .await
+        {
+            Ok(CatchUpOutcome::Restart { reason }) => {
+                assert_eq!(reason, "manifest_malformed");
+            }
+            other => panic!("a bad member manifest restarts before the index, got {other:?}"),
+        }
+        member.close().await;
+        world.db.close().await;
+    }
 }
 
 #[cfg(all(test, feature = "v2-kernel-probe"))]
@@ -4064,6 +4678,9 @@ mod kernel_budget_tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
                 deleted_at: None,
+                is_current: Covered::Present(Some(1)),
+                updated_at_ms: Covered::Present(Some(1_767_225_600_000)),
+                archived: Covered::Present(0),
             };
             let records = BTreeMap::from([("shared".into(), record)]);
             let facets = BTreeMap::new();

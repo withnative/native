@@ -17,13 +17,16 @@ const bound={effect:'records.body-set.v1',max_body_bytes:100,target:{need:sql.ke
 const errors=p=>p.findings.filter(f=>f.severity==='error');
 const refusal='body feature plans require a separately qualified Cookie host executor; runInstall refuses before source writes';
 
-test('all eight main269 plans differ only by intentional source confirmation',()=>{
+test('all eight main269 plans differ only by intentional source confirmation and package marker',()=>{
   assert.equal(oracles.main,'269dbff08890a36ef660945970665bac601627c0');
   // The oracles are the raw-body routes of main 269; the default is now gzip+base64, so pin utf8.
   for(const v of oracles.legacy) {
     const actual=planInstall({...v.input,bodyEncoding:'utf8'});
     assert.equal(actual.steps[0].arguments.confirm,true,v.name);
     delete actual.steps[0].arguments.confirm;
+    const packageFacets = actual.steps.find(step => step.arguments.facets)?.arguments.facets;
+    assert.equal(packageFacets.app_package, 'true');
+    delete packageFacets.app_package;
     assert.deepEqual(actual,v.plan,v.name);
   }
 });

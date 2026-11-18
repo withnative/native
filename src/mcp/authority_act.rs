@@ -23,6 +23,32 @@ use crate::standby::delta_transport::{AuthorityActDeltaResponseV1, AuthorityActH
 pub struct AuthorityActDeltaRequest {
     pub from_exclusive_act: i64,
     pub blob_inventory: Option<Vec<String>>,
+    /// The kernel-v2 delta wire version the client asks for. `None` is version
+    /// 1, as every request has always been.
+    pub kernel_delta_version: Option<u32>,
+}
+
+impl AuthorityActDeltaRequest {
+    /// The wire version to cut at. An absent field is version 1. Version 2 is
+    /// honoured only when the authority offers it, and version 3 (no
+    /// projection digest) only when it offers that; otherwise a request is
+    /// answered with the newest version offered below it, down to version 1,
+    /// which every client parses. Anything else is refused.
+    pub fn negotiated_kernel_delta_version(
+        &self,
+        v2_offered: bool,
+        v3_offered: bool,
+    ) -> Result<u32> {
+        let v2_or_1 = if v2_offered { 2 } else { 1 };
+        match self.kernel_delta_version {
+            None | Some(1) => Ok(1),
+            Some(2) => Ok(v2_or_1),
+            Some(3) => Ok(if v3_offered { 3 } else { v2_or_1 }),
+            Some(_) => Err(crate::error::Error::engine(
+                "authority_act_delta: kernel_delta_version must be 1, 2 or 3",
+            )),
+        }
+    }
 }
 
 pub trait AuthorityActSource: Send + Sync {

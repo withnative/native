@@ -49,9 +49,11 @@
 //! enables a retry.
 use super::hold;
 use super::journal::{
-    Entry, EntryState, HoldReason, Journal, KeyOrigin, NewEntry, StatusFilter, CONFIRMED_RETENTION,
+    installed_working_version, CustodyCompatibility, Entry, EntryState, HoldReason, Journal,
+    KeyOrigin, NewEntry, StatusFilter, CONFIRMED_RETENTION, INSTALLED_WORKING_VERSION,
 };
 use super::*;
+use crate::mcp::executor_prototype::NodeHoldingContract;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -67,6 +69,7 @@ const CONFIRM_CAP: Duration = Duration::from_secs(10);
 pub(super) struct GateConfig {
     /// Total time from receipt to the single reply, retries included.
     pub(super) budget: Duration,
+    pub(super) merge_short_budget: Duration,
     pub(super) attempt_timeout: Duration,
     /// Do not start an attempt with less than this left.
     pub(super) min_attempt: Duration,
@@ -90,6 +93,7 @@ pub(super) struct GateConfig {
     pub(super) disk_floor_bytes: u64,
     /// Where hosted's records can be opened, for links in `node_status`.
     pub(super) record_url_base: Option<String>,
+    pub(super) account_binding: Option<Value>,
 }
 
 /// 10 GiB: the default free-disk floor.
@@ -99,6 +103,7 @@ impl Default for GateConfig {
     fn default() -> Self {
         Self {
             budget: super::REQUEST_BUDGET,
+            merge_short_budget: Duration::from_secs(5),
             attempt_timeout: Duration::from_secs(20),
             min_attempt: super::MIN_ATTEMPT,
             backoff_start: Duration::from_millis(500),
@@ -112,6 +117,7 @@ impl Default for GateConfig {
             refusal_retention: Duration::from_secs(7 * 24 * 60 * 60),
             disk_floor_bytes: DEFAULT_DISK_FLOOR,
             record_url_base: None,
+            account_binding: None,
         }
     }
 }
@@ -124,7 +130,7 @@ pub(super) struct WriteRequest<'a> {
     /// How to confirm hosted is down. Without it the node never holds a write
     /// for unreachability (a `DEPLOYMENT_READ_ONLY` answer still holds).
     pub(super) outage: Option<&'a dyn Outage>,
-    /// Internal saver-to-gate hold opt-out (session saver, S1). When true the
+    /// Online-only hold opt-out (app traffic and session saver). When true the
     /// gate never holds this write: a condition that would otherwise hold it
     /// is reported as not-sent instead. This is an in-process flag, never
     /// parsed from the hosted wire and never sent to hosted.
@@ -140,8 +146,31 @@ pub(super) trait Outage: Send + Sync {
     fn held_replay_allowed(&self) -> Ready<'_, bool> {
         Box::pin(async { true })
     }
+    fn custody_credential(&self) -> Ready<'_, Option<[u8; 32]>> {
+        Box::pin(async { None })
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    fn working_published<'a>(
+        &'a self,
+        _scope: &'a super::journal::CustodyBinding,
+        _ordinal: i64,
+    ) -> Ready<'a, bool> {
+        Box::pin(async { false })
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    fn working_canonical_changed<'a>(
+        &'a self,
+        _scope: &'a super::journal::CustodyBinding,
+    ) -> Ready<'a, ()> {
+        Box::pin(async {})
+    }
     /// A second, independent look at whether hosted is unreachable.
     fn confirm_down(&self) -> Ready<'_, bool>;
+    /// Existing verified account evidence only; implementations do no network
+    /// work here. Missing evidence never grants access to scoped custody.
+    fn custody_binding(&self) -> Ready<'_, Option<super::journal::CustodyBinding>> {
+        Box::pin(async { None })
+    }
     fn known_unreachable(&self) -> Ready<'_, bool> {
         Box::pin(async { false })
     }
@@ -154,6 +183,26 @@ pub(super) trait Outage: Send + Sync {
     ) -> Ready<'a, Option<String>> {
         Box::pin(async { None })
     }
+    /// Complete, authenticated cached evidence for description-only custody
+    /// compatibility. This is not permission for speculative local execution.
+    fn holding_contract<'a>(
+        &'a self,
+        _executor: &'a str,
+        _operation: &'a str,
+        _protocol: Option<&'a str>,
+    ) -> Ready<'a, Option<NodeHoldingContract>> {
+        Box::pin(async { None })
+    }
+    /// True only when complete authenticated discovery for this protocol
+    /// establishes that the operation is absent. Missing evidence stays false.
+    fn holding_operation_absent<'a>(
+        &'a self,
+        _executor: &'a str,
+        _operation: &'a str,
+        _protocol: Option<&'a str>,
+    ) -> Ready<'a, bool> {
+        Box::pin(async { false })
+    }
     /// Called before the queue sends a held write: record it in the own-write
     /// floor. `false` means that could not be saved, so nothing may be sent.
     fn before_send(&self) -> Ready<'_, bool> {
@@ -161,6 +210,20 @@ pub(super) trait Outage: Send + Sync {
     }
     /// Called after the send, with whether the write may have committed.
     fn after_send(&self, _may_commit: bool) -> Ready<'_, ()> {
+        Box::pin(async {})
+    }
+    /// Called after a node-originated write that bypassed the gate's own
+    /// outage hooks (the session saver), with hosted's reply if any: settle
+    /// the own-write floor from it, including a receipt act.
+    fn after_write<'a>(&'a self, _reply: Option<&'a str>) -> Ready<'a, ()> {
+        Box::pin(async {})
+    }
+    /// Called after a gate send that already ran `before_send`/`after_send`
+    /// (body merges): raise the own-write floor from hosted's receipt act
+    /// only. Unlike `after_write`, this does not finish the write again; a
+    /// second finish underflows the in-flight count and keeps the floor from
+    /// ever resolving.
+    fn note_receipt<'a>(&'a self, _reply: Option<&'a str>) -> Ready<'a, ()> {
         Box::pin(async {})
     }
 }
@@ -202,10 +265,30 @@ struct Cached<T> {
 
 type Lookups = StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
 
+const HELD_WRITES_NOTE: &str =
+    "Node note: writes waiting for delivery or a canonical hosted outcome.";
+
 pub(super) struct WriteGate {
+    socket_directory: PathBuf,
     upstream_v2: std::sync::atomic::AtomicBool,
-    journal: Journal,
+    /// The kernel-v2 flag came from the operator's `hosted_kernel_v2`
+    /// declaration, not from a router observation; status says which.
+    upstream_v2_declared: std::sync::atomic::AtomicBool,
+    lineages: super::lineage::LineageStore,
+    unmerged: super::unmerged::RecoveryStore,
+
+    pending_fork_reads: std::sync::atomic::AtomicBool,
+    pub(super) journal: Arc<Journal>,
+    ordering_root: Option<Arc<Journal>>,
+    custody_scope: Option<super::journal::CustodyBinding>,
+    #[cfg(feature = "v2-kernel-probe")]
+    v2_holding: StdMutex<HashMap<String, Arc<WriteGate>>>,
+    merge_admission: Arc<StdMutex<()>>,
+    #[cfg(test)]
+    merge_stop_after: StdMutex<Option<&'static str>>,
     local_contracts: Arc<crate::mcp::executor_prototype::NodeOperationContracts>,
+    #[cfg(feature = "v2-kernel-probe")]
+    local_v2_contracts: Arc<crate::mcp::executor_prototype::NodeOperationContracts>,
     config: GateConfig,
     /// Whether the operation's input schema accepts `idempotency_key`.
     keyed: StdMutex<HashMap<(String, String), Cached<Keyed>>>,
@@ -214,6 +297,9 @@ pub(super) struct WriteGate {
     /// One lookup at a time per operation: a burst that misses the cache
     /// together makes a single request to hosted, and the rest read its result.
     keyed_lookups: Lookups,
+    /// Serialise hosted outcome checks with explicit caller retries.
+    hosted_check: tokio::sync::Mutex<()>,
+    hosted_cursor: StdMutex<u64>,
     access_lookups: Lookups,
     /// Test hook: park a forward after its entry is saved, before any send.
     #[cfg(test)]
@@ -223,7 +309,7 @@ pub(super) struct WriteGate {
     copy_size: StdMutex<Option<(Instant, u64)>>,
     /// Test hook: pretend this many bytes are free.
     #[cfg(test)]
-    free_override: StdMutex<Option<u64>>,
+    pub(super) free_override: StdMutex<Option<u64>>,
     #[cfg(test)]
     prepared_arguments_override: StdMutex<Option<Value>>,
     /// Wakes the queue when hosted looks reachable again or a write is held.
@@ -235,7 +321,13 @@ pub(super) struct WriteGate {
     drain_lock: tokio::sync::RwLock<()>,
 }
 
+mod body_merge;
+pub(super) mod body_merge_controls;
+mod body_merge_legacy;
 pub(super) mod queue;
+mod receiver_contracts;
+mod settlement;
+mod v2_holding;
 
 /// Names that are never writes and never need a contract lookup.
 const NOT_WRITES: [&str; 4] = [
@@ -246,26 +338,131 @@ const NOT_WRITES: [&str; 4] = [
 ];
 
 impl WriteGate {
+    fn merge_checkpoint(&self, phase: &str) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut stop = self.merge_stop_after.lock().expect("merge checkpoint");
+            if stop.as_ref().is_some_and(|expected| *expected == phase) {
+                stop.take();
+                return Err(Error::engine(format!("injected merge stop: {phase}")));
+            }
+        }
+        let _ = phase;
+        Ok(())
+    }
+
+    pub(super) fn enable_pending_fork(&self) {
+        self.pending_fork_reads
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(super) fn disable_pending_fork(&self) {
+        self.pending_fork_reads
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Err(error) = self.journal.retire_fork_payloads(None) {
+            tracing::warn!(%error, "could not release disabled preview payloads");
+        }
+        self.journal.prune();
+    }
+    pub(super) fn preview_space(&self, reserve: u64) -> bool {
+        let disk = self.disk();
+        disk["free_bytes"]
+            .as_u64()
+            .zip(disk["floor_bytes"].as_u64())
+            .is_some_and(|(free, floor)| free >= floor.saturating_add(reserve))
+    }
+    pub(super) fn fork_entries(&self, base_act: i64) -> Result<Vec<Entry>> {
+        self.journal.fork_entries(base_act)
+    }
+    /// A router observation of the hosted engine. It replaces any declaration.
     pub(super) fn set_kernel_v2_upstream(&self, value: bool) {
         self.upstream_v2
             .store(value, std::sync::atomic::Ordering::Release);
+        self.upstream_v2_declared
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    /// The operator declared a kernel-v2 hosted (routerless node). Only turns
+    /// holding and ID derivation off; reported as `declared`, never `observed`.
+    pub(super) fn declare_kernel_v2_upstream(&self) {
+        self.upstream_v2_declared
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.upstream_v2
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn upstream_basis(&self) -> &'static str {
+        if !self.kernel_v2_upstream() {
+            "not_observed"
+        } else if self
+            .upstream_v2_declared
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            "declared"
+        } else {
+            "observed"
+        }
     }
     fn kernel_v2_upstream(&self) -> bool {
         self.upstream_v2.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(super) fn open(socket_directory: &Path, config: GateConfig) -> Result<Self> {
-        let journal =
-            Journal::open_with(socket_directory, config.retention, config.refusal_retention)?;
-        Ok(Self {
+        Self::open_scoped(socket_directory, config, None)
+    }
+
+    fn open_scoped(
+        socket_directory: &Path,
+        config: GateConfig,
+        custody_scope: Option<super::journal::CustodyBinding>,
+    ) -> Result<Self> {
+        let journal = if custody_scope.is_some() {
+            Journal::open_bound(
+                socket_directory,
+                config.retention,
+                config.refusal_retention,
+                custody_scope.clone(),
+            )?
+        } else {
+            Journal::open_with(socket_directory, config.retention, config.refusal_retention)?
+        };
+        let gate = Self {
+            socket_directory: socket_directory.to_owned(),
             upstream_v2: std::sync::atomic::AtomicBool::new(false),
-            journal,
+            upstream_v2_declared: std::sync::atomic::AtomicBool::new(false),
+            pending_fork_reads: std::sync::atomic::AtomicBool::new(false),
+            journal: Arc::new(journal),
+            ordering_root: None,
+            custody_scope,
+            #[cfg(feature = "v2-kernel-probe")]
+            v2_holding: StdMutex::new(HashMap::new()),
+            lineages: super::lineage::LineageStore::new(socket_directory)?,
+            unmerged: {
+                let retention = Duration::from_secs(7 * 24 * 60 * 60);
+                let pending_forget = !matches!(
+                    std::fs::symlink_metadata(socket_directory.join("body-merge-forget.json")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+                if pending_forget {
+                    super::unmerged::RecoveryStore::open_for_pending_forget(
+                        socket_directory,
+                        retention,
+                    )?
+                } else {
+                    super::unmerged::RecoveryStore::open(socket_directory, retention)?
+                }
+            },
+            merge_admission: Arc::new(StdMutex::new(())),
+            #[cfg(test)]
+            merge_stop_after: StdMutex::new(None),
             local_contracts: crate::mcp::executor_prototype::NodeOperationContracts::local()?,
+            #[cfg(feature = "v2-kernel-probe")]
+            local_v2_contracts:
+                crate::mcp::executor_prototype::NodeOperationContracts::hosted_kernel_v2()?,
             config,
             keyed: StdMutex::new(HashMap::new()),
             access: StdMutex::new(HashMap::new()),
             hosted_contracts: StdMutex::new(HashMap::new()),
             keyed_lookups: StdMutex::new(HashMap::new()),
+            hosted_check: tokio::sync::Mutex::new(()),
+            hosted_cursor: StdMutex::new(0),
             access_lookups: StdMutex::new(HashMap::new()),
             #[cfg(test)]
             pause_before_send: StdMutex::new(None),
@@ -277,7 +474,26 @@ impl WriteGate {
             prepared_arguments_override: StdMutex::new(None),
             queue_wake: tokio::sync::Notify::new(),
             drain_lock: tokio::sync::RwLock::new(()),
-        })
+        };
+        gate.resume_body_merge_forget()?;
+        // A mismatched account can still use the explicit local erasure call.
+        // Private reads and merge admissions fail closed until it is resolved.
+        if gate.ensure_account_binding().is_ok() {
+            gate.import_legacy_merge_recovery()?;
+            // A crash can settle the last queued entry before compacting a
+            // retiring lineage. Finish that local-only step on restart.
+            for lineage in gate.lineages.list()? {
+                if lineage.state == super::lineage::LineageState::Retiring {
+                    gate.lineages.drain_retired(
+                        &lineage.record_id,
+                        &lineage.editor,
+                        gate.journal
+                            .has_open_merge(&lineage.record_id, &lineage.editor),
+                    )?;
+                }
+            }
+        }
+        Ok(gate)
     }
 
     /// The `node_status` read: open questions first, never record bodies.
@@ -290,12 +506,20 @@ impl WriteGate {
         let disk = self.disk();
         let object = status.as_object_mut().expect("object");
         object.insert(
+            "unmerged".into(),
+            match self.unmerged.counts() {
+                Ok(counts) => serde_json::to_value(counts).unwrap_or(Value::Null),
+                Err(_) => json!({"available":false,"reason":"recovery_store_unreadable"}),
+            },
+        );
+        object.insert(
             "held_writes".into(),
             self.journal
                 .held_writes(filter, self.config.record_url_base.as_deref()),
         );
         object.insert("queue".into(), pending.clone());
-        object.insert("holding".into(), json!({"supported":!self.kernel_v2_upstream(),"reason":if self.kernel_v2_upstream() {"kernel_v2_upstream_drain_first"} else {"kernel_v2_not_observed"}}));
+        object.insert("holding".into(), json!({"supported":!self.kernel_v2_upstream() || self.custody_scope.is_some(),"merge_body_supported":self.custody_scope.is_none(),"reason":if self.custody_scope.is_some() {"v2_existing_records_only"} else if self.kernel_v2_upstream() {"kernel_v2_upstream_drain_first"} else {"kernel_v2_not_observed"},
+            "basis":self.upstream_basis(), "pending_views":false}));
         object.insert("disk".into(), disk);
         let unrecognised = self.journal.unrecognised();
         if !unrecognised.is_empty() {
@@ -305,7 +529,23 @@ impl WriteGate {
                 json!("These entries were written by a build with states this one does not know (for example a newer build, before a rollback). This build leaves them alone: it neither sends nor settles them. Roll forward to the build that wrote them, or settle them by hand."),
             );
         }
-        if pending["pending"].as_u64().unwrap_or(0) > 0 {
+        let installed_entries = object
+            .get("installed_working_entries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if installed_entries > 0 {
+            object.insert("installed_working_rollback".into(), json!({
+                "version":INSTALLED_WORKING_VERSION, "entries":installed_entries,
+                "warning":"Older nodes preserve installed working custody as unreadable. Do not delete, downgrade or reinterpret these originals to unblock writes."
+            }));
+        }
+        let v6_entries = object
+            .get("v6_custody_entries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if v6_entries > 0 {
+            object.insert("rollback".into(),json!({"warning":"This journal uses version 6. Older nodes retain these files as unreadable and block every body append in this namespace. Roll forward to a version-6-capable node; do not delete or downgrade retained entries to unblock writes.","v6_entries":v6_entries,"pending":pending["pending"]}));
+        } else if pending["pending"].as_u64().unwrap_or(0) > 0 {
             object.insert(
                 "rollback".into(),
                 json!({
@@ -318,12 +558,55 @@ impl WriteGate {
     }
 
     /// Add what the node is holding for this run, and for the runs it started,
-    /// to a bootstrap reply. Replies it cannot read, and runs with nothing
-    /// held, are returned as they were.
+    /// to a bootstrap reply. Account totals cover earlier runs as well.
+    /// Replies it cannot read and empty journals are returned as they were.
+    /// Production combines both journals through `note_held_writes_across`.
+    #[cfg(test)]
     pub(super) fn note_held_writes(&self, reply: &str, run: &str) -> String {
-        let (own, children) = self.journal.held_counts_for_run(run);
+        Self::note_held_writes_across(&[self], reply, run)
+    }
+
+    /// One held-writes note covering every journal in `gates`. A v2 node can
+    /// carry a legacy journal and a workspace-scoped journal; their totals are
+    /// combined here, before annotating, because a text-format reply has no
+    /// structured payload to carry an earlier note's counts forward.
+    pub(super) fn note_held_writes_across(gates: &[&WriteGate], reply: &str, run: &str) -> String {
+        let add_counts = |target: &mut Value, more: &Value| {
+            if let (Some(target), Some(more)) = (target.as_object_mut(), more.as_object()) {
+                for (state, count) in more {
+                    let current = target.entry(state.clone()).or_insert(json!(0));
+                    *current = json!(current.as_u64().unwrap_or(0) + count.as_u64().unwrap_or(0));
+                }
+            }
+        };
+        let mut own = json!({});
+        let mut children = json!({});
+        let mut account = json!({"waiting": 0, "counts": {}});
+        for gate in gates {
+            // A backlog notice must not expose the previous account's journal.
+            // Keep the bootstrap response usable when recovery is unavailable.
+            if gate.ensure_account_binding().is_err() {
+                continue;
+            }
+            let (gate_own, gate_children) = gate.journal.held_counts_for_run(run);
+            let summary = gate.journal.waiting_summary();
+            add_counts(&mut own, &gate_own);
+            add_counts(&mut children, &gate_children);
+            add_counts(&mut account["counts"], &summary["counts"]);
+            account["waiting"] = json!(
+                account["waiting"].as_u64().unwrap_or(0) + summary["waiting"].as_u64().unwrap_or(0)
+            );
+            if let Some(oldest) = summary["oldest_accepted_at"].as_str() {
+                if account["oldest_accepted_at"]
+                    .as_str()
+                    .is_none_or(|current| oldest < current)
+                {
+                    account["oldest_accepted_at"] = json!(oldest);
+                }
+            }
+        }
         let nothing = |counts: &Value| counts.as_object().is_none_or(|c| c.is_empty());
-        if nothing(&own) && nothing(&children) {
+        if nothing(&own) && nothing(&children) && account["waiting"] == 0 {
             return reply.to_owned();
         }
         let Ok(mut value) = serde_json::from_str::<Value>(reply) else {
@@ -343,26 +626,47 @@ impl WriteGate {
                 })
                 .unwrap_or_default()
         };
-        let mut line =
-            String::from("Node note: writes waiting for delivery or a canonical hosted outcome.");
+        let mut line = String::from(HELD_WRITES_NOTE);
+        if account["waiting"].as_u64().unwrap_or(0) > 0 {
+            line.push_str(&format!(
+                " This account: {} ({}).",
+                account["waiting"],
+                describe(&account["counts"])
+            ));
+            if let Some(oldest) = account["oldest_accepted_at"].as_str() {
+                line.push_str(&format!(" Oldest accepted: {oldest}."));
+            }
+        }
         if !nothing(&own) {
             line.push_str(&format!(" This run: {}.", describe(&own)));
         }
         if !nothing(&children) {
             line.push_str(&format!(" Runs it started: {}.", describe(&children)));
         }
-        line.push_str(" Call node_status (filters: run, parent_run, state) to see them.");
-        if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+        line.push_str(" Run `native status` to inspect held writes and refresh health.");
+        if let Some(content) = result
+            .entry("content")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        {
+            content.retain(|item| {
+                !item["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(HELD_WRITES_NOTE))
+            });
             content.push(json!({"type":"text","text":line}));
         }
+        // 7e99834 (as deb2b566 for routing): never create structuredContent.
+        // A text-format reply has none, and clients that prefer it would show
+        // only this note and hide the reply's text, including bootstrap's run
+        // key. The text line above carries the note for those replies.
         if let Some(structured) = result
-            .entry("structuredContent")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
         {
             structured.insert(
                 "node_held_writes".into(),
-                json!({"this_run": own, "runs_it_started": children, "see": "node_status"}),
+                json!({"account":account,"this_run": own, "runs_it_started": children, "see": "native status"}),
             );
         }
         value.to_string()
@@ -451,6 +755,14 @@ impl WriteGate {
             loop {
                 timer.tick().await;
                 gate.journal.prune();
+                // Expire dismissed payloads even when nobody reads recovery.
+                // Serialize with explicit account erasure and admissions.
+                let _admission = gate.merge_admission.lock().expect("merge admission");
+                if gate.ensure_account_binding().is_ok() {
+                    if let Err(error) = gate.unmerged.prune() {
+                        tracing::warn!(%error, "Node recovery retention could not be applied");
+                    }
+                }
             }
         })
     }
@@ -493,9 +805,277 @@ impl WriteGate {
             attempt_timeout,
             min_attempt: self.config.min_attempt,
             cancel: Some(cancel.clone()),
+            custody_credential_sha256: None,
         }
     }
 
+    fn hold_contracts(
+        &self,
+        operation: &str,
+    ) -> &crate::mcp::executor_prototype::NodeOperationContracts {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.custody_scope.is_some() && operation != "merge_body" {
+            return &self.local_v2_contracts;
+        }
+        let _ = operation;
+        &self.local_contracts
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_create_contract_current(&self, entry: &Entry) -> bool {
+        entry.version == super::journal::INSTALLED_CREATE_VERSION && self.compatible_entry(entry)
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_contract_current(&self, entry: &Entry) -> bool {
+        if entry.version == super::journal::INSTALLED_CREATE_VERSION {
+            self.working_create_contract_current(entry)
+        } else {
+            super::journal::installed_working_version(entry.version) && self.compatible_entry(entry)
+        }
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) async fn prepare_working_create(
+        &self,
+        actor: &str,
+        original: &crate::mcp::kernel_v2::writes::replay::CapturedFirstPartyCreate,
+        prepared: Option<&Value>,
+    ) -> Result<crate::mcp::kernel_v2::writes::replay::ReplayProposal> {
+        self.journal
+            .prepare_working_create(actor, original, prepared)
+            .await
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) async fn working_contract(
+        &self,
+        request: &WriteRequest<'_>,
+        captured: &crate::fork::working_v2::manager::CapturedAppend,
+    ) -> Result<String> {
+        let Some((executor, operation, envelope)) = super::failover::target(request.message) else {
+            return Err(Error::engine("working append operation missing"));
+        };
+        let args = envelope.get("arguments").unwrap_or(&Value::Null);
+        if request.no_hold
+            || super::app_proof::attributed(request.message)
+            || self.custody_scope.is_none()
+            || !v2_holding::working_eligible(&executor, &operation, args)
+        {
+            return Err(Error::engine(
+                "operation is outside installed working append custody",
+            ));
+        }
+        if let Some((free, floor)) = self.below_floor() {
+            return Err(Error::engine(format!(
+                "working append not accepted: free disk {free} below required floor {floor}"
+            )));
+        }
+        let (record, native) = v2_holding::record_projection(&executor, &operation, args)?;
+        if self.ordering_root.as_ref().is_some_and(|root| {
+            root.has_opaque_custody()
+                || record
+                    .targets(&native)
+                    .iter()
+                    .any(|id| root.has_open_body_custody(id, true))
+        }) || self.journal.has_opaque_custody()
+        {
+            return Err(Error::engine(
+                "older body custody must reconcile before working append; originals retained",
+            ));
+        }
+        let digest = self
+            .hold_contracts(&operation)
+            .digest(&executor, &operation)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::engine("working compiled contract missing"))?;
+        let hosted_digest = if let Some(outage) = request.outage {
+            outage
+                .contract_digest(&executor, &operation, request.revision)
+                .await
+        } else {
+            None
+        };
+        if hosted_digest.as_deref() != Some(digest.as_str()) {
+            let hosted = if let Some(outage) = request.outage {
+                outage
+                    .holding_contract(&executor, &operation, request.revision)
+                    .await
+            } else {
+                None
+            };
+            let legacy_append = executor == "records_write"
+                && operation == "update_record"
+                && captured
+                    .legacy_append_proposal()
+                    .is_some_and(|proposal| proposal.args() == args);
+            let paired = legacy_append
+                && self
+                    .hold_contracts(&operation)
+                    .holding_contract(&executor, &operation)
+                    .zip(hosted)
+                    .is_some_and(|(local, hosted)| {
+                        hosted.description["contract_digest"].as_str() == hosted_digest.as_deref()
+                            && receiver_contracts::no_observation_pair(
+                                &executor, &operation, args, &local, &local, &hosted,
+                            )
+                    });
+            if !paired {
+                return Err(Error::engine(
+                    "working append needs the exact compiled v2 contract or a frozen receiver pair",
+                ));
+            }
+        }
+        // Fresh custody has no retained ordinary entry. Reuse the current
+        // scope/declaration/schema checks. A prose-only mismatch still gives
+        // no installed-working permission: only the exact frozen pair above
+        // may replace full digest equality for installed working 7.
+        match self.validate_hold(request, request.message, None).await {
+            Ok(HoldContract::V2) => {}
+            Ok(_) => {
+                return Err(Error::engine(
+                    "working append needs the exact compiled v2 contract",
+                ))
+            }
+            Err(report) => {
+                return Err(Error::engine(
+                    report
+                        .reply
+                        .unwrap_or_else(|| "working contract unavailable".into()),
+                ))
+            }
+        }
+        Ok(digest)
+    }
+    /// Match the existing send path's received + configured whole-call budget
+    /// (GateConfig defaults to node REQUEST_BUDGET, 40s). This is a request
+    /// deadline, never a new freshness expiry or a background lookup budget.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_deadline(&self, caller: &super::Caller) -> Instant {
+        caller.received + self.config.budget
+    }
+
+    /// The existing mixed-body admission turn extends through installed working fsync,
+    /// after asynchronous W preparation. No network or copy runs under it.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_admission(
+        &self,
+        operation: &str,
+        args: &Value,
+        contract: &str,
+    ) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let turn = self.merge_admission.lock().expect("merge admission");
+        let record = args.get("id").and_then(Value::as_str).ok_or_else(|| {
+            Error::conflict("working target missing before custody; nothing saved")
+        })?;
+        if !self.kernel_v2_upstream()
+            || self.custody_scope.is_none()
+            || self.ensure_account_binding().is_err()
+            || !v2_holding::working_eligible("records_write", operation, args)
+            || crate::fork::validate_working_shape_kernel_v2(operation, args, 1024 * 1024).is_err()
+            || self
+                .hold_contracts(operation)
+                .digest("records_write", operation)
+                != Some(contract)
+            || self.ordering_root.as_ref().is_some_and(|root| {
+                root.has_opaque_custody() || root.has_open_body_custody(record, true)
+            })
+            || self.journal.has_opaque_custody()
+        {
+            return Err(Error::conflict("working custody changed during preparation; nothing saved; reconcile earlier body custody before retry"));
+        }
+        if self.below_floor().is_some() {
+            return Err(Error::conflict(
+                "working custody disk floor changed before insertion; nothing saved",
+            ));
+        }
+        Ok(turn)
+    }
+
+    /// The same admission mutex and disk/account/ordering checks as legacy working
+    /// custody, using the provider's operation-aware source projection.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_record_admission(
+        &self,
+        executor: &str,
+        operation: &str,
+        args: &Value,
+        contract: &str,
+    ) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let turn = self.merge_admission.lock().expect("merge admission");
+        let (record, native) = v2_holding::record_projection(executor, operation, args)?;
+        if !self.kernel_v2_upstream()
+            || self.custody_scope.is_none()
+            || self.ensure_account_binding().is_err()
+            || self.hold_contracts(operation).digest(executor, operation) != Some(contract)
+            || self.ordering_root.as_ref().is_some_and(|root| {
+                root.has_opaque_custody()
+                    || record
+                        .targets(&native)
+                        .iter()
+                        .any(|id| root.has_open_body_custody(id, true))
+            })
+            || self.journal.has_opaque_custody()
+            || self.below_floor().is_some()
+        {
+            return Err(Error::conflict(
+                "working custody changed during preparation; nothing saved",
+            ));
+        }
+        Ok(turn)
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_journal(
+        self: &Arc<Self>,
+        binding: crate::fork::working_v2::WorkingBinding,
+    ) -> Result<crate::node::working_v2::WorkingJournal> {
+        crate::node::working_v2::WorkingJournal::from_scoped(self.journal.clone(), binding)
+            .and_then(|journal| journal.with_installed_admission(self.clone()))
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_retained_target(&self) -> Result<Option<(String, String)>> {
+        self.journal
+            .installed_working_target(|entry| self.working_contract_current(entry))
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn working_terminal_reply(
+        &self,
+        actor: &str,
+        proposal: &crate::mcp::kernel_v2::writes::replay::ReplayProposal,
+        id: Option<&Value>,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .journal
+            .working_terminal(actor, proposal)?
+            .map(|reply| with_request_id(&reply, id)))
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(in crate::node) fn retained_working_may_exist(&self) -> bool {
+        let scopes = match std::fs::read_dir(self.socket_directory.join("v2-held")) {
+            Ok(scopes) => scopes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        for scope in scopes {
+            let Ok(scope) = scope else { return true };
+            let files = match std::fs::read_dir(scope.path().join("journal")) {
+                Ok(files) => files,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            for file in files {
+                let Ok(file) = file else { return true };
+                if file.path().extension().is_none_or(|ext| ext != "json") {
+                    continue;
+                }
+                if super::journal::retained_working_entry_may_exist(&file.path()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// Send a write once or, when its contract allows, with in-call retry.
     /// `known_write` is the router's own classification from the local
     /// catalogue; without it the gate classifies the operation itself.
@@ -505,25 +1085,125 @@ impl WriteGate {
         request: &WriteRequest<'_>,
         known_write: bool,
     ) -> SendReport {
+        if self.kernel_v2_upstream()
+            && !super::app_proof::attributed(request.message)
+            && !request.no_hold
+            && super::failover::target(request.message).is_some_and(
+                |(executor, operation, envelope)| {
+                    v2_holding::eligible(
+                        &executor,
+                        &operation,
+                        envelope.get("arguments").unwrap_or(&Value::Null),
+                    )
+                },
+            )
+        {
+            let Some(binding) = v2_holding::binding(request.outage).await else {
+                // Local custody authority is narrower than ordinary hosted
+                // admission. Preserve forwarding without opening scoped custody.
+                return self.forward_scoped(upstream, request, known_write).await;
+            };
+            match self.scoped_v2_gate(&binding) {
+                Ok(gate) => return gate.forward_scoped(upstream, request, known_write).await,
+                Err(_) => {
+                    return not_sent_report(
+                        request.message.get("id"),
+                        "Cannot open the account's pending journal; write was not sent or held",
+                    )
+                }
+            }
+        }
+        self.forward_scoped(upstream, request, known_write).await
+    }
+
+    async fn forward_scoped(
+        &self,
+        upstream: &Upstream,
+        request: &WriteRequest<'_>,
+        known_write: bool,
+    ) -> SendReport {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.journal.has_working_resolution() {
+            return not_sent_report(
+                request.message.get("id"),
+                "Original resolution pending; existing work retained and dispatch paused",
+            );
+        }
+        if !self.scope_matches(request.outage).await || !self.scope_targets(upstream) {
+            return not_sent_report(
+                request.message.get("id"),
+                "Pending account or engine binding differs; write was not sent",
+            );
+        }
         // The budget runs from the frame's arrival, queueing included.
         let started = request.caller.received;
         let id = request.message.get("id");
         let cancel = &request.caller.cancel;
-        let plain =
-            || upstream.send_classified(request.body, request.message, request.revision, id);
+        let app_identity = super::app_proof::canonical_identity(request.message);
+        if super::app_proof::attributed(request.message)
+            && super::app_proof::header(
+                &upstream.config,
+                request.message,
+                Some(&request.caller.context),
+            )
+            .is_err()
+        {
+            return not_sent_report(id, "Desktop app proof unavailable; request was not sent");
+        }
+        let plain = || {
+            upstream.send_classified_context(
+                request.body,
+                request.message,
+                request.revision,
+                id,
+                &request.caller.context,
+            )
+        };
         let Some((executor, operation, envelope)) = super::failover::target(request.message) else {
             return plain().await;
         };
         if operation.is_empty() || NOT_WRITES.contains(&executor.as_str()) {
             return plain().await;
         }
+        if upstream.install_key.is_some() {
+            let access = if known_write {
+                Access::Write
+            } else {
+                self.access_of(upstream, &executor, &operation, started, cancel)
+                    .await
+            };
+            if access == Access::Read {
+                return plain().await;
+            }
+            return not_sent_report(
+                id,
+                "Enrolled nodes send only admitted keyed working originals",
+            );
+        }
+        if self.custody_scope.is_some()
+            && !v2_holding::eligible(
+                &executor,
+                &operation,
+                envelope.get("arguments").unwrap_or(&Value::Null),
+            )
+        {
+            return not_sent_report(id, "Operation is outside v2 existing-record custody");
+        }
         if cancel.is_cancelled() {
             return not_sent(id, "Request cancelled; request was not sent");
         }
 
+        if executor == "records_write"
+            && operation == "merge_body"
+            && !request.no_hold
+            && app_identity.is_none()
+        {
+            return self.forward_merge(upstream, request).await;
+        }
+
         // Is this a write? Then, separately, is it keyed? An operation whose
         // class could not be learned is journaled but never keyed or retried.
-        let access = if known_write {
+        let access = if known_write || self.custody_scope.is_some() {
             Access::Write
         } else {
             self.access_of(upstream, &executor, &operation, started, cancel)
@@ -539,8 +1219,15 @@ impl WriteGate {
             &operation,
             envelope.get("arguments").unwrap_or(&Value::Null),
         );
-        let holdable = holdable && !request.no_hold && !self.kernel_v2_upstream();
-        let keyed = if access == Access::Write {
+        let holdable = holdable
+            && !request.no_hold
+            && app_identity.is_none()
+            && (!self.kernel_v2_upstream() || self.custody_scope.is_some());
+        // Scoped v2 operations use the compiled hosted contract. They all
+        // take a key; do not turn an already known outage into a discovery wait.
+        let keyed = if self.custody_scope.is_some() {
+            true
+        } else if access == Access::Write {
             match self
                 .accepts_key(upstream, &executor, &operation, started, cancel)
                 .await
@@ -569,38 +1256,114 @@ impl WriteGate {
         }
 
         let mut message = request.message.clone();
+        let node_merge_meta_removed = operation == "merge_body"
+            && message
+                .pointer_mut("/params/_meta")
+                .and_then(Value::as_object_mut)
+                .is_some_and(|meta| meta.remove("native/body_merge").is_some());
         let mut key = None;
         if keyed {
             key = prepare_key(&mut message, &envelope);
         }
+        if !self.scope_matches(request.outage).await {
+            return not_sent_report(
+                id,
+                "Pending credential binding changed; no saved result was read or sent",
+            );
+        }
+        // Explicit null/blank keys opt out of keying and custody. Preserve
+        // that choice while still guarding body order and transport identity.
+        let holdable = holdable && (self.custody_scope.is_none() || key.is_some());
+        if let Some((key, _)) = key.as_ref() {
+            if let Some(hosted) = self.journal.hosted_pending_with_key(
+                &executor,
+                &operation,
+                key,
+                app_identity.as_deref(),
+            ) {
+                let digest = scoped_intent_digest(
+                    message
+                        .pointer("/params/arguments/arguments")
+                        .unwrap_or(&Value::Null),
+                    app_identity.as_deref(),
+                );
+                let expected = hosted.intent_digest.clone().or_else(|| {
+                    hosted
+                        .arguments
+                        .as_ref()
+                        .map(|a| scoped_intent_digest(a, hosted.app_identity.as_deref()))
+                });
+                if expected.as_deref() != Some(&digest) {
+                    return SendReport {
+                        reply: hold::conflict_reply(id, &hosted),
+                        failure: None,
+                        attempt: Attempt::Answered,
+                        status: None,
+                        reply_kind: Default::default(),
+                    };
+                }
+                return self.repeat_hosted(upstream, request, hosted).await;
+            }
+        }
+        // Withdrawn and acknowledged keys retain their local outcome even if a repeat changes
+        // shape and is no longer holdable (or opts out of holding).
+        if let Some(key) = envelope
+            .pointer("/arguments/idempotency_key")
+            .and_then(Value::as_str)
+        {
+            if let Some(done) = self
+                .journal
+                .settled_held_with_key(&executor, &operation, key, app_identity.as_deref())
+                .filter(|entry| {
+                    entry.operator_audit.as_ref().is_some_and(|audit| {
+                        audit.action == "withdraw" || entry.state == EntryState::Acknowledged
+                    })
+                })
+            {
+                let digest = scoped_intent_digest(
+                    envelope.get("arguments").unwrap_or(&Value::Null),
+                    app_identity.as_deref(),
+                );
+                return SendReport {
+                    reply: if done.intent_digest.as_deref() == Some(digest.as_str()) {
+                        done.reply
+                            .as_deref()
+                            .filter(|_| id.is_some())
+                            .map(|reply| with_request_id(reply, id))
+                    } else {
+                        hold::conflict_reply(id, &done)
+                    },
+                    failure: None,
+                    attempt: Attempt::Answered,
+                    status: None,
+                    reply_kind: Default::default(),
+                };
+            }
+        }
         let mut plan = hold::Plan::default();
-        let mut intent = None;
-        let mut checking_hosted_pending = false;
-        let mut rewritten = key
-            .as_ref()
-            .is_some_and(|(_, origin)| *origin == KeyOrigin::Node);
+        let mut intent = key.as_ref().map(|_| {
+            scoped_intent_digest(
+                message
+                    .pointer("/params/arguments/arguments")
+                    .unwrap_or(&Value::Null),
+                app_identity.as_deref(),
+            )
+        });
+        let mut rewritten = node_merge_meta_removed
+            || key
+                .as_ref()
+                .is_some_and(|(_, origin)| *origin == KeyOrigin::Node);
         if let (true, Some((key, _))) = (holdable, key.as_ref()) {
             if let Some(arguments) = message.pointer_mut("/params/arguments/arguments") {
-                let digest = hold::intent_digest(arguments);
-                if let Some(hosted) = self
-                    .journal
-                    .hosted_pending_with_key(&executor, &operation, key)
-                {
-                    if hosted.intent_digest.as_deref() != Some(digest.as_str()) {
-                        return SendReport {
-                            reply: hold::conflict_reply(id, &hosted),
-                            failure: None,
-                            attempt: Attempt::Answered,
-                            status: None,
-                        };
-                    }
-                    // A same-key check must reach hosted even when queued
-                    // dependants are waiting for this create's canonical outcome.
-                    checking_hosted_pending = true;
-                }
+                let digest = scoped_intent_digest(arguments, app_identity.as_deref());
                 // A repeat of a call the node is holding is answered from the
                 // journal: nothing is sent and nothing new is saved.
-                if let Some(held) = self.journal.pending_with_key(&executor, &operation, key) {
+                if let Some(held) = self.journal.pending_with_key(
+                    &executor,
+                    &operation,
+                    key,
+                    app_identity.as_deref(),
+                ) {
                     if held.intent_digest.as_deref() == Some(digest.as_str()) {
                         let position = self.journal.pending_position(held.seq);
                         return SendReport {
@@ -613,6 +1376,7 @@ impl WriteGate {
                             failure: None,
                             attempt: Attempt::Answered,
                             status: None,
+                            reply_kind: Default::default(),
                         };
                     }
                     return SendReport {
@@ -620,13 +1384,14 @@ impl WriteGate {
                         failure: None,
                         attempt: Attempt::Answered,
                         status: None,
+                        reply_kind: Default::default(),
                     };
                 }
                 // A held write the node has since sent: the repeat gets the
                 // original receipt or refusal.
                 if let Some(done) = self
                     .journal
-                    .settled_held_with_key(&executor, &operation, key)
+                    .settled_held_with_key(&executor, &operation, key, app_identity.as_deref())
                     // Older builds cached hosted pending/not-ready as terminal.
                     // Reconcile through hosted without rewriting historical files.
                     .filter(|done| {
@@ -658,6 +1423,7 @@ impl WriteGate {
                             failure: None,
                             attempt: Attempt::Answered,
                             status: None,
+                            reply_kind: Default::default(),
                         };
                     }
                 }
@@ -693,7 +1459,10 @@ impl WriteGate {
         // — the condition that would otherwise hold it — report not-sent
         // without sending, instead of burning the retry budget against a
         // dead endpoint. The caller (S3's spool) owns the key and the retry.
-        if !holdable && (request.no_hold || self.kernel_v2_upstream()) && key.is_some() {
+        if !holdable
+            && (request.no_hold || app_identity.is_some() || self.kernel_v2_upstream())
+            && (key.is_some() || app_identity.is_some())
+        {
             if let Some(outage) = request.outage {
                 if outage.known_unreachable().await
                     && self
@@ -706,16 +1475,36 @@ impl WriteGate {
                         if self.kernel_v2_upstream() {
                             "Kernel-v2 upstream: held writes are disabled; the write was not sent or held"
                         } else {
-                            "Hosted is unreachable; the write was not sent and not held (saver opt-out)"
+                            "Hosted is unreachable; the write was not sent or held (online-only request)"
                         },
                     );
                 }
             }
         }
         let mut _turn = None;
-        if access != Access::Read {
+        if app_identity.is_some() {
+            // Share the ordinary queue turn so a drain cannot race between
+            // this backlog check and the app send. Never drain on an
+            // app's behalf or accept custody behind the backlog.
             let limit = started + self.config.budget / 2;
-            if holdable && key.is_some() && !checking_hosted_pending {
+            let Ok(guard) = tokio::time::timeout_at(limit.into(), self.drain_lock.read()).await
+            else {
+                return not_sent_report(
+                    id,
+                    "Write backlog is busy; app write was not sent or held",
+                );
+            };
+            if self.journal.pending_count() > 0 {
+                return not_sent_report(
+                    id,
+                    "Held writes are waiting; app write was not sent or held",
+                );
+            }
+            _turn = Some(guard);
+        }
+        if access != Access::Read && app_identity.is_none() {
+            let limit = started + self.config.budget / 2;
+            if holdable && key.is_some() {
                 match self.backlog_turn(upstream, request, limit).await {
                     Turn::Clear(guard) => _turn = Some(guard),
                     Turn::Behind(reason, guard) => {
@@ -746,6 +1535,7 @@ impl WriteGate {
                             failure: status.map(|_| Health::AuthRefused),
                             attempt: Attempt::Stopped,
                             status: None,
+                            reply_kind: Default::default(),
                         };
                     }
                     Turn::Refuse => {
@@ -762,10 +1552,11 @@ impl WriteGate {
                             failure: None,
                             attempt: Attempt::Stopped,
                             status: None,
+                            reply_kind: Default::default(),
                         };
                     }
                 }
-            } else if !checking_hosted_pending && self.journal.pending_count() > 0 {
+            } else if self.journal.pending_count() > 0 {
                 Box::pin(self.drain(upstream, request.outage, Some(limit), Some(cancel))).await;
             }
         }
@@ -784,7 +1575,7 @@ impl WriteGate {
             .pointer("/params/arguments/arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let envelope_extra = holdable.then(|| {
+        let envelope_extra = (holdable || key.is_some()).then(|| {
             let mut extra = message
                 .pointer("/params/arguments")
                 .cloned()
@@ -796,12 +1587,19 @@ impl WriteGate {
             }
             extra
         });
+        // Only successful validation grants a holding mode. In particular,
+        // uncertainty by itself never grants scoped v2 compatibility.
+        let mut hold_contract = None;
         if behind.is_some() {
-            if let Some(refusal) = self.validate_hold(request, &message).await {
-                return refusal;
+            match self.validate_hold(request, &message, None).await {
+                Ok(contract) => hold_contract = Some(contract),
+                Err(refusal) => return refusal,
             }
         }
-        let entry = match self.journal.begin(NewEntry {
+        if self.custody_scope.is_some() {
+            plan.record_id = v2_holding::target_record(&operation, &operation_arguments);
+        }
+        let new_entry = NewEntry {
             executor: executor.clone(),
             operation: operation.clone(),
             tool: message
@@ -814,6 +1612,7 @@ impl WriteGate {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             client_info: request.caller.client_info.clone(),
+            app_identity: app_identity.clone(),
             idempotency_key: key.as_ref().map(|(key, _)| key.clone()),
             key_origin: key.as_ref().map(|(_, origin)| *origin),
             arguments: operation_arguments,
@@ -826,7 +1625,55 @@ impl WriteGate {
             record_ids: plan.record_ids,
             envelope: envelope_extra,
             intent_digest: intent,
-        }) {
+        };
+        let saved = {
+            // Share body admission with typed merges until this Sent entry is
+            // durable. No network work occurs while this lock is held.
+            let _admission = self.merge_admission.lock().expect("merge admission");
+            if self.custody_scope.is_some()
+                && operation == "update_record"
+                && new_entry.record_id.as_deref().is_some_and(|record| {
+                    self.ordering_root
+                        .as_ref()
+                        .is_some_and(|root| root.has_open_body_custody(record, true))
+                        || self.journal.has_opaque_custody()
+                        || (key.is_none() && self.journal.has_open_body_custody(record, false))
+                })
+            {
+                return not_sent_report(id, "Body custody is open or unreadable in this record's ordering scope; append was not sent or saved. Keep this append and retry after the earlier outcome or unreadable custody is resolved");
+            }
+            if self.custody_scope.is_some() {
+                match self
+                    .hold_contracts(&operation)
+                    .digest(&executor, &operation)
+                {
+                    Some(digest) => {
+                        let Some(original) = self
+                            .hold_contracts(&operation)
+                            .holding_contract(&executor, &operation)
+                            .and_then(|c| c.for_custody())
+                            .map(|contract| super::journal::OriginalContract {
+                                rule: super::journal::SOURCE_DESCRIPTION_RULE,
+                                contract,
+                            })
+                        else {
+                            return not_sent(
+                                id,
+                                "V2 contract evidence unavailable; nothing was sent",
+                            );
+                        };
+                        self.journal
+                            .begin_kernel_v2(new_entry, digest.to_owned(), original)
+                    }
+                    None => {
+                        return not_sent(id, "V2 operation contract unavailable; nothing was sent")
+                    }
+                }
+            } else {
+                self.journal.begin(new_entry)
+            }
+        };
+        let entry = match saved {
             Ok(entry) => entry,
             Err(_) => {
                 return not_sent(id, "Cannot save the write journal entry; nothing was sent");
@@ -856,6 +1703,7 @@ impl WriteGate {
                         &entry,
                         reason,
                         false,
+                        hold_contract,
                         id,
                         crate::mcp::is_modern_request(request.message),
                     )
@@ -867,6 +1715,7 @@ impl WriteGate {
                     failure: None,
                     attempt: Attempt::Answered,
                     status: None,
+                    reply_kind: Default::default(),
                 };
             }
         }
@@ -881,7 +1730,10 @@ impl WriteGate {
             // Hosted refused the key the node minted, before any effect: send
             // the caller's call once more without it (not for a held write).
             if held.is_none()
+                && self.custody_scope.is_none()
+                && operation != "merge_body"
                 && minted
+                && app_identity.is_none()
                 && !maybe_sent
                 && report.attempt == Attempt::Answered
                 && refuses_key(report.reply.as_deref())
@@ -893,21 +1745,74 @@ impl WriteGate {
                 (report, maybe_sent, held)
             }
         } else {
+            let limits = if self.custody_scope.is_some() {
+                let Some(fingerprint) = self.credential_for_scope(request.outage).await else {
+                    return self.finish(
+                        not_sent_report(
+                            id,
+                            "Verified custody credential unavailable; write was not sent",
+                        ),
+                        false,
+                        &entry,
+                        &executor,
+                        &operation,
+                        id,
+                    );
+                };
+                let mut limits = self.limits(started, self.config.attempt_timeout, cancel);
+                limits.custody_credential_sha256 = fingerprint;
+                Some(limits)
+            } else {
+                None
+            };
             let _ = self.journal.note_attempt(&entry.id);
             let report = upstream
-                .send_attempt(&body, &message, request.revision, id, None)
+                .send_attempt_context(
+                    &body,
+                    &message,
+                    request.revision,
+                    id,
+                    limits.as_ref(),
+                    Some(&request.caller.context),
+                )
                 .await;
             let maybe_sent = matches!(report.attempt, Attempt::Lost | Attempt::Unclear);
             (report, maybe_sent, None)
         };
+        if held.is_some() && !self.scope_matches(request.outage).await {
+            return self.finish(report, maybe_sent, &entry, &executor, &operation, id);
+        }
         if let Some(reason) = held {
             // Once a send may have applied, retain the prepared call and its
             // key for replay: hosted must decide its outcome. Local admission
             // checks may only refuse a write that has not reached hosted.
-            if !maybe_sent {
-                if let Some(mut refusal) = self.validate_hold(request, &message).await {
-                    refusal.failure = report.failure;
-                    return self.finish(refusal, false, &entry, &executor, &operation, id);
+            if maybe_sent {
+                // Earlier uncertainty must retain custody, but it is never
+                // evidence of an exact contract or permission to preview.
+                hold_contract = Some(
+                    match self
+                        .cached_hold_contract(request, &executor, &operation, Some(&entry))
+                        .await
+                    {
+                        Ok(contract) => contract,
+                        // Missing/incompatible v2 evidence leaves the original call
+                        // uncertain, with its key. Never substitute legacy v4 custody
+                        // or grant preview authority for an unverified attempt.
+                        Err(_) if self.custody_scope.is_some() => {
+                            return self.finish(report, true, &entry, &executor, &operation, id);
+                        }
+                        Err(_) => {
+                            HoldContract::CustodyOnly(CustodyCompatibility::PriorAttemptUnverified)
+                        }
+                    },
+                );
+            } else {
+                match self.validate_hold(request, &message, Some(&entry)).await {
+                    Ok(contract) => hold_contract = Some(contract),
+                    Err(mut refusal) => {
+                        refusal.failure = report.failure;
+                        return self.finish(refusal, false, &entry, &executor, &operation, id);
+                    }
                 }
             }
             let no_room = self.refuse_for_disk(&entry, reason, maybe_sent, id);
@@ -921,6 +1826,7 @@ impl WriteGate {
                         &entry,
                         reason,
                         maybe_sent,
+                        hold_contract,
                         id,
                         crate::mcp::is_modern_request(request.message),
                     )
@@ -933,6 +1839,7 @@ impl WriteGate {
                     failure: report.failure,
                     attempt: Attempt::Answered,
                     status: None,
+                    reply_kind: Default::default(),
                 };
             }
         }
@@ -941,12 +1848,19 @@ impl WriteGate {
         self.finish(report, maybe_sent, &entry, &executor, &operation, id)
     }
 
+    /// Custody-only compatibility must use a rollback-safe versioned format.
     async fn validate_hold(
         &self,
         request: &WriteRequest<'_>,
         prepared: &Value,
-    ) -> Option<SendReport> {
-        let (executor, operation, original) = super::failover::target(request.message)?;
+        entry: Option<&Entry>,
+    ) -> std::result::Result<HoldContract, SendReport> {
+        let Some((executor, operation, original)) = super::failover::target(request.message) else {
+            return Err(not_sent_report(
+                request.message.get("id"),
+                "Write has no operation contract; write was not held",
+            ));
+        };
         let id = request.message.get("id");
         let outcome = "not_sent";
         let refusal = |message: &str| SendReport {
@@ -954,51 +1868,44 @@ impl WriteGate {
             failure: None,
             attempt: Attempt::Stopped,
             status: None,
+            reply_kind: Default::default(),
         };
+        if !self.scope_matches(request.outage).await {
+            return Err(refusal(
+                "Pending account binding changed; write was not held",
+            ));
+        }
         if let Some(outage) = request.outage {
-            if !outage.held_replay_allowed().await {
-                return Some(refusal("Kernel-v2 upstream: holding v1 write envelopes is disabled; drain before cutover"));
+            if operation != "merge_body"
+                && self.custody_scope.is_none()
+                && !outage.held_replay_allowed().await
+            {
+                return Err(refusal("Kernel-v2 upstream: holding v1 write envelopes is disabled; drain before cutover"));
             }
         }
-        if self.kernel_v2_upstream() {
-            return Some(refusal(
+        if operation != "merge_body" && self.kernel_v2_upstream() && self.custody_scope.is_none() {
+            return Err(refusal(
                 "Kernel-v2 upstream: holding v1 write envelopes is disabled; drain before cutover",
             ));
         }
-        let Some(local) = self.local_contracts.digest(&executor, &operation) else {
-            return Some(refusal(
-                "Local operation contract unavailable; write was not held",
-            ));
-        };
-        let hosted = if let Some(outage) = request.outage {
-            outage
-                .contract_digest(&executor, &operation, request.revision)
-                .await
-        } else {
-            self.hosted_contracts
-                .lock()
-                .expect("hosted contracts")
-                .get(&(executor.clone(), operation.clone()))
-                .filter(|cached| cached.checked.elapsed() < cached.ttl)
-                .map(|cached| cached.value.clone())
-        };
-        if hosted.as_deref() != Some(local) {
-            return Some(refusal("Cached hosted operation contract is missing or differs from the local contract; write was not held"));
-        }
+        let contract = self
+            .cached_hold_contract(request, &executor, &operation, entry)
+            .await
+            .map_err(refusal)?;
         let Some((prepared_executor, prepared_operation, exact)) =
             super::failover::target(prepared)
         else {
-            return Some(refusal(
+            return Err(refusal(
                 "Prepared write has no operation contract; write was not held",
             ));
         };
         if prepared_executor != executor || prepared_operation != operation {
-            return Some(refusal(
+            return Err(refusal(
                 "Prepared write changed operation; write was not held",
             ));
         }
         for envelope in [&original, &exact] {
-            match self.local_contracts.validate(
+            match self.hold_contracts(&operation).validate(
                 &executor,
                 &operation,
                 envelope,
@@ -1007,22 +1914,132 @@ impl WriteGate {
                 Some(Ok(())) => {}
                 Some(Err(mut result)) => {
                     result["structuredContent"]["outcome"] = json!(outcome);
-                    return Some(SendReport {
+                    return Err(SendReport {
                         reply: id
                             .map(|id| json!({"jsonrpc":"2.0","id":id,"result":result}).to_string()),
                         failure: None,
                         attempt: Attempt::Stopped,
                         status: None,
+                        reply_kind: Default::default(),
                     });
                 }
                 None => {
-                    return Some(refusal(
+                    return Err(refusal(
                         "Local operation contract unavailable; write was not held",
                     ))
                 }
             }
         }
-        None
+        Ok(contract)
+    }
+
+    async fn cached_hold_contract(
+        &self,
+        request: &WriteRequest<'_>,
+        executor: &str,
+        operation: &str,
+        entry: Option<&Entry>,
+    ) -> std::result::Result<HoldContract, &'static str> {
+        if self.custody_scope.is_some() {
+            debug_assert_ne!(
+                operation, "merge_body",
+                "typed merge custody uses its separate contract gate"
+            );
+            let original = match entry {
+                Some(entry) => entry
+                    .kernel_v2_custody
+                    .as_ref()
+                    .and_then(|c| c.original.as_ref())
+                    .map(|o| o.contract.clone()),
+                None => self
+                    .hold_contracts(operation)
+                    .holding_contract(executor, operation)
+                    .and_then(|c| c.for_custody()),
+            }
+            .ok_or("Original v2 contract evidence unavailable; write was not held")?;
+            let hosted = if let Some(outage) = request.outage {
+                outage
+                    .holding_contract(executor, operation, request.revision)
+                    .await
+            } else {
+                None
+            }
+            .ok_or("Hosted v2 contract evidence unavailable; write was not held")?;
+            let local = self
+                .hold_contracts(operation)
+                .holding_contract(executor, operation);
+            let arguments = request
+                .message
+                .pointer("/params/arguments/arguments")
+                .unwrap_or(&Value::Null);
+            let paired = local.as_ref().is_some_and(|local| {
+                receiver_contracts::no_observation_pair(
+                    executor, operation, arguments, &original, local, &hosted,
+                )
+            });
+            if !hosted.valid_hosted_evidence(executor, operation)
+                || (!original.matches_custody(&hosted) && !paired)
+                || !self
+                    .hold_contracts(operation)
+                    .holding_contract(executor, operation)
+                    .is_some_and(|current| original.matches_custody(&current))
+            {
+                return Err("Hosted v2 operation contract is incompatible; write was not held");
+            }
+            if !self.scope_matches(request.outage).await {
+                return Err("Pending account binding changed; write was not held");
+            }
+            return Ok(HoldContract::V2);
+        }
+        let Some(local) = self.hold_contracts(operation).digest(executor, operation) else {
+            return Err("Local operation contract unavailable; write was not held");
+        };
+        let hosted = if let Some(outage) = request.outage {
+            outage
+                .contract_digest(executor, operation, request.revision)
+                .await
+        } else {
+            self.hosted_contracts
+                .lock()
+                .expect("hosted contracts")
+                .get(&(executor.into(), operation.into()))
+                .filter(|cached| cached.checked.elapsed() < cached.ttl)
+                .map(|cached| cached.value.clone())
+        };
+        let exact_contract = hosted.as_deref() == Some(local);
+        if !exact_contract {
+            // merge_body has a separate local merge/preview admission path;
+            // this first custody-only slice does not relax that boundary.
+            if operation == "merge_body" {
+                return Err(
+                    "Cached hosted merge contract is missing or incompatible; write was not held",
+                );
+            }
+            // Routerless calls retain their existing exact-digest/TTL gate.
+            // Only failover owns durable endpoint/account/protocol-bound evidence.
+            let evidence = if let Some(outage) = request.outage {
+                outage
+                    .holding_contract(executor, operation, request.revision)
+                    .await
+            } else {
+                None
+            };
+            let Some(evidence) = evidence else {
+                return Err("Cached hosted operation compatibility evidence is missing or malformed; write was not held");
+            };
+            if !schema_accepts_key(&evidence.description["input_schema"])
+                || !self
+                    .local_contracts
+                    .matches_holding_contract(executor, operation, &evidence)
+            {
+                return Err("Cached hosted operation contract is incompatible with the local contract; write was not held");
+            }
+        }
+        Ok(if exact_contract {
+            HoldContract::Exact
+        } else {
+            HoldContract::CustodyOnly(CustodyCompatibility::SourceDescriptionOnly)
+        })
     }
 
     /// Hosted refused the key the node minted, before any effect, and said to
@@ -1079,6 +2096,7 @@ impl WriteGate {
         holdable: bool,
     ) -> (SendReport, bool, Option<HoldReason>) {
         let id = message.get("id");
+        let replay_safe = automatic_replay_safe(entry);
         let started = request.caller.received;
         let cancel = &request.caller.cancel;
         let deadline = started + self.config.budget;
@@ -1086,6 +2104,27 @@ impl WriteGate {
         let mut backoff = self.config.backoff_start;
         let mut maybe_sent = false;
         loop {
+            if !self.scope_matches(request.outage).await || !self.scope_targets(upstream) {
+                return (
+                    not_sent_report(
+                        id,
+                        "Pending account or engine binding changed; write was not sent",
+                    ),
+                    maybe_sent,
+                    None,
+                );
+            }
+            let Some(custody_credential_sha256) = self.credential_for_scope(request.outage).await
+            else {
+                return (
+                    not_sent_report(
+                        id,
+                        "Verified custody credential unavailable; pending write was not sent",
+                    ),
+                    maybe_sent,
+                    None,
+                );
+            };
             if self.journal.note_attempt(&entry.id).is_err() && !maybe_sent {
                 return (
                     not_sent_report(id, "Cannot save the write journal entry; nothing was sent"),
@@ -1093,8 +2132,17 @@ impl WriteGate {
                     None,
                 );
             }
+            let mut attempt_limits = limits.clone();
+            attempt_limits.custody_credential_sha256 = custody_credential_sha256;
             let report = upstream
-                .send_attempt(body, message, request.revision, id, Some(&limits))
+                .send_attempt_context(
+                    body,
+                    message,
+                    request.revision,
+                    id,
+                    Some(&attempt_limits),
+                    Some(&request.caller.context),
+                )
                 .await;
             match report.attempt {
                 Attempt::Lost | Attempt::Unclear => maybe_sent = true,
@@ -1103,6 +2151,20 @@ impl WriteGate {
                     let _ = self.journal.update(&entry.id, |e| e.attempts -= 1);
                 }
                 _ => {}
+            }
+            if maybe_sent && !replay_safe {
+                return (report, true, None);
+            }
+            if let Some(update) = report.update_required() {
+                if !update.definitely_unapplied {
+                    maybe_sent = true;
+                }
+                return (
+                    report,
+                    maybe_sent,
+                    (holdable && !cancel.is_cancelled())
+                        .then_some(HoldReason::ClientUpdateRequired),
+                );
             }
             // A caller that has gone is not told anything, so the node does not
             // take its write over.
@@ -1173,6 +2235,9 @@ impl WriteGate {
         }
         match halt {
             queue::Halt::ReadOnly => Turn::Behind(HoldReason::DeploymentReadOnly, guard),
+            queue::Halt::ClientUpdateRequired => {
+                Turn::Behind(HoldReason::ClientUpdateRequired, guard)
+            }
             queue::Halt::Unreachable
                 if self
                     .confirm_down(request, limit + self.config.budget / 2)
@@ -1243,6 +2308,7 @@ impl WriteGate {
             failure: None,
             attempt: Attempt::Answered,
             status: None,
+            reply_kind: Default::default(),
         }))
     }
 
@@ -1254,13 +2320,23 @@ impl WriteGate {
         entry: &Entry,
         reason: HoldReason,
         maybe_applied: bool,
+        contract: Option<HoldContract>,
         id: Option<&Value>,
         modern: bool,
     ) -> Option<Option<String>> {
-        if self.kernel_v2_upstream() {
+        let contract = contract?;
+        if self.custody_scope.is_some() && contract.custody_compatibility().is_some() {
+            return None;
+        }
+        if self.kernel_v2_upstream() && self.custody_scope.is_none() {
             return None;
         }
         let detail = match (reason, maybe_applied) {
+            (HoldReason::ClientUpdateRequired, false) =>
+                "client update demand recorded; updater unavailable; this attempt was unapplied; original held",
+            (HoldReason::ClientUpdateRequired, true) =>
+                "client update demand recorded; updater unavailable; an attempt may have applied; original/key retained",
+
             (HoldReason::DeploymentReadOnly, false) => {
                 "hosted refused the write as read-only for a deployment; held to send later"
             }
@@ -1274,9 +2350,45 @@ impl WriteGate {
         };
         let held = self
             .journal
-            .hold(&entry.id, reason, detail.to_owned(), maybe_applied)
+            .hold_with_contract(
+                &entry.id,
+                reason,
+                detail.to_owned(),
+                maybe_applied,
+                contract.custody_compatibility(),
+            )
             .ok()
             .filter(|held| held.state == EntryState::Pending)?;
+        if let Some(head) = self
+            .journal
+            .pending_entries()
+            .into_iter()
+            .find(|e| e.compatibility_block.is_some())
+        {
+            if let Err(error) = self.journal.contract_block(&head, head.compatibility_block) {
+                // Custody is already durable. Decoration failure must never turn
+                // this into an inline send or let finish() overwrite Pending.
+                tracing::warn!(target: "native_ce::node::journal", %error, "held write retained; waiting markers unavailable");
+            }
+        }
+        let held = self.journal.get(&held.id).unwrap_or(held);
+        if self
+            .pending_fork_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+            && super::pending_fork::previewable(&held)
+        {
+            // Saved before the pending answer. Hosted replay still uses arguments.
+            if self
+                .journal
+                .update(&held.id, |e| {
+                    e.fork_arguments = e.arguments.clone();
+                    e.fork_run_key = e.run_key.clone();
+                })
+                .is_err()
+            {
+                tracing::warn!(target: "native_ce::node::pending_fork", "preview retention unavailable");
+            }
+        }
         let position = self.journal.pending_position(held.seq);
         Some(hold::pending_reply(id, &held, position, modern))
     }
@@ -1295,6 +2407,31 @@ impl WriteGate {
         operation: &str,
         id: Option<&Value>,
     ) -> SendReport {
+        if let Some(update) = report.update_required() {
+            // A nonholdable new call was refused before application, or remains
+            // uncertain. Neither case is a canonical business refusal/receipt.
+            let uncertain = maybe_sent || entry.maybe_applied || !update.definitely_unapplied;
+            let _ = self.journal.settle(
+                &entry.id,
+                if uncertain {
+                    EntryState::Uncertain
+                } else {
+                    EntryState::NotSent
+                },
+                None,
+                Some(if uncertain {
+                    "client update demand recorded; updater unavailable; original retained"
+                } else {
+                    "client update demand recorded; updater unavailable; attempt unapplied; not accepted for later sending"
+                }.into()),
+            );
+            if uncertain {
+                report.reply = report.reply.map(|reply| annotate_hosted_reply(&reply,
+                    json!({"outcome":"unknown","may_already_be_applied":true,"journal_entry":entry.id}),
+                    entry.idempotency_key.as_deref().unwrap_or_default()));
+            }
+            return report;
+        }
         let attempts = self.journal.get(&entry.id).map_or(0, |e| e.attempts);
         let answer =
             (report.attempt == Attempt::Answered).then(|| answer_of(report.reply.as_deref()));
@@ -1381,20 +2518,24 @@ impl WriteGate {
             "key_origin": entry.key_origin,
             "journal_entry": entry.id,
             "attempts": attempts,
-            "retry": "Send this exact call again with idempotency_key set to the value above: hosted returns the original receipt if the write was applied and applies it once if not. Or read the record first. The node does not replay an uncertain write; only a write it reports as accepted_pending is sent by the node.",
+            "retry": if automatic_replay_safe(entry) {
+                "Send this exact call again with idempotency_key set to the value above, or read the record first. The node does not replay an uncertain write. Keyed replay does not promise receipt continuity across hosted failover."
+            } else {
+                "Inspect canonical history and reconcile every batch item before writing again. The node stopped automatic batch replay after a possibly applied attempt; a key alone is not a guarantee of safe batch replay."
+            },
         });
         if report.attempt != Attempt::Answered {
             report.reply = frame_error(
                 id,
                 &format!(
-                    "Write outcome uncertain. Retry the same call with idempotency_key={key}, or read the record before writing again"
+                    "Write outcome uncertain (idempotency_key={key}). Inspect canonical history before writing again"
                 ),
                 info,
             );
-        } else if maybe_sent || entry.key_origin == Some(KeyOrigin::Node) {
+        } else {
             // Hosted's own answer stays as it was; the node adds what the
-            // caller cannot otherwise see: an earlier attempt may have landed,
-            // or the key is the node's.
+            // caller cannot otherwise see: this journal entry is uncertain,
+            // including when the caller supplied its key.
             report.reply = report
                 .reply
                 .map(|reply| annotate_hosted_reply(&reply, info, key));
@@ -1601,6 +2742,21 @@ impl WriteGate {
     }
 }
 
+#[derive(Clone, Copy)]
+enum HoldContract {
+    Exact,
+    V2,
+    CustodyOnly(CustodyCompatibility),
+}
+impl HoldContract {
+    fn custody_compatibility(self) -> Option<CustodyCompatibility> {
+        match self {
+            Self::Exact | Self::V2 => None,
+            Self::CustodyOnly(reason) => Some(reason),
+        }
+    }
+}
+
 /// A stored reply, addressed to the request that is repeating the call.
 fn with_request_id(stored: &str, id: Option<&Value>) -> String {
     match (serde_json::from_str::<Value>(stored), id) {
@@ -1618,6 +2774,7 @@ fn not_sent_report(id: Option<&Value>, message: &str) -> SendReport {
         failure: None,
         attempt: Attempt::Stopped,
         status: None,
+        reply_kind: Default::default(),
     }
 }
 
@@ -1638,14 +2795,24 @@ fn annotate_hosted_reply(reply: &str, info: Value, key: &str) -> String {
             .as_array_mut()
         {
             content.push(json!({"type":"text","text":format!(
-                "Node note: an earlier attempt of this write may have been applied, so its outcome is uncertain. Retry the same call with idempotency_key={key}, or read the record before writing again."
+                "Node note: this write has an uncertain outcome; an attempt may have been applied. Retry the same call with idempotency_key={key}, or read the record before writing again."
             )}));
         }
-        let structured = result
-            .entry("structuredContent")
-            .or_insert_with(|| json!({}));
-        if let Some(structured) = structured.as_object_mut() {
+        // Beside an existing structured payload only. Creating one for a
+        // text-format reply would hide hosted's own text and this note from
+        // clients that prefer structuredContent (7e99834, deb2b566); there the
+        // machine-readable note goes in `_meta`, which clients do not display.
+        if let Some(structured) = result
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
+        {
             structured.insert("node_journal".into(), info);
+        } else if let Some(meta) = result
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            meta.insert("node_journal".into(), info);
         }
     } else if let Some(error) = value.get_mut("error").and_then(Value::as_object_mut) {
         // A plain JSON-RPC error may carry no `data`, or data that is not an
@@ -1769,6 +2936,13 @@ fn answer_of(reply: Option<&str>) -> Answer {
     };
     if let Some(body) = reply.pointer("/error/data/upstream_body") {
         let nested = body.get("error").filter(|error| error.is_object());
+        if [Some(body), nested]
+            .into_iter()
+            .flatten()
+            .any(super::has_uncertain_outcome)
+        {
+            return Answer::Partial;
+        }
         if let Some(answer) = [Some(body), nested].into_iter().flatten().find_map(judge) {
             return answer;
         }
@@ -1827,6 +3001,9 @@ fn refuses_key(reply: Option<&str>) -> bool {
 }
 
 fn judge(body: &Value) -> Option<Answer> {
+    if super::has_uncertain_outcome(body) {
+        return Some(Answer::Partial);
+    }
     if body.get("outcome").and_then(Value::as_str) == Some("accepted_pending")
         && body.get("canonical").and_then(Value::as_bool) == Some(false)
     {
@@ -1911,3 +3088,56 @@ fn outbox_text_body(reply: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod tests;
+
+impl WriteGate {
+    #[cfg(feature = "mcp-executor-prototype")]
+    pub(super) async fn operator_decision(
+        &self,
+        entry_id: &str,
+        outcome: Option<&str>,
+        reason: &str,
+        pid: Option<i32>,
+    ) -> Result<Value> {
+        // Do not wait for an in-flight send to finish and accidentally act on
+        // its later state. Busy means retry the maintenance command after inspection.
+        let _queue = self
+            .drain_lock
+            .try_write()
+            .map_err(|_| Error::engine("journal send gate busy; nothing changed"))?;
+        let _hosted = self
+            .hosted_check
+            .try_lock()
+            .map_err(|_| Error::engine("hosted settlement busy; nothing changed"))?;
+        let entry = self
+            .journal
+            .operator_decision(entry_id, outcome, reason, owner_uid(), pid)?;
+        if outcome.is_none() {
+            self.refuse_dependants(&entry);
+        }
+        Ok(
+            json!({"entry_id":entry.id, "state":entry.state, "operator_audit":entry.operator_audit,
+            "sent":false, "canonical":false}),
+        )
+    }
+}
+
+/// Schema acceptance alone does not establish safe overlapping batch retries.
+/// A historical keyed create_many timed out and duplicated records on retry.
+/// Until that path is qualified, retain its key as evidence but stop automatic
+/// replay after any attempt that could have reached hosted.
+fn scoped_intent_digest(arguments: &Value, app: Option<&str>) -> String {
+    match app {
+        Some(app) => {
+            hold::intent_digest(&json!({"app":app,"intent_digest":hold::intent_digest(arguments)}))
+        }
+        None => hold::intent_digest(arguments),
+    }
+}
+
+fn automatic_replay_safe(entry: &Entry) -> bool {
+    entry
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+        && !(entry.executor == "records_write" && entry.operation == "create_many")
+}

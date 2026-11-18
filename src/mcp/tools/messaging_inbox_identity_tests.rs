@@ -98,6 +98,7 @@ async fn the_inbox_serves_the_v3_schema_string() {
     fixture(&db).await;
     let page = inbox(&db, "alice", "browse").await;
     assert_eq!(page["schema"], "native.message-inbox.v3");
+    assert_eq!(page["capabilities"]["saved_session_sharing"], true);
 }
 
 #[tokio::test]

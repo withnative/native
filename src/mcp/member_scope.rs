@@ -157,6 +157,7 @@ pub const QUERY_SQL_SERVED_RELATIONS: &[&str] = &[
     "facet_times",
     "facet_keys",
     "bindings",
+    "viewer",
     "blobs",
     "vocabularies",
     "vocabulary_values",
@@ -347,6 +348,7 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
         | K::VerifyArtifact
         | K::ManageRecordPolicy
         | K::ManageAccountConfig
+        | K::ManageSavedTabs
         | K::ManageBindings
         | K::ManageVocabularies
         | K::ManageSchemaConfig
@@ -355,11 +357,13 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
         | K::ManageChangeSummaries
         | K::ManageInterventions
         | K::ManageNamedViews
+        | K::ManagePublication
         | K::ManageRendererBinding
         | K::ManageMdxModules
         | K::ManageArtifactInputs
         | K::ManageArtifactModuleGrants
         | K::ManageSurfaceBindings
+        | K::ReadAppBundle
         | K::ManageAlphaTabs
         | K::StartWork => UnavailableOffline,
         // §2.3(b) catalog or hosting state (HostOwner-only or roster).
@@ -381,6 +385,7 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
         | K::SaveAccount
         | K::UpdateRecord
         | K::ClaimUnownedRecord
+        | K::MergeBody
         | K::CorrectRecordType
         | K::DeleteRecord
         | K::ArchiveRecord
@@ -425,8 +430,8 @@ mod tests {
             "ToolKind::ALL must not repeat a tool"
         );
         // The match has no wildcard arm, so a new ToolKind fails the build;
-        // this pins the current 92 and that no name repeats.
-        assert_eq!(ToolKind::ALL.len(), 92);
+        // this pins the current 96 and that no name repeats.
+        assert_eq!(ToolKind::ALL.len(), 96);
     }
 
     #[test]
@@ -480,12 +485,14 @@ mod tests {
             ToolKind::RenderSuggestionReview,
             ToolKind::ManageMessages,
             ToolKind::ManageNamedViews,
+            ToolKind::ManagePublication,
             ToolKind::ManageParticipants,
             ToolKind::ReadCanvas,
             ToolKind::RenderArtifact,
             ToolKind::VerifyArtifact,
             ToolKind::ManageRecordPolicy,
             ToolKind::ManageAccountConfig,
+            ToolKind::ManageSavedTabs,
             ToolKind::ManageBindings,
             ToolKind::ManageVocabularies,
             ToolKind::ManageSchemaConfig,
@@ -499,6 +506,8 @@ mod tests {
             ToolKind::ManageArtifactModuleGrants,
             ToolKind::ManageSurfaceBindings,
             ToolKind::ManageAlphaTabs,
+            // Owner-installed app consent is absent from member copies.
+            ToolKind::ReadAppBundle,
             ToolKind::StartWork,
             ToolKind::ManageMemberships,
             ToolKind::WorkspaceRead,
@@ -506,7 +515,7 @@ mod tests {
             ToolKind::AuthorityActHead,
             ToolKind::AuthorityActDelta,
         ];
-        assert_eq!(unavailable.len(), 43);
+        assert_eq!(unavailable.len(), 46);
         for kind in unavailable {
             assert_eq!(
                 scope(kind),
@@ -817,6 +826,7 @@ mod tests {
                 "facet_times",
                 "facet_keys",
                 "bindings",
+                "viewer",
                 "blobs",
                 "vocabularies",
                 "vocabulary_values",

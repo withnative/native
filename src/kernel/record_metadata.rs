@@ -12,6 +12,61 @@ pub(crate) const CLOCK_INDEX: &str =
 
 pub(crate) const REHOME_INDEX: &str = "CREATE INDEX idx_kernel_record_moves ON content_events(record_id,seq) WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')";
 
+// Structural candidate seeks only: current View and logical-name/placement
+// predicates still decide results. Partial indexes exclude unrelated bodies
+// and event payloads; keep REHOME_INDEX for latest-move lookup by record.
+pub(crate) const NAME_LOOKUP_INDEX: &str = "CREATE INDEX idx_kernel_record_names ON kernel_record_fields(json_extract(value_json,'$') COLLATE BINARY,record_id) WHERE name IN ('title','name')";
+pub(crate) const LOGICAL_HOME_LOOKUP_INDEX: &str = "CREATE INDEX idx_kernel_record_logical_homes ON content_events(json_extract(payload,'$.logical_home_id'),record_id) WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')";
+
+/// Reject same-name structures with different keys or partial predicates.
+/// SQLite retains the canonical CREATE statement without IF NOT EXISTS.
+pub(crate) async fn require_lookup_indexes_on(conn: &mut SqliteConnection) -> Result<()> {
+    for (name, expected) in [
+        ("idx_kernel_record_names", NAME_LOOKUP_INDEX),
+        ("idx_kernel_record_logical_homes", LOGICAL_HOME_LOOKUP_INDEX),
+    ] {
+        let actual: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+        )
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
+        if actual.as_deref() != Some(expected) {
+            return Err(Error::engine(format!(
+                "v2 database is not ready: unexpected definition for {name}; run explicit v2 index repair before serving"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Prepare the read-lookup index set on an otherwise ready, marked v2 file:
+/// two record lookup indexes and four optional endpoint indexes. Any
+/// conflicting definition or unrelated readiness failure rolls back the
+/// entire index transaction; retained projections and events stay put.
+pub async fn prepare_record_lookup_indexes(db: &Db) -> Result<()> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(&mut *tx)
+        .await?;
+    if marker != crate::db::V2_APPLICATION_ID {
+        return Err(Error::engine(
+            "record lookup preparation requires a marked v2 database",
+        ));
+    }
+    for index in [NAME_LOOKUP_INDEX, LOGICAL_HOME_LOOKUP_INDEX] {
+        sqlx::query(&index.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+            .execute(&mut *tx)
+            .await?;
+    }
+    super::generic_links::prepare_link_endpoint_indexes_on(&mut tx).await?;
+    require_lookup_indexes_on(&mut tx).await?;
+    super::verify_v2_ready_on(&mut tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 // A tiny index over filing/annotation identities; never index body values.
 pub(crate) const FILING_TYPE_INDEX: &str = "CREATE INDEX idx_kernel_record_filing_types ON kernel_record_fields(record_id) WHERE name='v1_type' AND value_json IN ('\"Annotation\"','\"Collection\"')";
 // Cover both the presence probe and per-bearer carrier checks without reading
@@ -29,11 +84,14 @@ pub(crate) const HISTORICAL_TARGET_INDEX: &str = "CREATE INDEX idx_kernel_histor
 // resolve their validated record subjects explicitly below.
 const NATIVE_ACTIVITY_EVENTS: &[&str] = &[
     "kernel.record_created.v1",
+    "kernel.saved_tab_changed.v1",
     "kernel.metadata_set.v1",
     "kernel.body_set.v1",
     "kernel.facet_observed.v1",
     "kernel.archive_changed.v1",
     "kernel.record_deleted.v1",
+    "kernel.record_type_corrected.v1",
+    "kernel.comment_anchor_removed.v1",
     "kernel.record_revised.v1",
     "kernel.record_revised.v2",
     "kernel.record_rebound.v1",
@@ -90,6 +148,8 @@ struct Patch {
     persistence: Option<String>,
     #[serde(default)]
     maturity: Option<serde_json::Value>,
+    #[serde(default, rename = "basis")]
+    _basis: Option<serde_json::Value>,
 }
 pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
     // Parse manually for explicit null: serde Option<Value> maps null to None.
@@ -231,6 +291,8 @@ pub async fn ensure_record_metadata(db: &Db) -> Result<()> {
     for index in [
         CLOCK_INDEX,
         REHOME_INDEX,
+        NAME_LOOKUP_INDEX,
+        LOGICAL_HOME_LOOKUP_INDEX,
         FILING_TYPE_INDEX,
         MESSAGE_TYPE_INDEX,
         HISTORICAL_HOME_INDEX,
@@ -240,6 +302,7 @@ pub async fn ensure_record_metadata(db: &Db) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
+    require_lookup_indexes_on(&mut tx).await?;
     sqlx::query(super::hosted_identity::EVENT_INDEX_DDL)
         .execute(&mut *tx)
         .await?;
@@ -257,8 +320,11 @@ pub async fn ensure_record_metadata(db: &Db) -> Result<()> {
     let relation = crate::v2_standard::relates_to::RELATIONSHIP;
     let transform = super::relates_to_port::HOST_TRANSFORM_BINDING;
     let latest = format!("FROM (SELECT e.created_at,e.seq FROM content_events e WHERE e.record_id=r.id AND e.type IN ({events}) UNION ALL SELECT e.created_at,e.seq FROM kernel_provider_subjects s JOIN kernel_provider_state p ON p.id=s.aggregate_id JOIN content_events e ON e.seq=p.head WHERE s.subject_id=r.id AND p.provider_key='{claims}' UNION ALL SELECT e.created_at,e.seq FROM kernel_provider_receipts pr JOIN kernel_provider_state p ON p.id=json_extract(pr.request_json,'$.aggregate_id') JOIN kernel_principals a ON a.principal_id=pr.principal_id JOIN content_events e ON e.seq=pr.event_seq WHERE json_extract(pr.request_json,'$.anchor.record_id')=r.id AND p.provider_key='{relation}' AND coalesce(a.auth_binding,'')!='{transform}') ORDER BY seq DESC LIMIT 1");
-    sqlx::query(&format!("INSERT INTO kernel_record_metadata(record_id,persistence,maturity,last_activity_at,event_seq) SELECT r.id,'enduring',NULL,coalesce((SELECT created_at {latest}),r.created_at),coalesce((SELECT seq {latest}),r.created_seq) FROM kernel_records r WHERE NOT EXISTS(SELECT 1 FROM kernel_record_metadata m WHERE m.record_id=r.id)"))
-        .execute(&mut *tx).await?;
+    let inserted = sqlx::query(&format!("INSERT INTO kernel_record_metadata(record_id,persistence,maturity,last_activity_at,event_seq) SELECT r.id,'enduring',NULL,coalesce((SELECT created_at {latest}),r.created_at),coalesce((SELECT seq {latest}),r.created_seq) FROM kernel_records r WHERE NOT EXISTS(SELECT 1 FROM kernel_record_metadata m WHERE m.record_id=r.id)"))
+        .execute(&mut *tx).await?.rows_affected();
+    if inserted > 0 {
+        super::sql_record_projection::reset_on(&mut tx).await?;
+    }
     tx.commit().await?;
     Ok(())
 }

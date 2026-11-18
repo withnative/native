@@ -280,7 +280,7 @@ test("package: a ~650 KB package bundle passes the lint and validates; ordinary 
   assert.deepEqual(validateHtml(ordinary600, { package: true }).filter((item) => item.severity === "error"), []);
 });
 
-test("package: the limit is exact, 1 MiB, and one byte over is refused even as a package", () => {
+test("package: the limit is exact, 2 MiB, and one byte over is refused even as a package", () => {
   const at = bigDoc(LIMITS.html.package_body_max_bytes);
   assert.deepEqual(validateHtml(at, { package: true }).filter((item) => item.severity === "error"), []);
   const over = bigDoc(LIMITS.html.package_body_max_bytes + 1);
@@ -289,7 +289,7 @@ test("package: the limit is exact, 1 MiB, and one byte over is refused even as a
   assert.equal(LINT_BUDGET.scriptBytes, LIMITS.html.body_max_bytes);
 });
 
-test("package: planInstall marks a bundle over the ordinary limit with the package facet on both routes, and only then", () => {
+test("package: planInstall marks large and small app bundles on both routes", () => {
   const html = bigDoc(600_000);
   const common = { descriptor: descriptorFor(html), html, homeId: "c59dffa3-a401-431a-a44b-c79cae9b8346", reason: "Install a package" };
   const whole = planInstall(common);
@@ -297,10 +297,10 @@ test("package: planInstall marks a bundle over the ordinary limit with the packa
   assert.deepEqual(whole.steps.find((step) => step.step === "create-artifact").arguments.facets, { runtime: "native.html.v1", app_package: "true" });
   const chunked = planInstall({ ...common, chunked: true });
   assert.deepEqual(chunked.steps.find((step) => step.step === "rekind-artifact").arguments.facets, { runtime: "native.html.v1", app_package: "true" });
-  // A bundle within the ordinary limit keeps its plan unchanged: no marker.
+  // Small apps also need the larger per-asset allowance.
   const small = doc("");
   const plain = planInstall({ ...common, descriptor: descriptorFor(small), html: small });
-  assert.deepEqual(plain.steps.find((step) => step.step === "create-artifact").arguments.facets, { runtime: "native.html.v1" });
+  assert.deepEqual(plain.steps.find((step) => step.step === "create-artifact").arguments.facets, { runtime: "native.html.v1", app_package: "true" });
 });
 
 test("package: the validate CLI defaults to package validation; --no-package holds a bundle to 512 KiB", async () => {

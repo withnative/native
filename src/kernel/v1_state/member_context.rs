@@ -165,7 +165,6 @@ pub(crate) async fn online_on(conn: &mut SqliteConnection, actor: &str) -> Resul
 }
 /// Delivery seam: both references must be visible in the caller's current cut.
 /// This is stricter reference closure, not an online private-root authority claim.
-#[allow(dead_code)] // N3 consumes this seam after independent integration review.
 pub(crate) async fn member_delivery_on(
     conn: &mut SqliteConnection,
     actor: &str,

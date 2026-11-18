@@ -744,9 +744,33 @@ async fn main() -> ExitCode {
             .unwrap_or_else(|| "account".to_string());
         let label = flag(&args, "label");
         let binding = flag(&args, "binding");
-        let (_, id) = kernel::create_v2_database(&args.db, &kind, &label, &binding)
+        let (db, id) = kernel::create_v2_database(&args.db, &kind, &label, &binding)
             .await
             .unwrap_or_else(|e| fail(e.to_string()));
+        // Opt-in fixture setup through the ordinary first-party package
+        // admission path; reserved definitions cannot be installed piecemeal.
+        if args.flags.get("standard").is_some_and(|v| v == "true") {
+            for package in [
+                native_ce::v2_standard::document4_package(),
+                native_ce::v2_standard::v1_compat::package(),
+                native_ce::v2_standard::relates_to::package(),
+            ] {
+                let installed = kernel::install_package_as(&db, &id, &package)
+                    .await
+                    .unwrap_or_else(|e| fail(e.to_string()));
+                kernel::adopt_package_at(
+                    &db,
+                    &id,
+                    native_ce::events::KERNEL_ROOT_ID,
+                    &package,
+                    Some(&installed),
+                    &package.declared_reads,
+                )
+                .await
+                .unwrap_or_else(|e| fail(e.to_string()));
+            }
+        }
+        db.close().await;
         println!("{}", serde_json::json!({"principal_id": id}));
         return ExitCode::SUCCESS;
     }

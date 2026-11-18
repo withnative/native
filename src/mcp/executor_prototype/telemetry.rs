@@ -591,6 +591,33 @@ impl BoundExecutorTelemetry {
         }
     }
 
+    /// Reuse only already-sanitized telemetry correlations. The retry group
+    /// binds key, operation and caller; no raw key or payload reaches logs.
+    pub(super) fn write_context(
+        &self,
+        request: &TelemetryRequest,
+        operation: &str,
+        idempotency_key: Option<&str>,
+    ) -> crate::write_diagnostics::Context {
+        let retry = idempotency_key.map(|key| {
+            let scope = REQUEST_SCOPE.try_with(Clone::clone).unwrap_or_default();
+            let identity = serde_json::to_string(&(
+                &self.session.correlation,
+                scope.account,
+                scope.run_key,
+                operation,
+                key,
+            ))
+            .expect("string tuple serializes");
+            self.context.correlation("write_retry", &identity)
+        });
+        crate::write_diagnostics::Context::new(
+            crate::write_diagnostics::operation_label(operation),
+            Some(request.correlation.clone()),
+            retry,
+        )
+    }
+
     pub(super) fn with_plan_correlation(
         &self,
         mut request: TelemetryRequest,
@@ -834,6 +861,59 @@ fn normalize_revision(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn write_retry_group_is_private_caller_bound_and_attempts_are_distinct() {
+        let context = super::ExecutorTelemetryContext::new(
+            std::sync::Arc::new(super::TestTelemetrySink::default()),
+            super::DEFAULT_RETENTION_DAYS,
+        )
+        .unwrap();
+        let bound = context.bind(
+            "PRIVATE_account",
+            &"a".repeat(64),
+            &"b".repeat(40),
+            super::TelemetryEngine::Hosted,
+            super::TelemetryTransport::Http,
+        );
+        async fn fields(bound: &super::BoundExecutorTelemetry, account: &str) -> String {
+            super::scope_request(
+                super::RequestScope {
+                    account: Some(account.into()),
+                    run_key: Some("PRIVATE_run".into()),
+                    ..Default::default()
+                },
+                async {
+                    let request = bound.request(Some("records_write"), Some("update_record"), None);
+                    let context =
+                        bound.write_context(&request, "update_record", Some("PRIVATE_key"));
+                    let fields = context.fields();
+                    assert!(fields.contains(&request.correlation));
+                    assert!(!fields.contains("PRIVATE"));
+                    fields
+                },
+            )
+            .await
+        }
+        let first = fields(&bound, "PRIVATE_account1").await;
+        let retry = fields(&bound, "PRIVATE_account1").await;
+        let other = fields(&bound, "PRIVATE_account2").await;
+        assert_ne!(first, retry);
+        let group = |s: &str| s.split(" retry=").nth(1).unwrap().to_owned();
+        assert_eq!(group(&first), group(&retry));
+        assert_ne!(group(&first), group(&other));
+        let other_workspace = context.bind(
+            "PRIVATE_other_workspace",
+            &"a".repeat(64),
+            &"b".repeat(40),
+            super::TelemetryEngine::Hosted,
+            super::TelemetryTransport::Http,
+        );
+        assert_ne!(
+            group(&first),
+            group(&fields(&other_workspace, "PRIVATE_account1").await)
+        );
+    }
+
     use super::*;
 
     #[test]

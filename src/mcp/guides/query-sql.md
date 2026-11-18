@@ -4,6 +4,18 @@
 
 `query_sql` accepts one read-only statement in the active engine's native dialect. Native does not translate SQL between engines. The `sql_read` descriptor card names the relations, value model and worked statements; `engine_info` remains available for the active profile revision, dialect, parameter convention, limits, and any fail-closed reason, but is not required before use.
 
+`SELECT person_id, display_name FROM viewer` returns exactly one row for the
+current authenticated caller, even before their first write. Both columns are
+nullable TEXT. The name is the same raw value used by `actors` for that caller:
+SQLite and PostgreSQL use the caller-visible account-bound person's name;
+kernel v2 uses the person title with a principal display-label fallback.
+If retained kernel v2 imports contain several directory entries for the caller,
+the singleton chooses the first by directory source id, then person id.
+Names are neither trimmed nor truncated. Hidden persons supply no person id or
+name. Person visibility follows the author relation's rules, including lifecycle
+and binding changes. Use this for display, never authorization. SQLite's offline
+member read surface also serves it; Turso refuses this relation explicitly.
+
 ## Parameters
 
 Parameters are optional and positional (`?N`, 1-based and contiguous, on every profile — `$N`, bare `?`, and `:name` are rejected). Each item is either a typed `{"type", "value"}` entry or a bare JSON scalar, inferred as text (string), integer (integer), real (fractional number), boolean, or SQL NULL (null); `value: null` is a typed SQL NULL, while the string `"null"` is a JSON null for the `json` tag. Bytes, json and timestamp stay typed-only: a bare string is always text. Bare integers must fit the signed 64-bit range, and integers beyond 2^53 that a client cannot carry exactly should use the typed decimal-string form. Use the active profile's encoding metadata below.
@@ -673,9 +685,14 @@ catalogue can call, with the same pairs and contract digests
 `describe_operation` answers. Columns are `executor, operation, surface,
 access, plan_required, direct_execution_enabled, contract_version,
 contract_digest, source_tool, selector_field, selector_value,
-advertised_directly`: booleans are 0/1, `access` is `read` or `mutation`,
-and selector fields are NULL without a selector. Full operation schemas stay
-on `describe_operation`. Order by `executor, operation` for a deterministic
+advertised_directly, requires_acceptance`: booleans are 0/1, `access` is
+`read` or `mutation`, and selector fields are NULL without a selector.
+`requires_acceptance` is 1 when the write is queued and shown as waiting
+until hosted accepts it, rather than applied to the local copy straight away.
+It is for effects on other people or the outside world that cannot be taken
+back. It is 0 when the write is shown as done straight away, and always 0 for a
+read. Hosted re-checks every write either way. Full operation schemas stay on
+`describe_operation`. Order by `executor, operation` for a deterministic
 listing:
 
 ```sql
@@ -1366,6 +1383,21 @@ This exhaustive reference is generated from the same typed metadata used by `eng
       ]
     },
     {
+      "identity": "native.query-sql.viewer",
+      "name": "viewer",
+      "semantic_version": 1,
+      "caller_relative": true,
+      "completeness": "complete",
+      "profiles": [
+        "sqlite-local",
+        "postgres-server"
+      ],
+      "columns": [
+        "person_id",
+        "display_name"
+      ]
+    },
+    {
       "identity": "native.query-sql.actors",
       "name": "actors",
       "semantic_version": 1,
@@ -1705,7 +1737,8 @@ This exhaustive reference is generated from the same typed metadata used by `eng
         "source_tool",
         "selector_field",
         "selector_value",
-        "advertised_directly"
+        "advertised_directly",
+        "requires_acceptance"
       ]
     }
   ],

@@ -110,7 +110,9 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
         specs.len(),
         "each local registration must use a distinct ToolKind"
     );
-    let hosted_only = HashSet::from([
+    // Host/configured services and publication management are absent from
+    // the default local registry; publication needs explicit registration.
+    let default_unavailable = HashSet::from([
         ToolKind::ManageMemberships,
         ToolKind::WorkspaceRead,
         ToolKind::StandbyStatus,
@@ -119,10 +121,11 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
         ToolKind::ReachConnect,
         ToolKind::AuthorityActHead,
         ToolKind::AuthorityActDelta,
+        ToolKind::ManagePublication,
     ]);
-    assert_eq!(specs.len(), ToolKind::ALL.len() - hosted_only.len());
+    assert_eq!(specs.len(), ToolKind::ALL.len() - default_unavailable.len());
     let expected_local = exhaustive
-        .difference(&hosted_only)
+        .difference(&default_unavailable)
         .copied()
         .collect::<HashSet<_>>();
     assert_eq!(registered, expected_local);
@@ -131,8 +134,8 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
             .difference(&registered)
             .copied()
             .collect::<HashSet<_>>(),
-        hosted_only,
-        "hosted membership management, workspace directory, reach, and configured status services stay off the local registry"
+        default_unavailable,
+        "host/configured services and opt-in publication stay off the default local registry"
     );
     for spec in &specs {
         assert_eq!(spec.name, spec.kind.unwrap().name());

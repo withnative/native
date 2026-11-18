@@ -249,20 +249,7 @@ export function lintSql(sql, params = [], where = "sql") {
     expectTable = false;
   });
 
-  // LIMIT needs ORDER BY at the same query level.
-  tokens.forEach((token, index) => {
-    if (!isWord(token, "limit")) return;
-    let ordered = false;
-    for (let j = index - 1; j >= 0; j -= 1) {
-      const t = tokens[j];
-      if (t.depth < token.depth) break;
-      if (t.depth > token.depth) continue;
-      if (t.type === "open" && t.depth === token.depth - 1) break;
-      if (isWord(t, "limit")) break;
-      if (isWord(t, "order") && isWord(tokens[j + 1], "by")) { ordered = true; break; }
-    }
-    if (!ordered) fail("sql.limit-order", "src/query/turso_ast_rules.rs:117 check_limit_order", "LIMIT without ORDER BY: add ORDER BY over a unique key");
-  });
+  findings.push(...limitOrderFindings(tokens, { where }));
 
   // Output columns of the outermost SELECT: count, and duplicate labels.
   const selectIndex = tokens.findIndex((token) => isWord(token, "select") && token.depth === 0);
@@ -294,5 +281,35 @@ export function lintSql(sql, params = [], where = "sql") {
       }
     }
   }
+  return findings;
+}
+
+/** Check LIMIT at each SELECT nesting level, independently of saved-need
+ * schema/function policy. V2 apps must explicitly lint their embedded reads:
+ * their installed declaration is empty, so validatePackage cannot see them.
+ * query_sql repairs only an unordered top-level LIMIT (with assumed_order);
+ * nested SELECTs, CTEs and recursive compound bodies still require ordering.
+ * This is a lexical mirror, not a uniqueness/schema or runtime qualification.
+ */
+export function lintSqlLimitOrder(sql, { profile = "saved", where = "sql" } = {}) {
+  if (!["saved", "query_sql"].includes(profile)) throw new Error(`Unknown SQL profile: ${profile}`);
+  return limitOrderFindings(tokenize(sql), { profile, where });
+}
+function limitOrderFindings(tokens, { profile = "saved", where }) {
+  const findings = [];
+  tokens.forEach((token, index) => {
+    if (!isWord(token, "limit") || profile === "query_sql" && token.depth === 0) return;
+    let ordered = false;
+    for (let j = index - 1; j >= 0; j -= 1) {
+      const t = tokens[j];
+      if (t.depth < token.depth) break;
+      if (t.depth > token.depth) continue;
+      // Never borrow a clause from a different SELECT or statement. A compound
+      // tail's ORDER BY follows its final SELECT, at the compound's own level.
+      if (isWord(t, "select", "limit") || t.type === "punct" && t.value === ";") break;
+      if (isWord(t, "order") && isWord(tokens[j + 1], "by")) { ordered = true; break; }
+    }
+    if (!ordered) findings.push(finding("sql.limit-order", "src/query/turso_ast_rules.rs:378 check_limit_order; src/query/sql.rs apply_default_order", "LIMIT without ORDER BY: add ORDER BY over a unique key", { where: `${where} (SQL offset ${token.start}, depth ${token.depth})` }));
+  });
   return findings;
 }

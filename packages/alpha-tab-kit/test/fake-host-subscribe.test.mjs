@@ -35,7 +35,7 @@ async function open(options = {}) {
   return { page, tab, probe, events, heard, until, settled, done: async () => { await tab.close(); await page.close(); } };
 }
 
-const ready = (rowsOut, extra = {}) => ({ status: "ready", rows: rowsOut, columns: ["n"], truncated: false, cached: false, frozen: true, ...extra });
+const ready = (rowsOut, extra = {}) => ({ status: "ready", rows: rowsOut, columns: ["n"], truncated: false, cached: false, behind: false, frozen: true, ...extra });
 
 test("a v1 install receives no v2 methods even when host test options enable them", { skip }, async () => {
   const v1 = JSON.parse(fixture("probe-descriptor.json"));
@@ -102,6 +102,9 @@ test("subscribe delivers the first result, then a pushed update, then nothing af
     assert.deepEqual((await until("list", 2))[1], ready([["v2"]]));
     await tab.pushSubscription("subscription-1", result("cached"), { cached: true });
     assert.deepEqual((await until("list", 3))[2], ready([["cached"]], { cached: true }));
+    // The host's `behind` (it cannot confirm these rows right now) reaches the app beside `cached`.
+    await tab.pushSubscription("subscription-1", result("behind"), { cached: true, behind: true });
+    assert.deepEqual((await until("list", 4))[3], ready([["behind"]], { cached: true, behind: true }));
     assert.deepEqual((await events("subscribe")).map((event) => [event.subscription_id, event.query]), [["subscription-1", { sql: "select n", parameters: [7] }]]);
 
     await probe("unsubscribe", "list");
@@ -109,7 +112,7 @@ test("subscribe delivers the first result, then a pushed update, then nothing af
     await settled();
     assert.equal((await events("unsubscribe")).length, 1);
     assert.deepEqual(await tab.subscriptions(), []);
-    assert.equal((await heard("list")).length, 3);
+    assert.equal((await heard("list")).length, 4);
     await tab.expectHealthy();
   } finally { await done(); }
 });
@@ -137,7 +140,9 @@ test("a host error is delivered; non-terminal leaves the subscription open, term
   const { tab, probe, until, settled, events, done } = await open({ queries: true });
   try {
     await probe("subscribe", "a", { sql: "select 1" });
+    await probe("subscribe", "b", { sql: "select 2" });
     await until("a", 1);
+    await until("b", 1);
     await tab.failSubscription("subscription-1", "stale_authority", "re-checking", false);
     assert.deepEqual((await until("a", 2))[1], { status: "error", code: "stale_authority", message: "re-checking", terminal: false, frozen: true });
     await tab.pushSubscription("subscription-1", result("again"));
@@ -148,7 +153,18 @@ test("a host error is delivered; non-terminal leaves the subscription open, term
     await probe("unsubscribe", "a");
     await settled();
     assert.equal((await events("unsubscribe")).length, 0);
+    assert.deepEqual(await tab.subscriptions(), ["subscription-2"]);
+    // Exact Map membership: terminal close + caller unsubscribe never double-subtracts.
+    const diag = await tab.subscriptionDiagnostics();
+    assert.equal(diag.activeCount, 1);
+    assert.equal(diag.peakOpen, 2);
+    assert.equal(diag.terminalClosed, 1);
+    assert.equal(diag.unsubscribed, 0);
+    assert.deepEqual(diag.openIds, ["subscription-2"]);
+    await probe("unsubscribe", "b");
+    await settled();
     assert.deepEqual(await tab.subscriptions(), []);
+    assert.equal((await tab.subscriptionDiagnostics()).activeCount, 0);
     await tab.expectHealthy();
   } finally { await done(); }
 });
@@ -265,16 +281,30 @@ test("at most 8 queries are in flight; the 9th is refused busy and a finished on
 test("at most 32 subscriptions are open; the 33rd gets subscription_limit, and closing one frees a slot", { skip }, async () => {
   const { tab, probe, events, until, settled, done } = await open({ queries: true });
   try {
-    for (let i = 0; i < 32; i += 1) await probe("subscribe", `s${i}`, { sql: `select ${i}` });
+    for (let i = 0; i < 32; i += 1) await probe("subscribe", `s${i}`, { sql: `select ${i === 1 ? 0 : i}` });
     await probe("subscribe", "extra", { sql: "select extra" });
     assert.deepEqual((await until("extra", 1)).map((frame) => [frame.status, frame.code, frame.terminal]), [["error", "subscription_limit", true]]);
     assert.equal((await events("subscribe")).length, 32);
+    const atCap = await tab.subscriptionDiagnostics();
+    assert.equal(atCap.budget, 32);
+    assert.equal(atCap.countingRule, "per_frame_before_dedup");
+    assert.equal(atCap.activeCount, 32);
+    assert.equal(atCap.peakOpen, 32);
+    assert.equal(atCap.duplicateQueries.length, 1);
+    assert.deepEqual(atCap.duplicateQueries[0].subscriptionIds, ["subscription-1", "subscription-2"]);
+    assert.ok(atCap.observedLimitRefusals >= 1);
+    assert.match(atCap.hint ?? "", /32-subscription cap/);
     await probe("unsubscribe", "s0");
     await probe("subscribe", "again", { sql: "select again" });
     assert.equal((await until("again", 1))[0].status, "ready");
     await settled();
     assert.equal((await events("subscribe")).length, 33);
     assert.equal((await tab.subscriptions()).length, 32);
+    const afterSwap = await tab.subscriptionDiagnostics();
+    assert.equal(afterSwap.activeCount, 32);
+    assert.equal(afterSwap.opened, 33);
+    assert.equal(afterSwap.unsubscribed, 1);
+    assert.equal(afterSwap.duplicateQueries.length, 0);
     await tab.expectHealthy();
   } finally { await done(); }
 });

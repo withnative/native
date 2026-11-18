@@ -157,10 +157,54 @@ enum ManageAttachmentsArgs {
     },
 }
 
-struct SqliteAttachmentTransaction<'a> {
-    db: &'a Db,
-    tx: &'a mut Transaction<'static, Sqlite>,
-    act_alloc: &'a mut crate::act::ActAllocation,
+/// Shared closed member request parsing. The native reader reuses these
+/// exact argument shapes and defaults without acquiring canonical authority.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) enum MemberAttachmentRequest {
+    Read {
+        id: String,
+        offset: u64,
+        length: u64,
+        max_length: u64,
+    },
+    List {
+        record_id: String,
+    },
+    Inspect {
+        id: String,
+    },
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn member_attachment_request(
+    name: &str,
+    arguments: Value,
+) -> Result<MemberAttachmentRequest> {
+    if name == "read_attachment" {
+        let args: ReadAttachmentArgs = parse_args(name, arguments)?;
+        return Ok(MemberAttachmentRequest::Read {
+            id: args.attachment_id,
+            offset: args.offset.unwrap_or(0),
+            length: args.length.unwrap_or(DEFAULT_READ_LENGTH),
+            max_length: MAX_READ_LENGTH,
+        });
+    }
+    Ok(
+        match parse_args::<ManageAttachmentsArgs>(name, arguments)? {
+            ManageAttachmentsArgs::List { record_id } => {
+                MemberAttachmentRequest::List { record_id }
+            }
+            ManageAttachmentsArgs::Inspect { attachment_id } => {
+                MemberAttachmentRequest::Inspect { id: attachment_id }
+            }
+            ManageAttachmentsArgs::Detach { .. } => return Err(Error::standby_read_only()),
+        },
+    )
+}
+
+pub(super) struct SqliteAttachmentTransaction<'a> {
+    pub(super) db: &'a Db,
+    pub(super) tx: &'a mut Transaction<'static, Sqlite>,
+    pub(super) act_alloc: &'a mut crate::act::ActAllocation,
 }
 
 struct SqliteAttachmentLifecycle<'a> {

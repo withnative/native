@@ -247,7 +247,7 @@ pub struct ServiceContext {
     pub unit_dir: PathBuf,
     /// macOS log directory (`~/Library/Logs/Native`); unused on Linux.
     pub log_dir: PathBuf,
-    /// Absolute, canonical path of the `native` binary to run.
+    /// Absolute, verified launcher path of the `native` binary to run.
     pub exe: PathBuf,
     /// Absolute path of the `node.json` to serve.
     pub node_config: PathBuf,
@@ -276,8 +276,7 @@ impl ServiceContext {
                 .unwrap_or_else(|| home.join(".config"))
                 .join("systemd/user"),
         };
-        let exe = std::env::current_exe()
-            .and_then(std::fs::canonicalize)
+        let exe = super::launch::saved_launch_exe()
             .map_err(|_| ServiceError::other("cannot find this program's own path"))?;
         let node_config = config_dir.join(crate::native_cli::setup::NODE_FILE);
         let node_config = match std::fs::canonicalize(&node_config) {

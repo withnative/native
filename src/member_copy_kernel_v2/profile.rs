@@ -17,6 +17,14 @@ use std::{
     path::Path,
 };
 
+pub(crate) mod attachments;
+pub(crate) mod executor;
+mod query;
+mod selection;
+pub(crate) mod session;
+pub(crate) mod source_context;
+pub(crate) mod virtual_root;
+
 type Result<T> = std::result::Result<T, Refusal>;
 
 /// Fixed errors only. SQLite errors, identifiers and content never escape.
@@ -46,8 +54,12 @@ const RELATIONS: &[&str] = &[
     "records",
     "links",
     "facet_values",
+    "facet_times",
+    "schema_config",
+    "facet_keys",
     "comment_anchors",
     "bindings",
+    "viewer",
     "vocabularies",
     "vocabulary_values",
     "record_lifecycle_interpretations",
@@ -76,11 +88,51 @@ fn tables() -> Vec<(String, Vec<String>)> {
         })
         .collect::<Vec<_>>();
     tables.push((
+        "member_record_metadata".into(),
+        vec![
+            "record_id".into(),
+            "owner_id".into(),
+            "custody_boundary".into(),
+            "display_reference".into(),
+            "native_comment".into(),
+            "bears_shape".into(),
+            "blob_metadata".into(),
+            "native_identity".into(),
+            "comment_context".into(),
+            "containment_path_visible".into(),
+        ],
+    ));
+    tables.push((
+        "member_context".into(),
+        vec![
+            "instructions".into(),
+            "schema_incomplete_for".into(),
+            "principal".into(),
+            "instruction_source_ids".into(),
+            "virtual_root".into(),
+            "source_context".into(),
+        ],
+    ));
+    tables.push((
         "member_attachments".into(),
         ["record_id", "metadata", "sha256", "bytes"]
             .into_iter()
             .map(str::to_owned)
             .collect(),
+    ));
+    tables.push((
+        "member_mentions".into(),
+        [
+            "source_id",
+            "authored_reference",
+            "lookup_key",
+            "form",
+            "span_start",
+            "span_end",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
     ));
     tables
 }
@@ -129,7 +181,6 @@ fn validate_header(manifest: &ReplicaGenerationManifest) -> Result<()> {
         || manifest.producer.schema_version != 0
         || !hex(&manifest.producer.source_sha, 40)
         || !hex(&manifest.producer.ddl_sha256, 64)
-        || !manifest.schema_incomplete_for.is_empty()
     {
         return Err(Refusal::Schema);
     }
@@ -198,12 +249,90 @@ fn validate_closure(conn: &Connection) -> Result<()> {
     let invalid: bool = storage(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.records WHERE id IS NULL) OR
         (SELECT count(*) FROM main.records)!=(SELECT count(DISTINCT id) FROM main.records) OR
+        (SELECT count(*) FROM main.viewer)!=1 OR
+        EXISTS(SELECT 1 FROM main.viewer v WHERE v.person_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=v.person_id)) OR
         EXISTS(SELECT 1 FROM main.links l WHERE NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=l.source_id) OR NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=l.target_id)) OR
         EXISTS(SELECT 1 FROM main.facet_values f WHERE NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=f.record_id)) OR
-        EXISTS(SELECT 1 FROM main.member_attachments a WHERE NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=a.record_id)) OR
+        (SELECT count(*) FROM main.member_attachments)!=(SELECT count(DISTINCT record_id) FROM main.member_attachments) OR
+        EXISTS(SELECT 1 FROM main.member_attachments a WHERE NOT EXISTS(SELECT 1 FROM main.records r JOIN main.facet_values f ON f.record_id=r.id AND f.key='blob_ref' WHERE r.id=a.record_id AND r.type='Document' AND r.kind='attachment' AND r.deleted_at IS NULL AND f.value=json_extract(a.metadata,'$.id'))) OR
+        (SELECT count(*) FROM main.member_record_metadata)!=(SELECT count(*) FROM main.records) OR
+        (SELECT count(*) FROM main.member_record_metadata)!=(SELECT count(DISTINCT record_id) FROM main.member_record_metadata) OR
+        EXISTS(SELECT 1 FROM main.member_record_metadata m WHERE NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=m.record_id) OR (m.owner_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=m.owner_id)) OR m.custody_boundary NOT IN (0,1) OR m.containment_path_visible IS NULL OR typeof(m.containment_path_visible)!='integer' OR m.containment_path_visible NOT IN (0,1) OR m.bears_shape NOT IN (0,1) OR m.native_comment NOT IN (0,1) OR (m.native_comment=1 AND NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=m.record_id AND r.type='Annotation' AND r.kind='comment')) OR (m.blob_metadata IS NOT NULL AND NOT EXISTS(SELECT 1 FROM main.member_attachments a WHERE a.record_id=m.record_id AND a.metadata=m.blob_metadata))) OR
+        EXISTS(SELECT 1 FROM main.member_mentions m WHERE NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=m.source_id AND m.span_start>=0 AND m.span_end>=m.span_start AND m.span_end<=length(CAST(r.body AS BLOB)))) OR
         EXISTS(SELECT 1 FROM main.comment_anchors a WHERE NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=a.annotation_id) OR NOT EXISTS(SELECT 1 FROM main.records r WHERE r.id=a.target_record_id))", [], |r| r.get(0)))?;
     if invalid {
         return Err(Refusal::Content);
+    }
+    let count: i64 =
+        storage(conn.query_row("SELECT COUNT(*) FROM main.member_context", [], |r| r.get(0)))?;
+    if count != 1 {
+        return Err(Refusal::Content);
+    }
+    let root: String = storage(conn.query_row(
+        "SELECT virtual_root FROM main.member_context",
+        [],
+        |r| r.get(0),
+    ))?;
+    virtual_root::MemberVirtualRoot::decode(&root).map_err(|_| Refusal::Content)?;
+    let selected: String = storage(conn.query_row(
+        "SELECT source_context FROM main.member_context",
+        [],
+        |row| row.get(0),
+    ))?;
+    let selected = source_context::MemberSourceContext::decode(&selected)?;
+    source_context::MemberSourceContext::validate_held(&selected, conn)?;
+    let (principal, sources): (String, String) = storage(conn.query_row(
+        "SELECT principal,instruction_source_ids FROM main.member_context",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ))?;
+    let principal: serde_json::Value =
+        serde_json::from_str(&principal).map_err(|_| Refusal::Content)?;
+    let expected: String = storage(conn.query_row(
+        "SELECT principal_id FROM main.kernel_member_identity WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    ))?;
+    if principal.as_object().is_none_or(|object| object.len() != 4)
+        || principal["principal_id"].as_str() != Some(expected.as_str())
+        || principal["kind"].as_str().is_none()
+        || principal["display_name"].as_str().is_none()
+        || principal["identity_basis"] != "authenticated kernel auth_binding"
+    {
+        return Err(Refusal::Content);
+    }
+    let sources: Vec<String> = serde_json::from_str(&sources).map_err(|_| Refusal::Content)?;
+    if sources.iter().collect::<BTreeSet<_>>().len() != sources.len() {
+        return Err(Refusal::Content);
+    }
+    for id in &sources {
+        let held:bool=storage(conn.query_row("SELECT EXISTS(SELECT 1 FROM main.records WHERE id=? AND deleted_at IS NULL AND archived=0)",[id],|r|r.get(0)))?;
+        if !held {
+            return Err(Refusal::Content);
+        }
+    }
+    let instructions: String = storage(conn.query_row(
+        "SELECT instructions FROM main.member_context",
+        [],
+        |r| r.get(0),
+    ))?;
+    let instructions: serde_json::Value =
+        serde_json::from_str(&instructions).map_err(|_| Refusal::Content)?;
+    for entry in instructions["entries"].as_array().ok_or(Refusal::Content)? {
+        let id = entry["source"]["record_id"]
+            .as_str()
+            .ok_or(Refusal::Content)?;
+        if !sources.iter().any(|source| source == id) {
+            return Err(Refusal::Content);
+        }
+        let held_body: Option<String> = storage(conn.query_row(
+            "SELECT body FROM main.records WHERE id=?",
+            [id],
+            |r| r.get(0),
+        ))?;
+        if entry["content"].as_str() != held_body.as_deref() {
+            return Err(Refusal::Content);
+        }
     }
     let mut stmt =
         storage(conn.prepare("SELECT metadata,sha256,bytes FROM main.member_attachments"))?;
@@ -214,7 +343,11 @@ fn validate_closure(conn: &Connection) -> Result<()> {
             serde_json::from_str(&metadata).map_err(|_| Refusal::Content)?;
         let sha: String = storage(row.get(1))?;
         let bytes: Vec<u8> = storage(row.get(2))?;
-        if meta.sha256 != sha || hash(&bytes) != sha || meta.size_bytes != bytes.len() as i64 {
+        if meta.sha256 != sha
+            || hash(&bytes) != sha
+            || meta.size_bytes != bytes.len() as i64
+            || meta.storage_tier != "inline"
+        {
             return Err(Refusal::Content);
         }
     }
@@ -245,6 +378,22 @@ pub struct ProducedMemberFile {
 impl ProducedMemberFile {
     pub fn manifest(&self) -> &ReplicaGenerationManifest {
         &self.manifest
+    }
+
+    /// Copy the sealed artifact to registry-owned immutable storage. The
+    /// registry supplies a unique pathname; never overwrite a published file.
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        let mut source = storage(self.builder._file.reopen())?;
+        storage(source.seek(SeekFrom::Start(0)))?;
+        let mut output = storage(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path),
+        )?;
+        storage(std::io::copy(&mut source, &mut output))?;
+        storage(output.sync_all())?;
+        Ok(())
     }
 
     /// Server-only comparison, disclosing no private source coordinates.
@@ -334,9 +483,39 @@ pub async fn produce_in(
         manifest.producer.schema_version = 0;
         manifest.producer.ddl_sha256 = coordinates.schema_sha256;
     }
+    let instructions =
+        crate::mcp::kernel_v2::selected_standing_instructions_on(source, &cut.principal_id, true)
+            .await
+            .map_err(|_| Refusal::Authorization)?;
+    let principal = crate::mcp::kernel_v2::bootstrap_principal_on(source, &cut.principal_id)
+        .await
+        .map_err(|_| Refusal::Authorization)?;
+    let virtual_root = virtual_root::capture(source, &cut.principal_id).await?;
+    // Only the sealed captured principal selects this association, before TEMP
+    // staging. The shared source helper owns preparation and current View checks.
+    let source_context =
+        crate::kernel::v1_state::member_context::member_delivery_on(source, &cut.principal_id)
+            .await
+            .map_err(|_| Refusal::Authorization)?;
+    let source_context = source_context::MemberSourceContext::decode(&storage(
+        serde_json::to_string(&source_context),
+    )?)?;
+    let schema = crate::kernel::v1_state::schema_rows_on(source, &cut.principal_id)
+        .await
+        .map_err(|_| Refusal::Authorization)?;
     let reads: BTreeSet<_> = tables()
         .into_iter()
-        .filter(|(name, _)| name != "member_attachments")
+        .filter(|(name, _)| {
+            ![
+                "member_attachments",
+                "member_context",
+                "member_record_metadata",
+                "member_mentions",
+                "schema_config",
+                "facet_keys",
+            ]
+            .contains(&name.as_str())
+        })
         .flat_map(|(name, columns)| {
             columns
                 .into_iter()
@@ -354,10 +533,17 @@ pub async fn produce_in(
     for sql in ddl().into_iter().skip(1) {
         storage(builder.connection.execute_batch(&sql))?;
     }
-    for (name, columns) in tables()
-        .into_iter()
-        .filter(|(name, _)| name != "member_attachments")
-    {
+    for (name, columns) in tables().into_iter().filter(|(name, _)| {
+        ![
+            "member_attachments",
+            "member_context",
+            "member_record_metadata",
+            "member_mentions",
+            "schema_config",
+            "facet_keys",
+        ]
+        .contains(&name.as_str())
+    }) {
         let sql = format!(
             "SELECT {} FROM temp.{name} ORDER BY {}",
             quoted(&columns),
@@ -380,6 +566,23 @@ pub async fn produce_in(
         }
         storage(tx.commit())?;
     }
+    let shape_ids = schema
+        .iter()
+        .filter_map(|row| row.applies_to_collection_id.clone())
+        .collect::<BTreeSet<_>>();
+    manifest.schema_incomplete_for = selection::populate(
+        source,
+        &mut builder.connection,
+        schema,
+        selection::SelectedMemberContext {
+            instructions: instructions.instructions,
+            instruction_source_ids: instructions.source_ids,
+            principal,
+            virtual_root,
+            source_context,
+        },
+    )
+    .await?;
     let ids: Vec<String> = storage(sqlx::query_scalar("SELECT a.record_id FROM main.kernel_attachment_blobs a JOIN temp.records r ON r.id=a.record_id ORDER BY a.record_id").fetch_all(&mut *source).await)?;
     // Physical kernel helpers use the canonical tables. In particular the
     // logical TEMP content_events must not shadow their physical event stream.
@@ -389,6 +592,14 @@ pub async fn produce_in(
             .execute(&mut *source)
             .await,
     )?;
+    selection::record_metadata(
+        source,
+        &mut builder.connection,
+        &cut.principal_id,
+        &shape_ids,
+    )
+    .await?;
+    selection::mentions(&mut builder.connection)?;
     for id in ids {
         // Reuse the single-record live gate too, including terminal bearers.
         let meta = crate::kernel::blobs::metadata(source, &cut.principal_id, &id)
@@ -446,6 +657,8 @@ pub struct AdmittedMemberFile {
     connection: Connection,
     expected: file_fence::ExpectedFileFence,
     _file: tempfile::NamedTempFile,
+    principal: String,
+    read_snapshots: std::sync::Arc<crate::db::ReadSnapshotCache>,
 }
 impl AdmittedMemberFile {
     pub fn open(
@@ -454,10 +667,8 @@ impl AdmittedMemberFile {
         context: &MemberCopyContext,
         manifest: &ReplicaGenerationManifest,
     ) -> Result<Self> {
-        // TODO(native admission wiring): check the authenticated lifecycle's
-        // monotonic scope ordinal before admission. A consistent old manifest
-        // and file pair must not bypass replay refusal. This verifier alone
-        // grants no serving authority; native serving remains Locked.
+        // Lifecycle admission enforces rollback refusal before calling here.
+        // This independent file verifier grants no serving authority.
         validate_header(manifest)?;
         let expected = file_fence::ExpectedFileFence::from_authenticated_context(context, manifest)
             .map_err(|_| Refusal::Identity)?;
@@ -521,16 +732,75 @@ impl AdmittedMemberFile {
         if actual != expected_ddl {
             return Err(Refusal::Schema);
         }
+        let declared: String = storage(connection.query_row(
+            "SELECT schema_incomplete_for FROM main.member_context",
+            [],
+            |r| r.get(0),
+        ))?;
+        if serde_json::from_str::<Vec<String>>(&declared).map_err(|_| Refusal::Content)?
+            != manifest.schema_incomplete_for
+        {
+            return Err(Refusal::Content);
+        }
         validate_closure(&connection)?;
         if digest(&connection)? != manifest.content_digest {
             return Err(Refusal::Content);
         }
         Ok(Self {
             connection,
+            read_snapshots: Default::default(),
             expected,
             _file: file,
+            principal: match &manifest.profile {
+                ReplicaProfile::MemberReadKernelV2 { identity, .. } => {
+                    identity.principal_id.clone()
+                }
+                _ => return Err(Refusal::Identity),
+            },
         })
     }
+    /// Persist exactly the private verified bytes; never recopy an offered
+    /// pathname after verification. The lifecycle owns the destination.
+    pub(crate) fn copy_to(&self, path: &Path) -> Result<()> {
+        let mut source = storage(self._file.reopen())?;
+        storage(source.seek(SeekFrom::Start(0)))?;
+        let mut target = storage(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path),
+        )?;
+        storage(std::io::copy(&mut source, &mut target))?;
+        storage(target.sync_all())?;
+        Ok(())
+    }
+
+    /// Logical rows preserve the compiled public relation column names.
+    pub(crate) fn objects(&self, name: &str) -> Result<Vec<serde_json::Value>> {
+        let (_, columns) = tables()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .ok_or(Refusal::Schema)?;
+        self.relation(name)?
+            .into_iter()
+            .map(|row| {
+                let mut object = serde_json::Map::new();
+                for (key, value) in columns.iter().zip(row) {
+                    object.insert(key.clone(), json_cell(value)?);
+                }
+                Ok(serde_json::Value::Object(object))
+            })
+            .collect()
+    }
+
+    pub(crate) fn principal_id(&self) -> &str {
+        &self.principal
+    }
+
+    pub(crate) fn query(&self, arguments: serde_json::Value) -> crate::Result<serde_json::Value> {
+        query::execute(self, arguments)
+    }
+
     /// Closed relation reads only, after identity admission. No arbitrary SQL,
     /// PRAGMA, attachment, write, or connection escape hatch.
     pub fn relation(&self, name: &str) -> Result<Vec<Vec<Value>>> {
@@ -546,6 +816,18 @@ impl AdmittedMemberFile {
         let rows = storage(stmt.query_map([], |r| (0..columns.len()).map(|i| r.get(i)).collect()))?;
         storage(rows.collect())
     }
+}
+
+fn json_cell(value: Value) -> Result<serde_json::Value> {
+    Ok(match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(n) => n.into(),
+        Value::Real(n) => serde_json::Number::from_f64(n)
+            .ok_or(Refusal::Content)?
+            .into(),
+        Value::Text(s) => s.into(),
+        Value::Blob(_) => return Err(Refusal::Content),
+    })
 }
 
 #[cfg(test)]

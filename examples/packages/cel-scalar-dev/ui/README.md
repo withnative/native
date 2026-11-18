@@ -45,7 +45,7 @@ the public stdio/CLI tools and prepare the local proof:
 
 ```sh
 cargo build -p native-ce --features package-cel-dev --bin mcp-stdio --example v2_contract
-node web/workbench/scripts/check-playwright.mjs
+node web/dev/scripts/check-playwright.mjs
 node examples/packages/cel-scalar-dev/ui/prepare.mjs
 node examples/packages/cel-scalar-dev/ui/host.mjs
 ```

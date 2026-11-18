@@ -110,7 +110,7 @@ pub(crate) async fn context_as(
     authenticated_owner: &str,
     run_id: &str,
 ) -> Result<RunContext> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     let w = witness(&mut tx, run_id).await?;
     if w.owner != authenticated_owner {
         return Err(Error::engine(HIDDEN_OR_MISSING));
@@ -261,7 +261,8 @@ async fn historical_key_on(conn: &mut SqliteConnection, key: &str) -> Result<boo
 }
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn reject_historical_key_as(db: &Db, key: &str) -> Result<()> {
-    let mut conn = db.write_pool().acquire().await?;
+    // Runs on every keyed call; a read of committed state.
+    let mut conn = db.pool().acquire().await?;
     reject_historical_key_on(&mut conn, key).await
 }
 pub async fn open_run_as(db: &Db, authenticated_principal: &str, key: &str) -> Result<RunContext> {
@@ -271,9 +272,34 @@ pub async fn open_run_as(db: &Db, authenticated_principal: &str, key: &str) -> R
     ) {
         return Err(Error::engine("invalid full run key"));
     }
+    let binding = format!("mcp-run:{key}");
+    // Fast path: an existing run resolves from a read snapshot. Taking the
+    // serialised writer (BEGIN IMMEDIATE) only to read and roll back made every
+    // set_intent, claim and keyed bootstrap queue behind unrelated writes. Run
+    // rows are never deleted and ownership never changes, so a run seen here is
+    // still this owner's; creation below re-checks everything under the writer.
+    {
+        let mut snapshot = db.pool().begin().await?;
+        reject_historical_key_on(&mut snapshot, key).await?;
+        let existing: Option<String> = sqlx::query_scalar("SELECT r.id FROM kernel_runs r JOIN kernel_principals p ON p.principal_id=r.run_principal WHERE p.auth_binding=?")
+            .bind(&binding).fetch_optional(&mut *snapshot).await?;
+        if let Some(id) = existing {
+            let genesis_id = genesis_identity(&mut snapshot).await?;
+            let w = witness(&mut snapshot, &id).await?;
+            snapshot.rollback().await?;
+            if w.owner != authenticated_principal {
+                return Err(Error::engine(HIDDEN_OR_MISSING));
+            }
+            return Ok(RunContext {
+                run_id: id,
+                owner: w.owner,
+                genesis_id,
+            });
+        }
+        snapshot.rollback().await?;
+    }
     let mut tx = begin_write(db.write_pool()).await?;
     reject_historical_key_on(&mut tx, key).await?;
-    let binding = format!("mcp-run:{key}");
     let existing: Option<String> = sqlx::query_scalar("SELECT r.id FROM kernel_runs r JOIN kernel_principals p ON p.principal_id=r.run_principal WHERE p.auth_binding=?")
         .bind(&binding).fetch_optional(&mut *tx).await?;
     let genesis_id = genesis_identity(&mut tx).await?;
@@ -352,14 +378,14 @@ pub(crate) async fn mint_run_with_context_as(
     agent_key: Option<&str>,
 ) -> Result<(String, RunContext)> {
     let keys: Vec<String> = sqlx::query_scalar("SELECT substr(auth_binding,9) FROM kernel_principals WHERE kind='run' AND auth_binding LIKE 'mcp-run:%'")
-        .fetch_all(db.write_pool()).await?;
+        .fetch_all(db.pool()).await?;
     let mut taken = keys.into_iter().collect();
     loop {
         let key = match agent_key {
             Some(agent) => crate::runkey::mint_run_for_agent(agent, &taken)?,
             None => crate::runkey::mint_fresh_agent_run(&taken)?,
         };
-        let mut conn = db.write_pool().acquire().await?;
+        let mut conn = db.pool().acquire().await?;
         let historical = historical_key_on(&mut conn, &key).await?;
         drop(conn);
         if historical {
@@ -391,7 +417,8 @@ async fn intent_on(conn: &mut SqliteConnection, run: &str) -> Result<Option<Inte
         .transpose()
 }
 pub async fn run_intent_as(db: &Db, context: &RunContext) -> Result<Option<String>> {
-    let mut tx = db.write_pool().begin().await?;
+    // Read on every keyed call to label the run context; never needs a writer.
+    let mut tx = db.pool().begin().await?;
     let w = resolve(&mut tx, context, false).await?;
     Ok(intent_on(&mut tx, &w.run_id).await?.map(|p| p.intent))
 }
@@ -452,6 +479,6 @@ pub async fn finish_run_as(db: &Db, context: &RunContext) -> Result<bool> {
 
 /// Observe the authenticated owner's run, including its closed state.
 pub async fn run_witness_as(db: &Db, context: &RunContext) -> Result<Witness> {
-    let mut conn = db.write_pool().acquire().await?;
+    let mut conn = db.pool().acquire().await?;
     resolve(&mut conn, context, false).await
 }

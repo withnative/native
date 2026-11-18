@@ -497,6 +497,7 @@ impl<'a> Signals<'a> {
         let node_pointers = [
             "/error/data/node_journal",
             "/result/structuredContent/node_journal",
+            "/result/_meta/node_journal",
         ];
         Signals {
             rpc_error,
@@ -628,6 +629,7 @@ fn classify(reply: &Value) -> Verdict {
     let key = [
         "/error/data/node_journal/idempotency_key",
         "/result/structuredContent/node_journal/idempotency_key",
+        "/result/_meta/node_journal/idempotency_key",
         "/error/data/idempotency_key",
         "/result/structuredContent/idempotency_key",
     ]
@@ -799,6 +801,7 @@ fn explain(
     if let Some(journal) = [
         "/error/data/node_journal",
         "/result/structuredContent/node_journal",
+        "/result/_meta/node_journal",
     ]
     .iter()
     .find_map(|p| reply.pointer(p))

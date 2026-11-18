@@ -3,6 +3,8 @@
 //! The broadcast channel is latency machinery only. SQLite's `content_events`
 //! sequence is the source of truth for pump recovery and client reconnects.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -174,6 +176,10 @@ pub struct RealtimeHub {
     current_db: RwLock<personal_scope::CurrentDbSlot>,
     notify: Arc<Notify>,
     terminal: AtomicBool,
+    /// Test-only count of [`RealtimeHub::wake`] calls: proves uncommitted
+    /// transaction-owned work wakes nothing before the outer commit.
+    #[cfg(test)]
+    wake_calls: AtomicU64,
     last_published_seq: Mutex<i64>,
     last_inbox_vector: Mutex<InboxInvalidationVector>,
     published: Notify,
@@ -267,6 +273,8 @@ impl RealtimeHub {
             current_db: RwLock::new(personal_scope::CurrentDbSlot::Retired),
             notify: Arc::new(Notify::new()),
             terminal: AtomicBool::new(false),
+            #[cfg(test)]
+            wake_calls: AtomicU64::new(0),
             last_published_seq: Mutex::new(last_published_seq),
             last_inbox_vector: Mutex::new(last_inbox_vector),
             published: Notify::new(),
@@ -470,7 +478,16 @@ impl RealtimeHub {
     }
 
     pub(crate) fn wake(&self) {
+        #[cfg(test)]
+        self.wake_calls.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
+    }
+
+    /// Test-only [`RealtimeHub::wake`] call count. Only the probe-gated
+    /// replay tests observe commit-path wakes.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn wake_calls_for_test(&self) -> u64 {
+        self.wake_calls.load(Ordering::Relaxed)
     }
 
     pub(crate) fn refresh_pool(&self, pool: SqlitePool) {

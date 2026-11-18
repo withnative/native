@@ -344,23 +344,103 @@ mod tests {
             BTreeSet::from(["records".into()])
         );
     }
-    use super::super::view_validation::run;
+    use super::super::view_validation::{
+        run, run_controlled_for_test, validation_run_test_control, ValidationRunTestMode,
+    };
     #[tokio::test]
     async fn named_view_fresh_validator_deadline_interrupts_sqlite_and_retires() {
+        let (control, _release) = validation_run_test_control(ValidationRunTestMode::ObserveVm);
+        // The unconditional release/expiry guard exists before dispatch.
+        control.observe_next_statement();
+        let worker_control = control.clone();
         let finished = Arc::new(tokio::sync::Notify::new());
         let notify = finished.clone();
-        let result=run(Instant::now()+Duration::from_millis(100),move || {
+        let (error_send, error_recv) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_controlled_for_test(control.clone(), move || {
             struct Finish(Arc<tokio::sync::Notify>);
-            impl Drop for Finish {fn drop(&mut self){self.0.notify_one();}}
-            let _finished=Finish(notify);
-            let conn=build_strict_validator()?;
-            conn.query_row("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n",[],|row|row.get::<_,i64>(0)).map_err(|e|contract_violation(e.to_string()))?;
+            impl Drop for Finish {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
+            let _finished = Finish(notify);
+            let conn = build_strict_validator()?;
+            worker_control.validator_built();
+            let result = conn.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n",
+                [],
+                |row| row.get::<_, i64>(0),
+            );
+            // Observation cannot change the work outcome if a failed test has
+            // dropped its receiver. Retain the real SQLite error before mapping.
+            let _ = error_send.send(result.as_ref().err().and_then(|e| e.sqlite_error_code()));
+            result.map_err(|e| contract_violation(e.to_string()))?;
             Ok(())
-        }).await;
-        assert!(result.unwrap_err().to_string().contains("deadline"));
-        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+        }));
+        tokio::time::timeout(Duration::from_secs(2), control.vm_started())
             .await
             .unwrap();
+        assert!(control.has_vm_started());
+        let retire_by = tokio::time::Instant::now() + Duration::from_secs(2);
+        control.expire_at_deadline();
+        let result = tokio::time::timeout_at(retire_by, task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        tokio::time::timeout_at(retire_by, async {
+            assert_eq!(
+                error_recv.await.unwrap(),
+                Some(rusqlite::ErrorCode::OperationInterrupted)
+            );
+            finished.notified().await;
+            control.worker_retired().await;
+        })
+        .await
+        .unwrap();
+        run(Instant::now() + Duration::from_secs(2), || {
+            let conn = build_strict_validator()?;
+            let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn named_view_fresh_validator_dispatch_expiry_does_not_start_work_and_retires() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (control, _release) =
+            validation_run_test_control(ValidationRunTestMode::HoldBeforeWork);
+        control.observe_next_statement();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let worker_invoked = invoked.clone();
+        let worker_control = control.clone();
+        let task = tokio::spawn(run_controlled_for_test(control.clone(), move || {
+            worker_invoked.store(true, Ordering::Release);
+            let conn = build_strict_validator()?;
+            worker_control.validator_built();
+            let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+            Ok(())
+        }));
+        tokio::time::timeout(Duration::from_secs(2), control.before_work())
+            .await
+            .unwrap();
+        assert!(!invoked.load(Ordering::Acquire));
+        assert!(!control.has_vm_started());
+        let retire_by = tokio::time::Instant::now() + Duration::from_secs(2);
+        control.expire_at_deadline();
+        let result = tokio::time::timeout_at(retire_by, task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(!invoked.load(Ordering::Acquire));
+        control.release_before_work();
+        tokio::time::timeout_at(retire_by, control.worker_retired())
+            .await
+            .unwrap();
+        assert!(!invoked.load(Ordering::Acquire));
+        assert!(!control.has_vm_started());
         run(Instant::now() + Duration::from_secs(2), || {
             let conn = build_strict_validator()?;
             let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();

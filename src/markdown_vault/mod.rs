@@ -1,5 +1,7 @@
 //! Opt-in, read-only filesystem projection. Source selection, rendering and
 //! publication are separate: only the source collector has an engine handle.
+pub(crate) mod check;
+pub(crate) mod inspect;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod kernel_v2;
 mod publisher;

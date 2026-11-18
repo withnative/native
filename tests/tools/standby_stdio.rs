@@ -226,6 +226,14 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         "startup-selection",
         "startup-prune",
         "startup-generation-verify",
+        // Trusting an in-place copy by its at-rest audit (ff74f06), and
+        // the audit's own phases on an in-place node.
+        "startup-trusted-at-rest",
+        "startup-generation-trusted",
+        "audit-quick-check",
+        "audit-foreign-keys",
+        "audit-receipts-full",
+        "audit-shape",
         "background-retention",
         "byte-manifest-consumer-identity",
         "engine-manifest-state",
@@ -258,13 +266,17 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         "portable-identity-state",
         "storage-portability-policy-state",
     ];
-    let events: [(&str, &[&str]); 13] = [
+    let events: [(&str, &[&str]); 14] = [
         ("standby startup verification started", &[]),
         (
             "standby startup verification finished",
             &["elapsed_ms", "ok", "serving"],
         ),
         ("standby startup phase finished", &["phase", "elapsed_ms"]),
+        (
+            "standby verification shared with a concurrent pass",
+            &["generation_id"],
+        ),
         ("standby phase started", &["phase"]),
         ("standby phase finished", &["phase", "elapsed_ms", "ok"]),
         ("standby suite started", &[]),
@@ -288,8 +300,13 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
     let mut serving_completion = false;
     let mut startup_completion = false;
     for line in stderr.lines() {
+        // This receipt now includes a closed reason label (at most 19 bytes).
+        // Keep the existing limit for every other verification/vault line.
+        let max_line_bytes = if line.contains(
+            " INFO native_ce::standby::verification: standby startup phase finished phase=\"startup-generation-verify\" ",
+        ) { 288 } else { 256 };
         assert!(
-            line.len() <= 256,
+            line.len() <= max_line_bytes,
             "bounded diagnostic line ({} bytes)",
             line.len()
         );
@@ -322,7 +339,7 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
             for field in field_text.split(' ') {
                 let (key, value) = field.split_once('=').expect("key=value field");
                 let timing_field = event == "standby startup phase finished"
-                    && ["generation_id", "ok", "serving", "deferred"].contains(&key);
+                    && ["generation_id", "ok", "serving", "deferred", "reason"].contains(&key);
                 assert!(
                     required.contains(&key) || timing_field,
                     "unexpected field: {field}"
@@ -344,6 +361,21 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
                         };
                         assert!(names.contains(&name), "unexpected fixed name: {name}");
                     }
+                    "reason" => assert!(
+                        matches!(
+                            value,
+                            "\"startup\""
+                                | "\"handoff\""
+                                | "\"v1_pin\""
+                                | "\"retention\""
+                                | "\"startup_recheck\""
+                                | "\"maintenance_recheck\""
+                                | "\"predecessor_recheck\""
+                                | "\"startup_successor\""
+                                | "\"startup_fallback\""
+                        ),
+                        "fixed verification reason: {value}"
+                    ),
                     "generation_id" => {
                         let id = value
                             .strip_prefix('"')
@@ -400,7 +432,7 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         }
         if event == "standby startup phase finished" {
             let extra: &[&str] = match fields["phase"] {
-                "\"startup-generation-verify\"" => &["generation_id", "ok"],
+                "\"startup-generation-verify\"" => &["generation_id", "ok", "reason"],
                 "\"startup-prune\"" => &["deferred"],
                 "\"startup-selection\"" if fields.contains_key("serving") => &["serving"],
                 "\"startup-selection\"" => &[],
@@ -434,6 +466,52 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         "run context stays out of diagnostics"
     );
     serving_completion
+}
+
+fn verification_reason_receipt(reason: &str) -> String {
+    format!(
+        "2026-11-16T00:00:00.000000Z  INFO native_ce::standby::verification: standby startup phase finished phase=\"startup-generation-verify\" generation_id=\"{}\" elapsed_ms=1 ok=true reason=\"{reason}\"\n\
+         2026-11-16T00:00:00.000000Z  INFO native_ce::standby::verification: standby startup verification finished elapsed_ms=1 ok=true serving=true\n",
+        "a".repeat(64)
+    )
+}
+
+#[test]
+fn verification_receipts_admit_fixed_reasons_and_shared_pass_identity() {
+    for reason in [
+        "startup",
+        "handoff",
+        "v1_pin",
+        "retention",
+        "startup_recheck",
+        "maintenance_recheck",
+        "predecessor_recheck",
+        "startup_successor",
+        "startup_fallback",
+    ] {
+        assert!(assert_bounded_verification_receipts(
+            &verification_reason_receipt(reason)
+        ));
+    }
+    let receipt = format!(
+        "2026-11-16T00:00:00.000000Z  INFO native_ce::standby::verification: standby verification shared with a concurrent pass generation_id=\"{}\"\n{}",
+        "a".repeat(64), verification_reason_receipt("startup")
+    );
+    assert!(assert_bounded_verification_receipts(&receipt));
+}
+
+#[test]
+#[should_panic(expected = "fixed verification reason")]
+fn verification_receipts_refuse_unknown_reason_values() {
+    assert_bounded_verification_receipts(&verification_reason_receipt("secret"));
+}
+
+#[test]
+#[should_panic(expected = "closed timing fields")]
+fn verification_receipts_refuse_reason_on_unrelated_phase() {
+    let receipt = verification_reason_receipt("startup")
+        .replace("startup-generation-verify", "startup-selection");
+    assert_bounded_verification_receipts(&receipt);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -858,6 +936,7 @@ async fn snapshot_fixture(
         .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let artifact_sha256 = sha256_path(&executable);
     let consumer = StandbyConsumerIdentity {
+        kernel_v2_reader: Default::default(),
         contract: STANDBY_CONSUMER_CONTRACT.into(),
         version: 1,
         platform: standby_test_platform(),
@@ -867,6 +946,7 @@ async fn snapshot_fixture(
         ddl_sha256: native_ce::schema::FROZEN_DDL_SHA256.into(),
     };
     let observed = ObservedInstalledConsumerIdentity {
+        kernel_v2_reader: Default::default(),
         platform: consumer.platform,
         source_sha: consumer.source_sha.clone(),
         artifact_sha256,
@@ -1640,8 +1720,11 @@ async fn standby_process_serves_reads_rejects_writes_and_preserves_accepted_byte
     );
     assert_eq!(runtime["freshness"]["target_rpo_seconds"], 300);
     assert_eq!(runtime["freshness"]["target_refresh_interval_seconds"], 60);
-    assert_eq!(runtime["serving_generation"]["frontier"]["version"], 1);
-    assert_eq!(runtime["retained_generation_ids"], json!([installed.id]));
+    assert_eq!(runtime["status_scope"], "bootstrap_summary");
+    assert_eq!(runtime["full_status_tool"], "standby_status");
+    assert_eq!(runtime["retained_generation_count"], 1);
+    assert!(runtime["serving_generation"].get("frontier").is_none());
+    assert!(runtime.get("retained_generation_ids").is_none());
     assert_eq!(successful_tool(&output, 4)["records"][0]["id"], FIXTURE_ID);
     for id in [5, 6, 7, 8] {
         let result = successful_tool(&output, id);
@@ -1667,6 +1750,13 @@ async fn standby_process_serves_reads_rejects_writes_and_preserves_accepted_byte
     let status = successful_tool(&output, 12);
     assert_eq!(status["contract"], "native.standby-status.v1");
     assert_eq!(status["serving_generation"]["generation_id"], installed.id);
+    assert_eq!(status["serving_generation"]["frontier"]["version"], 1);
+    assert_eq!(status["retained_generation_ids"], json!([installed.id]));
+    assert_eq!(runtime["freshness"]["state"], status["freshness"]["state"]);
+    assert!(
+        runtime["freshness"]["age_seconds"].as_u64().unwrap()
+            <= status["freshness"]["age_seconds"].as_u64().unwrap()
+    );
     let context = &successful_tool(&output, 4)["standby_context"];
     assert_eq!(context["mode"], "standby");
     assert_eq!(context["canonical_authority"], "hosted");
@@ -1675,7 +1765,7 @@ async fn standby_process_serves_reads_rejects_writes_and_preserves_accepted_byte
     let rendered = response(&output, 13)["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(rendered.starts_with("Standby context:"), "{rendered}");
+    assert!(rendered.starts_with("Source: local copy"), "{rendered}");
     assert!(
         rendered.contains("hosted Native is canonical"),
         "{rendered}"
@@ -3101,6 +3191,7 @@ async fn standby_process_v2_vault_delivery_restart_and_unavailable() {
     assert_eq!(identity["source_sha"], native_ce::FULL_GIT_SHA);
     let artifact_sha256 = sha256_path(&binary);
     let consumer = StandbyConsumerIdentity {
+        kernel_v2_reader: Default::default(),
         contract: STANDBY_CONSUMER_CONTRACT.into(),
         version: 1,
         platform: standby_test_platform(),
@@ -3110,6 +3201,7 @@ async fn standby_process_v2_vault_delivery_restart_and_unavailable() {
         ddl_sha256: native_ce::schema::FROZEN_DDL_SHA256.into(),
     };
     let observed = ObservedInstalledConsumerIdentity {
+        kernel_v2_reader: Default::default(),
         platform: consumer.platform,
         source_sha: consumer.source_sha.clone(),
         artifact_sha256,
@@ -3262,5 +3354,610 @@ async fn standby_process_v2_vault_delivery_restart_and_unavailable() {
     }
     drop(node);
     drop(offline);
+    db.close().await;
+}
+
+/// A disposable hosted authority for the C6 old node: answers the real
+/// `authority_act_head` and `authority_act_delta` operations from a live
+/// primary through the production observers, and declines the chunked delta
+/// route (404, no wire code) so the node takes the JSON-RPC path. Every other
+/// request is a 404. Records the operations served.
+#[cfg(all(unix, feature = "v2-kernel-probe"))]
+async fn spawn_authority_endpoint(
+    db: native_ce::Db,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = served.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let db = db.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0_u8; 8192];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let length = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let mut buffer = [0_u8; 8192];
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let request_line = head.lines().next().unwrap_or_default().to_owned();
+                let body = &request[header_end..header_end + length];
+                let route = format!("/mcp/{}", HOSTED_ROUTE_ID.replace('-', "%2D"));
+                let plain_route = format!("/mcp/{HOSTED_ROUTE_ID}");
+                let (status, payload) = if request_line.starts_with("POST ")
+                    && (request_line.contains(&format!("{route} "))
+                        || request_line.contains(&format!("{plain_route} ")))
+                {
+                    let call: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+                    let arguments = &call["params"]["arguments"];
+                    let operation = arguments["operation"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let value = match operation.as_str() {
+                        "authority_act_head" => serde_json::to_value(
+                            native_ce::standby::delta_transport::observe_authority_act_head(
+                                &db,
+                                HOSTED_ROUTE_ID,
+                            )
+                            .await
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                        "authority_act_delta" => {
+                            let inventory: Vec<String> = serde_json::from_value(
+                                arguments["arguments"]["blob_inventory"].clone(),
+                            )
+                            .unwrap_or_default();
+                            serde_json::to_value(
+                                native_ce::standby::delta_transport::observe_authority_act_delta_with_inventory(
+                                    &db,
+                                    HOSTED_ROUTE_ID,
+                                    arguments["arguments"]["from_exclusive_act"].as_i64().unwrap(),
+                                    Some(&inventory),
+                                )
+                                .await
+                                .unwrap(),
+                            )
+                            .unwrap()
+                        }
+                        _ => Value::Null,
+                    };
+                    log.lock().unwrap().push(operation.clone());
+                    if value.is_null() {
+                        (404, "{}".to_owned())
+                    } else {
+                        (
+                            200,
+                            json!({"jsonrpc":"2.0","id":call["id"],"result":{"isError":false,"content":[],"structuredContent":value}})
+                                .to_string(),
+                        )
+                    }
+                } else {
+                    log.lock().unwrap().push(format!("declined {request_line}"));
+                    (404, "{}".to_owned())
+                };
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (origin, served)
+}
+
+/// Stored-visibility M1 C6 (design 73ad275 rev 2 C6; plan 5b21bd7 slice 2a):
+/// a real pre-floor binary, pinned by image digest in `ci/c6-old-binary.json`,
+/// against a primary that carries the marking objects.
+///
+/// - (a) The old receiver installs the stripped FULL. It then pulls a delta
+///   cut from the marked primary by its own refresh, applies it, and still
+///   serves after restart.
+/// - (b) The old receiver refuses an unstripped file from the same primary,
+///   with the same source and manifest bindings, at its owned-schema check.
+///
+/// Matrix cases (c) "old primary serving a marked file" and (d) "new standby
+/// with an old primary" need a pre-floor kernel-v2 *primary*. The pinned
+/// binary's local mode refuses v2 files, and no harness here runs a
+/// pre-floor hosted `serve`, so those are reported as a blocker, not claimed.
+///
+/// The old binary's identity is never taken from its own report: artifact
+/// SHA-256, version, revision, platform and schema identity come from the pin
+/// (the release-train record), and the binary must match them.
+/// `NATIVE_C6_OLD_BINARY` names the extracted binary
+/// (`scripts/c6-fetch-old-binary.sh`); with `NATIVE_C6_REQUIRED` set, a
+/// missing binary fails instead of skipping.
+#[cfg(all(unix, feature = "v2-kernel-probe"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standby_c6_pre_floor_binary_against_a_marked_primary() {
+    use native_ce::{
+        kernel as k,
+        standby_snapshot::{HostedStandbyManifestContext, ProducerBuildIdentity},
+    };
+    let required = std::env::var_os("NATIVE_C6_REQUIRED").is_some();
+    let Some(binary) = std::env::var_os("NATIVE_C6_OLD_BINARY").map(PathBuf::from) else {
+        assert!(
+            !required,
+            "NATIVE_C6_REQUIRED is set but NATIVE_C6_OLD_BINARY names no binary"
+        );
+        eprintln!("C6 old-binary qualification not configured (NATIVE_C6_OLD_BINARY unset)");
+        return;
+    };
+    assert!(
+        supported_standby_host(),
+        "C6 needs a supported standby host"
+    );
+    let pin: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("ci/c6-old-binary.json"))
+            .expect("the C6 pin ci/c6-old-binary.json"),
+    )
+    .unwrap();
+    assert!(pin["image"].as_str().unwrap().contains("@sha256:"));
+    assert_eq!(
+        sha256_path(&binary),
+        pin["artifact_sha256"],
+        "the binary is not the pinned artifact"
+    );
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        pin["version_output"],
+        "the binary does not report the pinned release"
+    );
+    let revision = pin["image_revision"].as_str().unwrap();
+    assert!(lowercase_hex(revision, 40));
+    assert!(
+        lowercase_hex(native_ce::FULL_GIT_SHA, 40),
+        "the producer must be source-stamped"
+    );
+    assert_ne!(
+        revision,
+        native_ce::FULL_GIT_SHA,
+        "C6 needs an older release"
+    );
+    assert_eq!(expected_standby_platform_string(), pin["platform"]);
+    let artifact_sha256 = pin["artifact_sha256"].as_str().unwrap().to_owned();
+    let consumer = StandbyConsumerIdentity {
+        kernel_v2_reader: Default::default(),
+        contract: STANDBY_CONSUMER_CONTRACT.into(),
+        version: 1,
+        platform: standby_test_platform(),
+        source_sha: revision.into(),
+        artifact_sha256: artifact_sha256.clone(),
+        engine_schema_version: pin["engine_schema_version"].as_i64().unwrap(),
+        ddl_sha256: pin["ddl_sha256"].as_str().unwrap().into(),
+    };
+    let observed = ObservedInstalledConsumerIdentity {
+        kernel_v2_reader: Default::default(),
+        platform: consumer.platform,
+        source_sha: consumer.source_sha.clone(),
+        artifact_sha256,
+        engine_schema_version: consumer.engine_schema_version,
+        ddl_sha256: consumer.ddl_sha256.clone(),
+    };
+
+    struct Node(std::process::Child);
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn state(vault: &Path) -> Value {
+        std::fs::read(vault.join(".native/state.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null)
+    }
+    fn vault_text(root: &Path) -> String {
+        let mut text = String::new();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.file_name() == ".native" {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    text.push_str(&vault_text(&entry.path()));
+                } else {
+                    text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+                }
+            }
+        }
+        text
+    }
+    fn accelerators(path: &Path) -> Vec<String> {
+        let c =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut names: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_schema WHERE name LIKE 'p\\_%' ESCAPE '\\'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.sort();
+        names
+    }
+    async fn wait_until(node: &mut Node, stderr: &Path, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            assert!(
+                node.0.try_wait().unwrap().is_none(),
+                "old node exited: {}",
+                std::fs::read_to_string(stderr).unwrap_or_default()
+            );
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let source_path = root.join("marked-primary.db");
+    let (db, owner) = k::create_v2_database(
+        source_path.to_str().unwrap(),
+        "account",
+        "C6 owner",
+        "acct:c6",
+    )
+    .await
+    .unwrap();
+    k::install_stored_visibility_marking_for_qualification(&db)
+        .await
+        .unwrap();
+    let write_body = |text: &'static str| {
+        let db = db.clone();
+        let owner = owner.clone();
+        async move {
+            let record = k::create_record_as(&db, &owner, native_ce::events::KERNEL_ROOT_ID)
+                .await
+                .unwrap();
+            let revision = k::read_record_as(&db, &owner, &record)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision;
+            k::set_body_as(&db, &owner, &record, text, revision)
+                .await
+                .unwrap();
+        }
+    };
+    write_body("C6 first marked body").await;
+    let head =
+        native_ce::standby::delta_transport::observe_authority_act_head(&db, HOSTED_ROUTE_ID)
+            .await
+            .unwrap();
+    let origin = serde_json::to_value(head).unwrap()["head"]["origin_database_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The manifest binds the actual old consumer and the current producer.
+    let context = HostedStandbyManifestContext::new_with_producer(
+        HOSTED_ROUTE_ID.into(),
+        consumer,
+        ProducerBuildIdentity::new(
+            native_ce::FULL_GIT_SHA.into(),
+            native_ce::schema::FROZEN_DDL_SHA256.into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Stage a FULL through the real coordinator and manifest function. The
+    // unstripped control replaces the owned copy with a raw copy of the same
+    // marked source and derives its manifest from those bytes with the same
+    // context, as a primary without the strip would ship it.
+    // `raw`: the owned copy is a raw copy of the marked source. `then_strip`
+    // runs the real egress strip on that raw copy, which makes the paired
+    // control: the two files differ only by the accelerator objects.
+    let stage = |store: GenerationStore, name: &'static str, raw: bool, then_strip: bool| {
+        let db = db.clone();
+        let context = context.clone();
+        let source_path = source_path.clone();
+        let observed = observed.clone();
+        async move {
+            let snapshot = store.staging_dir().join(format!("{name}.db"));
+            let destination = snapshot.clone();
+            let coordinator = native_ce::export::ExportCoordinator::new();
+            let page_context = context.clone();
+            let page = coordinator
+                .tool_page("c6-owner".into(), None, 0, 1, move || async move {
+                    let export = native_ce::export::export_connected_db(&db, None).await?;
+                    if raw {
+                        let raw = export.path().with_extension("raw");
+                        let c = rusqlite::Connection::open_with_flags(
+                            &source_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .unwrap();
+                        c.execute("VACUUM INTO ?1", [raw.to_str().unwrap()])
+                            .unwrap();
+                        std::fs::rename(&raw, export.path())?;
+                        if then_strip {
+                            native_ce::export::strip_marking_from_snapshot(&export.path()).await?;
+                        }
+                    }
+                    std::fs::copy(export.path(), destination)?;
+                    Ok(export.with_hosted_standby_context(page_context))
+                })
+                .await
+                .unwrap();
+            let mut page_manifest = page.manifest.unwrap();
+            if raw {
+                page_manifest = native_ce::standby_snapshot::manifest_from_completed_export(
+                    &snapshot,
+                    std::fs::metadata(&snapshot).unwrap().len(),
+                    sha256_path(&snapshot),
+                    page_manifest.captured_at.clone(),
+                    page_manifest.snapshot_completed_at.clone(),
+                    context,
+                )
+                .await
+                .unwrap();
+            }
+            let manifest = store.staging_dir().join(format!("{name}.json"));
+            std::fs::write(&manifest, page_manifest.canonical_json().unwrap()).unwrap();
+            let shipped = accelerators(&snapshot);
+            let generation = store
+                .install_staged(&snapshot, &manifest, &observed)
+                .await
+                .unwrap();
+            coordinator.drain().await;
+            (generation, shipped)
+        }
+    };
+    let credential = root.join("token");
+    create_private_empty_file(&credential);
+    std::fs::write(&credential, "disposable-c6-token").unwrap();
+    let (hosted_origin, served) = spawn_authority_endpoint(db.clone()).await;
+    let configure = |name: &str, replica: &Path| {
+        let standby_config = root.join(format!("{name}-standby.json"));
+        write_runtime_config(&standby_config, replica, &origin);
+        let refresh_config = root.join(format!("{name}-refresh.json"));
+        std::fs::write(
+            &refresh_config,
+            serde_json::to_vec(&json!({
+                "contract":"native.standby-refresh-config.v1",
+                "version":1,
+                "hosted_origin":hosted_origin,
+                "credential_file":credential,
+                // Only the startup refresh: keep the next tick beyond the test.
+                "refresh_interval_seconds":3600,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = root.join(format!("{name}-vault"));
+        let node_config = root.join(format!("{name}-node.json"));
+        let config = json!({"hosted_base_url":hosted_origin,"home_id":format!("disposable-c6-{name}"),
+            "db_id":HOSTED_ROUTE_ID,"credential_file":credential,"socket_directory":root.join(format!("{name}-socket")),
+            "standby_config":standby_config,"refresh_config":refresh_config,"account_id":"acct:c6","markdown_folder":vault});
+        std::fs::write(&node_config, serde_json::to_vec(&config).unwrap()).unwrap();
+        (node_config, vault)
+    };
+    let spawn = |node_config: &Path, phase: &str| {
+        let stderr = root.join(format!("{phase}.stderr"));
+        let node = Node(
+            Command::new(&binary)
+                .env_clear()
+                .env("NATIVE_CE_MCP_SURFACE", "executor")
+                .env("RUST_LOG", "info")
+                .args(["node", "serve", "--config"])
+                .arg(node_config)
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(root.join(format!("{phase}.stdout"))).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        (node, stderr)
+    };
+
+    // (a) Stripped FULL; marked writes on the primary; the old node's own
+    // refresh pulls and applies the delta; it still serves after restart.
+    let replica = root.join("replica");
+    let store = GenerationStore::open(&replica, HOSTED_ROUTE_ID, Some(origin.clone())).unwrap();
+    let (first, shipped) = stage(store.clone(), "first", false, false).await;
+    assert!(
+        shipped.is_empty(),
+        "the FULL ships no accelerators: {shipped:?}"
+    );
+    write_body("C6 delta marked body").await;
+    let (node_config, vault) = configure("a", &replica);
+    let (mut node, stderr) = spawn(&node_config, "a-first");
+    assert!(
+        wait_until(&mut node, &stderr, || {
+            state(&vault)["successful_generation"]
+                .as_str()
+                .is_some_and(|id| id != first.id)
+                && vault_text(&vault).contains("C6 delta marked body")
+                && vault_text(&vault).contains("C6 first marked body")
+        })
+        .await,
+        "(a) the pre-floor binary must apply the marked primary's delta: state {} served {:?} {}",
+        state(&vault),
+        served.lock().unwrap(),
+        std::fs::read_to_string(&stderr).unwrap_or_default()
+    );
+    assert!(
+        served
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| op == "authority_act_delta"),
+        "(a) the delta came from the old node's own refresh: {:?}",
+        served.lock().unwrap()
+    );
+    let advanced = state(&vault)["successful_generation"].clone();
+    drop(node);
+    // Fresh restart evidence: remove everything the first process rendered
+    // (bodies, state and STATUS) and keep the replica. Anything seen after
+    // this was produced by the restarted process from the accepted
+    // delta-applied generation; the endpoint serves no FULL.
+    // The old node renders read-only files and may leave a directory it was
+    // writing without owner write/search when killed; the vault is this
+    // test's own scratch folder, so make each directory removable first. The
+    // mode listing is kept for the failure message.
+    let modes = {
+        fn walk(p: &Path, out: &mut String) {
+            use std::os::unix::fs::PermissionsExt;
+            let Ok(m) = std::fs::symlink_metadata(p) else {
+                return;
+            };
+            out.push_str(&format!("{:o} {}\n", m.permissions().mode(), p.display()));
+            if m.is_dir() {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+                for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                    walk(&e.path(), out);
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(&vault, &mut out);
+        out
+    };
+    std::fs::remove_dir_all(&vault)
+        .unwrap_or_else(|error| panic!("remove the first render: {error}\n{modes}"));
+    assert!(state(&vault).is_null() && vault_text(&vault).is_empty());
+    let (mut node, stderr) = spawn(&node_config, "a-restart");
+    assert!(
+        wait_until(&mut node, &stderr, || {
+            state(&vault)["successful_generation"] == advanced
+                && state(&vault)["rendered_at"].is_string()
+                && vault_text(&vault).contains("C6 delta marked body")
+                && vault_text(&vault).contains("C6 first marked body")
+                && std::fs::read_to_string(vault.join(".native/STATUS.md"))
+                    .unwrap_or_default()
+                    .contains("authorized copy available")
+        })
+        .await,
+        "(a) after restart the pre-floor binary must serve the same delta-applied generation: state {} {}",
+        state(&vault),
+        std::fs::read_to_string(&stderr).unwrap_or_default()
+    );
+    let replica_dump = {
+        let generation = replica
+            .join("accepted")
+            .join("generations")
+            .join(advanced.as_str().unwrap())
+            .join("snapshot.db");
+        assert!(generation.is_file(), "{}", generation.display());
+        assert!(accelerators(&generation).is_empty());
+        let reopened = native_ce::db::open_marked_v2_database_read_only_at(&generation)
+            .await
+            .unwrap();
+        let dump = k::dump_all_kernel_tables(&reopened).await.unwrap();
+        reopened.close().await;
+        dump
+    };
+    assert_eq!(
+        replica_dump,
+        k::dump_all_kernel_tables(&db).await.unwrap(),
+        "(a) the old node's delta-applied copy equals the marked primary's canonical state"
+    );
+    drop(node);
+
+    // (b) Paired control from one raw copy of the marked primary: the same
+    // bytes stripped by the real egress strip, and unstripped. Same source,
+    // context and manifest function; the only difference is the accelerator
+    // objects. The old node serves the stripped copy and refuses the other
+    // as an unusable current copy at verification.
+    let pair = |name: &'static str, then_strip: bool| {
+        let root = root.clone();
+        let origin = origin.clone();
+        async move {
+            let replica = root.join(format!("{name}-replica"));
+            let store =
+                GenerationStore::open(&replica, HOSTED_ROUTE_ID, Some(origin.clone())).unwrap();
+            let (generation, shipped) = stage(store.clone(), name, true, then_strip).await;
+            (replica, store, generation, shipped)
+        }
+    };
+    let (stripped_replica, _, stripped, shipped) = pair("paired-stripped", true).await;
+    assert!(shipped.is_empty());
+    let (node_config, vault) = configure("paired-stripped", &stripped_replica);
+    let (mut node, stderr) = spawn(&node_config, "paired-stripped");
+    assert!(
+        wait_until(&mut node, &stderr, || {
+            state(&vault)["successful_generation"] == stripped.id
+        })
+        .await,
+        "(b) the stripped half of the pair must be served: {}",
+        std::fs::read_to_string(&stderr).unwrap_or_default()
+    );
+    drop(node);
+    let (refused_replica, refused_store, unstripped, shipped) =
+        pair("paired-unstripped", false).await;
+    for object in [
+        "p_dirty",
+        "p_marking",
+        "p_state",
+        "p_mark_content_events_insert",
+    ] {
+        assert!(
+            shipped.iter().any(|name| name == object),
+            "the control file carries {object}: {shipped:?}"
+        );
+    }
+    let (node_config, vault) = configure("paired-unstripped", &refused_replica);
+    let (mut node, stderr) = spawn(&node_config, "paired-unstripped");
+    let refused = wait_until(&mut node, &stderr, || {
+        std::fs::read_to_string(&stderr)
+            .unwrap_or_default()
+            .contains("cause=Startup phase=Full")
+    })
+    .await;
+    let log = std::fs::read_to_string(&stderr).unwrap_or_default();
+    assert!(
+        refused && log.contains("fallback=Some(IntegrityOrApplyRefusal)"),
+        "(b) the old node must classify the unstripped copy as an integrity refusal: {log}"
+    );
+    drop(refused_store);
+    assert!(
+        !std::fs::read_to_string(vault.join(".native/STATUS.md"))
+            .unwrap_or_default()
+            .contains("authorized copy available"),
+        "(b) the old node reports no authorized copy for the unstripped file"
+    );
+    assert_ne!(
+        state(&vault)["successful_generation"],
+        unstripped.id,
+        "(b) the refused generation is never served"
+    );
+    drop(node);
     db.close().await;
 }

@@ -27,6 +27,14 @@ pub(crate) const TARGET_INDEX_DDL: &str =
 
 /// Ordinary anchored-root write, admitted on the comment's transaction.
 pub(crate) const ANCHOR_SET_EVENT: &str = "kernel.comment_anchor_set.v1";
+pub(crate) const ANCHOR_REMOVED_EVENT: &str = "kernel.comment_anchor_removed.v1";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnchorRemoval {
+    pub reason: String,
+    pub previous_seq: i64,
+}
 /// Sealed import of a v1 `annotation_targets` row, with legacy provenance.
 pub(crate) const ANCHOR_IMPORTED_EVENT: &str = "kernel.comment_anchor_imported.v1";
 
@@ -428,12 +436,35 @@ async fn visible(conn: &mut SqliteConnection, principal: &str, record: &str) -> 
 pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
     if !matches!(
         event.event_type.as_str(),
-        ANCHOR_SET_EVENT | ANCHOR_IMPORTED_EVENT
+        ANCHOR_SET_EVENT | ANCHOR_IMPORTED_EVENT | ANCHOR_REMOVED_EVENT
     ) {
         return Ok(());
     }
     if event.event_type == ANCHOR_IMPORTED_EVENT {
         hq::require_import(conn, event.actor.as_deref().unwrap_or("")).await?;
+        return Ok(());
+    }
+    if event.event_type == ANCHOR_REMOVED_EVENT {
+        let removal: AnchorRemoval = event_payload(event)?;
+        if removal.reason.trim().is_empty() {
+            return Err(invalid("removal reason must not be blank"));
+        }
+        hq::record_edit(
+            conn,
+            event.actor.as_deref().unwrap_or(""),
+            &event.record_id,
+            Some(removal.previous_seq),
+        )
+        .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kernel_comment_anchors WHERE annotation_id=?)",
+        )
+        .bind(&event.record_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !exists {
+            return Err(invalid("annotation has no target"));
+        }
         return Ok(());
     }
     hq::record_edit(
@@ -473,7 +504,7 @@ pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Resu
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn set_anchor_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     principal: &str,
     annotation_id: &str,
@@ -614,6 +645,17 @@ async fn import_anchor_snapshot_as(
 /// Fold either anchor event into the projection. Pure state replacement:
 /// the event carries the full row, so replay rebuilds the table exactly.
 pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    if event.event_type == ANCHOR_REMOVED_EVENT {
+        let removal: AnchorRemoval = event_payload(event)?;
+        if removal.reason.trim().is_empty() {
+            return Err(invalid("removal reason must not be blank"));
+        }
+        sqlx::query("DELETE FROM kernel_comment_anchors WHERE annotation_id=?")
+            .bind(&event.record_id)
+            .execute(conn)
+            .await?;
+        return Ok(());
+    }
     let (anchor, created_at, actor) = if event.event_type == ANCHOR_IMPORTED_EVENT {
         hq::require_import(conn, event.actor.as_deref().unwrap_or("")).await?;
         let import = event_payload::<AnchorImport>(event)?;
@@ -763,7 +805,7 @@ pub(crate) async fn body_revision_on(
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn create_comment_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     creator_principal_id: &str,
     family: &str,
@@ -771,6 +813,8 @@ pub(crate) async fn create_comment_in(
     input: FieldInput<'_>,
     home_id: &str,
     bearer_id: &str,
+    requested_id: Option<&str>,
+    origin: Option<serde_json::Value>,
     basis: Option<serde_json::Value>,
 ) -> Result<String> {
     let home_exists: bool =
@@ -796,8 +840,8 @@ pub(crate) async fn create_comment_in(
         // No home Edit: bearer View above is the whole admission, so any
         // member who can see the record can file the comment.
         false,
-        None,
-        None,
+        requested_id,
+        origin,
         basis,
     )
     .await
@@ -810,7 +854,7 @@ pub(crate) async fn create_comment_in(
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn append_bearer_link_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     principal: &str,
     comment_id: &str,

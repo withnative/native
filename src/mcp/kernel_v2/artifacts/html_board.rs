@@ -100,13 +100,24 @@ async fn source_on(tx: &mut SqliteConnection, actor: &str, id: &str) -> Result<S
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
+    let bindings: Vec<Value> = serde_json::from_str(&bindings)?;
+    let grants: Vec<Value> = serde_json::from_str(&grants)?;
+    // Continuity cannot retain named inputs or capabilities across source edits.
+    let published_body = match &current {
+        Some((_, body_seq))
+            if *body_seq > activation && bindings.is_empty() && grants.is_empty() =>
+        {
+            kernel::app_installs::sources::published_body_on(tx, id, *body_seq).await?
+        }
+        _ => false,
+    };
     if descriptor["runtime"] != runtime
         || descriptor["source_event_id"] != event_id
         || descriptor["source_sha256"] != digest
         || mdx::sha256_hex(body.as_bytes()) != digest
         || current
             .as_ref()
-            .is_none_or(|(text, seq)| text != &body || *seq > activation)
+            .is_none_or(|(text, seq)| !published_body && (text != &body || *seq > activation))
     {
         return Err(Error::engine("frozen artifact source changed"));
     }
@@ -122,8 +133,8 @@ async fn source_on(tx: &mut SqliteConnection, actor: &str, id: &str) -> Result<S
         source_seq,
         runtime,
         descriptor,
-        bindings: serde_json::from_str(&bindings)?,
-        grants: serde_json::from_str(&grants)?,
+        bindings,
+        grants,
         revision: record.revision,
         activation,
         limit,

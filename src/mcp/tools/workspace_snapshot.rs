@@ -533,7 +533,7 @@ mod tests {
         let alice = Caller::authenticated("alice");
         let manifest = json!({
             "version": 1,
-            "profile": "workspace-snapshot-resume/v1",
+            "profile": "workspace-snapshot-resume/v2",
             "records": [],
             "facets": [],
             "links": [],

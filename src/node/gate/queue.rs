@@ -19,8 +19,12 @@
 //!
 //! Sends are spaced by `queue_gap`. The queue is woken when the router sees
 //! hosted reachable and otherwise tries again every `queue_retry`.
+#[cfg(feature = "v2-kernel-probe")]
+mod working;
 use super::*;
 use crate::node::hold;
+#[cfg(feature = "v2-kernel-probe")]
+pub(in crate::node) use working::{WorkingSettlementVerdict, WorkingVerdict};
 
 /// Why a drain stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +33,7 @@ pub(in crate::node) enum Halt {
     EngineV2,
     Unreachable,
     ReadOnly,
+    ClientUpdateRequired,
     /// Hosted refused the node's credential (with this status, if it gave
     /// one), or none were usable.
     Credentials(Option<u16>),
@@ -40,7 +45,7 @@ pub(in crate::node) enum Halt {
     Busy,
 }
 
-enum Step {
+pub(super) enum Step {
     Next,
     Halt(Halt),
 }
@@ -60,10 +65,24 @@ impl WriteGate {
         let gate = self.clone();
         tokio::spawn(async move {
             loop {
+                gate.settle_hosted_batch(&upstream).await;
                 gate.drain(&upstream, hooks.as_deref(), None, None).await;
+                if gate.kernel_v2_upstream() {
+                    if let Some(binding) = super::v2_holding::binding(hooks.as_deref()).await {
+                        if let Ok(scoped) = gate.scoped_v2_gate(&binding) {
+                            scoped.drain(&upstream, hooks.as_deref(), None, None).await;
+                        }
+                    }
+                }
+                let retry = gate
+                    .journal
+                    .next_retry_delay()
+                    .map_or(gate.config.queue_retry, |delay| {
+                        delay.min(gate.config.queue_retry)
+                    });
                 tokio::select! {
                     _ = gate.queue_wake.notified() => {}
-                    _ = tokio::time::sleep(gate.config.queue_retry) => {}
+                    _ = tokio::time::sleep(retry) => {}
                 }
             }
         })
@@ -101,20 +120,49 @@ impl WriteGate {
     ) -> Halt {
         let mut sent = false;
         loop {
+            #[cfg(feature = "v2-kernel-probe")]
+            if self.journal.has_working_resolution() {
+                return Halt::Local;
+            }
+            if !self.scope_matches(hooks).await {
+                return Halt::Local;
+            }
             if cancel.is_some_and(Cancel::is_cancelled) {
                 return Halt::Time;
             }
-            let Some(entry) = self.journal.oldest_pending() else {
-                return Halt::Empty;
-            };
-            if self.kernel_v2_upstream()
-                || if let Some(hooks) = hooks {
-                    !hooks.held_replay_allowed().await
+            let merge_only = self.custody_scope.is_none()
+                && (self.kernel_v2_upstream()
+                    || if let Some(hooks) = hooks {
+                        !hooks.held_replay_allowed().await
+                    } else {
+                        false
+                    });
+            let Some(entry) = (if merge_only {
+                self.journal.next_pending(true)
+            } else {
+                self.journal.oldest_pending()
+            }) else {
+                return if self
+                    .journal
+                    .has_pending_hosted_creator_dependency(merge_only)
+                {
+                    Halt::ReadOnly
+                } else if merge_only
+                    && (self.journal.oldest_pending().is_some()
+                        || self.journal.has_pending_hosted_creator_dependency(false))
+                {
+                    Halt::EngineV2
                 } else {
-                    false
-                }
-            {
-                return Halt::EngineV2;
+                    Halt::Empty
+                };
+            };
+            if !self.compatible_entry(&entry) {
+                let reason = self
+                    .v2_contract_block(&entry, hooks)
+                    .await
+                    .unwrap_or(super::super::journal::CompatibilityBlock::Incompatible);
+                let _ = self.journal.contract_block(&entry, Some(reason));
+                return Halt::Local;
             }
             if self.journal.hosted_pending_creator_of(&entry) {
                 return Halt::ReadOnly;
@@ -148,7 +196,12 @@ impl WriteGate {
             if deadline.is_some_and(|d| d < Instant::now() + self.config.min_attempt) {
                 return Halt::Time;
             }
-            match self.send_held(upstream, hooks, entry, deadline).await {
+            let step = if entry.is_merge() {
+                self.send_merge(upstream, hooks, entry, deadline).await
+            } else {
+                self.send_held(upstream, hooks, entry, deadline).await
+            };
+            match step {
                 Step::Next => sent = true,
                 Step::Halt(halt) => return halt,
             }
@@ -159,6 +212,10 @@ impl WriteGate {
     /// the entry saved. Sent under the node's own credential, so the same
     /// account, with the original run key in the envelope.
     fn request_for(entry: &Entry) -> Option<(Value, String)> {
+        // This release never grants durable app replay authority.
+        if entry.app_identity.is_some() {
+            return None;
+        }
         let arguments = entry.arguments.clone()?;
         let mut envelope = entry.envelope.clone()?.as_object()?.clone();
         if entry.tool == "call_executor" {
@@ -166,6 +223,24 @@ impl WriteGate {
         }
         envelope.insert("operation".into(), json!(entry.operation));
         envelope.insert("arguments".into(), arguments);
+        #[cfg(feature = "v2-kernel-probe")]
+        if installed_working_version(entry.version) {
+            if matches!(
+                entry.version,
+                crate::node::journal::INSTALLED_CREATE_VERSION
+                    | crate::node::journal::INSTALLED_RECORD_VERSION
+            ) && entry.operation == "create_record"
+            {
+                envelope.insert("format".into(), json!("json"));
+            }
+            let original = entry.working_annotations()?;
+            if let Some(run) = original.run_key {
+                envelope.insert("run_key".into(), json!(run));
+            }
+            if let Some(parent) = original.parent_key {
+                envelope.insert("parent_key".into(), json!(parent));
+            }
+        }
         let mut meta = super::super::failover::probe_meta();
         if let Some(info) = &entry.client_info {
             meta["io.modelcontextprotocol/clientInfo"] = info.clone();
@@ -178,6 +253,11 @@ impl WriteGate {
         });
         let body = message.to_string();
         Some((message, body))
+    }
+
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(in crate::node) fn fixture_request_for(entry: &Entry) -> Option<Value> {
+        Self::request_for(entry).map(|(request, _)| request)
     }
 
     /// Leave a note on a pending entry saying why it is still waiting, and
@@ -203,24 +283,114 @@ impl WriteGate {
 
     /// One send of a held write, with the floor bookkeeping around it.
     /// `Err` is a local failure: nothing was sent.
-    async fn send_once(
+    pub(super) async fn send_once(
         &self,
         upstream: &Upstream,
         hooks: Option<&dyn Outage>,
         entry: &Entry,
         deadline: Option<Instant>,
     ) -> std::result::Result<(SendReport, Option<Answer>), Halt> {
+        if !self.scope_matches(hooks).await
+            || !self.scope_targets(upstream)
+            || !self.compatible_entry(entry)
+            || self.root_merge_blocks(entry)
+        {
+            return Err(Halt::Local);
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if upstream.install_key.is_some()
+            && self
+                .journal
+                .enrolled_qualification()
+                .and_then(tokio::sync::OnceCell::get)
+                .is_none()
+        {
+            // Even an attempt marker would misrepresent a restored journal.
+            return Err(Halt::Local);
+        }
+        if entry.kernel_v2_custody.is_some() {
+            let block = self.v2_contract_block(entry, hooks).await;
+            self.journal
+                .contract_block(entry, block)
+                .map_err(|_| Halt::Local)?;
+            if block.is_some() || !self.scope_matches(hooks).await {
+                return Err(Halt::Local);
+            }
+        }
+        let Some(custody_credential_sha256) = self.credential_for_scope(hooks).await else {
+            return Err(Halt::Credentials(None));
+        };
         let Some((message, body)) = Self::request_for(entry) else {
             return Err(Halt::Local);
         };
+        if entry.version == super::super::journal::V2_EVIDENCE_VERSION {
+            let envelope = &message["params"]["arguments"];
+            if !matches!(
+                self.hold_contracts(&entry.operation).validate(
+                    &entry.executor,
+                    &entry.operation,
+                    envelope,
+                    crate::mcp::is_modern_request(&message)
+                ),
+                Some(Ok(()))
+            ) {
+                self.journal
+                    .contract_block(
+                        entry,
+                        Some(super::super::journal::CompatibilityBlock::Incompatible),
+                    )
+                    .map_err(|_| Halt::Local)?;
+                return Err(Halt::Local);
+            }
+        }
         if let Some(hooks) = hooks {
             if !hooks.before_send().await {
                 return Err(Halt::Local);
             }
         }
+        // The floor hook can wait for a probe/state writer. Recheck after it
+        // yields: a newly known account/history/engine boundary must stop this
+        // old scope before its attempt marker or HTTP dispatch.
+        if !self.scope_matches(hooks).await
+            || !self.compatible_entry(entry)
+            || self.root_merge_blocks(entry)
+        {
+            if let Some(hooks) = hooks {
+                hooks.after_send(false).await;
+            }
+            return Err(Halt::Local);
+        }
         // Saved before the send, in one write: the attempt, and that it is in
         // flight. If this cannot be saved, nothing is sent.
-        if self.journal.begin_queue_send(&entry.id).is_err() {
+        let attempt_saved = {
+            #[cfg(feature = "v2-kernel-probe")]
+            let _working = if installed_working_version(entry.version) {
+                Some(self.journal.working_serial.lock().await)
+            } else {
+                None
+            };
+            #[cfg(feature = "v2-kernel-probe")]
+            if installed_working_version(entry.version)
+                && (!self.scope_matches(hooks).await
+                    || !self.scope_targets(upstream)
+                    || !self.compatible_entry(entry)
+                    || self.root_merge_blocks(entry))
+            {
+                drop(_working);
+                if let Some(hooks) = hooks {
+                    hooks.after_send(false).await;
+                }
+                return Err(Halt::Local);
+            }
+            self.journal.begin_queue_send(&entry.id)
+        };
+        if attempt_saved.is_err() {
+            if let Some(hooks) = hooks {
+                hooks.after_send(false).await;
+            }
+            return Err(Halt::Local);
+        }
+        if entry.is_merge() && self.merge_checkpoint("attempt_recorded").is_err() {
             if let Some(hooks) = hooks {
                 hooks.after_send(false).await;
             }
@@ -232,10 +402,21 @@ impl WriteGate {
         }
         let limits = Limits {
             deadline: limit,
+            custody_credential_sha256,
             attempt_timeout: self.config.attempt_timeout,
             min_attempt: self.config.min_attempt,
             cancel: None,
         };
+        #[cfg(feature = "v2-kernel-probe")]
+        let report = if upstream.install_key.is_some() {
+            self.send_enrolled_once(upstream, entry, message.get("id"), &limits)
+                .await
+        } else {
+            upstream
+                .send_attempt(&body, &message, None, message.get("id"), Some(&limits))
+                .await
+        };
+        #[cfg(not(feature = "v2-kernel-probe"))]
         let report = upstream
             .send_attempt(&body, &message, None, message.get("id"), Some(&limits))
             .await;
@@ -289,6 +470,18 @@ impl WriteGate {
         // An attempt whose outcome could not be saved left its marker behind:
         // it may have been applied.
         let possibly_applied = entry.maybe_applied || entry.in_flight;
+        if possibly_applied && !automatic_replay_safe(&entry) {
+            saved!(self.journal.finish_held(
+                &entry.id, EntryState::Uncertain, None,
+                "automatic batch replay stopped: an earlier attempt may have applied; reconcile canonical history".into(),
+                None, true, None,
+            ));
+            return Step::Next;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if installed_working_version(entry.version) {
+            return self.send_working(upstream, hooks, &entry, deadline).await;
+        }
         let (report, answer) = match self.send_once(upstream, hooks, &entry, deadline).await {
             Ok(sent) => sent,
             Err(halt) => return Step::Halt(halt),
@@ -312,6 +505,15 @@ impl WriteGate {
                 return Step::Halt(Halt::Time);
             }
             return Step::Halt(Halt::Credentials(status));
+        }
+        if let Some(update) = report.update_required() {
+            saved!(self.note_waiting(
+                &entry,
+                "client update demand recorded; updater unavailable; original retained",
+                Some(HoldReason::ClientUpdateRequired),
+                !update.definitely_unapplied
+            ));
+            return Step::Halt(Halt::ClientUpdateRequired);
         }
         match (report.attempt, answer) {
             (Attempt::Answered, Some(answer)) => {
@@ -423,6 +625,14 @@ impl WriteGate {
                 saved!(self.note_waiting(&entry, "hosted is unreachable", None, false));
                 Step::Halt(Halt::Unreachable)
             }
+            (Attempt::Lost, _) if !automatic_replay_safe(&entry) => {
+                saved!(self.journal.finish_held(
+                    &entry.id, EntryState::Uncertain, None,
+                    "automatic batch replay stopped after a lost reply; reconcile canonical history".into(),
+                    None, true, None,
+                ));
+                Step::Next
+            }
             (Attempt::Lost, _) => {
                 // One write: possibly applied, and the send has ended.
                 saved!(self.note_waiting(
@@ -452,7 +662,7 @@ impl WriteGate {
     /// A refused create takes its dependants with it: held writes after it
     /// that name a record it would have made (an append to it, a link to it,
     /// an attachment on it, a create inside it), and in turn theirs.
-    fn refuse_dependants(&self, refused: &Entry) {
+    pub(super) fn refuse_dependants(&self, refused: &Entry) {
         let mut work = vec![refused.clone()];
         while let Some(root) = work.pop() {
             if !hold::creates(&root.operation) {
@@ -494,6 +704,9 @@ impl WriteGate {
                 "idempotency_key": dependant.idempotency_key,
             }),
         );
+        if dependant.is_merge() {
+            return self.settle_merge(dependant, true, "refused", reply).ok();
+        }
         self.journal
             .finish_held(
                 &dependant.id,

@@ -210,6 +210,12 @@ where
         "{}: a keyed no-op leaves one anchor",
         case.tool
     );
+    let violations = native_ce::provenance::state_violations(db).await.unwrap();
+    assert!(
+        violations.is_empty(),
+        "{}: genuine keyed no-op must remain conformant: {violations:?}",
+        case.tool
+    );
     disturb().await;
     let disturbed = write_footprint(db).await;
     let replay = call(registry, db, caller, case.tool, case.args.clone())
@@ -1192,6 +1198,11 @@ async fn archive_record_replays_conflicts_and_replays_a_noop_as_a_noop() {
         })
         .await;
     assert_eq!(receipt["changed"], false, "{receipt}");
+    let violations = native_ce::provenance::state_violations(&db).await.unwrap();
+    assert!(
+        violations.is_empty(),
+        "legitimate keyed archive no-op must remain conformant: {violations:?}"
+    );
     assert_reuse_with_other_args_conflicts(&registry, &db, Caller::local(), &noop).await;
 }
 
@@ -1431,7 +1442,7 @@ async fn attribution_retract_and_add_evidence_replay_and_conflict() {
 }
 
 #[tokio::test]
-async fn suggestion_reject_replays_and_accept_refuses_a_key() {
+async fn suggestion_accept_replays_and_conflicts() {
     let registry = registry();
     let db = db().await;
     let target = note(&registry, &db, "suggested", "alpha beta").await;
@@ -1460,7 +1471,57 @@ async fn suggestion_reject_replays_and_accept_refuses_a_key() {
                 .to_owned()
         }
     };
-    let rejected = suggestion("to reject").await;
+    let accepted = suggestion("to accept").await;
+    let case = KeyedCase {
+        tool: "resolve_suggestions",
+        args: json!({"action": "accept", "suggestion_ids": [accepted],
+                     "reason": "Yes", "idempotency_key": "suggest-accept"}),
+        conflicting: json!({"action": "accept", "suggestion_ids": [accepted],
+                            "reason": "A different reason", "idempotency_key": "suggest-accept"}),
+    };
+    let first = assert_replays_without_writing(&registry, &db, Caller::local(), &case).await;
+    assert_eq!(first["status"], "accepted", "{first}");
+    assert_eq!(first["suggestion_ids"], json!([accepted]), "{first}");
+    assert_eq!(body_of(&db, &target).await, "gamma beta");
+    assert_reuse_with_other_args_conflicts(&registry, &db, Caller::local(), &case).await;
+    // Unkeyed, the retry is a lifecycle conflict; the key replays the acceptance.
+    let mut unkeyed = case.args.clone();
+    unkeyed.as_object_mut().unwrap().remove("idempotency_key");
+    let unkeyed = call(
+        &registry,
+        &db,
+        Caller::local(),
+        "resolve_suggestions",
+        unkeyed,
+    )
+    .await
+    .unwrap();
+    assert_eq!(unkeyed["status"], "conflict", "{unkeyed}");
+    assert_eq!(body_of(&db, &target).await, "gamma beta");
+}
+
+#[tokio::test]
+async fn suggestion_reject_replays() {
+    let registry = registry();
+    let db = db().await;
+    let target = note(&registry, &db, "suggested", "alpha beta").await;
+    let rejected: String = call(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_record",
+        json!({
+            "type": "Annotation", "kind": "suggestion", "name": "to reject",
+            "lifecycle": "open", "body": "gamma",
+            "facets": {"proposal.precondition": "span", "anchor.old": "alpha"},
+            "links": [{"target_id": target, "relationship": "part_of"}],
+        }),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let case = KeyedCase {
         tool: "resolve_suggestions",
         args: json!({"action": "reject", "suggestion_ids": [rejected],
@@ -1484,25 +1545,164 @@ async fn suggestion_reject_replays_and_accept_refuses_a_key() {
     .await
     .unwrap();
     assert_eq!(unkeyed["status"], "conflict", "{unkeyed}");
+}
 
-    // Accept is not keyed, and says so by name.
-    let open = suggestion("to accept").await;
-    let refused = call(
+/// A keyed accept that goes stale replays the stale outcome instead of
+/// judging the marked suggestions again: the retry must not conflict and must
+/// not mark anything a second time.
+#[tokio::test]
+async fn suggestion_accept_stale_replays() {
+    let registry = registry();
+    let db = db().await;
+    let target = note(&registry, &db, "suggested", "alpha beta").await;
+    let stale: String = call(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_record",
+        json!({
+            "type": "Annotation", "kind": "suggestion", "name": "to stale",
+            "lifecycle": "open", "body": "gamma",
+            "facets": {"proposal.precondition": "span", "anchor.old": "alpha"},
+            "links": [{"target_id": target, "relationship": "part_of"}],
+        }),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Move the target so the span precondition no longer holds.
+    call(
+        &registry,
+        &db,
+        Caller::local(),
+        "update_record",
+        json!({"id": target, "body_replace": [{"old": "alpha", "new": "omega"}],
+               "reason": "drift"}),
+    )
+    .await
+    .unwrap();
+    let case = KeyedCase {
+        tool: "resolve_suggestions",
+        args: json!({"action": "accept", "suggestion_ids": [stale],
+                     "reason": "Yes", "idempotency_key": "suggest-stale"}),
+        conflicting: json!({"action": "accept", "suggestion_ids": [stale],
+                            "reason": "A different reason", "idempotency_key": "suggest-stale"}),
+    };
+    let first = assert_replays_without_writing(&registry, &db, Caller::local(), &case).await;
+    assert_eq!(first["status"], "stale", "{first}");
+    assert_eq!(first["suggestion_ids"], json!([stale]), "{first}");
+    assert_eq!(first["causes"][0]["code"], "span_missing", "{first}");
+    assert_eq!(body_of(&db, &target).await, "omega beta");
+    assert_reuse_with_other_args_conflicts(&registry, &db, Caller::local(), &case).await;
+    // Move the world again (restore the missing span) and redeliver with the
+    // same key: the receipt must be identical to the original, not re-judged
+    // against the current target, and nothing is written again.
+    call(
+        &registry,
+        &db,
+        Caller::local(),
+        "update_record",
+        json!({"id": target, "body_replace": [{"old": "omega", "new": "alpha"}],
+               "reason": "restore"}),
+    )
+    .await
+    .unwrap();
+    let before = write_footprint(&db).await;
+    let redelivered = call(
         &registry,
         &db,
         Caller::local(),
         "resolve_suggestions",
-        json!({"action": "accept", "suggestion_ids": [open], "reason": "Yes",
-               "idempotency_key": "suggest-accept"}),
+        case.args.clone(),
     )
     .await
-    .unwrap_err()
-    .to_string();
-    assert!(
-        refused.contains("accept does not accept idempotency_key"),
-        "{refused}"
+    .unwrap();
+    assert_same_receipt(&redelivered, &first, "resolve_suggestions");
+    assert_eq!(
+        write_footprint(&db).await,
+        before,
+        "a stale replay after the world moved must append nothing"
     );
     assert_eq!(body_of(&db, &target).await, "alpha beta");
+}
+
+/// A redelivery must not disclose a record the caller can no longer see, even
+/// when the suggestion now points at a record they still can: the renderer
+/// authorizes the attested target, so losing access to it is the same opaque
+/// refusal as an ordinary access refusal, and nothing is written.
+#[tokio::test]
+async fn suggestion_accept_replay_refuses_a_revoked_attested_target() {
+    use native_ce::authorization::Capability;
+    let registry = registry();
+    let db = db().await;
+    participant_owner(&registry, &db, "acct:alice").await;
+    let alice = hosted("acct:alice");
+    let target_a = note(&registry, &db, "restricted", "alpha beta").await;
+    let target_b = note(&registry, &db, "open", "alpha beta").await;
+    grant(&db, &target_a, "acct:alice", Capability::Edit).await;
+    grant(&db, &target_b, "acct:alice", Capability::Edit).await;
+    let suggestion: String = call(
+        &registry,
+        &db,
+        alice.clone(),
+        "create_record",
+        json!({
+            "type": "Annotation", "kind": "suggestion", "name": "to accept",
+            "lifecycle": "open", "body": "gamma",
+            "facets": {"proposal.precondition": "span", "anchor.old": "alpha"},
+            "links": [{"target_id": target_a, "relationship": "part_of"}],
+        }),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let args = json!({"action": "accept", "suggestion_ids": [suggestion],
+                     "reason": "Yes", "idempotency_key": "accept-revoked"});
+    let first = call(
+        &registry,
+        &db,
+        alice.clone(),
+        "resolve_suggestions",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["status"], "accepted", "{first}");
+    // Re-point the suggestion at the record alice keeps. A suggestion's
+    // part_of link is not re-pointable through manage_links here, so the
+    // fixture moves the row directly; what the test needs is the resulting
+    // state (current links no longer name the attested target).
+    sqlx::query("UPDATE links SET target_id = ? WHERE source_id = ? AND relationship = 'part_of'")
+        .bind(&target_b)
+        .bind(&suggestion)
+        .execute(&crate::common::fixture_write_pool(&db).await)
+        .await
+        .unwrap();
+    grant(&db, &target_a, "acct:nobody", Capability::Manage).await;
+    let before = write_footprint(&db).await;
+    let denied = call(
+        &registry,
+        &db,
+        alice.clone(),
+        "resolve_suggestions",
+        args.clone(),
+    )
+    .await
+    .expect_err("a redelivery after losing the attested target must be refused")
+    .to_string();
+    assert_eq!(
+        denied, "resolve_suggestions: suggestion does not exist",
+        "the refusal must be opaque, like an ordinary access refusal"
+    );
+    assert!(
+        !denied.contains(&target_a),
+        "the refusal must not name the revoked record: {denied}"
+    );
+    assert_eq!(write_footprint(&db).await, before, "a denied replay wrote");
 }
 
 /// A person who owns personas: an account and a native-principal binding.

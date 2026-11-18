@@ -1,5 +1,7 @@
 use super::*;
+#[cfg(feature = "mcp-executor-prototype")]
 use crate::native_cli::setup::tests::{McpHook, WS_A};
+#[cfg(feature = "mcp-executor-prototype")]
 use crate::native_cli::status::tests::{start_node_with, Running};
 use std::future::Future;
 use std::path::Path;
@@ -433,6 +435,17 @@ fn classification_rows() -> Vec<(String, Value, Kind)> {
     add(
         "node_journal uncertain beside hosted's own data".into(),
         rpc_error(json!({"upstream_data":{"outcome":"refused"},"node_journal":journal})),
+        Uncertain,
+    );
+    // A text-format refusal has no structuredContent; the node's note rides
+    // in `_meta` there (7e99834) and still decides.
+    add(
+        "node_journal uncertain in _meta of a text refusal".into(),
+        json!({"jsonrpc":"2.0","id":1,"result":{
+            "content":[{"type":"text","text":"refused"}],
+            "isError":true,
+            "_meta":{"node_journal":journal},
+        }}),
         Uncertain,
     );
     add(
@@ -907,12 +920,14 @@ fn an_unopenable_local_database_is_exit_2() {
 
 /// Hosted's engine, on its own thread (its futures are deep): the fake hosted
 /// server hands it every tool call but the two setup makes.
+#[cfg(feature = "mcp-executor-prototype")]
 struct HostedEngine {
     requests:
         tokio::sync::mpsc::UnboundedSender<(Value, tokio::sync::oneshot::Sender<Option<Value>>)>,
     _dir: tempfile::TempDir,
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 impl HostedEngine {
     fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -969,11 +984,13 @@ impl HostedEngine {
     }
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 struct Hosted {
     running: Running,
     engine: HostedEngine,
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 impl Hosted {
     async fn start() -> Self {
         let engine = HostedEngine::start();
@@ -1001,10 +1018,12 @@ impl Hosted {
     }
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 fn keyed(name: &str, key: &str) -> String {
     json!({"type":"Document","kind":"note","name":name,"body":format!("{name} body"),"reason":"hosted test","idempotency_key":key}).to_string()
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn hosted_read_and_write_go_through_the_node() {
     let hosted = Hosted::start().await;
@@ -1062,6 +1081,7 @@ async fn hosted_read_and_write_go_through_the_node() {
     assert!(!WS_A.is_empty());
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn hosted_refusals_exit_4_and_apply_nothing() {
     let hosted = Hosted::start().await;
@@ -1099,6 +1119,7 @@ async fn hosted_refusals_exit_4_and_apply_nothing() {
     assert_eq!(hosted.hosted_hits("missing").await, 0);
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn a_write_held_while_hosted_is_down_is_exit_3_and_delivered_when_it_returns() {
     let hosted = Hosted::start().await;
@@ -1185,6 +1206,7 @@ async fn a_write_held_while_hosted_is_down_is_exit_3_and_delivered_when_it_retur
     assert_eq!(hosted.hosted_hits("during").await, 1);
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn no_node_is_exit_2_with_a_hint() {
     let dir = tempfile::tempdir().unwrap();
@@ -1662,6 +1684,7 @@ fn nothing_was_applied_is_said_only_when_the_reply_says_so() {
 /// A config directory whose node is a scripted socket server: each request
 /// line goes to `answer`, whose reply is written back (`None` hangs up;
 /// `Some(Null)` stays silent; `{"__delay_ms": n, "reply": …}` answers late).
+#[cfg(feature = "mcp-executor-prototype")]
 async fn scripted_node(
     template: &Hosted,
     answer: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static,
@@ -1725,6 +1748,7 @@ async fn scripted_node(
     (config_dir, socket_dir)
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn a_node_that_says_nothing_is_a_timeout_not_a_hang() {
     let template = Hosted::start().await;
@@ -1751,6 +1775,7 @@ async fn a_node_that_says_nothing_is_a_timeout_not_a_hang() {
     );
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn a_reply_lost_after_a_call_is_uncertain_for_a_call_and_unreachable_for_a_read() {
     let template = Hosted::start().await;
@@ -1795,6 +1820,7 @@ async fn a_reply_lost_after_a_call_is_uncertain_for_a_call_and_unreachable_for_a
 
 // ---- late and stray replies ------------------------------------------------------------------------
 
+#[cfg(feature = "mcp-executor-prototype")]
 fn catalogue_lookup(request: &Value) -> bool {
     request
         .to_string()
@@ -1804,6 +1830,7 @@ fn catalogue_lookup(request: &Value) -> bool {
 /// The scripted node of the late-reply regression: it answers the handshake
 /// and tool listing at once, the catalogue lookup after `lookup_delay_ms`, and
 /// a write with `write` (`None`: never).
+#[cfg(feature = "mcp-executor-prototype")]
 fn late_catalogue_node(
     lookup_delay_ms: u64,
     write: Option<Value>,
@@ -1833,6 +1860,7 @@ fn late_catalogue_node(
     }
 }
 
+#[cfg(feature = "mcp-executor-prototype")]
 #[tokio::test]
 async fn a_late_catalogue_reply_is_never_taken_for_the_writes_receipt() {
     let template = Hosted::start().await;

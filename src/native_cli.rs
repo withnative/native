@@ -23,20 +23,34 @@ use crate::mcp::{ExecutorPrototypeStdioServer, ExecutorTelemetryContext};
 #[cfg(unix)]
 pub mod call;
 pub mod connect;
+pub mod consumer;
 pub mod enrich;
 pub mod enrichment;
 pub mod import;
 pub mod init;
+pub mod launch;
+/// Legacy MCP command line shared by the wrapper and the `native` basename alias.
+pub mod legacy_stdio;
 #[cfg(unix)]
 pub mod login;
 #[cfg(unix)]
+pub mod login_node;
+#[cfg(feature = "v2-kernel-probe")]
+pub mod maintenance;
+#[cfg(unix)]
 pub mod node_client;
+#[cfg(unix)]
+pub mod recovery;
+pub mod replica;
+pub mod runtime;
 #[cfg(unix)]
 pub mod service;
 #[cfg(unix)]
 pub mod setup;
 #[cfg(unix)]
 pub mod status;
+#[cfg(unix)]
+pub mod vault;
 
 /// Environment selector for the MCP surface (executor by default).
 pub const ENV_MCP_SURFACE: &str = "NATIVE_CE_MCP_SURFACE";

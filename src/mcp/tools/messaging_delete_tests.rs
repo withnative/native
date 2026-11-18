@@ -158,7 +158,7 @@ async fn author_delete_tombstones_hides_withdraws_and_keeps_history() {
 }
 
 #[tokio::test]
-async fn only_the_author_can_delete_including_persona_messages() {
+async fn non_managers_cannot_delete_including_persona_messages() {
     let db = crate::create_database(":memory:").await.unwrap();
     let (shared, _) = fixture(&db).await;
     let plain = send_as(
@@ -227,19 +227,409 @@ async fn only_the_author_can_delete_including_persona_messages() {
         .await,
         1
     );
-    // Bob's own message is not Alice's to delete either, whatever her rights.
+    // Alice manages the channel, so she may delete Bob's message there even
+    // though she is not its author (moderation; see the channel-manager tests).
     let bobs = send_as(&db, "bob", &shared, "bobs", "from bob", &[ALICE], json!({})).await;
-    let error = call(&db, "alice", delete_args(&bobs, "alice-del"))
+    call(&db, "alice", delete_args(&bobs, "alice-del"))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("only the author"), "{error}");
+        .unwrap();
+    // Bob's next message is his own to delete.
+    let bobs_own = send_as(
+        &db,
+        "bob",
+        &shared,
+        "bobs2",
+        "also from bob",
+        &[ALICE],
+        json!({}),
+    )
+    .await;
     // The persona's owner is its sender and may delete it.
     call(&db, "alice", delete_args(&spoken, "alice-del-2"))
         .await
         .unwrap();
-    call(&db, "bob", delete_args(&bobs, "bob-del-3"))
+    call(&db, "bob", delete_args(&bobs_own, "bob-del-3"))
         .await
         .unwrap();
+    db.close().await;
+}
+
+const CAROL: &str = "ca401000-0000-4000-8000-000000000003";
+
+async fn add_view_only_carol(db: &Db, shared: &str) {
+    crate::store::create_record(
+        db,
+        json!({"id":CAROL,"type":"Entity","kind":"person","name":"carol","home_id":crate::schema::ROOT_RECORD_ID}),
+    )
+    .await
+    .unwrap();
+    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+    let mut act = crate::act::ActAllocation::new();
+    for (system, ident) in [("account", "carol"), ("native-principal", "native/carol")] {
+        crate::identity::add_binding_internal_in(
+            &mut tx,
+            "local",
+            "install fixture identity",
+            CAROL,
+            system,
+            ident,
+            true,
+            &mut act,
+        )
+        .await
+        .unwrap();
+    }
+    db.commit_authorization(tx).await.unwrap();
+    // Carol is a channel member with View only; Alice keeps Manage and Bob Edit.
+    crate::authorization::replace_explicit_policy(
+        db,
+        "alice",
+        shared,
+        vec![
+            AllowEntry::account("alice", Capability::Manage),
+            AllowEntry::account("bob", Capability::Edit),
+            AllowEntry::account("carol", Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+fn delete_args_with_reason(id: &str, key: &str, reason: &str) -> Value {
+    json!({"action":"delete","message_id":id,"idempotency_key":key,"reason":reason})
+}
+
+/// A Conversation plus an explicit policy, so the fixture can say exactly who
+/// manages it. Classification asks for Edit on the Message and View on the
+/// Conversation, so a Manage holder here is also the filer's counterpart.
+async fn create_conversation(
+    db: &Db,
+    account: &str,
+    name: &str,
+    entries: Vec<AllowEntry>,
+) -> String {
+    let id = registry()
+        .call(
+            db.clone(),
+            Caller::authenticated(account),
+            "create_record",
+            json!({"type":"Conversation","kind":"thread","name":name,"home_id":crate::schema::ROOT_RECORD_ID,"reason":"fixture"}),
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    crate::authorization::replace_explicit_policy(db, account, &id, entries)
+        .await
+        .unwrap();
+    id
+}
+
+async fn listed_in_conversation(db: &Db, account: &str, conversation: &str) -> Vec<String> {
+    let conversation = call(
+        db,
+        account,
+        json!({"action":"list_conversation","conversation_id":conversation}),
+    )
+    .await
+    .unwrap();
+    listed_ids(&conversation)
+}
+
+#[tokio::test]
+async fn channel_manager_deletes_others_message_actor_is_manager_and_retry_replays() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let (shared, _) = fixture(&db).await;
+    // Bob authors; Alice manages the channel (Manage on the root/shared folder).
+    let id = send_as(
+        &db,
+        "bob",
+        &shared,
+        "bob-1",
+        "spam from bob",
+        &[ALICE],
+        json!({}),
+    )
+    .await;
+
+    // A channel manager still cannot edit someone else's message.
+    let error = call(
+        &db,
+        "alice",
+        json!({"action":"edit","message_id":id,"body":"rewritten by manager","idempotency_key":"mgr-edit","reason":"Moderation."}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("only the author can edit"),
+        "{error}"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NULL AND body='spam from bob'", &id).await,
+        1
+    );
+
+    let receipt = call(
+        &db,
+        "alice",
+        delete_args_with_reason(&id, "mgr-del", "Moderation: spam."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["status"], "deleted");
+    assert_eq!(receipt["message_id"], id.as_str());
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NOT NULL",
+            &id
+        )
+        .await,
+        1
+    );
+    // The deletion is attributed to the moderator, with the reason kept.
+    let actor: String = sqlx::query_scalar(
+        "SELECT actor FROM content_events WHERE record_id=? AND type='record.deleted'",
+    )
+    .bind(&id)
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(actor, "alice");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.deleted' AND payload LIKE '%Moderation: spam.%'", &id).await,
+        1
+    );
+
+    // Idempotent retry by the moderator replays the receipt, writes nothing new.
+    let replay = call(
+        &db,
+        "alice",
+        delete_args_with_reason(&id, "mgr-del", "Moderation: spam."),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay, receipt);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.deleted'",
+            &id
+        )
+        .await,
+        1
+    );
+
+    // Persona messages follow the same rule: Bob speaks as his persona,
+    // Alice (channel manager, not the author) may remove it.
+    let persona = registry()
+        .call(
+            db.clone(),
+            Caller::authenticated("bob"),
+            "manage_participants",
+            json!({"action":"register_persona","name":"Bobby","home_id":crate::schema::ROOT_RECORD_ID,"reason":"fixture"}),
+        )
+        .await
+        .unwrap()["persona_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let spoken = send_as(
+        &db,
+        "bob",
+        &shared,
+        "bob-persona",
+        "persona spam",
+        &[ALICE],
+        json!({"speaker":{"persona_id":persona}}),
+    )
+    .await;
+    call(
+        &db,
+        "alice",
+        delete_args_with_reason(&spoken, "mgr-del-persona", "Moderation: persona spam."),
+    )
+    .await
+    .unwrap();
+    let actor: String = sqlx::query_scalar(
+        "SELECT actor FROM content_events WHERE record_id=? AND type='record.deleted'",
+    )
+    .bind(&spoken)
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(actor, "alice");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn channel_member_without_manage_and_guest_cannot_delete_others_message() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let (shared, _) = fixture(&db).await;
+    add_view_only_carol(&db, &shared).await;
+    let id = send_as(
+        &db,
+        "alice",
+        &shared,
+        "alice-1",
+        "alice note",
+        &[BOB],
+        json!({}),
+    )
+    .await;
+    // Bob has Edit on the channel, Carol only View: neither may delete.
+    for (account, key) in [("bob", "bob-nomanage"), ("carol", "carol-view")] {
+        let error = call(&db, account, delete_args(&id, key)).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only the author or someone who manages this channel can delete"),
+            "{account}: {error}"
+        );
+    }
+    // A guest / non-member learns nothing about the message.
+    let error = call(&db, "mallory", delete_args(&id, "mallory-nomanage"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not exist"), "{error}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NULL",
+            &id
+        )
+        .await,
+        1
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn classifying_a_channel_message_into_a_managed_conversation_confers_no_delete() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    let (shared, _) = fixture(&db).await;
+    // Alice manages the channel, Bob only edits it.
+    add_view_only_carol(&db, &shared).await;
+    let id = send_as(
+        &db,
+        "alice",
+        &shared,
+        "alice-filed",
+        "alice note",
+        &[BOB],
+        json!({}),
+    )
+    .await;
+
+    // Bob's own Conversation, which he manages and Alice can view. Filing is
+    // allowed: Edit on the Message plus View on the Conversation is all that
+    // classification asks for, and Bob has both.
+    let conversation = create_conversation(
+        &db,
+        "bob",
+        "bob's filing thread",
+        vec![
+            AllowEntry::account("bob", Capability::Manage),
+            AllowEntry::account("alice", Capability::View),
+        ],
+    )
+    .await;
+    call(
+        &db,
+        "bob",
+        json!({"action":"classify","message_id":id,"conversation_id":conversation}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        listed_in_conversation(&db, "bob", &conversation).await,
+        vec![id.clone()]
+    );
+
+    // Managing the Conversation he filed into is not authority over the
+    // channel the Message was sent to, so the delete is refused.
+    let error = call(&db, "bob", delete_args(&id, "bob-filed-delete"))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("only the author or someone who manages this channel can delete"),
+        "{error}"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NULL",
+            &id
+        )
+        .await,
+        1
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn manager_of_a_conversation_a_direct_message_was_filed_into_cannot_delete_it() {
+    let db = crate::create_database(":memory:").await.unwrap();
+    fixture(&db).await;
+    let dm = call(
+        &db,
+        "alice",
+        json!({"action":"send","body":"just between us","origin":{"type":"direct","participant_ids":[ALICE,BOB]},
+               "addressed_to":[BOB],"expectation":"none","idempotency_key":"dm-filed","reason":"fixture"}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Bob manages the Conversation; Alice can view it, so the author may file
+    // her own direct Message into it.
+    let conversation = create_conversation(
+        &db,
+        "bob",
+        "bob's dm thread",
+        vec![
+            AllowEntry::account("bob", Capability::Manage),
+            AllowEntry::account("alice", Capability::View),
+        ],
+    )
+    .await;
+    call(
+        &db,
+        "alice",
+        json!({"action":"classify","message_id":dm,"conversation_id":conversation}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        listed_in_conversation(&db, "bob", &conversation).await,
+        vec![dm.clone()]
+    );
+
+    // A direct Message has no origin channel, so moderation has nothing to act
+    // through and the refusal does not mention one.
+    let error = call(&db, "bob", delete_args(&dm, "bob-dm-filed"))
+        .await
+        .unwrap_err();
+    let refusal = error.to_string();
+    assert!(
+        refusal.contains("only the author can delete a Message"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("channel"), "{refusal}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NULL",
+            &dm
+        )
+        .await,
+        1
+    );
     db.close().await;
 }
 
@@ -534,6 +924,17 @@ async fn author_edit_replaces_the_text_keeps_history_and_shows_as_edited_through
     let db = crate::create_database(":memory:").await.unwrap();
     let (shared, _) = fixture(&db).await;
     let id = send_with_bob_mention(&db, &shared, "send-1").await;
+    let state = call(
+        &db,
+        "alice",
+        json!({"action":"list_message_state","message_ids":[id]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state["capabilities"],
+        json!({"edit":true,"delete":true,"reactions":true,"saved_session_sharing":true})
+    );
     let awareness_before = count(
         &db,
         "SELECT COUNT(*) FROM human_message_awareness WHERE message_id=?",
@@ -943,6 +1344,19 @@ async fn re_pointing_an_account_at_the_author_does_not_hand_over_authorship() {
         json!({}),
     )
     .await;
+    // A direct Message from Alice to Bob, made before the re-point. It has no
+    // channel, so channel moderation cannot apply to it below.
+    let dm = call(
+        &db,
+        "alice",
+        json!({"action":"send","body":"direct note","origin":{"type":"direct","participant_ids":[ALICE,BOB]},
+               "addressed_to":[BOB],"expectation":"none","idempotency_key":"dm-repoint","reason":"fixture"}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     // Bob's canonical account is moved onto Alice's live Person with no
     // identity-layer record of it, while her own credential stays there as an
     // alias. The binding now says Bob *is* Alice, but the Message was sent by
@@ -961,9 +1375,22 @@ async fn re_pointing_an_account_at_the_author_does_not_hand_over_authorship() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("only the author"), "{error}");
-    let error = call(&db, "bob", delete_args(&id, "d")).await.unwrap_err();
+    // Delete stays authorship-guarded where no channel moderation applies:
+    // the direct Message has no channel, so the re-point hands Bob nothing.
+    // (In the shared channel the re-pointed binding also carries Alice's
+    // channel authority, which is a separate, authorization-derived path.)
+    let error = call(&db, "bob", delete_args(&dm, "d")).await.unwrap_err();
     assert!(error.to_string().contains("only the author"), "{error}");
     assert_eq!(count(&db, "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NULL AND body='alice wrote this'", &id).await, 1);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM records WHERE id=? AND deleted_at IS NULL AND body='direct note'",
+            &dm
+        )
+        .await,
+        1
+    );
     db.close().await;
 }
 

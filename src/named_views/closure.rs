@@ -435,37 +435,86 @@ async fn inspect_on(
             let revision: Revision = decode(&event, MAX_CARRIER_BYTES)?;
             let def = revision.validate_retained(&event)?;
             if revision.v == 2 {
-                let generated: super::v2::Definition =
-                    serde_json::from_value(revision.definition.clone())?;
-                if !executable {
-                    super::generated::authorize_metadata_on(tx, actor, &generated, deadline)
-                        .await?;
-                } else if super::generated::is_writer(tx).await? {
-                    super::generated::require_certified(&revision)?;
-                } else {
-                    let workspace = super::generated::workspace_on(tx).await?;
-                    if budget.skip_advisory {
-                        super::retained_facets::mandatory_on(
-                            tx, actor, &workspace, record, &generated, deadline,
-                        )
-                        .await?;
-                    } else {
-                        let checked = super::retained_facets::inspect_definition_shared_on(
-                            tx,
-                            actor,
-                            &workspace,
-                            record,
-                            generated,
-                            deadline,
-                            super::source_proof::ScanLimits::default(),
-                            &mut budget.comparison,
-                        )
-                        .await?;
-                        budget.drift.insert(pin.clone(), checked.drift);
-                        if let Some(reason) = checked.unknown_reason {
-                            budget.unknown_reason.insert(pin.clone(), reason);
+                let format = revision
+                    .definition
+                    .pointer("/generated/format")
+                    .and_then(serde_json::Value::as_str);
+                match format {
+                    Some("native.generated-facets.v1") => {
+                        let generated: super::v2::Definition =
+                            serde_json::from_value(revision.definition.clone())?;
+                        if !executable {
+                            super::generated::authorize_metadata_on(
+                                tx, actor, &generated, deadline,
+                            )
+                            .await?;
+                        } else if super::generated::is_writer(tx).await? {
+                            super::generated::require_certified(&revision)?;
+                        } else {
+                            let workspace = super::generated::workspace_on(tx).await?;
+                            if budget.skip_advisory {
+                                super::retained_facets::mandatory_on(
+                                    tx, actor, &workspace, record, &generated, deadline,
+                                )
+                                .await?;
+                            } else {
+                                let checked = super::retained_facets::inspect_definition_shared_on(
+                                    tx,
+                                    actor,
+                                    &workspace,
+                                    record,
+                                    generated,
+                                    deadline,
+                                    super::source_proof::ScanLimits::default(),
+                                    &mut budget.comparison,
+                                )
+                                .await?;
+                                budget.drift.insert(pin.clone(), checked.drift);
+                                if let Some(reason) = checked.unknown_reason {
+                                    budget.unknown_reason.insert(pin.clone(), reason);
+                                }
+                            }
                         }
                     }
+                    Some("native.generated-facets.v2") => {
+                        let generated: super::v2::Definition<super::v2::GlobalManifest> =
+                            serde_json::from_value(revision.definition.clone())?;
+                        // Bearer View was checked before loading this revision.
+                        if !executable {
+                            let inputs = super::retained_facets::global_inputs(&generated);
+                            super::generated::authorize_metadata_on(tx, actor, &inputs, deadline)
+                                .await?;
+                        } else if super::generated::is_writer(tx).await? {
+                            super::generated::require_certified(&revision)?;
+                        } else {
+                            let workspace = super::generated::workspace_on(tx).await?;
+                            if budget.skip_advisory {
+                                let inputs = super::retained_facets::global_inputs(&generated);
+                                super::retained_facets::mandatory_on(
+                                    tx, actor, &workspace, record, &inputs, deadline,
+                                )
+                                .await?;
+                            } else {
+                                let checked =
+                                    super::retained_facets::inspect_global_definition_shared_on(
+                                        tx,
+                                        actor,
+                                        &workspace,
+                                        record,
+                                        generated,
+                                        deadline,
+                                        super::source_proof::ScanLimits::default(),
+                                        &mut budget.comparison,
+                                    )
+                                    .await?;
+                                budget.drift.insert(pin.clone(), checked.drift);
+                                if let Some(reason) = checked.unknown_reason {
+                                    budget.unknown_reason.insert(pin.clone(), reason);
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err(invalid("view_revision_unavailable")),
                 }
             }
             budget.retained.insert(pin.clone(), revision.clone());

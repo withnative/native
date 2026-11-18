@@ -117,6 +117,18 @@ async fn authorized_source(
             .bind(&invocation.artifact_id)
             .fetch_optional(&mut **tx)
             .await?;
+    let bindings: Vec<Value> = serde_json::from_str(&bindings)?;
+    let grants: Vec<Value> = serde_json::from_str(&grants)?;
+    // Continuity cannot retain named inputs or capabilities across source edits.
+    let published_body = match &current {
+        Some((_, body_seq))
+            if *body_seq > activation_seq && bindings.is_empty() && grants.is_empty() =>
+        {
+            kernel::app_installs::sources::published_body_on(tx, &invocation.artifact_id, *body_seq)
+                .await?
+        }
+        _ => false,
+    };
     if record.archived
         || kernel::hq::tombstoned_on(tx, &invocation.artifact_id).await?
         || !matches!(
@@ -125,7 +137,7 @@ async fn authorized_source(
         )
         || current
             .as_ref()
-            .is_none_or(|(live, seq)| live != &body || *seq > activation_seq)
+            .is_none_or(|(live, seq)| !published_body && (live != &body || *seq > activation_seq))
         || mdx::sha256_hex(body.as_bytes()) != digest
     {
         return Ok(None);
@@ -150,8 +162,8 @@ async fn authorized_source(
         body,
         digest,
         source_event_id,
-        serde_json::from_str(&bindings)?,
-        serde_json::from_str(&grants)?,
+        bindings,
+        grants,
         manifest,
     )))
 }

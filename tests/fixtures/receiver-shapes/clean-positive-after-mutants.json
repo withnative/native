@@ -1,0 +1,96 @@
+{
+  "head": "bb6cbedb363bfb3bf51f1fcd41d3e1c1d34978fb",
+  "features": [
+    "v2-kernel-probe"
+  ],
+  "binary_sha256": "59f47aa75bc8f66821ec3e2303d24d5e6f088f88e461146753d3e0118416effb",
+  "tests": [
+    {
+      "test": "node::failover::tests::receiver_node_probe_preserves_selected_shape_and_maintenance_boundaries",
+      "exit": 0,
+      "log_sha256": "23e67a91f8b89f7b9b46b28bcefe4cb95b002779bc75d0e79357ab763f7604cc"
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_pairs_are_complete_exact_and_argument_bounded",
+      "exit": 0,
+      "log_sha256": "93e8abf08479ffd34c71aff8b3957b93441eaedd780b505063433326839b4487"
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_custody_three_ordinary94_calls_restart_and_drain_under95_discovery",
+      "exit": 0,
+      "log_sha256": "bc25e28b315d440961c16f4cc2e08f9ef75266790cc3a15967f0058c7ca0cfed"
+    },
+    {
+      "test": "node::gate::tests::body_merge_real_home_tests::v2_holding_tests::receiver_v7_original94_digest_none_restart_drain_and_retry_under95_discovery",
+      "exit": 0,
+      "log_sha256": "a8a188db183b902c114b26085352d17ebe215237b28937e19318f71910cf1d57"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver95_configured_origin_route_and_read_only_handles_remain_fenced",
+      "exit": 0,
+      "log_sha256": "83a85899b8b3567d3c397de4677ed9a0f20e42bba6097c41409b0348fd712401"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_producer_full_and_delta_projection_equal_source",
+      "exit": 0,
+      "log_sha256": "9f4fd1f6a470abd281535cf80fe69aaa0d1868b9abb908381479648fb11b884f"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_v1_audit_uses_only_disposable_registered_scratch",
+      "exit": 0,
+      "log_sha256": "12ac7998e475dab2923171837f4e96db7e784be51ffa1d943a4c57999fb15022"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_real95_working_fold_after_private_ddl",
+      "exit": 0,
+      "log_sha256": "238b18c09f720ef187d55796c226d88ccba7c4e1f6fd8a2371a751217a4163c7"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_shape_full_switch_rebind_and_pin",
+      "exit": 0,
+      "log_sha256": "5b2d9ecb034879c00cf3442ef46ff81b44cd7764488d33b1ef50e4ed70212474"
+    },
+    {
+      "test": "standby::generation_store::receiver_shape_tests::receiver_v1_exact95_full_keeps94_while_unknown96_refuses",
+      "exit": 0,
+      "log_sha256": "27955dc3c66cf3cf4ea8d9daffe0d638cf263ad4d1f926a8f4d67271e8626edf"
+    },
+    {
+      "test": "standby::refresh::shape_transition::tests::transition_budget_survives_head_changes_and_caps_retries",
+      "exit": 0,
+      "log_sha256": "1cf8071977250ae989c6235aed7e722ca0860f40dca970fffa9bf324eb3612be"
+    },
+    {
+      "test": "standby::refresh::tests::kernel_v2_refresh::receiver_shape_transition_from_advanced_copy_uses_full_and_hands_off",
+      "exit": 0,
+      "log_sha256": "f68da32b1f99a525977ddbb5fb5745bdb12849fc2d3e56286e32589e54784866"
+    },
+    {
+      "test": "standby::refresh::tests::kernel_v2_refresh::receiver_stale_episode_cannot_waive_an_unrelated_full_cooldown",
+      "exit": 0,
+      "log_sha256": "3887dc21d29cc08b57ce24b887e50ce10f3248511612f72a5823ab3387769c1d"
+    },
+    {
+      "test": "standby::refresh::tests::kernel_v2_refresh::receiver_transition_disk_budget_refuses_before_range_or_page_tail",
+      "exit": 0,
+      "log_sha256": "83d727ccfaa938552702af04cd1c6076e7039c592ceaa147f530b82bc9102a6d"
+    },
+    {
+      "test": "standby::refresh::tests::kernel_v2_refresh::receiver_unknown_owned_shape_goes_full_without_opening_local_writer",
+      "exit": 0,
+      "log_sha256": "4b3c704011244dc6ab8a15dafc66b8c826b6a40d82e52e0abd6056e14dcd8da7"
+    },
+    {
+      "test": "standby::refresh::tests::receiver_shapes::real95_v1_cut_without_selection_refuses_before_writer_and_keeps94",
+      "exit": 0,
+      "log_sha256": "9afed6ff2a03e449164053381093333ebece0bb12ea757f604bc04b926f0d883"
+    },
+    {
+      "test": "standby::shapes::tests::compiled_emission_is_an_exact_registry_member",
+      "exit": 0,
+      "log_sha256": "2240d393b279aa0c6b0aeaabeb71a58894da2ca5fc57b01c5a15d141dda07e3c"
+    }
+  ],
+  "matches_prior_dbb_positive_binary": true,
+  "qualification": "Clean unmutated library-test artifact after all source mutants restored; not a shipping process artifact or final-head CI claim."
+}

@@ -239,3 +239,58 @@ fn references_come_only_from_the_fields_that_hold_them() {
         );
     }
 }
+
+/// The set of writes the node holds is the hand-kept [`HOLDABLE`] list, and
+/// it has not widened: declaring an operation local-first does not hold it.
+/// Widening it waits on the replay conformance gate; when that lands, this
+/// test is the line to change, on purpose and in review.
+#[test]
+fn the_held_set_is_exactly_the_set_held_before_acceptance_was_declared() {
+    let mut held: Vec<(&str, &str)> = HOLDABLE.to_vec();
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            ("records_write", "attach_text"),
+            ("records_write", "create_many"),
+            ("records_write", "create_record"),
+            ("records_write", "manage_links.add"),
+            ("records_write", "merge_body"),
+            ("records_write", "update_record"),
+        ]
+    );
+    // And the shape rule for `update_record` is part of what is held.
+    assert!(!is_holdable(
+        "records_write",
+        "update_record",
+        &json!({"id":"r","reason":"x","body_set":"y"})
+    ));
+}
+
+/// Every write the node holds is a declared write, and it may be declared as
+/// waiting for hosted acceptance only if it is a named exception.
+#[test]
+fn every_holdable_write_is_declared_and_only_named_exceptions_require_acceptance() {
+    let contracts = crate::mcp::executor_prototype::NodeOperationContracts::local().unwrap();
+    for (executor, operation) in HOLDABLE {
+        let declared = contracts
+            .declared_requires_acceptance(executor, operation)
+            .unwrap_or_else(|| panic!("{executor}.{operation} has no acceptance declaration"));
+        assert_eq!(
+            declared,
+            HELD_DESPITE_REQUIRING_ACCEPTANCE.contains(&(executor, operation)),
+            "{executor}.{operation}: declared requires_acceptance = {declared}; it is held \
+             while requiring acceptance only if listed in HELD_DESPITE_REQUIRING_ACCEPTANCE"
+        );
+    }
+    // The exception list names only writes that really are held and really
+    // do require acceptance, so it cannot outlive its reason.
+    for (executor, operation) in HELD_DESPITE_REQUIRING_ACCEPTANCE {
+        assert!(HOLDABLE.contains(&(executor, operation)));
+        assert_eq!(
+            contracts.declared_requires_acceptance(executor, operation),
+            Some(true),
+            "{executor}.{operation} no longer requires acceptance: remove it from the exceptions"
+        );
+    }
+}

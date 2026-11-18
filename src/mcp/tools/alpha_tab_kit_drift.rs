@@ -157,6 +157,8 @@ const ASSERTED: &[&str] = &[
     "html.package_body_max_bytes",
     "html.data_asset_max_bytes",
     "html.data_assets_total_max_bytes",
+    "html.package_data_asset_max_bytes",
+    "html.package_data_assets_total_max_bytes",
     "html.dom_node_max",
     "html.css_rule_max",
     "html.input_json_max_bytes",
@@ -722,6 +724,16 @@ fn html_policy_matches_the_engine() {
         "html.data_assets_total_max_bytes",
         json!(html::DATA_ASSET_TOTAL_LIMIT),
         "DATA_ASSET_TOTAL_LIMIT",
+    );
+    same(
+        "html.package_data_asset_max_bytes",
+        json!(html::PACKAGE_DATA_ASSET_EACH_LIMIT),
+        "PACKAGE_DATA_ASSET_EACH_LIMIT",
+    );
+    same(
+        "html.package_data_assets_total_max_bytes",
+        json!(html::PACKAGE_DATA_ASSET_TOTAL_LIMIT),
+        "PACKAGE_DATA_ASSET_TOTAL_LIMIT",
     );
     same(
         "html.dom_node_max",

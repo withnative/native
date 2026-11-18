@@ -841,6 +841,14 @@ impl<F, R> RequestRevisionApplicabilityGate<F, R> {
             current_basis,
         }
     }
+
+    #[cfg(test)]
+    pub fn live_answer(&self, candidate: &str) -> Option<bool>
+    where
+        F: Fn(&str) -> Option<bool>,
+    {
+        (self.live_membership)(candidate)
+    }
 }
 
 impl<F, R> RevisionApplicabilityGate for RequestRevisionApplicabilityGate<F, R>

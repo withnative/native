@@ -134,6 +134,36 @@ function settle(frame, port, request_id, accepted) {
   const data = vm.runInContext(`({version:${JSON.stringify(VERSION)},type:"presentation-result",request_id:${JSON.stringify(request_id)},status:"ok",accepted:${accepted ? "true" : "false"}})`, frame.sandbox);
   port._emit("message", new frame.refs.MessageEvent("message", { data }));
 }
+test('saved call presentation is opt-in, frozen and cannot settle the confirmed read', async () => {
+  const f = loadFrame(), port = initFrame(f, ['app.call.v2']);
+  vm.runInContext(`var snapshots=[], confirmed=false; var ticket=window.native.call('manage_messages',
+    {action:'list_inbox'}, {onSnapshot:function(result,meta){snapshots.push({result,meta});}});
+    ticket.confirmed.then(function(){confirmed=true;});`, f.sandbox);
+  const id = posts(port).find(message => message.type === 'call').request_id;
+  assert.equal(posts(port).find(message => message.type === 'call').read_snapshot, true);
+  emit(f, port, { version: VERSION, type: 'call-snapshot', request_id: id, result: { items: ['old'] }, stored_at: 123 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.sandbox.snapshots.length, 1);
+  assert.equal(Object.isFrozen(f.sandbox.snapshots[0].result), true);
+  assert.equal(f.sandbox.snapshots[0].meta.storedAt, 123);
+  assert.equal(f.sandbox.confirmed, false);
+  emit(f, port, { version: VERSION, type: 'call-result', request_id: id, status: 'ok', result: { items: ['new'] } });
+  assert.equal((await f.sandbox.ticket.confirmed).items[0], 'new');
+  emit(f, port, { version: VERSION, type: 'call-snapshot', request_id: id, result: { items: ['late'] } });
+  assert.equal(f.sandbox.snapshots.length, 1);
+});
+test('a snapshot callback failure cannot break confirmation and normal calls request no snapshot', async () => {
+  const f = loadFrame(), port = initFrame(f, ['app.call.v2']);
+  vm.runInContext(`var normal=window.native.call('get_record',{});
+    var ticket=window.native.call('manage_messages',{}, {onSnapshot:function(){throw Error('paint failed');}});`, f.sandbox);
+  const calls = posts(port).filter(message => message.type === 'call');
+  assert.equal(calls[0].read_snapshot, undefined);
+  emit(f, port, { version: VERSION, type: 'call-snapshot', request_id: calls[1].request_id, result: {} });
+  emit(f, port, { version: VERSION, type: 'call-result', request_id: calls[1].request_id, status: 'ok', result: 'confirmed' });
+  assert.equal(await f.sandbox.ticket.confirmed, 'confirmed');
+  emit(f, port, { version: VERSION, type: 'call-result', request_id: calls[0].request_id, status: 'ok', result: {} });
+  await f.sandbox.normal.confirmed;
+});
 test("absent without host feature; present with app.presentation.v1", () => {
   const off = loadFrame(); initFrame(off, []);
   assert.equal(off.sandbox.window.nativeArtifact.presentation, undefined);
@@ -201,4 +231,19 @@ test("supplied canonical kit disposes if native slot initialization fails", asyn
   const frame=loadFrame(true,true);
   assert.match(String(frame.error),/Cannot redefine property/);
   await assert.rejects(frame.sandbox.testOwned.kit.read('records.recent'),error=>error.code==='closed');
+});
+
+test('title feature negotiates independently, normalizes, acknowledges and closes pending work', async () => {
+  const f=loadFrame(); const port=initFrame(f,['app.tab-title.v1']);
+  const api=f.sandbox.window.native.presentation;
+  assert.equal(api,f.sandbox.window.nativeArtifact.presentation);
+  assert.equal(api.setFloatingChat,undefined);assert.equal(typeof api.setTabTitle,'function');
+  const pending=api.setTabTitle(vm.runInContext('({title:"  My   document  "})',f.sandbox));
+  const sent=posts(port).find(m=>m.type==='tab-title');assert.equal(sent.title,'My document');
+  emit(f,port,{version:VERSION,type:'tab-title-result',request_id:sent.request_id,status:'ok',accepted:true});
+  assert.equal(await pending,true);
+  for(const expression of ['({title:""})','({title:"bad\\nname"})','({title:"\\u202ename"})','({title:"x".repeat(257)})','({get title(){throw Error("getter")}})','({title:"ok",extra:1})']) assert.throws(()=>api.setTabTitle(vm.runInContext(expression,f.sandbox)));
+  const clear=api.setTabTitle(vm.runInContext('({title:null})',f.sandbox));
+  port._emit('close',new f.refs.MessageEvent('close'));assert.equal(await clear,false);
+  const old=loadFrame();initFrame(old,['app.presentation.v1']);assert.equal(old.sandbox.window.native.presentation.setTabTitle,undefined);
 });

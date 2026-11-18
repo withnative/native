@@ -1,0 +1,14 @@
+{
+  "result": "UNPROVED: preserved3be9 predates installed-v7 ingress",
+  "a_source": "79af50f2deaf6b9cc87b9964274f922d7079b874",
+  "a_artifact_sha256": "ef2c7735d1e8aee295d3583a3705a2636fe184330264b0eec77191cad7d9f2aa",
+  "old_source": "3be9be425815749ec49653791fdebdd8019a3999",
+  "old_artifact_sha256": "a98eff0af6695f6033cc7db607de370ea614f837a0a9049926c85fe735136a84",
+  "compilation": "11m35s succeeded",
+  "execution": "12.74s; exact qualification test failed at private node start",
+  "failure": "invalid node config JSON: unknown field working_note_appends",
+  "ingress_reached": false,
+  "journal_fabricated": false,
+  "production_changed": false,
+  "next": "Build exact03b1bbb3 pre-A binary in managed workspace, then run sealed ingress;3be9 remains copy-downgrade evidence only."
+}

@@ -21,7 +21,7 @@ fn service_line() -> Option<ServiceInfo> {
 
 fn options(config_dir: &Path) -> StatusOptions {
     StatusOptions {
-        config_dir: config_dir.to_path_buf(),
+        config_path: config_dir.join(NODE_FILE),
         timeout: Duration::from_secs(5),
         service: service_line(),
     }
@@ -96,6 +96,8 @@ pub(crate) struct Seed {
     state: &'static str,
     accepted: String,
     title: String,
+    held: bool,
+    refused: bool,
 }
 
 impl Seed {
@@ -106,6 +108,8 @@ impl Seed {
             state: "pending",
             accepted: accepted.to_owned(),
             title: title.to_owned(),
+            held: true,
+            refused: false,
         }
     }
 }
@@ -126,7 +130,7 @@ fn seed_writes(socket_directory: &Path, seeds: &[Seed]) {
             "state": seed.state,
             "received_at": seed.accepted,
             "received_unix_ms": 1_792_656_000_000u64 + seed.seq,
-            "updated_at": seed.accepted,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
             "executor": "records_write",
             "operation": "create_record",
             "tool": "call_executor",
@@ -137,7 +141,8 @@ fn seed_writes(socket_directory: &Path, seeds: &[Seed]) {
             "arguments": {"name": seed.title, "body": SECRET_BODY},
             "seq": seed.seq,
             "title": seed.title,
-            "hold_reason": "hosted_unreachable",
+            "hold_reason": if seed.held { json!("hosted_unreachable") } else { Value::Null },
+            "answer": if seed.refused { json!("refused") } else { Value::Null },
             "envelope": {"run_key": "run-1", "format": "json"},
         });
         let path = journal.join(format!("{}.json", seed.id));
@@ -196,6 +201,7 @@ pub(crate) async fn start_node_with(
         hosted.shut_down();
     }
     // A local build is stamped `dev` and cannot serve a copy; see the setup test.
+    #[cfg(feature = "mcp-executor-prototype")]
     crate::node::set_test_consumer_identity(Some(
         crate::standby::generation_store::tests::observed(),
     ));
@@ -273,7 +279,7 @@ async fn online_status_names_the_mode_the_copy_and_the_account() {
     let text = render_text(&report);
     assert!(text.contains("Mode:        hosted reachable"), "{text}");
     assert!(
-        text.contains("Local copy:") && text.contains("accepted copy synced"),
+        text.contains("Local copy:") && text.contains("accepted copy last matching check/capture"),
         "{text}"
     );
     assert!(
@@ -311,7 +317,10 @@ async fn an_unreachable_hosted_is_reported_with_the_local_copy_age() {
     assert!(copy.accepted && copy.age_seconds.is_some(), "{copy:?}");
     let text = render_text(&report);
     assert!(text.contains("Mode:        hosted unreachable"), "{text}");
-    assert!(text.contains("synced") && text.contains("ago"), "{text}");
+    assert!(
+        text.contains("last matching check/capture") && text.contains("ago"),
+        "{text}"
+    );
     assert_eq!((report.health, report.exit_code), (Health::Degraded, 1));
     assert!(report.problems.iter().any(|p| p.contains("unreachable")));
 }
@@ -412,6 +421,8 @@ async fn missing_and_invalid_node_json_are_misconfiguration() {
         (NodeState::NoConfig, 2)
     );
     assert!(render_text(&report).contains("native setup"));
+    assert!(render_text(&report).contains("--config-dir"));
+    assert!(!render_text(&report).contains("setup` first"));
     std::fs::write(dir.path().join(NODE_FILE), b"{\"hosted_base_url\": 7}").unwrap();
     let report = collect(options(dir.path())).await;
     assert_eq!(
@@ -603,6 +614,48 @@ fn quiet_node(hosted: &str) -> Value {
     })
 }
 
+#[test]
+fn reporting_keeps_check_materialization_and_revision_lag_separate() {
+    for (health, state, expected) in [
+        (
+            "reachable",
+            "matches_latest_known",
+            "matches the latest known hosted revision",
+        ),
+        (
+            "reachable",
+            "behind_latest_known",
+            "hosted has confirmed newer revisions",
+        ),
+        (
+            "unreachable",
+            "matches_latest_known",
+            "matches the latest known hosted revision",
+        ),
+    ] {
+        let mut status = serving_status(900, "beyond_rpo");
+        status["sync_observation"] = json!({
+            "last_matching_hosted_check_at":"2026-10-22T09:45:00Z",
+            "last_local_materialization_at":"2026-10-22T08:00:00Z",
+            "last_data_change_at":null,
+        });
+        status["node_routing"] = json!({"revision_comparison":{
+            "state":state,"last_successful_hosted_check_at":"2026-10-22T09:45:00Z",
+            "current_lag_known":false,"time_lag_seconds":null,
+        }});
+        let report = report_of(status, quiet_node(health));
+        let text = render_text(&report);
+        assert!(text.contains(expected), "{text}");
+        assert!(
+            text.contains("Last local materialization: 2026-10-22T08:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("Last source data change: unknown"), "{text}");
+        assert!(text.contains("current lag and time lag unknown"), "{text}");
+        assert!(!text.contains("copy is stale"), "{text}");
+    }
+}
+
 fn report_of(standby: Value, node: Value) -> Report {
     build(
         Path::new("/c/node.json"),
@@ -630,10 +683,39 @@ fn a_serving_fresh_copy_with_nothing_waiting_is_healthy_and_exit_0() {
         "{text}"
     );
     assert!(
-        text.contains("Local copy:  synced 42s ago (fresh, within the 5m 0s target)"),
+        text.contains(
+            "Local copy:  last matching check/capture 42s ago (check age within the 5m 0s target)"
+        ),
         "{text}"
     );
     assert!(text.contains("Held writes: none waiting"));
+}
+
+#[test]
+fn verification_passes_reach_the_cli_report_and_older_nodes_stay_silent() {
+    let mut status = serving_status(42, "fresh");
+    status["verification_passes"] = json!(7);
+    status["verification_total_seconds"] = json!(125);
+    let report = report_of(status, quiet_node("reachable"));
+    let copy = report.local_copy.as_ref().unwrap();
+    assert_eq!(copy.verification_passes, Some(7));
+    assert_eq!(copy.verification_total_seconds, Some(125));
+    let text = render_text(&report);
+    assert!(
+        text.contains("Verification:  7 full passes (2m 5s total)"),
+        "{text}"
+    );
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["local_copy"]["verification_passes"], 7);
+    assert_eq!(json["local_copy"]["verification_total_seconds"], 125);
+
+    // An older node without the projection: no line, no failure.
+    let report = report_of(serving_status(42, "fresh"), quiet_node("reachable"));
+    let copy = report.local_copy.as_ref().unwrap();
+    assert_eq!(copy.verification_passes, None);
+    assert_eq!(copy.verification_total_seconds, None);
+    assert_eq!((report.health, report.exit_code), (Health::Healthy, 0));
+    assert!(!render_text(&report).contains("Verification:"));
 }
 
 #[test]
@@ -645,7 +727,10 @@ fn unreachable_hosted_with_a_serving_copy_says_it_serves_local_reads() {
         text.contains("Mode:        hosted unreachable; serving local reads"),
         "{text}"
     );
-    assert!(text.contains("synced 1m 35s ago"), "{text}");
+    assert!(
+        text.contains("last matching check/capture 1m 35s ago"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -658,7 +743,10 @@ fn a_copy_past_the_rpo_is_stale_and_auth_refusal_is_its_own_mode() {
     assert_eq!(copy.stale, Some(true));
     assert_eq!(report.exit_code, 1);
     let text = render_text(&report);
-    assert!(text.contains("stale, beyond the 5m 0s target"), "{text}");
+    assert!(
+        text.contains("check age beyond the 5m 0s target; missing changes unknown"),
+        "{text}"
+    );
     assert!(
         text.contains("Mode:        hosted refused the node's credentials"),
         "{text}"
@@ -732,10 +820,10 @@ fn held_writes_show_counts_the_newest_five_and_never_bodies() {
     assert_eq!(held.recent.len(), 5);
     assert_eq!(held.recent[0].title.as_deref(), Some("Write 8"));
     assert_eq!(held.recent[4].title.as_deref(), Some("Write 4"));
-    assert_eq!(held.more, 3);
+    assert_eq!(held.more, 5);
     let text = render_text(&report);
     assert!(text.contains("Held writes: 10 waiting (4 pending, 4 hosted_pending, 2 uncertain); oldest accepted 2026-10-22T08:01:00Z"), "{text}");
-    assert!(text.contains("... and 3 more"), "{text}");
+    assert!(text.contains("... and 5 more"), "{text}");
     assert!(
         !text.contains(SECRET_BODY)
             && !serde_json::to_string(&report)
@@ -817,6 +905,20 @@ fn assert_schema(value: &Value) {
         for key in ["hosted", "serving", "status_only_reason", "summary"] {
             assert!(mode.get(key).is_some(), "mode.{key}");
         }
+        if let Some(observations) = mode.get("client_compatibility") {
+            assert!(observations.is_object(), "mode.client_compatibility");
+            for scope in ["node", "replication"] {
+                let observation = observations.get(scope).expect("named compatibility scope");
+                if observation.is_null() {
+                    continue;
+                }
+                assert!(["no_demand", "demand_recorded"]
+                    .contains(&observation["status"].as_str().unwrap()));
+                assert_eq!(observation["updater"], "unavailable");
+                assert!(observation["demands"].is_array());
+                assert!(observation["additional_demands"].is_boolean());
+            }
+        }
         let held = &value["held_writes"];
         for key in [
             "waiting",
@@ -858,6 +960,8 @@ fn assert_schema(value: &Value) {
                 "last_refresh_failure",
                 "consecutive_failures",
                 "degraded_reasons",
+                "verification_passes",
+                "verification_total_seconds",
             ] {
                 assert!(copy.contains_key(key), "local_copy.{key}");
             }
@@ -933,6 +1037,11 @@ async fn json_from_a_real_node_matches_the_schema() {
     let value = serde_json::to_value(&report).unwrap();
     assert_schema(&value);
     assert_eq!(value["node"]["state"], "running");
+    assert!(value.get("client_compatibility").is_none());
+    assert_eq!(
+        value["mode"]["client_compatibility"]["node"]["status"],
+        "no_demand"
+    );
     assert_eq!(value["held_writes"]["recent"][0]["title"], "Quarterly plan");
     assert!(!value.to_string().contains(SECRET_BODY));
 }
@@ -1185,7 +1294,7 @@ fn a_stale_revision_is_stale_with_its_real_age_never_fresh() {
         assert!(copy.following_paused, "{label}");
         let text = render_text(&report);
         assert!(
-            text.contains("synced 30s ago (stale: following is paused"),
+            text.contains("last matching check/capture 30s ago (stale: following is paused"),
             "{label}: {text}"
         );
         assert!(!text.contains("fresh"), "{label}: {text}");
@@ -1453,4 +1562,272 @@ async fn an_old_node_that_ignores_order_never_has_its_oldest_writes_called_the_n
         .collect();
     assert_eq!(titles, ["Write 3", "Write 2", "Write 1"]);
     assert!(!render_text(&report).contains("unavailable from this node version"));
+}
+
+#[tokio::test]
+async fn status_lists_the_waiting_backlog_instead_of_acknowledged_receipts() {
+    let mut seeds = Vec::new();
+    for n in 1..=30 {
+        let mut seed = Seed::pending(
+            n,
+            &format!("2026-11-13T08:{n:02}:00.000Z"),
+            &format!("Write {n}"),
+        );
+        if n <= 22 {
+            seed.state = "uncertain";
+            seed.held = false; // Older forwards were never held by the node.
+        } else if n <= 24 {
+            seed.state = "confirmed";
+            seed.refused = true;
+        } else {
+            seed.state = "acknowledged";
+        }
+        seeds.push(seed);
+    }
+    let running = start_node(true, &seeds).await;
+    let report = collect(options(&running.install.config)).await;
+    let held = report.held_writes.as_ref().unwrap();
+    assert_eq!(held.waiting, 24);
+    assert_eq!(held.counts.get("uncertain"), Some(&22));
+    assert_eq!(held.counts.get("refused"), Some(&2));
+    assert_eq!(
+        held.recent
+            .iter()
+            .map(|w| w.title.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["Write 24", "Write 23", "Write 22", "Write 21", "Write 20"]
+    );
+    assert_eq!(held.more, 19);
+    assert_eq!(
+        held.oldest_accepted_at.as_deref(),
+        Some("2026-11-13T08:01:00.000Z")
+    );
+    let text = render_text(&report);
+    assert!(!text.contains("acknowledged"));
+    assert!(!text.contains(SECRET_BODY));
+    assert!(text.contains("19 more"));
+    // Reconciled receipts remain inspectable with an explicit filter.
+    let acknowledged = raw_node_status(&running.socket, json!({"state":"acknowledged"})).await;
+    assert_eq!(acknowledged["held_writes"]["matched"], 6);
+    let legacy = raw_node_status(
+        &running.socket,
+        json!({"state":"uncertain", "run":"run-1", "limit":3}),
+    )
+    .await;
+    assert_eq!(legacy["held_writes"]["matched"], 22);
+    assert_eq!(legacy["held_writes"]["shown"], 3);
+}
+
+#[test]
+fn overdue_refresh_is_visible_even_when_hosted_is_reachable_and_no_failure_is_recorded() {
+    let mut standby = serving_status(3952, "beyond_rpo");
+    standby["refresh"]["last_success_at"] = json!("2026-11-16T07:58:00Z");
+    standby["refresh"]["in_flight"] = json!({
+        "cause":"after_admitted_write", "phase":"following", "started_at":"2026-11-16T08:02:16Z",
+        "elapsed_seconds":3952, "deadline_seconds":600, "overdue":true,
+    });
+    let report = report_of(standby, quiet_node("reachable"));
+    assert_eq!(report.health, Health::Degraded);
+    assert!(report
+        .problems
+        .iter()
+        .any(|problem| problem.contains("exceeded its deadline")));
+    let text = render_text(&report);
+    assert!(text.contains("3952s elapsed; deadline 600s"), "{text}");
+    assert!(text.contains("2026-11-16T07:58:00Z"), "{text}");
+    assert!(text.contains("native status --diagnose"), "{text}");
+    assert!(!text.contains("restore hosted connectivity"), "{text}");
+}
+
+#[cfg(unix)]
+mod mac_service_report_tests {
+    use super::super::{mac_service_info, ServiceInfo};
+    use crate::native_cli::service::{Installed, StatusReport, LAUNCHD_LABEL};
+    use crate::native_cli::status::discovery::{
+        mac_jobs_from_prints, MacServiceJob, LEGACY_MAC_LABEL,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn report(installed: Installed, running: Option<bool>) -> StatusReport {
+        StatusReport {
+            unit_path: PathBuf::from(
+                "/Users/example/Library/LaunchAgents/ai.withnative.node.plist",
+            ),
+            installed,
+            running,
+            state: None,
+            enabled: None,
+            unknown: None,
+        }
+    }
+
+    fn print(plist: &str, state: &str, config: &str) -> String {
+        let program = "/Users/example/Library/Application Support/native-node/bin/mcp-stdio";
+        format!(
+            "\tpath = {plist}\n\tstate = {state}\n\tprogram = {program}\n\
+             \targuments = {{\n\t\t{program}\n\t\tnode\n\t\tserve\n\
+             \t\t--config\n\t\t{config}\n\t}}\n"
+        )
+    }
+
+    fn jobs(current: Option<&str>, legacy: Option<&str>) -> Vec<MacServiceJob> {
+        let mut prints = Vec::new();
+        if let Some(text) = current {
+            prints.push((LAUNCHD_LABEL, text.to_owned()));
+        }
+        if let Some(text) = legacy {
+            prints.push((LEGACY_MAC_LABEL, text.to_owned()));
+        }
+        mac_jobs_from_prints(prints)
+    }
+
+    #[test]
+    fn reports_external_legacy_job_matching_selected_config_with_spaces() {
+        let selected =
+            Path::new("/Users/example/Library/Application Support/native-node/config/node.json");
+        let plist = "/Users/example/Library/LaunchAgents/my agent.plist";
+        let jobs = jobs(
+            None,
+            Some(&print(plist, "running", selected.to_str().unwrap())),
+        );
+        let info: ServiceInfo = mac_service_info(selected, &report(Installed::No, None), &jobs);
+        assert_eq!(info.installed, Some(true));
+        assert_eq!(info.running, Some(true));
+        assert!(info.line.contains(LEGACY_MAC_LABEL), "{}", info.line);
+        assert!(
+            info.line.contains("not managed by `native service`"),
+            "{}",
+            info.line
+        );
+        assert!(info.line.contains(plist), "{}", info.line);
+    }
+
+    #[test]
+    fn owned_service_is_reported_only_for_the_selected_config() {
+        let selected = Path::new("/selected/node.json");
+        let owned = report(Installed::Ours, Some(true));
+        let other = print("/agent.plist", "running", "/other/node.json");
+        // A loaded current job naming another config is not this config's service.
+        let info = mac_service_info(selected, &owned, &jobs(Some(&other), None));
+        assert_ne!(info.installed, Some(true));
+        assert!(!info.line.contains("installed, running"), "{}", info.line);
+        // The same config keeps the owned report unchanged.
+        let matching = print("/agent.plist", "running", "/selected/node.json");
+        let info = mac_service_info(selected, &owned, &jobs(Some(&matching), None));
+        assert_eq!(info.installed, Some(true));
+        assert_eq!(info.running, Some(true));
+        assert_eq!(info.line, owned.to_string());
+    }
+
+    #[test]
+    fn owned_other_config_still_reports_a_legacy_job_for_selected() {
+        let selected = Path::new("/selected/node.json");
+        let info = mac_service_info(
+            selected,
+            &report(Installed::Ours, Some(true)),
+            &jobs(
+                Some(&print("/agent.plist", "running", "/other/node.json")),
+                Some(&print("/legacy.plist", "running", "/selected/node.json")),
+            ),
+        );
+        assert_eq!(info.installed, Some(true));
+        assert_eq!(info.running, Some(true));
+        assert!(info.line.contains(LEGACY_MAC_LABEL), "{}", info.line);
+        assert!(
+            info.line.contains("not managed by `native service`"),
+            "{}",
+            info.line
+        );
+    }
+
+    #[test]
+    fn unloaded_owned_service_does_not_hide_running_legacy_job() {
+        let selected = Path::new("/selected/node.json");
+        let owned = report(Installed::Ours, Some(false));
+        let legacy = print("/legacy.plist", "running", "/selected/node.json");
+        let info = mac_service_info(selected, &owned, &jobs(None, Some(&legacy)));
+        assert_eq!(info.running, Some(true));
+        assert!(info.line.contains(LEGACY_MAC_LABEL), "{}", info.line);
+        // Without live evidence, an installed plist does not identify this config.
+        let stopped_current = print("/current.plist", "waiting", "/selected/node.json");
+        let info = mac_service_info(
+            selected,
+            &owned,
+            &jobs(Some(&stopped_current), Some(&legacy)),
+        );
+        assert_eq!(info.running, Some(true));
+        assert!(info.line.contains(LEGACY_MAC_LABEL), "{}", info.line);
+        let info = mac_service_info(selected, &owned, &[]);
+        assert_eq!(info.installed, None);
+        assert_eq!(info.running, None);
+        assert!(info.line.contains("cannot confirm"), "{}", info.line);
+    }
+
+    #[test]
+    fn malformed_current_job_falls_through_to_legacy_and_absence_is_honest() {
+        let selected = Path::new("/selected/node.json");
+        let info = mac_service_info(
+            selected,
+            &report(Installed::No, None),
+            &jobs(
+                Some("not a launchd record"),
+                Some(&print("/legacy.plist", "waiting", "/selected/node.json")),
+            ),
+        );
+        assert_eq!(info.running, Some(false), "{}", info.line);
+        assert!(info.line.contains("not running (waiting)"), "{}", info.line);
+        // Nothing loaded and nothing installed: no owned state is invented.
+        let info = mac_service_info(selected, &report(Installed::No, None), &[]);
+        assert_eq!(info.installed, Some(false));
+        assert_eq!(info.running, None);
+        assert!(info.line.contains("not installed"), "{}", info.line);
+    }
+}
+
+#[test]
+fn update_required_observation_reaches_cli_json_and_text_without_an_updater() {
+    let monitor = crate::client_compatibility::Monitor::default();
+    monitor.observe(
+        "records_write",
+        "create_record",
+        Some(426),
+        br#"{"error_code":"client_update_required","outcome":"refused","applied":false}"#,
+    );
+    for replication in [false, true] {
+        let mut node = quiet_node("reachable");
+        if replication {
+            node["hosted"]["replication_compatibility"] = monitor.status();
+        } else {
+            node["client_compatibility"] = monitor.status();
+        }
+        let report = report_of(serving_status(42, "fresh"), node);
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_schema(&encoded);
+        assert!(encoded.get("client_compatibility").is_none());
+        let scope = if replication { "replication" } else { "node" };
+        assert_eq!(
+            encoded["mode"]["client_compatibility"][scope]["status"],
+            "demand_recorded"
+        );
+        assert_eq!(
+            encoded["mode"]["client_compatibility"][scope]["updater"],
+            "unavailable"
+        );
+        assert!(render_text(&report).contains("demand recorded; updater unavailable"));
+        assert_eq!(report.health, Health::Healthy);
+    }
+    let older = report_of(serving_status(42, "fresh"), quiet_node("reachable"));
+    let older_json = serde_json::to_value(&older).unwrap();
+    assert_schema(&older_json);
+    assert!(older_json["mode"].get("client_compatibility").is_none());
+    assert_eq!(older_json["mode"].as_object().unwrap().len(), 4);
+    let down = serde_json::to_value(report_down(
+        down(NodeState::NoSocket, "not running", None, None),
+        None,
+    ))
+    .unwrap();
+    assert_schema(&down);
+    assert!(down["mode"].is_null());
+    assert!(down.get("client_compatibility").is_none());
+    assert!(!render_text(&older).contains("Update:"));
 }

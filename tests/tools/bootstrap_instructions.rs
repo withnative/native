@@ -658,7 +658,7 @@ async fn bootstrap_resolves_ordered_caller_context_without_consuming_obligations
         native_ce::ENGINE_VERSION
     );
     assert_eq!(entries[0]["source"]["template_key"], "engine-orientation");
-    assert_eq!(entries[0]["source"]["template_version"], 11);
+    assert_eq!(entries[0]["source"]["template_version"], 14);
     assert!(entries[0]["source"]["record_id"].is_null());
     let orientation = entries[0]["content"].as_str().unwrap();
     for guarantee in [

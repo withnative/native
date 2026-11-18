@@ -1,4 +1,4 @@
-//! Finite record scopes for rows whose visibility depends only on those IDs.
+//! Finite record scopes with closed placement and currency dependencies.
 //! Caller SQL stays intact; global catalogue joins need no additional records.
 use super::contract::QuerySqlParameter;
 use std::collections::BTreeSet;
@@ -18,17 +18,26 @@ pub(super) fn full_staging() -> bool {
     false
 }
 
+#[cfg(test)]
 pub(super) fn ids(
     statement: &str,
     parameters: &[QuerySqlParameter],
     reads: &BTreeSet<(String, String)>,
 ) -> Option<Vec<String>> {
-    if full_staging()
-        || reads
-            .iter()
-            .any(|(r, c)| r == "records" && ["is_current", "successor_count"].contains(&c.as_str()))
-    {
-        // Currency cells depend on other visible records, not just this row.
+    ids_with(statement, parameters, reads, false).map(|(ids, _)| ids)
+}
+
+/// Finite record IDs that bound every records occurrence, optionally also accepting a closed chain of records self-joins
+/// `hN.id = h(N-1).home_id` from the scoped record. The second value says a
+/// chain was accepted: the caller must then stage the logical-placement
+/// fixpoint of the IDs (`demand::placement_closure`), never only the IDs.
+pub(super) fn ids_with(
+    statement: &str,
+    parameters: &[QuerySqlParameter],
+    reads: &BTreeSet<(String, String)>,
+    allow_home_chain: bool,
+) -> Option<(Vec<String>, bool)> {
+    if full_staging() {
         return None;
     }
     let mut parser = turso_parser::parser::Parser::new(statement.as_bytes());
@@ -83,15 +92,42 @@ pub(super) fn ids(
         .map(|a| a.name().as_str())
         .unwrap_or_else(|| table.name.as_str());
     // Only global vocabulary joins are independent of the finite record set.
-    // Home self-joins can read the joined home's own logical placement. The
-    // finite-ID path stages only one home level, so retain full staging for
-    // every records self-join rather than exposing incomplete home-derived cells.
+    // Home self-joins can read the joined home's own logical placement. One
+    // finite level cannot answer them, so a records self-join stages in full
+    // unless the caller will stage the placement fixpoint (`allow_home_chain`)
+    // and every join is exactly `hN.id = h(N-1).home_id` down a single chain.
+    let mut home_chain = false;
+    let mut predecessor = qualifier.to_owned();
     for join in &from.joins {
-        let SelectTable::Table(table, _, _) = join.table.as_ref() else {
+        let SelectTable::Table(table, joined_alias, _) = join.table.as_ref() else {
             return None;
         };
         if table.db_name.is_some() || table.alias.is_some() {
             return None;
+        }
+        if allow_home_chain
+            && relation == "records"
+            && table.name.as_str().eq_ignore_ascii_case("records")
+        {
+            let joined = joined_alias
+                .as_ref()
+                .map(|a| a.name().as_str())
+                .unwrap_or(table.name.as_str());
+            let Some(turso_parser::ast::JoinConstraint::On(expr)) = &join.constraint else {
+                return None;
+            };
+            let Expr::Binary(a, Operator::Equals, b) = unparen(expr) else {
+                return None;
+            };
+            if joined.eq_ignore_ascii_case(&predecessor)
+                || !((is_column(a, joined, "id") && is_column(b, &predecessor, "home_id"))
+                    || (is_column(b, joined, "id") && is_column(a, &predecessor, "home_id")))
+            {
+                return None;
+            }
+            predecessor = joined.to_owned();
+            home_chain = true;
+            continue;
         }
         if relation != "record_lifecycle_interpretations"
             || !["vocabularies", "vocabulary_values"]
@@ -133,7 +169,7 @@ pub(super) fn ids(
         }
     }
     let ids = bounds(predicate, qualifier, column, parameters)?;
-    (ids.len() <= 1000).then(|| ids.into_iter().collect())
+    (ids.len() <= 1000).then(|| (ids.into_iter().collect(), home_chain))
 }
 
 fn unparen(mut expr: &Expr) -> &Expr {
@@ -350,6 +386,32 @@ mod tests {
             "SELECT r.id, h.id AS home, h.home_id AS grand FROM records r LEFT JOIN records h ON h.id = r.home_id WHERE r.id='private-child'",
         ] {
             assert_eq!(plan(sql), None, "{sql}");
+        }
+    }
+    #[test]
+    fn scoped_currency_keeps_finite_bounds_and_rejects_record_dependencies() {
+        let parameters = [QuerySqlParameter::Text {
+            value: Some("parameter".into()),
+        }];
+        let reads = BTreeSet::from([
+            ("records".into(), "id".into()),
+            ("records".into(), "is_current".into()),
+            ("records".into(), "successor_count".into()),
+        ]);
+        for sql in [
+            "SELECT is_current,successor_count FROM records WHERE id=?1",
+            "SELECT * FROM records WHERE id=?1 AND is_current IS NULL",
+            "SELECT id FROM records WHERE id=?1 OR id='other' ORDER BY successor_count",
+        ] {
+            assert!(ids(sql, &parameters, &reads).is_some(), "{sql}");
+        }
+        for sql in [
+            "SELECT id,is_current FROM records WHERE is_current=1",
+            "SELECT r.id,h.is_current FROM records r JOIN records h ON h.id=r.home_id WHERE r.id=?1",
+            "SELECT id FROM records WHERE id=?1 AND EXISTS(SELECT 1 FROM records WHERE is_current=1)",
+            "SELECT id FROM records WHERE id=?1 UNION SELECT id FROM records",
+        ] {
+            assert_eq!(ids(sql, &parameters, &reads), None, "{sql}");
         }
     }
     #[test]

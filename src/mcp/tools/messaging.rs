@@ -27,6 +27,14 @@ use super::{
     REASON_DESCRIPTION,
 };
 
+/// Keep authority refusals actionable without implying that ordinary MCP
+/// credentials attest a human interaction or an independently verified agent.
+pub(crate) fn authority_refusal(boundary: &str) -> Error {
+    Error::engine(format!(
+        "{boundary}. For completed action work, use a recipient-authored WorkItem linked to the Message with derived_from and a governed positively completed lifecycle; then check manage_messages.list_message_state. Read the messaging guide for completion steps and authority boundaries."
+    ))
+}
+
 // Missing means no claim; explicit null is an invalid supplied claim.
 fn deserialize_speaker_claim<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -1665,17 +1673,17 @@ async fn own_no_longer_relevant_marks_in(
     .await?)
 }
 
-/// Delete one of the caller's own Messages: the existing `record.deleted`
-/// tombstone (every listing already filters it, a later reaction is refused by
-/// the projector, and its notification candidates are withdrawn in the same
-/// transaction). The body is not erased; it stays in stored history.
+/// Delete a Message: the existing `record.deleted` tombstone (every listing
+/// already filters it, a later reaction is refused by the projector, and its
+/// notification candidates are withdrawn in the same transaction). The body is
+/// not erased; it stays in stored history.
 ///
-/// Only the author may delete: the Message's `owner_id` must be the Person
-/// bound to the authenticated caller, on top of the Edit capability the
-/// sibling operations require. A persona-voiced Message has the same owner as
-/// its sender, so its owner may delete it and nobody else can. A repeat with
-/// the same idempotency key replays the first receipt; an already-deleted
-/// Message sent again under a new key is refused by name to its author.
+/// The author may delete, and so may a caller who holds Manage on the
+/// Message's channel (see [`require_author_or_channel_manager_in`]). Editing
+/// stays author-only. A persona-voiced Message follows the same rule: its
+/// owner is its sender. A repeat with the same idempotency key replays the
+/// first receipt; an already-deleted Message sent again under a new key is
+/// refused by name to its author.
 async fn delete_message(
     db: &Db,
     caller: &Caller,
@@ -1718,7 +1726,7 @@ async fn delete_message(
             replay.act(),
         );
     }
-    require_author_in(&mut tx, caller, &message_id, AuthorAction::Delete).await?;
+    require_author_or_channel_manager_in(&mut tx, caller, &message_id).await?;
     let deletion = append_in(
         db,
         &mut tx,
@@ -1751,62 +1759,107 @@ async fn delete_message(
     )
 }
 
-#[derive(Clone, Copy)]
-enum AuthorAction {
-    Delete,
-    Edit,
+/// The channel a Message belongs to, for moderation: strictly the Collection
+/// declared as the Message's communication origin at send time
+/// (`message_origin_state.collection_id`); a direct Message has none.
+///
+/// Classification is deliberately not consulted. Filing a Message into a
+/// Conversation needs only Edit on the Message and View on the Conversation,
+/// so a Conversation is something an Edit holder controls. Treating it as a
+/// channel would let any Edit holder file a colleague's Message into their own
+/// Conversation and then delete it; moderation authority must come from the
+/// place the Message was actually sent. `home_id` is filing, not the channel:
+/// it defaults to the origin Collection for channel posts but is
+/// `native:unfiled` for direct Messages, so it is not used here.
+async fn message_origin_channel_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    message_id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT collection_id FROM message_origin_state
+          WHERE message_id=? AND origin_type='collection' AND collection_id IS NOT NULL",
+    )
+    .bind(message_id)
+    .fetch_optional(&mut **tx)
+    .await?)
 }
 
-impl AuthorAction {
-    fn tool(self) -> &'static str {
-        match self {
-            Self::Delete => "manage_messages.delete",
-            Self::Edit => "manage_messages.edit",
-        }
-    }
-
-    fn verb(self) -> &'static str {
-        match self {
-            Self::Delete => "delete",
-            Self::Edit => "edit",
-        }
-    }
+async fn message_is_persona_voiced_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    message_id: &str,
+) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_speakers WHERE message_id=?)")
+            .bind(message_id)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
 }
 
-/// The checks shared by the author-only Message operations, in order: a
+/// Delete's authorization, split from edit's: the author may delete, and so
+/// may a caller who holds Manage on the Message's channel. In order: a
 /// deleted Message is named as such to its author (and reads as missing to
-/// anyone else), the Message must be visible, local and Edit-able by the
-/// caller, and the caller must be its author. A Message sent as a persona is
-/// held to the same rule: its owner is its sender.
+/// anyone else), the Message must be visible and local, an author must also
+/// hold Edit on the Message, and a non-author must hold Manage on the
+/// Message's origin channel. Persona-voiced Messages follow the same rule.
+async fn require_author_or_channel_manager_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    message_id: &str,
+) -> Result<()> {
+    let is_author = message_author_is_caller_in(tx, caller, message_id).await?;
+    if is_author == Some(true) && message_deleted_at_in(tx, message_id).await?.is_some() {
+        return Err(Error::engine(format!(
+            "manage_messages.delete: Message {message_id} is already deleted"
+        )));
+    }
+    require_local_message_in(tx, caller, message_id).await?;
+    if is_author == Some(true) {
+        require_record_in(tx, caller, "manage_messages", message_id, Capability::Edit).await?;
+        return Ok(());
+    }
+    let origin_channel = message_origin_channel_in(tx, message_id).await?;
+    if let Some(channel_id) = origin_channel.as_deref() {
+        if can_record_in(tx, caller, channel_id, Capability::Manage).await? {
+            return Ok(());
+        }
+    }
+    let persona = message_is_persona_voiced_in(tx, message_id).await?;
+    // A Message with no origin channel (a direct Message) is author-only, so
+    // the refusal must not imply a channel exists to manage.
+    let manager_clause = if origin_channel.is_some() {
+        " or someone who manages this channel"
+    } else {
+        ""
+    };
+    Err(Error::engine(format!(
+        "manage_messages.delete: only the author{manager_clause} can delete a Message{}",
+        if persona { " sent as a persona" } else { "" }
+    )))
+}
+
+/// Edit's authorization, author-only: a deleted Message is named as such to
+/// its author (and reads as missing to anyone else), the Message must be
+/// visible, local and Edit-able by the caller, and the caller must be its
+/// author. A Message sent as a persona is held to the same rule: its owner
+/// is its sender. Channel managers may delete but never edit.
 async fn require_author_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
     message_id: &str,
-    action: AuthorAction,
 ) -> Result<()> {
     let is_author = message_author_is_caller_in(tx, caller, message_id).await?;
     if is_author == Some(true) && message_deleted_at_in(tx, message_id).await?.is_some() {
-        return Err(Error::engine(match action {
-            AuthorAction::Delete => {
-                format!("manage_messages.delete: Message {message_id} is already deleted")
-            }
-            AuthorAction::Edit => format!(
-                "manage_messages.edit: Message {message_id} is deleted and cannot be edited"
-            ),
-        }));
+        return Err(Error::engine(format!(
+            "manage_messages.edit: Message {message_id} is deleted and cannot be edited"
+        )));
     }
     require_local_message_in(tx, caller, message_id).await?;
     require_record_in(tx, caller, "manage_messages", message_id, Capability::Edit).await?;
     if is_author != Some(true) {
-        let persona: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_speakers WHERE message_id=?)")
-                .bind(message_id)
-                .fetch_one(&mut **tx)
-                .await?;
+        let persona = message_is_persona_voiced_in(tx, message_id).await?;
         return Err(Error::engine(format!(
-            "{}: only the author can {} a Message{}",
-            action.tool(),
-            action.verb(),
+            "manage_messages.edit: only the author can edit a Message{}",
             if persona { " sent as a persona" } else { "" }
         )));
     }
@@ -1818,7 +1871,8 @@ async fn require_author_in(
 /// Message, so every earlier text stays in the log and the Message
 /// immutability guard stays closed to every other path.
 ///
-/// Authorship is exactly delete's. An edit never alerts anyone: awareness,
+/// Authorship is edit's own, author-only rule (delete also admits channel
+/// managers; edit does not). An edit never alerts anyone: awareness,
 /// read state and notification candidates are untouched (candidates carry no
 /// text, so none can go stale), except that a person whose mention the edit
 /// removes has their mention candidate withdrawn. Structured mention spans
@@ -1878,7 +1932,7 @@ async fn edit_message(
             replay.act(),
         );
     }
-    require_author_in(&mut tx, caller, &message_id, AuthorAction::Edit).await?;
+    require_author_in(&mut tx, caller, &message_id).await?;
     let (current_body, audience_status): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT r.body,s.status FROM records r
            LEFT JOIN message_audience_state s ON s.message_id=r.id WHERE r.id=?",
@@ -4343,6 +4397,7 @@ async fn manage_messages_non_send(
             Ok(json!({
                 "schema":"native.message-state.v1","content_head":content_head,
                 "messages":messages,"viewer_relative":true,"snapshot_consistent":true,
+                "capabilities":{"edit":true,"delete":true,"reactions":true,"saved_session_sharing":true},
             }))
         }
         ManageMessagesArgs::ListConversation { conversation_id } => {
@@ -4433,7 +4488,7 @@ async fn manage_messages_non_send(
             let attestation = caller
                 .verified_human_interaction()
                 .ok_or_else(|| {
-                    Error::engine(
+                    authority_refusal(
                         "human awareness requires a server-verified interaction attestation",
                     )
                 })?
@@ -4523,7 +4578,7 @@ async fn manage_messages_non_send(
         } => {
             require_nonblank_reason("manage_messages.set_agent_disposition", &reason)?;
             let verified_executor = caller.verified_agent_executor().ok_or_else(|| {
-                Error::engine(
+                authority_refusal(
                     "agent disposition requires server-verified executor and delegation context",
                 )
             })?;
@@ -4613,7 +4668,7 @@ async fn manage_messages_non_send(
                 } else if caller.has_policy_authority() {
                     ("system", caller.run_key())
                 } else {
-                    return Err(Error::engine(
+                    return Err(authority_refusal(
                         "routing requires attested principal choice or trusted policy authority",
                     ));
                 };
@@ -4790,7 +4845,7 @@ async fn manage_messages_non_send(
                 sqlx::query_scalar("SELECT epoch FROM authorization_revision WHERE id=1")
                     .fetch_one(db.write_pool())
                     .await?;
-            let response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":items,"snapshot":snapshot_token,"next_after":(cursor<snapshot.items.len()).then_some(cursor),"newer_available":current_content>snapshot.content_head||heads.0>snapshot.awareness_head||heads.1>snapshot.candidate_head||current_control>snapshot.control_head||current_authorization!=snapshot.authorization_revision,"heads":{"content":snapshot.content_head,"awareness":snapshot.awareness_head,"candidates":snapshot.candidate_head,"control":snapshot.control_head,"authorization":snapshot.authorization_revision},"counts_are_distinct_message_ids":true});
+            let response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":items,"snapshot":snapshot_token,"next_after":(cursor<snapshot.items.len()).then_some(cursor),"newer_available":current_content>snapshot.content_head||heads.0>snapshot.awareness_head||heads.1>snapshot.candidate_head||current_control>snapshot.control_head||current_authorization!=snapshot.authorization_revision,"heads":{"content":snapshot.content_head,"awareness":snapshot.awareness_head,"candidates":snapshot.candidate_head,"control":snapshot.control_head,"authorization":snapshot.authorization_revision},"counts_are_distinct_message_ids":true,"capabilities":{"edit":true,"delete":true,"reactions":true,"saved_session_sharing":true}});
             let mut response = response;
             if let Some(scope) = &snapshot.scope {
                 response["scope"] = json!(scope);

@@ -40,7 +40,7 @@ impl Limits {
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
     Running,
-    /// No `node.json`: `native setup` has not been run.
+    /// No config at the selected path (one may exist elsewhere).
     NoConfig,
     /// `node.json` fails the node's loader.
     InvalidConfig,
@@ -87,7 +87,7 @@ pub fn read_config(path: &Path) -> Result<NodeConfig, NodeInfo> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(down(
                 NodeState::NoConfig,
-                "no node.json found; run `native setup` first",
+                "no node.json at the selected path; use --config-dir <dir> for an existing node, or `native setup` to configure a new one",
                 Some(path),
                 None,
             ))
@@ -144,6 +144,7 @@ pub fn io_kind(error: &std::io::Error) -> String {
 /// After any error or timeout the connection is spent (see [`Connection::is_spent`]):
 /// a reply may still be on its way, so it must not carry another request.
 pub struct Connection {
+    peer_pid: Option<u32>,
     write: tokio::net::unix::OwnedWriteHalf,
     lines: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
     timeout: Duration,
@@ -154,6 +155,11 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// OS-reported PID after the same-user peer check, when supported.
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.peer_pid
+    }
+
     /// Check the socket and connect to it. `tool` names the command in the
     /// messages ("native status only talks to your own node").
     pub async fn open(
@@ -259,8 +265,14 @@ impl Connection {
                 ))
             }
         }
+        let peer_pid = stream
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok());
         let (read, write) = stream.into_split();
         Ok(Self {
+            peer_pid,
             write,
             lines: BufReader::new(read),
             timeout,

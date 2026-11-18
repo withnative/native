@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 44228,
+        "descriptor_bytes": 44714,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -250,6 +250,9 @@
                     "manage_relationships.find",
                     "manage_relationships.read",
                     "manage_relationships.why",
+                    "manage_saved_tabs.get",
+                    "manage_saved_tabs.list",
+                    "propose_view",
                     "query_record",
                     "read_attachment",
                     "read_attributions",
@@ -322,6 +325,10 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "manage_saved_tabs.create",
+                    "manage_saved_tabs.rename",
+                    "manage_saved_tabs.retire",
+                    "merge_body",
                     "prepare_named_views",
                     "record_view_revision",
                     "resolve_suggestions.accept",
@@ -387,6 +394,10 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "manage_saved_tabs.create",
+                        "manage_saved_tabs.rename",
+                        "manage_saved_tabs.retire",
+                        "merge_body",
                         "prepare_named_views",
                         "record_view_revision",
                         "resolve_suggestions.accept",
@@ -1668,6 +1679,7 @@
                   "enum": [
                     "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.install_link",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
                     "manage_alpha_tabs.prepare_install",
@@ -1682,6 +1694,7 @@
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
+                    "read_app_bundle",
                     "verify_artifact"
                   ]
                 },
@@ -1764,9 +1777,14 @@
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
                     "manage_alpha_tabs.live_unsubscribe",
+                    "manage_alpha_tabs.materialize_catalog_update",
+                    "manage_alpha_tabs.publish_catalog_update",
                     "manage_alpha_tabs.remove",
                     "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.set_scope",
+                    "manage_alpha_tabs.shelf_add",
+                    "manage_alpha_tabs.shelf_remove",
                     "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
@@ -2461,7 +2479,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 50458,
+        "descriptor_bytes": 50944,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -2730,6 +2748,9 @@
                     "manage_relationships.find",
                     "manage_relationships.read",
                     "manage_relationships.why",
+                    "manage_saved_tabs.get",
+                    "manage_saved_tabs.list",
+                    "propose_view",
                     "query_record",
                     "read_attachment",
                     "read_attributions",
@@ -2813,6 +2834,10 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "manage_saved_tabs.create",
+                    "manage_saved_tabs.rename",
+                    "manage_saved_tabs.retire",
+                    "merge_body",
                     "prepare_named_views",
                     "record_view_revision",
                     "resolve_suggestions.accept",
@@ -2882,6 +2907,10 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "manage_saved_tabs.create",
+                        "manage_saved_tabs.rename",
+                        "manage_saved_tabs.retire",
+                        "merge_body",
                         "prepare_named_views",
                         "record_view_revision",
                         "resolve_suggestions.accept",
@@ -4324,6 +4353,7 @@
                   "enum": [
                     "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.install_link",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
                     "manage_alpha_tabs.prepare_install",
@@ -4338,6 +4368,7 @@
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
+                    "read_app_bundle",
                     "verify_artifact"
                   ]
                 },
@@ -4436,9 +4467,14 @@
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
                     "manage_alpha_tabs.live_unsubscribe",
+                    "manage_alpha_tabs.materialize_catalog_update",
+                    "manage_alpha_tabs.publish_catalog_update",
                     "manage_alpha_tabs.remove",
                     "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.set_scope",
+                    "manage_alpha_tabs.shelf_add",
+                    "manage_alpha_tabs.shelf_remove",
                     "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
@@ -5139,7 +5175,7 @@
     },
     "build_enabled_experimental": {
       "ordinary": {
-        "descriptor_bytes": 47318,
+        "descriptor_bytes": 47804,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -5383,6 +5419,9 @@
                     "manage_relationships.find",
                     "manage_relationships.read",
                     "manage_relationships.why",
+                    "manage_saved_tabs.get",
+                    "manage_saved_tabs.list",
+                    "propose_view",
                     "query_record",
                     "read_attachment",
                     "read_attributions",
@@ -5455,6 +5494,10 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "manage_saved_tabs.create",
+                    "manage_saved_tabs.rename",
+                    "manage_saved_tabs.retire",
+                    "merge_body",
                     "prepare_named_views",
                     "record_view_revision",
                     "resolve_suggestions.accept",
@@ -5520,6 +5563,10 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "manage_saved_tabs.create",
+                        "manage_saved_tabs.rename",
+                        "manage_saved_tabs.retire",
+                        "merge_body",
                         "prepare_named_views",
                         "record_view_revision",
                         "resolve_suggestions.accept",
@@ -6801,6 +6848,7 @@
                   "enum": [
                     "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.install_link",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
                     "manage_alpha_tabs.prepare_install",
@@ -6815,6 +6863,7 @@
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
+                    "read_app_bundle",
                     "verify_artifact"
                   ]
                 },
@@ -6897,9 +6946,14 @@
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
                     "manage_alpha_tabs.live_unsubscribe",
+                    "manage_alpha_tabs.materialize_catalog_update",
+                    "manage_alpha_tabs.publish_catalog_update",
                     "manage_alpha_tabs.remove",
                     "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.set_scope",
+                    "manage_alpha_tabs.shelf_add",
+                    "manage_alpha_tabs.shelf_remove",
                     "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
@@ -7769,7 +7823,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 54080,
+        "descriptor_bytes": 54566,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -8039,6 +8093,9 @@
                     "manage_relationships.find",
                     "manage_relationships.read",
                     "manage_relationships.why",
+                    "manage_saved_tabs.get",
+                    "manage_saved_tabs.list",
+                    "propose_view",
                     "query_record",
                     "read_attachment",
                     "read_attributions",
@@ -8122,6 +8179,10 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "manage_saved_tabs.create",
+                    "manage_saved_tabs.rename",
+                    "manage_saved_tabs.retire",
+                    "merge_body",
                     "prepare_named_views",
                     "record_view_revision",
                     "resolve_suggestions.accept",
@@ -8191,6 +8252,10 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "manage_saved_tabs.create",
+                        "manage_saved_tabs.rename",
+                        "manage_saved_tabs.retire",
+                        "merge_body",
                         "prepare_named_views",
                         "record_view_revision",
                         "resolve_suggestions.accept",
@@ -9633,6 +9698,7 @@
                   "enum": [
                     "manage_alpha_tabs.admit_reveal_target",
                     "manage_alpha_tabs.inspect",
+                    "manage_alpha_tabs.install_link",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
                     "manage_alpha_tabs.prepare_install",
@@ -9647,6 +9713,7 @@
                     "query_change_summaries.drill",
                     "query_change_summaries.get",
                     "query_change_summaries.list",
+                    "read_app_bundle",
                     "verify_artifact"
                   ]
                 },
@@ -9745,9 +9812,14 @@
                     "manage_alpha_tabs.disable",
                     "manage_alpha_tabs.install",
                     "manage_alpha_tabs.live_unsubscribe",
+                    "manage_alpha_tabs.materialize_catalog_update",
+                    "manage_alpha_tabs.publish_catalog_update",
                     "manage_alpha_tabs.remove",
                     "manage_alpha_tabs.reorder",
                     "manage_alpha_tabs.restore",
+                    "manage_alpha_tabs.set_scope",
+                    "manage_alpha_tabs.shelf_add",
+                    "manage_alpha_tabs.shelf_remove",
                     "manage_alpha_tabs.update",
                     "manage_artifact_inputs.bind",
                     "manage_artifact_inputs.bind_many",
@@ -10772,6 +10844,18 @@
       "candidate_plan_policy": "direct"
     },
     {
+      "legacy_tool": "merge_body",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "merge_body",
+      "candidate_plan_policy": "direct"
+    },
+    {
       "legacy_tool": "claim_unowned_record",
       "legacy_action": "call",
       "stability": "stable",
@@ -11152,6 +11236,66 @@
       ],
       "candidate_executor": "records_write",
       "candidate_operation": "manage_account_config.replace",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_saved_tabs",
+      "legacy_action": "create",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "manage_saved_tabs.create",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_saved_tabs",
+      "legacy_action": "get",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "manage_saved_tabs.get",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_saved_tabs",
+      "legacy_action": "list",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "manage_saved_tabs.list",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_saved_tabs",
+      "legacy_action": "rename",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "manage_saved_tabs.rename",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_saved_tabs",
+      "legacy_action": "retire",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "manage_saved_tabs.retire",
       "candidate_plan_policy": "direct"
     },
     {
@@ -12032,6 +12176,18 @@
     },
     {
       "legacy_tool": "manage_named_views",
+      "legacy_action": "propose_view",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "propose_view",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_named_views",
       "legacy_action": "record_view_revision",
       "stability": "stable",
       "availability": [
@@ -12295,6 +12451,18 @@
       "candidate_plan_policy": "direct"
     },
     {
+      "legacy_tool": "read_app_bundle",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "read_app_bundle",
+      "candidate_plan_policy": "direct"
+    },
+    {
       "legacy_tool": "manage_surface_bindings",
       "legacy_action": "get",
       "stability": "stable",
@@ -12416,6 +12584,18 @@
     },
     {
       "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "install_link",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.install_link",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
       "legacy_action": "launch",
       "stability": "stable",
       "availability": [
@@ -12464,6 +12644,18 @@
     },
     {
       "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "materialize_catalog_update",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.materialize_catalog_update",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
       "legacy_action": "prepare_install",
       "stability": "stable",
       "availability": [
@@ -12484,6 +12676,18 @@
       ],
       "candidate_executor": "artifacts_read",
       "candidate_operation": "manage_alpha_tabs.preview",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "publish_catalog_update",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.publish_catalog_update",
       "candidate_plan_policy": "direct"
     },
     {
@@ -12520,6 +12724,42 @@
       ],
       "candidate_executor": "artifacts_write",
       "candidate_operation": "manage_alpha_tabs.restore",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "set_scope",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.set_scope",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "shelf_add",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.shelf_add",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "shelf_remove",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_write",
+      "candidate_operation": "manage_alpha_tabs.shelf_remove",
       "candidate_plan_policy": "direct"
     },
     {

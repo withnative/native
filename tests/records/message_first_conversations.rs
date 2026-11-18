@@ -1136,8 +1136,11 @@ async fn ordinary_agent_cannot_claim_human_awareness_or_reroute_without_policy_a
             .as_str()
             .unwrap()
     ));
+    assert!(error.to_string().contains("recipient-authored WorkItem"));
+    assert!(error.to_string().contains("messaging guide"));
     let route=call_as(&registry,&db,Caller::authenticated("acct_recipient"),"manage_messages",json!({"action":"set_routing","message_id":message,"obligation_state":"open","executor_route":"agent","policy_version":"v1","expected_version":0,"idempotency_key":"route","reason":"agent decides"})).await.unwrap_err();
     assert!(route.to_string().contains("trusted policy"));
+    assert!(route.to_string().contains("derived_from"));
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM awareness_events")
             .fetch_one(db.pool())
@@ -1586,6 +1589,9 @@ async fn agent_lane_requires_verified_executor_and_semantic_evidence() {
     .await
     .unwrap_err();
     assert!(untrusted.to_string().contains("server-verified executor"));
+    assert!(untrusted
+        .to_string()
+        .contains("recipient-authored WorkItem"));
 
     let issuer = native_ce::awareness::HumanInteractionTokenIssuer::random("test-host");
     let ids = vec![message.clone()];

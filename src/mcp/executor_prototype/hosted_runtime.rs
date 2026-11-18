@@ -155,6 +155,10 @@ pub struct HostedExecutorRuntime {
     telemetry: Arc<ExecutorTelemetryContext>,
     experimental: ExperimentalExecutors,
     sql_commit: bool,
+    #[cfg(feature = "v2-kernel-probe")]
+    publication_management: bool,
+    #[cfg(feature = "v2-kernel-probe")]
+    publication_databases: Option<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -170,6 +174,32 @@ struct PinnedLensCatalogueCache {
 }
 
 impl HostedExecutorRuntime {
+    /// Deployment scope for a limited publication rollout. This applies to
+    /// both transports, including completed-plan replay; UI hiding is not an
+    /// authority boundary. Existing fixture constructors retain their scope.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub fn with_publication_management_in_databases(self, databases: Vec<String>) -> Result<Self> {
+        if databases.is_empty() || databases.iter().any(|id| id.trim().is_empty()) {
+            return Err(Error::engine("publication database scope must be nonempty"));
+        }
+        let mut runtime = self.with_publication_management()?;
+        runtime.publication_databases = Some(databases.into_iter().collect());
+        Ok(runtime)
+    }
+
+    /// Explicitly qualify the registered v2 publication plan surface.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub fn with_publication_management(mut self) -> Result<Self> {
+        if self.registry.get("manage_publication").is_none()
+            || self.registry.deployment_mutation_barrier().is_none()
+        {
+            return Err(Error::engine(
+                "publication management source is unavailable",
+            ));
+        }
+        self.publication_management = true;
+        Ok(self)
+    }
     /// Deployment consent for qualified ordinary SQLite commit plans. Each
     /// preparation still needs signed commit consent. Lens writes are excluded.
     pub fn with_sql_commit(mut self) -> Result<Self> {
@@ -363,6 +393,10 @@ impl HostedExecutorRuntime {
             telemetry,
             experimental,
             sql_commit: false,
+            #[cfg(feature = "v2-kernel-probe")]
+            publication_management: false,
+            #[cfg(feature = "v2-kernel-probe")]
+            publication_databases: None,
         })
     }
 
@@ -491,6 +525,68 @@ impl HostedExecutorRuntime {
             .await
     }
 
+    /// Installed node reads use the same engine-pinned selection and row
+    /// authorization as ordinary reads, with request persistence suppressed.
+    /// A new operation is unavailable unless that very catalogue classifies it
+    /// as a read.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub async fn handle_enrolled_node_read(
+        &self,
+        engine: EngineHandle,
+        caller: Caller,
+        database_id: String,
+        mut message: Value,
+    ) -> Result<Option<Value>> {
+        if engine.kind() != EngineKind::KernelV2 {
+            return Err(Error::auth("enrolled node reads require KernelV2"));
+        }
+        match message["method"].as_str() {
+            Some("tools/call") => {
+                let catalogue = &self.v2_ordinary;
+                if !catalogue.is_lean() && message["params"]["name"] == super::lean::CALL_EXECUTOR {
+                    let (executor, arguments) =
+                        super::lean::unwrap_envelope(&message["params"]["arguments"])
+                            .map_err(Error::auth)?;
+                    message["params"]["name"] = json!(executor);
+                    message["params"]["arguments"] = arguments;
+                }
+                let name = message["params"]["name"].as_str().unwrap_or_default();
+                let access = catalogue
+                    .call_target(name, message.pointer("/params/arguments"))
+                    .and_then(|(executor, operation)| {
+                        let operation =
+                            operation.or_else(|| (executor == "bootstrap").then_some("bootstrap"));
+                        catalogue.classify_call(executor, operation)
+                    });
+                // Describe only reads a contract. Its arguments name a tool,
+                // but it cannot invoke that tool.
+                if name != "describe_operation"
+                    && !matches!(access, Some((_, OperationAccess::Read)))
+                {
+                    return Err(Error::auth(
+                        "enrolled node read route requires a read operation",
+                    ));
+                }
+            }
+            Some(
+                "initialize"
+                | "server/discover"
+                | "ping"
+                | "tools/list"
+                | "notifications/initialized",
+            ) => {}
+            _ => return Err(Error::auth("enrolled node read method is unavailable")),
+        }
+        self.handle_ordinary_inner(
+            engine,
+            caller.with_suppressed_request_persistence(),
+            database_id,
+            message,
+            None,
+        )
+        .await
+    }
+
     async fn handle_ordinary_inner(
         &self,
         engine: EngineHandle,
@@ -543,10 +639,29 @@ impl HostedExecutorRuntime {
             }
         };
         #[cfg(feature = "v2-kernel-probe")]
+        if message["method"] == "tools/call"
+            && self
+                .publication_databases
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&database_id))
+            && catalogue
+                .call_target(
+                    message["params"]["name"].as_str().unwrap_or(""),
+                    message.pointer("/params/arguments"),
+                )
+                .is_some_and(|(executor, operation)| {
+                    matches!(executor, "records_read" | "records_write")
+                        && operation.is_some_and(|op| op.starts_with("manage_publication."))
+                })
+        {
+            return Err(Error::engine(
+                "publication management is unavailable for this database",
+            ));
+        }
+        #[cfg(feature = "v2-kernel-probe")]
         if matches!(&engine, EngineHandle::KernelV2(db) if db.has_enrolled_execution())
             && message["method"] == "tools/call"
-            && self
-                .ordinary
+            && catalogue
                 .classify_tools_call(
                     message["params"]["name"].as_str().unwrap_or(""),
                     message.pointer("/params/arguments"),
@@ -561,8 +676,33 @@ impl HostedExecutorRuntime {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let arguments = message.pointer("/params/arguments");
-            if let Some((executor, Some(operation))) = self.ordinary.call_target(name, arguments) {
-                if super::write_operations::requires_plan(executor, operation) {
+            if let Some((executor, Some(operation))) = catalogue.call_target(name, arguments) {
+                let qualified = {
+                    #[cfg(feature = "v2-kernel-probe")]
+                    {
+                        self.publication_management
+                            && executor == "records_write"
+                            && matches!(
+                                operation,
+                                "manage_publication.publish" | "manage_publication.unpublish"
+                            )
+                    }
+                    #[cfg(not(feature = "v2-kernel-probe"))]
+                    {
+                        false
+                    }
+                };
+                // KernelV2 executes consequential operations in one direct
+                // call, so the gate follows the engine-specific contract
+                // (`requires_plan_for_engine` is false on KernelV2) instead of
+                // the legacy engine-blind table, which would refuse direct v2
+                // operations such as `restore_inheritance`.
+                if super::write_operations::requires_plan_for_engine(
+                    engine.kind(),
+                    executor,
+                    operation,
+                ) && !qualified
+                {
                     let Some(id) = message.get("id").cloned() else {
                         return Ok(None);
                     };
@@ -594,6 +734,10 @@ impl HostedExecutorRuntime {
         .await?;
         if self.sql_commit && server.engine.kind() == EngineKind::Sqlite {
             server = server.with_hosted_sql_commit()?;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.publication_management && server.engine.kind() == EngineKind::KernelV2 {
+            server.hosted_publication_management = true;
         }
         if let Some(lease) = persistence_lease {
             server = server.with_persistence_lease(lease);

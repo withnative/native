@@ -244,6 +244,7 @@ fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
         Arc::new(Engine90To91Migration),
         Arc::new(Engine91To92Migration),
         Arc::new(Engine92To93Migration),
+        Arc::new(Engine93To94Migration),
     ]
 }
 
@@ -3923,6 +3924,42 @@ impl EngineMigrationStep for Engine92To93Migration {
     }
 }
 
+#[derive(Debug)]
+struct Engine93To94Migration;
+impl EngineMigrationStep for Engine93To94Migration {
+    fn from(&self) -> i64 {
+        93
+    }
+    fn to(&self) -> i64 {
+        94
+    }
+    fn name(&self) -> &str {
+        "engine-93-to-94-held-command-cancellation"
+    }
+    fn preflight<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            if version == 93 {
+                crate::db::validate_supported_engine_migration_source(conn, 93).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(conn, 93).await?;
+            for statement in crate::schema::ddl::HELD_COMMAND_CANCELLATION_DDL {
+                sqlx::query(statement).execute(&mut *conn).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
 /// The row copy for a `records` rebuild, shared by the SQLite and Turso paths.
 /// `rowid` is listed first on both sides: see [`Engine86To87Migration`].
 pub(crate) fn records_rebuild_copy(target: &str, source: &str, columns: &[String]) -> String {
@@ -4250,6 +4287,9 @@ const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
     // Named views are post-freeze. Retain every historical action, including
     // reads and malformed calls; never widen the frozen DELETE predicate.
     "manage_named_views",
+    // Publication management is post-freeze. Retain all historical calls;
+    // the attention report recognizes the tool, without widening DELETE.
+    "manage_publication",
     "get_workspace_snapshot",
     "authority_act_head",
     "authority_act_delta",
@@ -4260,12 +4300,21 @@ const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
     // The account-scoped configuration tool arrived at89. Retain its
     // historical calls without changing the frozen cleanup predicate.
     "manage_account_config",
+    // Private saved-tab operations are post-freeze. Recognize their evidence
+    // while retaining every historical call; never widen the frozen DELETE.
+    "manage_saved_tabs",
+    // Body merge is a post-freeze mutation. Its calls are retained like every
+    // mutation; the frozen mutation list above is not extended.
+    "merge_body",
     // Hosted outbox status is a post-freeze, host-only read. Retain any
     // historical evidence; the frozen deletion predicate is unchanged.
     "outbox_status",
     // HCP audit arrived after the freeze. Retain any historical audit calls;
     // neither the frozen deletion sets nor their predicate may change.
     "read_hcp_audit",
+    // Installed bundle reads are post-freeze. Recognize and retain historical
+    // calls without changing the frozen deletion predicate (as for HCP audit).
+    "read_app_bundle",
 ];
 
 /// Read actions that arrived after the 62→63 freeze on already-shipped
@@ -4878,38 +4927,73 @@ impl EngineMigrationRegistry {
 /// pending transition inspects the same original preimage, matching the
 /// production runner's all-steps-before-backup contract.
 pub async fn preflight_production_migration_read_only(path: &Path) -> Result<i64> {
+    preflight_migration_read_only(path, &EngineMigrationRegistry::production()).await
+}
+
+/// Candidate-aware source admission, also used as the hosted fleet barrier.
+/// The caller must hold offline/frozen custody through subsequent mutation;
+/// this read transaction provides a consistent per-file view, not a fleet lock.
+#[doc(hidden)]
+pub async fn preflight_migration_read_only(
+    path: &Path,
+    registry: &EngineMigrationRegistry,
+) -> Result<i64> {
     let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))?
         .create_if_missing(false)
         .read_only(true)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
     let mut connection = SqliteConnection::connect_with(&options).await?;
+    let mut snapshot = connection.begin().await?;
     let outcome: Result<i64> = async {
-        crate::db::refuse_v2_database(&mut connection).await?;
+        let connection = &mut *snapshot;
+        crate::db::refuse_v2_database(connection).await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&mut connection)
+            .fetch_one(&mut *connection)
             .await?;
         let integrity: String = sqlx::query_scalar("PRAGMA quick_check(1)")
-            .fetch_one(&mut connection)
+            .fetch_one(&mut *connection)
             .await?;
         if integrity != "ok" {
             return Err(Error::engine("migration preflight quick_check failed"));
         }
-        let registry = EngineMigrationRegistry::production();
         let pending = registry.pending(version, registry.current)?;
         for migration in pending {
-            migration.preflight(&mut connection).await.map_err(|err| {
+            migration.preflight(&mut *connection).await.map_err(|err| {
                 Error::engine(format!(
                     "migration {} preflight failed: {err}",
                     migration.name()
                 ))
             })?;
         }
+        preflight_source_provenance(&mut *connection, version).await?;
         Ok(version)
     }
     .await;
+    snapshot.rollback().await?;
     let _ = connection.close().await;
     outcome
+}
+
+async fn preflight_source_provenance(
+    connection: &mut SqliteConnection,
+    source_version: i64,
+) -> Result<()> {
+    let violations =
+        crate::provenance::migration_source_violations_on(connection, source_version).await?;
+    if !violations.is_empty() {
+        return Err(Error::engine(format!(
+            "migration source provenance-state failed ({} violations): {}",
+            violations.len(),
+            violations
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+    Ok(())
 }
 
 pub type FenceFn = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>;
@@ -5341,6 +5425,16 @@ async fn migrate_database_with_reservation_impl(
                 format!("{}: {err}", migration.name()),
             );
         }
+    }
+    if let Err(err) = preflight_source_provenance(&mut preflight_connection, from).await {
+        let _ = preflight_connection.close().await;
+        return failed(
+            path,
+            Some(from),
+            target,
+            "preflight-provenance",
+            err.to_string(),
+        );
     }
     let _ = preflight_connection.close().await;
 
@@ -5866,6 +5960,138 @@ mod tests {
             .unwrap()
             .close()
             .await;
+    }
+
+    #[tokio::test]
+    async fn source_provenance_preflight_accepts_real_noop_on_supported_source_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive-source.db");
+        let db = crate::create_database(&path.to_string_lossy())
+            .await
+            .unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let record = registry.call(db.clone(), crate::mcp::Caller::local(), "create_record",
+            serde_json::json!({"type":"Document", "kind":"note", "name":"archive source", "reason":"source preflight proof"}))
+            .await.unwrap();
+        let id = record["id"].as_str().unwrap();
+        for keyed in [false, true] {
+            let mut args = serde_json::json!({"id":id,"reason":"source preflight proof"});
+            if keyed {
+                args["idempotency_key"] = serde_json::json!("source-noop");
+            }
+            registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::local(),
+                    "archive_record",
+                    args,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(crate::provenance::state_violations(&db)
+            .await
+            .unwrap()
+            .is_empty());
+        db.close().await;
+        // Descend through every source with the prerequisite receipt tables.
+        for version in (90..=CURRENT_ENGINE_SCHEMA_VERSION).rev() {
+            let options =
+                SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display())).unwrap();
+            let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+            if version < CURRENT_ENGINE_SCHEMA_VERSION {
+                crate::schema::step_down::step_down_with(
+                    &mut conn,
+                    crate::schema::step_down::ADDITIONS,
+                    version + 1,
+                    version,
+                )
+                .await
+                .unwrap();
+            }
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                preflight_production_migration_read_only(&path)
+                    .await
+                    .unwrap(),
+                version
+            );
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "source {version} changed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_provenance_preflight_refuses_before_backup_or_schema_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-source.db");
+        let db = crate::create_database(&path.to_string_lossy())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO provenance_action_attestations (id,schema_version,principal,executor_kind,operation,action_commitment,action_digest,output_event_set_digest,issuer,issuer_origin_database_id,issued_at) VALUES ('bad-source',2,'acct:test','authenticated_principal','forged','{}',printf('%064d',0),printf('%064d',0),'native-ce',(SELECT origin_db_id FROM database_identity),'2026-11-05T00:00:00Z')")
+            .execute(db.write_pool()).await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        crate::schema::step_down::step_down(&mut conn, 93)
+            .await
+            .unwrap();
+        drop(conn);
+        db.close().await;
+        // Establish the physical fixture before measuring non-mutation. Pool
+        // shutdown alone does not promise the committed WAL has reached the
+        // main file; a later writer close could otherwise change our baseline.
+        let mut stable = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut stable)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.0, 0, "fixture checkpoint must finish");
+        stable.close().await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let err = preflight_production_migration_read_only(&path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("provenance-state") && err.contains("has no output events"),
+            "{err}"
+        );
+        let offbox = tempfile::tempdir().unwrap();
+        let report = migrate_database(
+            &path,
+            "source",
+            "source-proof",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &test_preimage_store(offbox.path(), dir.path()),
+            always_fenced(),
+        )
+        .await;
+        assert_eq!(
+            report.error_kind.as_deref(),
+            Some("preflight-provenance"),
+            "{report:?}"
+        );
+        assert!(report.backup.is_none());
+        assert_eq!(std::fs::read_dir(offbox.path()).unwrap().count(), 0);
+        assert_eq!(header_version(&path), 93);
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "source bytes changed"
+        );
     }
 
     #[tokio::test]
@@ -6975,6 +7201,7 @@ mod tests {
             (90, 91, "engine-90-to-91-subject-authorization-revisions"),
             (91, 92, "engine-91-to-92-causal-heads"),
             (92, 93, "engine-92-to-93-unfiled-message-owner-index"),
+            (93, 94, "engine-93-to-94-held-command-cancellation"),
         ] {
             if from < start {
                 continue;
@@ -9847,6 +10074,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_93_to_94_adds_empty_cancellation_authority_without_rewriting_history() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM control_events")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        crate::schema::step_down::step_down(&mut conn, 93)
+            .await
+            .unwrap();
+        let registry = EngineMigrationRegistry::production();
+        let steps = registry.pending(93, 94).unwrap();
+        assert_eq!(steps.len(), 1);
+        steps[0].preflight(&mut conn).await.unwrap();
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        steps[0].apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=94")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 94)
+            .await
+            .unwrap());
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM control_events")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let anchors: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM provenance_local_command_cancellations")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(anchors, 0);
+    }
+
+    #[tokio::test]
     async fn current_engine_migration_is_a_no_op_without_vacuum() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("current.db");
@@ -11134,6 +11399,7 @@ mod tests {
             })
             .map(|kind| kind.name())
             .collect();
+        derived_mutation.retain(|name| !ENGINE_62_TO_63_POST_FREEZE_TOOLS.contains(name));
         derived_mutation.sort_unstable();
         let mut frozen_mutation = ENGINE_62_TO_63_MUTATION_TOOLS.to_vec();
         frozen_mutation.sort_unstable();
@@ -11155,6 +11421,11 @@ mod tests {
         revert_to_engine_62(&mut connection).await;
         let calls = [
             (
+                "read_app_bundle",
+                r#"{"package":"agent.docs","expected_install_event_id":"historical","parent_origin":"native-ui://app"}"#,
+            ),
+            ("read_app_bundle", "{malformed"),
+            (
                 "manage_named_views",
                 r#"{"action":"get_view_revision","run_key":"new"}"#,
             ),
@@ -11165,6 +11436,12 @@ mod tests {
             ("manage_named_views", r#"{"action":"prepare_named_views"}"#),
             ("manage_named_views", r#"{"action":"future_action"}"#),
             ("manage_named_views", "{malformed"),
+            ("manage_publication", r#"{"action":"inspect"}"#),
+            ("manage_publication", r#"{"action":"preview"}"#),
+            ("manage_publication", r#"{"action":"publish"}"#),
+            ("manage_publication", r#"{"action":"unpublish"}"#),
+            ("manage_publication", r#"{"action":"future_action"}"#),
+            ("manage_publication", "{malformed"),
             // The post-freeze read must remain evidence, never be added to
             // the frozen historical read-deletion predicate.
             (
@@ -16519,6 +16796,26 @@ mod tests {
             .unwrap();
         drop(conn);
         db.close().await;
+        // Finish WAL checkpointing before taking a physical byte baseline.
+        // Pool shutdown can leave committed pages in the WAL; the source
+        // header probe below must not be the operation that settles them.
+        let mut stable = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&source_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut stable)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.0, 0, "fixture checkpoint must finish");
+        assert_eq!(
+            checkpoint.1, checkpoint.2,
+            "all fixture WAL frames must settle"
+        );
+        stable.close().await.unwrap();
         let original_bytes = std::fs::read(&source_path).unwrap();
         let offbox = tempfile::tempdir().unwrap();
         let backup = test_preimage_store(offbox.path(), dir.path());

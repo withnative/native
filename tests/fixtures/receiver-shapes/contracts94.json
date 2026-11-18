@@ -1,0 +1,448 @@
+{
+  "update_record": {
+    "description": {
+      "contract_version": "native.operation-contract.v1",
+      "contract_digest": "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a",
+      "executor": "records_write",
+      "operation": "update_record",
+      "surface": "ordinary",
+      "input_schema": {
+        "allOf": [
+          {
+            "type": "object",
+            "description": "non-empty body guard: if_body_digest (get_record.body_digest) or if_unmodified_since.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "record_id": {
+                "type": "string",
+                "description": "Alias for id; ids selects batch mode."
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sources": {
+                "type": "array",
+                "maxItems": 50,
+                "description": "Records this write rests on; [] declares none, omitted means undeclared.",
+                "items": {
+                  "type": [
+                    "string",
+                    "object"
+                  ],
+                  "properties": {
+                    "record_id": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "revision_event_id": {
+                      "type": "string",
+                      "description": "Body revision; omit for the current head."
+                    }
+                  },
+                  "required": [
+                    "record_id",
+                    "reason"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "name": {
+                "type": "string"
+              },
+              "body": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Deprecated body_set alias."
+              },
+              "body_set": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Replace all; null clears."
+              },
+              "body_append": {
+                "type": "string",
+                "description": "Small additions only; re-stores whole body."
+              },
+              "body_replace": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "old": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "new": {
+                      "type": "string"
+                    },
+                    "expected_count": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "replace_all": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "old",
+                    "new"
+                  ],
+                  "not": {
+                    "required": [
+                      "expected_count",
+                      "replace_all"
+                    ]
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "if_body_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$"
+              },
+              "if_unmodified_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "if_policy_revision": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Opaque policy list revision, checked in the write transaction."
+              },
+              "response_mode": {
+                "type": "string",
+                "enum": [
+                  "full"
+                ]
+              },
+              "idempotency_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "home_id": {
+                "type": "string",
+                "description": "Move to a canonical browse home. Non-Collection records sent to native:root by the caller are filed in Unfiled instead (messages and comments excepted); the receipt discloses the redirect. Only the engine root may have null."
+              },
+              "summary": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "lifecycle": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "persistence": {
+                "type": "string",
+                "enum": [
+                  "enduring",
+                  "occurrent"
+                ]
+              },
+              "maturity": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "facets": {
+                "type": "object",
+                "description": "Open facets; use observations for evidence.",
+                "additionalProperties": true
+              },
+              "links": {
+                "type": "array",
+                "description": "Add outgoing links with edits; links-only: manage_links.add.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target_id": {
+                      "type": "string"
+                    },
+                    "relationship": {
+                      "type": "string"
+                    },
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "target_id",
+                    "relationship"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "reason"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "oneOf": [
+              {
+                "required": [
+                  "id"
+                ]
+              },
+              {
+                "required": [
+                  "record_id"
+                ]
+              }
+            ],
+            "properties": {},
+            "required": []
+          },
+          {
+            "not": {
+              "required": [
+                "body",
+                "body_set"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "body",
+                "body_append"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "body",
+                "body_replace"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "body_set",
+                "body_append"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "body_set",
+                "body_replace"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "body_append",
+                "body_replace"
+              ]
+            }
+          }
+        ],
+        "description": "Update one v2 record with guarded body, field, metadata, facet and link changes. Whole-body replacement requires a revision guard. Declared sources are validated with current View and body revision on the write transaction and retained on the first authoring event; updates without such an event report not_recorded. Owner/type changes and bulk updates are unavailable. response_mode is full."
+      },
+      "source": {
+        "tool": "update_record",
+        "tool_description": "Update one v2 record with guarded body, field, metadata, facet and link changes. Whole-body replacement requires a revision guard. Declared sources are validated with current View and body revision on the write transaction and retained on the first authoring event; updates without such an event report not_recorded. Owner/type changes and bulk updates are unavailable. response_mode is full.",
+        "selector": null,
+        "authority": "the registered production ToolSpec schema and exact-name runtime handler"
+      },
+      "prototype": {
+        "direct_execution_enabled": true,
+        "fast_path": true,
+        "plan_required": false,
+        "guided_path": true,
+        "repair_path": true
+      }
+    },
+    "catalog": {
+      "access": "mutation",
+      "requires_acceptance": false,
+      "plan_required": false,
+      "direct_execution_enabled": true
+    }
+  },
+  "manage_links.add": {
+    "description": {
+      "contract_version": "native.operation-contract.v1",
+      "contract_digest": "fc94ae7c32c84e0a8409fb06b9814ac6f55962835d56b9893f313cfcd758321c",
+      "executor": "records_write",
+      "operation": "manage_links.add",
+      "surface": "ordinary",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "relationship": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional link note."
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id",
+          "relationship"
+        ],
+        "additionalProperties": false
+      },
+      "source": {
+        "tool": "manage_links",
+        "tool_description": "Add, remove, or page typed links. Relationship strings are open-additive. Writes echo previous_seq; list returns a bounded, viewer-relative live page. Returns previous_seq/previous_event_id (the pre-write record event). get_record as_of.content_seq or as_of.event_id reconstructs prior state; see the lifecycle guide.",
+        "selector": {
+          "field": "action",
+          "value": "add"
+        },
+        "authority": "the registered production ToolSpec schema and exact-name runtime handler"
+      },
+      "prototype": {
+        "direct_execution_enabled": true,
+        "fast_path": true,
+        "plan_required": false,
+        "guided_path": true,
+        "repair_path": true
+      }
+    },
+    "catalog": {
+      "access": "mutation",
+      "requires_acceptance": false,
+      "plan_required": false,
+      "direct_execution_enabled": true
+    }
+  },
+  "attach_text": {
+    "description": {
+      "contract_version": "native.operation-contract.v1",
+      "contract_digest": "79ce3a68310b0be1ba073206f5fa5b07625d8b3809a38f7746616c39a4c5d106",
+      "executor": "records_write",
+      "operation": "attach_text",
+      "surface": "ordinary",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "record_id": {
+            "type": "string",
+            "description": "Record to attach under.",
+            "minLength": 1
+          },
+          "text": {
+            "type": "string",
+            "description": "The text to store."
+          },
+          "filename": {
+            "type": "string"
+          },
+          "mime": {
+            "type": "string",
+            "description": "Defaults to text/plain; charset=utf-8."
+          },
+          "name": {
+            "type": "string",
+            "description": "Attachment record name; defaults to filename."
+          },
+          "lifecycle": {
+            "type": "string",
+            "description": "Attachment lifecycle spine facet."
+          },
+          "facets": {
+            "type": "object",
+            "description": "Open facets on the attachment record: key → string/number value or { value, vocab_ref }. Preserve JSON numbers for facets declared type:number. Engine-reserved and spine facets are refused.",
+            "additionalProperties": true
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "maxItems": 1
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "id"
+            ]
+          },
+          {
+            "required": [
+              "record_id"
+            ]
+          },
+          {
+            "required": [
+              "ids"
+            ]
+          }
+        ],
+        "description": "Store UTF-8 text as an attachment on v2. Owner, persistence and maturity overrides are unavailable."
+      },
+      "source": {
+        "tool": "attach_text",
+        "tool_description": "Store UTF-8 text as an attachment on v2. Owner, persistence and maturity overrides are unavailable.",
+        "selector": null,
+        "authority": "the registered production ToolSpec schema and exact-name runtime handler"
+      },
+      "prototype": {
+        "direct_execution_enabled": true,
+        "fast_path": true,
+        "plan_required": false,
+        "guided_path": true,
+        "repair_path": true
+      }
+    },
+    "catalog": {
+      "access": "mutation",
+      "requires_acceptance": false,
+      "plan_required": false,
+      "direct_execution_enabled": true
+    }
+  }
+}

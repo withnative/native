@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Shared record reads</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+</head><body><main id="app"></main><script>
+(async () => {
+  const kit = window.native.kit;
+  await kit.ready;
+  const ui = kit.preact;
+  function Reader({ index, distinct }) {
+    const read = ui.useRecord(distinct ? 'record-' + index : 'record-1', { body: false });
+    return ui.h('div', { className: 'reader', 'data-status': read.status, 'data-error': read.error?.code || '', 'data-index': index }, read.record?.name || '');
+  }
+  function App() {
+    const [count, setCount] = ui.useState(40);
+    const [distinct, setDistinct] = ui.useState(false);
+    return ui.h('section', {},
+      ui.h('output', { id: 'release' }, kit.release.version),
+      ui.h('button', { id: 'distinct', onClick: () => setDistinct(true) }, 'Distinct records'),
+      ui.h('button', { id: 'add', onClick: () => setCount(value => value + 1) }, 'Add'),
+      ui.h('button', { id: 'remove', onClick: () => setCount(value => Math.max(0, value - 1)) }, 'Remove'),
+      ui.h('button', { id: 'clear', onClick: () => setCount(0) }, 'Clear'),
+      ui.h('button', { id: 'mount', onClick: () => setCount(40) }, 'Mount'),
+      Array.from({ length: count }, (_, index) => ui.h(Reader, { key: index, index, distinct })));
+  }
+  ui.render(ui.h(App, {}), document.getElementById('app'));
+})().catch(error => { document.getElementById('app').textContent = String(error); });
+</script></body></html>

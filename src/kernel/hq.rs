@@ -72,11 +72,11 @@ pub(super) async fn require_import(conn: &mut SqliteConnection, principal: &str)
 /// Keep this separate from require_import: replay and hosted preparation still
 /// need the reserved principal after source reconciliation has closed.
 pub(super) async fn require_source_import_open(conn: &mut SqliteConnection) -> Result<()> {
-    let closed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE type IN ('kernel.hosted_membership.v1','kernel.app_installs_activated.v1'))")
+    let closed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE type IN ('kernel.hosted_membership.v1','kernel.app_installs_activated.v1','kernel.vocabulary_mutated.v1','kernel.schema_config_written.v1'))")
         .fetch_one(conn).await?;
     if closed {
         return Err(Error::engine(
-            "source import is closed after hosted activation",
+            "source import is closed after hosted activation or native catalogue editing",
         ));
     }
     Ok(())
@@ -233,6 +233,8 @@ async fn import_record_snapshot_as(
     let mut tx = begin_write(db.write_pool()).await?;
     require_import(&mut tx, principal).await?;
     require_source_import_open(&mut tx).await?;
+    // Per-record transaction: typed refusal rolls back this candidate only.
+    super::mcp_write_receipts::fences::refuse_retired_on(&mut tx, id, None).await?;
     if let Some(metadata) = &state.metadata {
         metadata.validate()?;
     }
@@ -468,7 +470,7 @@ async fn import_record_snapshot_as(
 /// edits made before an interrupted resume. Legacy and relationship history
 /// alone do not overwrite record state.
 async fn refuse_native_changes(conn: &mut SqliteConnection, id: &str, before: i64) -> Result<()> {
-    let changed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e WHERE record_id=? AND seq<? AND (type IN ('kernel.record_revised.v1','kernel.record_revised.v2','kernel.body_set.v1','kernel.facet_observed.v1','kernel.named_view_admitted.v1','kernel.named_view_revision_recorded.v1','kernel.named_view_binding_changed.v1','kernel.metadata_set.v1','kernel.archive_changed.v1','kernel.record_rehomed.v1','kernel.record_rehomed.v2','kernel.message_state.v1') OR (type='kernel.attachment_bound.v1' AND actor!=(SELECT principal_id FROM kernel_principals WHERE auth_binding='host:v1-import'))))")
+    let changed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e WHERE record_id=? AND seq<? AND (type IN ('kernel.record_revised.v1','kernel.record_revised.v2','kernel.record_type_corrected.v1','kernel.body_set.v1','kernel.facet_observed.v1','kernel.named_view_admitted.v1','kernel.named_view_revision_recorded.v1','kernel.named_view_binding_changed.v1','kernel.metadata_set.v1','kernel.archive_changed.v1','kernel.record_rehomed.v1','kernel.record_rehomed.v2','kernel.message_state.v1') OR (type='kernel.attachment_bound.v1' AND actor!=(SELECT principal_id FROM kernel_principals WHERE auth_binding='host:v1-import'))))")
         .bind(id).bind(before).fetch_one(conn).await?;
     if changed {
         return Err(Error::conflict(
@@ -920,7 +922,7 @@ async fn import_home_snapshot_as(
         home: KernelHomeCreatedPayload {
             source_record_id: None,
             parent_id: parent.into(),
-            owner_id: owner.into(),
+            owner_id: Some(owner.into()),
             entries: entries.map(|es| {
                 es.iter()
                     .map(|(s, c)| KernelHomeEntryPayload {
@@ -983,6 +985,7 @@ pub async fn import_home_policy_as(
     require_import(&mut tx, principal).await?;
     require_source_import_open(&mut tx).await?;
     let payload = serde_json::to_value(KernelPolicyReplacedPayload {
+        record_policy: None,
         entries: entries
             .iter()
             .map(|(subject, capability)| KernelHomeEntryPayload {
@@ -1181,6 +1184,12 @@ pub struct FacetObservation {
 // All facet consumers share the additive audit envelope, including admission
 // and history. Keep unknown observation members fail-closed.
 pub(super) fn decode_facet_observation(mut payload: serde_json::Value) -> Result<FacetObservation> {
+    // Authoring evidence is an audit envelope, never a facet member.
+    if let Some(basis) = payload.as_object_mut().and_then(|p| p.remove("basis")) {
+        if !basis.is_object() {
+            return Err(Error::engine("invalid facet basis"));
+        }
+    }
     if let Some(origin) = payload.as_object_mut().and_then(|p| p.remove("origin")) {
         if !origin.is_object() {
             return Err(Error::engine("invalid facet origin"));
@@ -1272,6 +1281,7 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
         if let Some(entries) = p.home.entries {
             let mut projected = event.clone();
             projected.payload = Some(serde_json::to_string(&KernelPolicyReplacedPayload {
+                record_policy: None,
                 entries,
             })?);
             project_kernel_home_policy_replaced(conn, &projected).await?;
@@ -1546,6 +1556,9 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
         }
         "kernel.body_set.v1" => {
             let p: KernelBodyPayload = event_payload(event)?;
+            if let Some(coedit) = &p.coedit {
+                crate::coedit::version_metadata::validate_kernel_metadata(&p.body, coedit)?;
+            }
             fold_body(conn, event, &p.body).await
         }
         "kernel.facet_observed.v1" => {
@@ -1586,10 +1599,25 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KernelBodyPayload {
-    body: String,
+pub(crate) struct KernelBodyPayload {
+    pub(crate) body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    origin: Option<serde_json::Value>,
+    pub(crate) origin: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) basis: Option<serde_json::Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_coedit"
+    )]
+    pub(crate) coedit: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+// Absent is compatible; an explicit null is not a valid version object.
+fn deserialize_coedit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Map<String, serde_json::Value>>, D::Error> {
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 fn validate_body(body: &str) -> Result<()> {
@@ -1603,8 +1631,14 @@ fn validate_body(body: &str) -> Result<()> {
 
 async fn fold_body(conn: &mut SqliteConnection, event: &EventRow, body: &str) -> Result<()> {
     validate_body(body)?;
+    #[cfg(feature = "v2-kernel-probe")]
+    let timer = crate::mcp::kernel_v2::write_diagnostics::Timer::new(
+        crate::mcp::kernel_v2::write_diagnostics::Stage::BodyUpsert,
+    );
     sqlx::query("INSERT INTO kernel_record_bodies(record_id,body,event_seq) VALUES(?,?,?) ON CONFLICT(record_id) DO UPDATE SET body=excluded.body,event_seq=excluded.event_seq")
         .bind(&event.record_id).bind(body).bind(event.local_seq).execute(&mut *conn).await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    drop(timer);
     // S7a probe index follows the projection in the same transaction.
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     super::search_v2::refresh_search_row(&mut *conn, &event.record_id).await?;
@@ -1639,6 +1673,8 @@ pub async fn set_body_as(
         serde_json::to_value(KernelBodyPayload {
             body: body.into(),
             origin: None,
+            basis: None,
+            coedit: None,
         })?,
         Some(expected_revision),
     )
@@ -1649,6 +1685,8 @@ pub async fn set_body_as(
 pub struct KernelBodyRevision {
     pub body: String,
     pub event: KernelHistoryEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coedit: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Imported initial text and later native body revisions, in event sequence
@@ -1660,7 +1698,7 @@ pub async fn body_history_as(
     record: &str,
 ) -> Result<Vec<KernelBodyRevision>> {
     let history =
-        history_page_as(db, principal, record, None, false, usize::MAX, false, false).await?;
+        history_page_as(db, principal, record, None, false, usize::MAX, true, false).await?;
     let mut result = Vec::new();
     for event in history {
         if !matches!(
@@ -1673,8 +1711,19 @@ pub async fn body_history_as(
             .bind(event.seq)
             .fetch_one(db.pool())
             .await?;
+        let mut coedit = None;
         let body = if event.event_type == "kernel.body_set.v1" {
-            Some(serde_json::from_str::<KernelBodyPayload>(&payload)?.body)
+            let p = serde_json::from_str::<KernelBodyPayload>(&payload)?;
+            if let Some(metadata) = &p.coedit {
+                crate::coedit::version_metadata::validate_kernel_metadata(&p.body, metadata)?;
+            }
+            coedit = event
+                .native_body_version
+                .as_ref()
+                .and_then(|p| p.get("coedit"))
+                .and_then(serde_json::Value::as_object)
+                .cloned();
+            Some(p.body)
         } else if event.event_type == "kernel.import_state_delta.v1" {
             serde_json::from_str::<RecordDelta>(&payload)?
                 .snapshot
@@ -1684,7 +1733,11 @@ pub async fn body_history_as(
             serde_json::from_str::<ImportSnapshot>(&payload)?.state.body
         };
         if let Some(body) = body {
-            result.push(KernelBodyRevision { body, event });
+            result.push(KernelBodyRevision {
+                body,
+                event,
+                coedit,
+            });
         }
     }
     Ok(result)

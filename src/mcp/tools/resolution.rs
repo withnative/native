@@ -155,6 +155,36 @@ pub(crate) async fn resolve_many(db: Db, caller: Caller, arguments: Value) -> Re
     }
 }
 
+/// Only the admitted immutable source can choose the native member path. The
+/// shared parser/discovery/cardinality fold stays identical to v1 resolution;
+/// no canonical principal-less connection or Db facade is constructed.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_resolve_many(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    let args: ResolveManyArgs = parse_args(TOOL, arguments)?;
+    validate_args(&args)?;
+    resolve_many_with_source(
+        session.transaction(),
+        caller,
+        &args,
+        ResolutionSource::NativeMember,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ResolutionSource {
+    Canonical,
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember,
+}
+
 fn validate_args(args: &ResolveManyArgs) -> Result<()> {
     if args.names.is_empty() {
         return Err(Error::engine(format!("{TOOL}: 'names' must not be empty")));
@@ -195,6 +225,15 @@ async fn resolve_many_in(
     caller: &Caller,
     args: &ResolveManyArgs,
 ) -> Result<Value> {
+    resolve_many_with_source(snapshot, caller, args, ResolutionSource::Canonical).await
+}
+
+async fn resolve_many_with_source(
+    snapshot: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    args: &ResolveManyArgs,
+    source: ResolutionSource,
+) -> Result<Value> {
     let distinct = args.names.iter().cloned().collect::<BTreeSet<_>>();
     let placeholders = vec!["?"; distinct.len()].join(",");
     let mut sql = format!(
@@ -208,10 +247,14 @@ async fn resolve_many_in(
         sql.push_str(" AND r.kind = ?");
     }
     if !args.include_archived.unwrap_or(false) {
-        sql.push_str(
-            " AND NOT EXISTS (SELECT 1 FROM facet_values archived \
-             WHERE archived.record_id = r.id AND archived.key = ?)",
-        );
+        match source {
+            ResolutionSource::Canonical => sql.push_str(
+                " AND NOT EXISTS (SELECT 1 FROM facet_values archived \
+                 WHERE archived.record_id = r.id AND archived.key = ?)",
+            ),
+            #[cfg(feature = "v2-kernel-probe")]
+            ResolutionSource::NativeMember => sql.push_str(" AND r.archived=0"),
+        }
     }
     sql.push_str(" ORDER BY r.name COLLATE BINARY,r.id");
 
@@ -225,7 +268,7 @@ async fn resolve_many_in(
     if let Some(kind) = args.kind.as_deref() {
         query = query.bind(kind);
     }
-    if !args.include_archived.unwrap_or(false) {
+    if !args.include_archived.unwrap_or(false) && matches!(source, ResolutionSource::Canonical) {
         query = query.bind(ARCHIVED_FACET_KEY);
     }
     let rows = query.fetch_all(&mut **snapshot).await?;
@@ -243,7 +286,17 @@ async fn resolve_many_in(
         // This is the same ordinary-record admission seam used by get_record:
         // governed attribution records and malformed comments do not become
         // general-purpose resolution candidates.
-        if !crate::query::read::ordinary_record_read_eligible_live_in(snapshot, &id).await? {
+        let eligible = match source {
+            ResolutionSource::Canonical => {
+                crate::query::read::ordinary_record_read_eligible_live_in(snapshot, &id).await?
+            }
+            #[cfg(feature = "v2-kernel-probe")]
+            ResolutionSource::NativeMember => {
+                crate::query::read::ordinary_record_read_eligible_native_member_in(snapshot, &id)
+                    .await?
+            }
+        };
+        if !eligible {
             continue;
         }
         let visible = if member {

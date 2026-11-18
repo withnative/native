@@ -2,8 +2,8 @@
 
 # Native core app kit 1.1.0
 
-Major 1 now defaults to 1.1.0 on the next launch; 1.0.0 is retained for host
-rollback. The host installs frozen `window.native.kit` synchronously before the
+Major 1 defaulted to 1.1.0 at first; the current default is 1.4.0 (read
+`app-kit-core-1.4.0`). 1.3.0, 1.2.0, 1.1.2, 1.1.1, 1.1.0 and 1.0.0 are retained for host rollback. The host installs frozen `window.native.kit` synchronously before the
 first author script. No imports, npm, JSX compiler or build are required.
 An unavailable requested major refuses `kit_major_unavailable`.
 

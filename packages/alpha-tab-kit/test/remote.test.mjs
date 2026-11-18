@@ -192,7 +192,7 @@ test("whole-body create survives MCP encoding and retries stage a fresh source",
       assert.equal(args.body_encoding, "gzip+base64");
       assert.equal(gunzipSync(Buffer.from(args.body, "base64")).toString("utf8"), html);
       assert.deepEqual(args.sources, input.sources);
-      assert.deepEqual(args.facets, { runtime: "native.html.v1" });
+      assert.deepEqual(args.facets, { runtime: "native.html.v1", app_package: "true" });
       assert.equal(Object.hasOwn(args, "idempotency_key"), false);
       const receipt = { id: `artifact-${creates.length}`, body_digest: plan.digests.bundle_sha256, source_event_id: `body-created-${creates.length}` };
       creates.push(receipt);

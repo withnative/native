@@ -59,7 +59,7 @@ pub enum FileFenceRefusal {
 type Result<T> = std::result::Result<T, FileFenceRefusal>;
 
 // No Debug/Serialize: a failed comparison must not disclose either identity.
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct Identity {
     schema: String,
     origin: String,
@@ -103,6 +103,7 @@ impl Identity {
 /// expectation. The existing transport is responsible for verifying the server
 /// and installed source binding before constructing that sealed context.
 /// This expectation alone is insufficient to admit or open a member Db.
+#[derive(Clone)]
 pub struct ExpectedFileFence(Identity);
 
 impl ExpectedFileFence {

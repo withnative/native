@@ -4,42 +4,88 @@ mod activity;
 mod app_data;
 mod apps;
 pub(crate) mod artifacts;
+#[cfg(feature = "v2-kernel-probe")]
+#[allow(dead_code)] // Inactive scoped ToolRegistry proof lane.
+mod current_body_read;
+mod saved_tabs;
 pub use app_data::NativeAppDataNeeds;
 mod attachments;
 mod bindings;
+mod bootstrap_diagnostics;
 mod canvas;
 mod changes;
+mod citations;
 pub(crate) mod comments;
 pub(crate) mod coordination;
 mod deletion;
+mod describe_schema;
 mod event_context;
+mod guidance;
 mod history_diff;
 pub mod identity_read;
 pub(crate) mod intents;
 mod interventions;
 mod member_configuration;
+mod merge_body;
 mod messaging;
 mod metadata_reads;
+mod schema_config_operations;
+mod schema_operations;
+mod type_correction;
+pub(crate) use metadata_reads::GUARANTEE as NATIVE_SCHEMA_SHAPE_GUARANTEE;
+mod contracts;
 #[cfg(feature = "package-cel-dev")]
 mod package_operations;
 mod policy;
+#[cfg(test)]
+mod policy_mutation_tests;
+mod read_disclosures;
 mod read_surface;
 pub mod record_images;
+mod record_reads;
 pub mod reference_read;
+pub mod release_append;
+mod scan;
 mod shape;
 mod source_basis;
 pub(crate) mod sql;
 mod suggestions;
 mod surface_bindings;
+pub mod webhooks;
 pub(crate) mod workspace_snapshot;
+pub(crate) mod write_diagnostics;
 pub(crate) mod writes;
 pub(crate) use writes::render_links;
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use sql::working_snapshot::{PinnedWorkingCollection, PinnedWorkingRead};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::registry::{Caller, EngineHandle, EngineKind, ToolRegistry};
 use crate::{db::Db, kernel, Error, Result};
+
+/// Read-only pre-spawn guard for the inactive native peer-operation unit.
+#[cfg(feature = "v2-kernel-probe")]
+#[allow(dead_code)]
+pub(crate) fn require_no_sql_session_for_native_peer_ingress() -> Result<()> {
+    sql::require_no_read_session()
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn with_native_peer_sql_read_session_for_test<'a, T, F>(
+    db: &'a Db,
+    actor: &'a str,
+    reads: &'a [(&'a str, &'a str)],
+    work: F,
+) -> Result<T>
+where
+    T: 'a,
+    F: std::future::Future<Output = Result<T>> + 'a,
+{
+    sql::with_read_session(db, actor, reads, work).await
+}
 
 pub(crate) async fn principal(db: &Db, caller: &Caller) -> Result<String> {
     // Credential is the authenticated transport identity, never a supplied
@@ -58,6 +104,60 @@ pub(crate) async fn principal(db: &Db, caller: &Caller) -> Result<String> {
         kernel::run_ledger::reject_historical_key_as(db, key).await?;
     }
     Ok(id)
+}
+
+/// Recheck ordinary transport authority on the actual write transaction.
+/// Ordinary principals need not be account contributors; live CRDT authors
+/// are admitted separately by the coedit adapter when minting a candidate.
+pub(crate) async fn principal_on(
+    conn: &mut sqlx::SqliteConnection,
+    caller: &Caller,
+) -> Result<String> {
+    if caller.credential().starts_with("host:") {
+        return Err(Error::engine(
+            "kernel-v2: host bindings cannot authenticate callers",
+        ));
+    }
+    let id: String =
+        sqlx::query_scalar("SELECT principal_id FROM kernel_principals WHERE auth_binding=?")
+            .bind(caller.credential())
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| Error::engine("kernel-v2: caller has no principal auth_binding"))?;
+    if !kernel::hosted_identity::admitted(conn, &id).await? {
+        return Err(Error::engine("database membership not found"));
+    }
+    if let Some(app) = caller.host_asserted_app() {
+        kernel::app_installs::admit_app_on(conn, &id, app).await?;
+    }
+    if let Some(key) = caller.run_key().filter(|key| *key != "new") {
+        kernel::run_ledger::reject_historical_key_on(conn, key).await?;
+    }
+    Ok(id)
+}
+
+// Tests can suspend one actual registered read after its handler finishes,
+// before the final authority check. This is task-local, never a global hook.
+#[cfg(test)]
+tokio::task_local! {
+    static READ_RETURN_BARRIER: (std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>);
+}
+
+#[cfg(test)]
+pub(crate) async fn with_read_return_barrier<F: std::future::Future>(
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    resume: std::sync::Arc<tokio::sync::Notify>,
+    work: F,
+) -> F::Output {
+    READ_RETURN_BARRIER.scope((entered, resume), work).await
+}
+
+#[cfg(test)]
+async fn pause_before_read_return() {
+    if let Ok((entered, resume)) = READ_RETURN_BARRIER.try_with(Clone::clone) {
+        entered.notify_one();
+        resume.notified().await;
+    }
 }
 
 /// Register hosted v2 handlers without changing the v1 discovery schemas.
@@ -86,8 +186,11 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
     #[cfg(feature = "package-cel-dev")]
     package_operations::register(registry)?;
     apps::register(registry)?;
+    register_app_bundle(registry)?;
     intents::register(registry)?;
     deletion::register(registry)?;
+    citations::register(registry)?;
+    type_correction::register(registry)?;
     bindings::register(registry)?;
     interventions::register(registry)?;
     macro_rules! register {
@@ -100,7 +203,13 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
                         unreachable!()
                     };
                     let actor = principal(&db, &caller).await?;
+                    let attachment_mutation =
+                        $name == "manage_attachments" && arguments["action"] == "detach";
                     let value = $handler(&db, &actor, arguments).await?;
+                    #[cfg(test)]
+                    if $name == "whats_changed" {
+                        pause_before_read_return().await;
+                    }
                     // Composed reads can use several separately authorized
                     // snapshots. Refuse a changed consent/source before
                     // returning their result; writes never get a fallible
@@ -111,6 +220,7 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
                             | "read_canvas"
                             | "get_record"
                             | "query_record"
+                            | "whats_changed"
                             | "query_sql"
                             | "get_history"
                             | "search"
@@ -123,8 +233,13 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
                             | "get_run_activity"
                             | "preview_record_shape"
                             | "get_event_context"
+                            | "get_dashboard"
+                            | "scan"
+                            | "render_record"
+                            | "resolve_many"
                             | "render_record_version_diff"
-                    ) {
+                    ) && !attachment_mutation
+                    {
                         if let Some(app) = caller.host_asserted_app() {
                             kernel::app_installs::admit_account_app_as(
                                 &db,
@@ -153,14 +268,14 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
             if args["action"] == "set_agent_disposition"
                 && caller.verified_agent_executor().is_none()
             {
-                return Err(Error::engine(
+                return Err(crate::mcp::tools::messaging::authority_refusal(
                     "agent disposition requires server-verified executor and delegation context",
                 ));
             }
             if args["action"] == "mutate_human_awareness"
                 && caller.verified_human_interaction().is_none()
             {
-                return Err(Error::engine(
+                return Err(crate::mcp::tools::messaging::authority_refusal(
                     "human awareness requires a server-verified interaction attestation",
                 ));
             }
@@ -168,7 +283,7 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
                 && caller.verified_human_interaction().is_none()
                 && !caller.has_policy_authority()
             {
-                return Err(Error::engine(
+                return Err(crate::mcp::tools::messaging::authority_refusal(
                     "routing requires attested principal choice or trusted policy authority",
                 ));
             }
@@ -178,28 +293,40 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     register!("read_attachment", attachments::read);
     register!("manage_attachments", attachments::manage);
-    register!("get_record", get_record);
-    register!("get_structure", read_surface::get_structure);
-    register!("open_collection", read_surface::open_collection);
-    register!("resolve_facets", metadata_reads::resolve_facets);
-    register!("suggest_facet_values", metadata_reads::suggest);
-    registry.register_engine_handler_for_selector_values(
-        "manage_vocabularies",
+    registry.set_kernel_v2_schema("manage_attachments", json!({"oneOf":[
+        {"type":"object","properties":{"action":{"const":"list"},"record_id":{"type":"string"}},"required":["action","record_id"],"additionalProperties":false},
+        {"type":"object","properties":{"action":{"const":"inspect"},"attachment_id":{"type":"string"}},"required":["action","attachment_id"],"additionalProperties":false},
+        {"type":"object","properties":{"action":{"const":"detach"},"attachment_id":{"type":"string"},"if_content_seq":{"type":"integer","description":"Optional expected attachment revision; a mismatch appends nothing."}},"required":["action","attachment_id"],"additionalProperties":false}
+    ]}))?;
+    registry.register_engine_handler(
+        "get_record",
         EngineKind::KernelV2,
-        "action",
-        &["list_values"],
         |engine, caller, args| async move {
             let EngineHandle::KernelV2(db) = engine else {
                 unreachable!()
             };
+            #[cfg(all(test, feature = "v2-kernel-probe"))]
+            if current_body_read::selected() {
+                return current_body_read::get(&db, &caller, args).await;
+            }
             let actor = principal(&db, &caller).await?;
-            let value = metadata_reads::list_values(&db, &actor, args).await?;
+            let value = get_record(&db, &actor, args).await?;
             if let Some(app) = caller.host_asserted_app() {
                 kernel::app_installs::admit_account_app_as(&db, caller.credential(), app).await?;
             }
             Ok(value)
         },
     )?;
+    register!("resolve_many", record_reads::resolve_many);
+    register!("render_record", record_reads::render_record);
+    register!("get_dashboard", record_reads::get_dashboard);
+    register!("scan", scan::scan);
+    register!("get_structure", read_surface::get_structure);
+    register!("open_collection", read_surface::open_collection);
+    register!("resolve_facets", metadata_reads::resolve_facets);
+    register!("suggest_facet_values", metadata_reads::suggest);
+    schema_operations::register(registry)?;
+    schema_config_operations::register(registry)?;
     register!("query_record", query_record);
     register!("get_history", get_history);
     register!("get_run_activity", activity::read);
@@ -271,13 +398,32 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
             }
         },
     )?;
+    guidance::register(registry)?;
+    describe_schema::register(registry)?;
     coordination::register(registry)?;
     member_configuration::register(registry)?;
     surface_bindings::register(registry)?;
-    register!("query_sql", sql::query_sql);
+    registry.register_engine_handler(
+        "query_sql",
+        EngineKind::KernelV2,
+        |engine, caller, args| async move {
+            let EngineHandle::KernelV2(db) = engine else {
+                unreachable!()
+            };
+            let actor = principal(&db, &caller).await?;
+            let value = sql::query_sql_for_caller(&db, &actor, &caller, args).await?;
+            if let Some(app) = caller.host_asserted_app() {
+                kernel::app_installs::admit_account_app_as(&db, caller.credential(), app).await?;
+            }
+            Ok(value)
+        },
+    )?;
     policy::register(registry)?;
     account_config::register(registry)?;
+    saved_tabs::register(registry)?;
     writes::register(registry)?;
+    contracts::register(registry)?;
+    merge_body::register(registry)?;
     registry.register_engine_handler(
         "resolve_suggestions",
         EngineKind::KernelV2,
@@ -298,6 +444,47 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
     Ok(())
 }
 
+fn register_app_bundle(registry: &mut ToolRegistry) -> Result<()> {
+    registry.register_engine_handler(
+        "read_app_bundle",
+        EngineKind::KernelV2,
+        |engine, caller, arguments| async move {
+            let EngineHandle::KernelV2(db) = engine else {
+                unreachable!()
+            };
+            super::tools::app_bundle::refuse_app(&caller)?;
+            let args = super::tools::app_bundle::Args::parse(arguments)?;
+            let mut snapshot = db.pool().begin().await?;
+            let actor = principal_on(&mut snapshot, &caller).await?;
+            let admitted = kernel::app_installs::admit_install_on(
+                &mut snapshot,
+                &actor,
+                &args.package,
+                &args.expected_install_event_id,
+            )
+            .await?;
+            let result = super::tools::app_bundle::response(
+                args,
+                admitted.body,
+                admitted.pin["artifact_id"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        Error::engine(
+                            "read_app_bundle: missing artifact identity [invalid_install]",
+                        )
+                    })?
+                    .to_owned(),
+                admitted.version,
+                admitted.body_limit,
+                db.open_mode() == crate::db::DatabaseOpenMode::StandbyReadOnly
+                    || caller.hosting_database().is_none(),
+            )?;
+            snapshot.rollback().await?;
+            Ok(result)
+        },
+    )
+}
+
 fn parse<T: serde::de::DeserializeOwned>(tool: &str, value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|e| {
         Error::engine(format!(
@@ -305,11 +492,16 @@ fn parse<T: serde::de::DeserializeOwned>(tool: &str, value: Value) -> Result<T> 
         ))
     })
 }
-const LOGICAL_EVENT_TYPES: &[(&str, &str)] = &[
+pub(crate) const LEGACY_RECEIPT_MAPPING: (&str, &str) = ("receipt.committed.v1", "record.updated");
+pub(crate) const LOGICAL_EVENT_TYPES: &[(&str, &str)] = &[
     ("kernel.record_created.v1", "record.created"),
     ("kernel.record_created.v2", "record.created"),
     ("kernel.record_revised.v1", "record.updated"),
     ("kernel.record_revised.v2", "record.updated"),
+    (
+        "kernel.record_type_corrected.v1",
+        "record.type_corrected.v1",
+    ),
     ("kernel.body_set.v1", "record.updated"),
     ("kernel.metadata_set.v1", "record.updated"),
     ("kernel.archive_changed.v1", "record.updated"),
@@ -320,15 +512,19 @@ const LOGICAL_EVENT_TYPES: &[(&str, &str)] = &[
     ("kernel.link_added.v2", "link.added"),
     ("kernel.link_removed.v1", "link.removed"),
     ("kernel.comment_anchor_set.v1", "annotation.target.set"),
+    (
+        "kernel.comment_anchor_removed.v1",
+        "annotation.target.removed",
+    ),
     ("kernel.record_deleted.v1", "record.deleted"),
 ];
-const IMPORTED_EVENTS: &[&str] = &[
+pub(crate) const IMPORTED_EVENTS: &[&str] = &[
     "kernel.generic_link_imported.v1",
     "kernel.generic_link_removal_imported.v1",
     "kernel.comment_anchor_imported.v1",
     "kernel.comment_anchor_removal_imported.v1",
 ];
-fn logical_event_type(native: &str) -> &str {
+pub(crate) fn logical_event_type(native: &str) -> &str {
     LOGICAL_EVENT_TYPES
         .iter()
         .find(|(event, _)| *event == native)
@@ -361,6 +557,27 @@ async fn record_value_on(
     actor: &str,
     record: &kernel::KernelRecordView,
 ) -> Result<Value> {
+    record_value_projection_on(snapshot, actor, record, ValueProjection::Full).await
+}
+
+/// Hydration width for one record value. `Metadata` is the public
+/// metadata-only response and never changes shape here; `Envelope` is the
+/// private collection-envelope width — the same body-free row plus the
+/// persistence already present on the view, so the envelope pairs maturity
+/// and persistence from a single snapshot instead of refetching.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ValueProjection {
+    Full,
+    Metadata,
+    Envelope,
+}
+
+async fn record_value_projection_on(
+    snapshot: &mut sqlx::SqliteConnection,
+    actor: &str,
+    record: &kernel::KernelRecordView,
+    projection: ValueProjection,
+) -> Result<Value> {
     kernel::app_installs::admit_dispatched_on(snapshot, actor).await?;
     kernel::kernel_require(
         snapshot,
@@ -392,23 +609,35 @@ async fn record_value_on(
     .bind(record.revision)
     .fetch_one(&mut *snapshot)
     .await?;
-    let body = record
-        .body
-        .as_ref()
-        .map(|body| json!(body))
-        .unwrap_or_else(|| field("body"));
+    let body = if projection == ValueProjection::Full {
+        let hydrated = record
+            .body
+            .as_ref()
+            .map(|body| json!(body))
+            .unwrap_or_else(|| field("body"));
+        // Tally real body bytes materialized into full values; the envelope
+        // regression compares this against the body-free paths.
+        #[cfg(test)]
+        read_surface::envelope_diagnostics::note_body_hydrated(
+            hydrated.as_str().map(str::len).unwrap_or(0),
+        );
+        hydrated
+    } else {
+        Value::Null
+    };
     let mut owner = record.owner_id.clone();
-    let communication_origin = if record_type == Some("Message") {
-        owner = messaging::visible_person(snapshot, actor, owner.as_deref()).await?;
-        let origin = if let Some(state) = kernel::messaging::on(snapshot, &record.id).await? {
-            Some(kernel::messaging::communication_origin(snapshot, &state).await?)
+    let communication_origin =
+        if projection == ValueProjection::Full && record_type == Some("Message") {
+            owner = messaging::visible_person(snapshot, actor, owner.as_deref()).await?;
+            let origin = if let Some(state) = kernel::messaging::on(snapshot, &record.id).await? {
+                Some(kernel::messaging::communication_origin(snapshot, &state).await?)
+            } else {
+                None
+            };
+            origin
         } else {
             None
         };
-        origin
-    } else {
-        None
-    };
     let placement_started = std::time::Instant::now();
     let home_id = crate::v1_import::placement_on(snapshot, actor, &record.id)
         .await?
@@ -425,6 +654,24 @@ async fn record_value_on(
     )
     .await?;
     tracing::debug!(target:"native_ce::read_staging",phase="record_lifecycle",elapsed_us=started.elapsed().as_micros() as u64);
+    if projection != ValueProjection::Full {
+        // `Metadata` is the public shape and stays fixed; `Envelope` carries
+        // the same row plus the persistence already on this view, so the
+        // envelope never pairs maturity from one snapshot with persistence
+        // refetched from another.
+        let mut value = json!({
+            "id":record.id,"type":record_type,"kind":kind,
+            "name":record.fields.get("title").cloned().unwrap_or_else(|| field("name")),
+            "summary":field("summary"),"home_id":home_id,
+            "lifecycle_interpretation":lifecycle_interpretation,
+            "maturity":record.metadata.maturity,"updated_at":updated_at,
+            "last_activity_at":record.metadata.last_activity_at
+        });
+        if projection == ValueProjection::Envelope {
+            value["persistence"] = json!(record.metadata.persistence);
+        }
+        return Ok(value);
+    }
     let started = std::time::Instant::now();
     let historical_claims = kernel::v1_state::claims_on(snapshot, actor, &record.id).await?;
     tracing::debug!(target:"native_ce::read_staging",phase="record_claims",elapsed_us=started.elapsed().as_micros() as u64);
@@ -432,7 +679,22 @@ async fn record_value_on(
     let legacy_provenance =
         crate::v1_import::legacy_record_provenance_on(snapshot, actor, &record.id).await?;
     tracing::debug!(target:"native_ce::read_staging",phase="record_provenance",elapsed_us=started.elapsed().as_micros() as u64);
+    let intake = webhooks::recorded_source_on(snapshot, &record.id, record.revision).await?;
+    let mut contribution = Value::Null;
+    if let Some((source, act, created)) = &intake {
+        let body_revision:Option<(String,String,i64)>=sqlx::query_as("SELECT id,type,act FROM main.content_events WHERE record_id=? AND seq<=? AND (type IN ('kernel.record_created.v1','kernel.record_created.v2','kernel.body_set.v1') OR (type IN ('kernel.record_revised.v1','kernel.record_revised.v2') AND json_type(payload,'$.fields.body') IS NOT NULL)) ORDER BY seq DESC LIMIT 1")
+            .bind(&record.id).bind(record.revision).fetch_optional(&mut *snapshot).await?;
+        if let Some((event, kind, body_act)) =
+            body_revision.filter(|(_, _, body_act)| body_act == act)
+        {
+            let _ = body_act;
+            contribution = webhooks::contribution(source, created, &event, &kind);
+        }
+    }
+    let intake_origin = intake.map(|(source, _, _)| source);
     Ok(json!({
+        "intake_origin":intake_origin,
+        "contribution":contribution,
         "communication_origin":communication_origin,
         "id": record.id, "type": record_type, "kind": kind,
         "name": record.fields.get("title").cloned().unwrap_or_else(|| field("name")), "body": body, "body_digest": super::tools::lifecycle::body_digest(body.as_str()), "summary": field("summary"),
@@ -445,8 +707,15 @@ async fn record_value_on(
         "legacy_provenance": legacy_provenance,
         "deleted_at": null,
         "fields": record.fields, "version": format!("rec:{}", record.revision), "record_version": format!("rec:{}", record.revision),
-        "kernel_v2": {"family": record.family, "pin": record.pin, "interpreter": record.interpreter, "native_created_at":native_created_at}
+        "kernel_v2": native_record_identity(record, &native_created_at)
     }))
+}
+
+pub(crate) fn native_record_identity(
+    record: &kernel::KernelRecordView,
+    native_created_at: &str,
+) -> Value {
+    json!({"family":record.family,"pin":record.pin,"interpreter":record.interpreter,"native_created_at":native_created_at})
 }
 
 #[derive(Deserialize)]
@@ -486,24 +755,58 @@ fn get_batch_deadline() -> std::time::Duration {
     }
     GET_BATCH_DEADLINE
 }
+#[inline(never)]
+fn app_scope_get_precheck<'a>(
+    db: &'a Db,
+    actor: &'a str,
+    ids: &'a [String],
+) -> futures::future::BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+        let mut snapshot = db.write_pool().begin().await?;
+        kernel::app_installs::admit_dispatched_on(&mut snapshot, actor).await?;
+        for id in ids {
+            if let Some(error) = kernel::app_scope_direct_refusal_on(
+                &mut snapshot,
+                actor,
+                id,
+                crate::authorization::Capability::View,
+            )
+            .await?
+            {
+                return Err(error);
+            }
+        }
+        snapshot.rollback().await?;
+        Ok(())
+    })
+}
+
+const GET_RECORD_READS: &[(&str, &str)] = &[
+    ("records", "id"),
+    ("records", "type"),
+    ("records", "kind"),
+    ("records", "name"),
+    ("records", "archived"),
+    ("records", "created_at"),
+    ("records", "home_id"),
+    ("links", "source_id"),
+    ("links", "target_id"),
+    ("links", "relationship"),
+];
+
 async fn get_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let plan = get_plan(args)?;
     let ids = plan.args.ids.clone();
+    // Direct reach by a scoped app for a person-visible record outside
+    // its grant is a typed refusal, not a silent omission. Short
+    // references that do not literally name a record stay omissions.
+    if crate::provenance::current_app_package().is_some() {
+        app_scope_get_precheck(db, actor, &ids).await?;
+    }
     sql::with_part_of_read_session(
         db,
         actor,
-        &[
-            ("records", "id"),
-            ("records", "type"),
-            ("records", "kind"),
-            ("records", "name"),
-            ("records", "archived"),
-            ("records", "created_at"),
-            ("records", "home_id"),
-            ("links", "source_id"),
-            ("links", "target_id"),
-            ("links", "relationship"),
-        ],
+        GET_RECORD_READS,
         &ids,
         get_record_from_plan(db, actor, plan),
     )
@@ -584,7 +887,25 @@ async fn get_record_in_session(db: &Db, actor: &str, args: Value) -> Result<Valu
     get_record_from_plan(db, actor, get_plan(args)?).await
 }
 async fn get_record_from_plan(db: &Db, actor: &str, plan: GetPlan) -> Result<Value> {
-    let plan = std::sync::Arc::new(plan);
+    get_record_from_shared_plan(db, actor, std::sync::Arc::new(plan)).await
+}
+async fn get_record_from_shared_plan(
+    db: &Db,
+    actor: &str,
+    plan: std::sync::Arc<GetPlan>,
+) -> Result<Value> {
+    get_record_from_shared_plan_bounded(db, actor, plan, None).await
+}
+async fn get_record_from_shared_plan_bounded(
+    db: &Db,
+    actor: &str,
+    plan: std::sync::Arc<GetPlan>,
+    encoded_limit: Option<usize>,
+) -> Result<Value> {
+    #[cfg(feature = "v2-kernel-probe")]
+    let mut staged_encoded_bytes = br#"{"records":[]}"#.len();
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let _ = encoded_limit;
     let started = std::time::Instant::now();
     let artifact_kinds = read_surface::artifact_kinds(db, actor).await?;
     tracing::debug!(target:"native_ce::read_staging",phase="get_artifact_kinds",elapsed_us=started.elapsed().as_micros() as u64);
@@ -658,7 +979,15 @@ async fn get_record_from_plan(db: &Db, actor: &str, plan: GetPlan) -> Result<Val
             }
             value
         } else {
-            records.push(json!({"id":id,"status":"not_found"}));
+            let value = json!({"id":id,"status":"not_found"});
+            #[cfg(feature = "v2-kernel-probe")]
+            if let Some(limit) = encoded_limit {
+                let remaining =
+                    limit.saturating_sub(staged_encoded_bytes + usize::from(!records.is_empty()));
+                staged_encoded_bytes += current_body_read::encoded_size_within(&value, remaining)?
+                    + usize::from(!records.is_empty());
+            }
+            records.push(value);
             continue;
         };
         read_surface::enrich(
@@ -673,6 +1002,13 @@ async fn get_record_from_plan(db: &Db, actor: &str, plan: GetPlan) -> Result<Val
             &mut value,
         )
         .await?;
+        #[cfg(feature = "v2-kernel-probe")]
+        if let Some(limit) = encoded_limit {
+            let remaining =
+                limit.saturating_sub(staged_encoded_bytes + usize::from(!records.is_empty()));
+            staged_encoded_bytes += current_body_read::encoded_size_within(&value, remaining)?
+                + usize::from(!records.is_empty());
+        }
         records.push(value);
     }
     Ok(json!({"records": records}))
@@ -758,6 +1094,7 @@ async fn hydrate_get_on(
         // Direct thread children ride every row: the count always, the
         // anchored summaries only with include_comments. A hidden record
         // stays not_found above, so its comments never leak.
+        let comments_started = std::time::Instant::now();
         let enriched = comments::enrich_on(
             conn,
             actor,
@@ -767,9 +1104,17 @@ async fn hydrate_get_on(
             comments_offset,
         )
         .await?;
+        tracing::debug!(target:"native_ce::read_staging",phase="get_comments",elapsed_us=comments_started.elapsed().as_micros() as u64);
         value["comment_count"] = enriched["comment_count"].clone();
         if let Some(comments) = enriched.get("comments") {
             value["comments"] = comments.clone();
+        }
+        // Definition-driven disclosures ride the admitted link batch, never
+        // the caller-sized links window: links_limit cannot suppress them.
+        let disclosed =
+            read_disclosures::disclosures_for(conn, actor, &[(id, links.as_slice())]).await?;
+        if let Some(rules) = disclosed.get(id) {
+            value["read_disclosures"] = json!(rules);
         }
         Ok(Some(value))
     } else {
@@ -781,6 +1126,7 @@ async fn hydrate_get_on(
 #[serde(deny_unknown_fields)]
 struct QueryArgs {
     steps: Vec<Value>,
+    projection: Option<crate::mcp::tools::querying::RecordProjection>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -805,6 +1151,22 @@ async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Value> {
     kernel::read_cache::with_capabilities(query_record_read(db, actor, args)).await
 }
 async fn query_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    if crate::mcp::tools::record_hook::requested(&args) {
+        let (sql, parameters, limit, offset) =
+            crate::mcp::tools::record_hook::kernel_statement(&args)?;
+        let answer =
+            sql::query_sql(db, actor, json!({"sql": sql, "parameters": parameters})).await?;
+        let rows = answer
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                crate::Error::engine("query_record: record_hook.v1 SQL result omitted rows")
+            })?;
+        let mut connection = db.pool().acquire().await?;
+        let interpreter = kernel::v1_state::interpreter_on(&mut connection, actor).await?;
+        return crate::mcp::tools::record_hook::project_page(&interpreter, rows, limit, offset);
+    }
     let extended = args.get("order").is_some()
         || args["steps"].as_array().is_some_and(|steps| {
             steps.len() == 2
@@ -826,9 +1188,13 @@ async fn query_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
                 })
         });
     if extended {
-        return read_surface::query_record(db, actor, args).await;
+        return sql::with_query_record_guard_diagnostics(read_surface::query_record(
+            db, actor, args,
+        ))
+        .await;
     }
     let args: QueryArgs = parse("query_record", args)?;
+    let metadata_only = args.projection.is_some();
     let limit = args.limit.unwrap_or(50);
     let offset = args.offset.unwrap_or(0);
     if !(1..=500).contains(&limit) {
@@ -912,26 +1278,7 @@ async fn query_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let mut records = kernel::read_cache::in_pinned_snapshot(
         identity,
         kernel::read_cache::connection_id(&mut snapshot),
-        async {
-            let mut records = Vec::with_capacity(page.records.len());
-            for record in &page.records {
-                let home = crate::v1_import::placement_on(&mut snapshot, actor, &record.id)
-                    .await?
-                    // Do not attach a newer placement to an older bounded-list hit.
-                    .filter(|p| p.kernel_home_id == record.home_id)
-                    .and_then(|p| p.home_id);
-                if record.primary_type.as_deref() == Some("Message") {
-                    if let Some(message) =
-                        kernel::read_record_on(&mut snapshot, actor, &record.id).await?
-                    {
-                        records.push(record_value_on(&mut snapshot, actor, &message).await?);
-                    }
-                } else {
-                    records.push(bounded_value(record, home));
-                }
-            }
-            Ok::<_, Error>(records)
-        },
+        async { bounded_page_on(&mut snapshot, actor, &page, metadata_only).await },
     )
     .await?;
     snapshot.rollback().await?;
@@ -940,10 +1287,11 @@ async fn query_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     // this bounded list. These are governed Message metadata, not body reads.
     // Finish placement first so the read snapshot never holds a pool slot
     // while asking placement to acquire another one.
-    if page
-        .records
-        .iter()
-        .any(|r| r.primary_type.as_deref() == Some("Message"))
+    if !metadata_only
+        && page
+            .records
+            .iter()
+            .any(|r| r.primary_type.as_deref() == Some("Message"))
     {
         let mut tx = db.pool().begin().await?;
         kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
@@ -971,17 +1319,97 @@ async fn query_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
         tx.rollback().await?;
     }
     let returned = records.len();
-    Ok(
-        json!({"shape": "records", "records": records, "total": page.total,
-        "returned": returned, "offset": offset, "has_more": offset.saturating_add(returned) < page.total}),
-    )
+    let mut payload = json!({"shape": "records", "records": records, "total": page.total,
+        "returned": returned, "offset": offset, "has_more": offset.saturating_add(returned) < page.total});
+    if metadata_only {
+        crate::mcp::tools::querying::project_record_metadata(&mut payload);
+    }
+    Ok(payload)
 }
 
 /// v1-shaped JSON for one bounded-query hit. Same envelope keys as
 /// `record_value` (which stays the get_record path); the body lane is absent
 /// by construction — lists never read it.
-fn bounded_value(record: &kernel::search_v2::BoundedRecord, home: Option<String>) -> Value {
+async fn bounded_page_on(
+    conn: &mut sqlx::SqliteConnection,
+    actor: &str,
+    page: &kernel::search_v2::BoundedQueryPage,
+    metadata_only: bool,
+) -> Result<Vec<Value>> {
+    let mut records = Vec::with_capacity(page.records.len());
+    for record in &page.records {
+        let home = crate::v1_import::placement_on(&mut *conn, actor, &record.id)
+            .await?
+            // Do not attach a newer placement to an older bounded-list hit.
+            .filter(|p| p.kernel_home_id == record.home_id)
+            .and_then(|p| p.home_id);
+        if record.primary_type.as_deref() == Some("Message") {
+            let message = if metadata_only {
+                kernel::read_record_metadata_on(&mut *conn, actor, &record.id).await?
+            } else {
+                kernel::read_record_on(&mut *conn, actor, &record.id).await?
+            };
+            if let Some(message) = message {
+                records.push(
+                    record_value_projection_on(
+                        &mut *conn,
+                        actor,
+                        &message,
+                        if metadata_only {
+                            ValueProjection::Metadata
+                        } else {
+                            ValueProjection::Full
+                        },
+                    )
+                    .await?,
+                );
+            }
+        } else {
+            records.push(bounded_value_projection(record, home, metadata_only));
+        }
+    }
+    // Same admitted-batch disclosures as Get, computed once per page
+    // on this snapshot rather than per row.
+    let ids: Vec<String> = page
+        .records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect();
+    let anchor_set: std::collections::BTreeSet<String> = ids.iter().cloned().collect();
+    let batch = kernel::generic_links::visible_link_rows_for_on(&mut *conn, actor, &ids).await?;
+    let by_anchor = read_disclosures::partition_links(batch, &anchor_set);
+    let refs: Vec<(&str, &[Value])> = ids
+        .iter()
+        .map(|id| {
+            (
+                id.as_str(),
+                by_anchor.get(id).map(Vec::as_slice).unwrap_or(&[]),
+            )
+        })
+        .collect();
+    let disclosed = read_disclosures::disclosures_for(&mut *conn, actor, &refs).await?;
+    for (record, value) in page.records.iter().zip(records.iter_mut()) {
+        if let Some(rules) = disclosed.get(&record.id) {
+            value["read_disclosures"] = json!(rules);
+        }
+    }
+    Ok::<_, Error>(records)
+}
+
+fn bounded_value_projection(
+    record: &kernel::search_v2::BoundedRecord,
+    home: Option<String>,
+    metadata_only: bool,
+) -> Value {
     let field = |name: &str| record.fields.get(name).cloned().unwrap_or(Value::Null);
+    if metadata_only {
+        return json!({
+            "id":record.id,"type":record.primary_type,"kind":record.kind,
+            "name":record.fields.get("title").cloned().unwrap_or_else(|| field("name")),
+            "summary":field("summary"),"home_id":home,"maturity":record.metadata.maturity,
+            "updated_at":null,"last_activity_at":record.metadata.last_activity_at
+        });
+    }
     json!({
         "id": record.id, "type": record.primary_type, "kind": record.kind,
         "name": record.fields.get("title").cloned().unwrap_or_else(|| field("name")), "body": field("body"), "summary": field("summary"),
@@ -1065,6 +1493,29 @@ async fn search_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
                 .filter(|p| p.kernel_home_id == hit.home_id)
                 .and_then(|p| p.home_id);
             rendered_hits.push(json!({"id":hit.id,"type":hit.record_type,"kind":hit.kind,"name":hit.name,"home_id":home_id,"score":hit.score,"snippet":hit.snippet}));
+        }
+        // Disclosures ride the same admitted batch and snapshot as Get, and
+        // are independent of any link paging: search has none to suppress.
+        let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
+        let anchor_set: std::collections::BTreeSet<String> =
+            ids.iter().cloned().collect();
+        let batch =
+            kernel::generic_links::visible_link_rows_for_on(&mut snapshot, actor, &ids).await?;
+        let by_anchor = read_disclosures::partition_links(batch, &anchor_set);
+        let refs: Vec<(&str, &[Value])> = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.as_str(),
+                    by_anchor.get(id).map(Vec::as_slice).unwrap_or(&[]),
+                )
+            })
+            .collect();
+        let disclosed = read_disclosures::disclosures_for(&mut snapshot, actor, &refs).await?;
+        for (hit, out) in hits.iter().zip(rendered_hits.iter_mut()) {
+            if let Some(rules) = disclosed.get(&hit.id) {
+                out["read_disclosures"] = json!(rules);
+            }
         }
         Ok::<_, Error>(rendered_hits)
     }).await;
@@ -1172,7 +1623,45 @@ async fn record_history(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let has_more = events.len() > limit;
     let selected = events.into_iter().take(limit).collect::<Vec<_>>();
     let next = has_more.then(|| selected.last().unwrap().seq);
-    let events = history_values(selected, full, Some(&args.record_id));
+    let mut events = history_values(selected, full, Some(&args.record_id));
+    let mut source_snapshot = db.pool().begin().await?;
+    if kernel::read_record_on(&mut source_snapshot, actor, &args.record_id)
+        .await?
+        .is_some()
+    {
+        if let Some((source, act, created)) =
+            webhooks::recorded_source_on(&mut source_snapshot, &args.record_id, i64::MAX).await?
+        {
+            let ids: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM main.content_events WHERE record_id=? AND act=?",
+            )
+            .bind(&args.record_id)
+            .bind(act)
+            .fetch_all(&mut *source_snapshot)
+            .await?;
+            for event in &mut events {
+                if event["id"]
+                    .as_str()
+                    .is_some_and(|id| ids.iter().any(|known| known == id))
+                {
+                    event["source"] = source.clone();
+                    event["contribution"] = webhooks::contribution(
+                        &source,
+                        &created,
+                        event["id"].as_str().unwrap_or(""),
+                        event["type"].as_str().unwrap_or(""),
+                    );
+                    event["delegation_principal"] = event["actor"].clone();
+                    event["actor"] = Value::Null;
+                    event["actor_name"] = "Delegated service".into();
+                }
+            }
+        }
+    }
+    source_snapshot.rollback().await?;
+    let native_versions = events
+        .iter()
+        .any(|event| event.get("native_event_type").is_some());
     let retained = events
         .iter()
         .any(|event| event["legacy_interpretation"] == true);
@@ -1180,7 +1669,7 @@ async fn record_history(db: &Db, actor: &str, args: Value) -> Result<Value> {
         json!({"local_database_id": null, "events": events, "next_after_local_seq": next,
         "legacy_provenance": crate::v1_import::legacy_record_provenance_as(db, actor, &args.record_id).await?,
         "order": order, "representation": {"detail": if full {"full"} else {"metadata"},
-        "payloads": if !retained {"unavailable"} else if full {"retained_v1"} else {"omitted"},
+        "payloads": if native_versions {"native_body_versions_and_retained_v1_when_disclosed"} else if !retained {"unavailable"} else if full {"retained_v1"} else {"omitted"},
         "legacy_payloads": "retained v1 interpretation; payloads and event visibility redacted for the caller"}}),
     )
 }
@@ -1200,6 +1689,17 @@ fn history_values(
             "run_key": e.run_key, "parent_key": null, "intent": null, "causal_envelope": null,
             "payload_omitted": true, "payload_json_utf8_bytes": null, "changed_fields": null
         });
+        if let Some(native) = e.native_body_version {
+            let mut payload = native["coedit"].as_object().cloned().unwrap_or_default();
+            payload.insert("body".into(), native["body"].clone());
+            value["payload"] = Value::Object(payload);
+            value["native_event_type"] = json!(e.event_type);
+            value = super::tools::history::shape_history_event(
+                value,
+                super::tools::history::HistoryDetail::Full,
+            );
+            value["payload_omitted"] = json!(false);
+        }
         if let Some(legacy) = e.retained_legacy {
             value["type"] = legacy["event_type"].clone();
             value["record_id"] = json!(legacy_subject.unwrap_or(&e.record_id));
@@ -1230,7 +1730,25 @@ fn history_values(
 mod tests;
 
 #[cfg(test)]
+mod describe_schema_tests;
+
+#[cfg(test)]
+mod guidance_tests;
+
+#[cfg(test)]
 mod policy_tests;
+
+pub(crate) use coordination::{bootstrap_principal_on, selected_standing_instructions_on};
+
+pub(crate) use messaging::visible_person as member_visible_person_on;
+pub(crate) use read_surface::{
+    artifact_kind_tokens as native_artifact_kind_tokens,
+    containment_path_visible_on as native_containment_path_visible_on, custody_boundary_on,
+    query_hidden_predicate as native_query_hidden_predicate, root_on as member_virtual_root_on,
+    ATTRIBUTION_KIND as NATIVE_ATTRIBUTION_KIND,
+    QUERY_OPT_IN_FAMILIES as NATIVE_QUERY_OPT_IN_FAMILIES,
+};
+pub(crate) use writes::short_reference as member_display_reference_on;
 
 /// Qualified hosted entry point; callers supply retained exact pins, never a
 /// mutable active-name lookup. Other serving profiles have no equivalent route.
@@ -1267,4 +1785,40 @@ pub(crate) async fn query_pinned_saved_sql(
         json!({"sql":sql,"parameters":definition.parameters,"_named_view_pins":definition.roots()}),
     )
     .await
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod current_body_read_tests;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod merge_body_tests;
+
+#[cfg(test)]
+mod schema_config_operations_tests;
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod url_attachment_tests;
+
+/// Enable the cross-request visible-set cache for a read-write **serving**
+/// handle (Native b171a9d / 788c170). Lazily creates the persisted access
+/// epoch in a writer transaction and registers the handle's cache. Call only
+/// from hosted serving when it opens a workspace's read-write serving handle;
+/// never from generic, inspection, CLI, standby or member opens. A no-op for
+/// any other open mode.
+pub async fn start_serving_visible_cache(db: &crate::Db) -> crate::Result<()> {
+    sql::visible_cache::start_serving(db).await
+}
+
+/// Unregister a retired serving handle's visible-set cache.
+pub fn stop_serving_visible_cache(db: &crate::Db) {
+    sql::visible_cache::stop_serving(db);
+}
+
+/// Settlement's closed variant-8/create-9 capture profile always includes the
+/// original mint proof. It never derives historical identity from live flags.
+#[cfg(test)]
+pub(crate) fn register_original_settlement_contract_profile(
+    registry: &mut ToolRegistry,
+) -> Result<()> {
+    contracts::register_minted_id_contracts(registry, &["create_record"])
 }

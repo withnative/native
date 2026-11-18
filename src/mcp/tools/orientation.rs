@@ -74,7 +74,15 @@ const MAX_DASHBOARD_LIMIT: usize = 100;
 /// context window, and that it is what lets the person it acts for see the
 /// basis — so the prose could not be shortened to fit. This is a required
 /// product guidance cost, not a widening; `cc34ddc` remains the question.
-pub const MAX_BOOTSTRAP_ORIENTATION_BYTES: usize = 9 * 1024;
+///
+/// Raised again from 9 KiB to 10 KiB on 4 Nov 2026 for the blocked-write
+/// paragraph under "Recording by default". Hosts such as Claude Code auto mode
+/// block writes the person did not request; without that paragraph agents gave
+/// confusing repair advice, and with it they offer to save this item, save as
+/// they go, or leave it (Native `853c409`). The serialized orientation was 9171
+/// bytes before and 9536 after; fitting under 9 KiB would have meant rewording
+/// unrelated sections.
+pub const MAX_BOOTSTRAP_ORIENTATION_BYTES: usize = 10 * 1024;
 pub const MAX_BOOTSTRAP_FOOTING_BYTES: usize = 8 * 1024;
 pub const MAX_BOOTSTRAP_CURRENT_WORLD_BYTES: usize = 8 * 1024;
 pub const MAX_BOOTSTRAP_INTENTFUL_SESSIONS_BYTES: usize = 2 * 1024;
@@ -1342,7 +1350,48 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
     let principal = member_principal_footing(&db, &caller, &observed_at).await?;
     let workspace = member_workspace_footing(&db, &caller, &root).await?;
     let current_world = member_current_world(&db, &caller, &observed_at).await?;
-    let intent_declared = caller.intent().is_some();
+    let instructions = serde_json::to_value(member_instruction_stack(&db, &caller).await?)?;
+    let engine = json!({"name":ENGINE_NAME,"version":ENGINE_VERSION,"schema_version":CURRENT_ENGINE_SCHEMA_VERSION,"user_version":user_version(&db).await?});
+    let roots = member_roots(&db, &root_id, &root).await?;
+    finish_member_bootstrap(MemberBootstrapParts {
+        run_key,
+        intent_declared: caller.intent().is_some(),
+        principal,
+        source_context: None,
+        workspace,
+        current_world,
+        instructions,
+        engine,
+        roots,
+    })
+}
+
+struct MemberBootstrapParts {
+    run_key: String,
+    intent_declared: bool,
+    principal: Value,
+    source_context: Option<Value>,
+    workspace: Value,
+    current_world: Value,
+    instructions: Value,
+    engine: Value,
+    roots: Value,
+}
+
+/// Pure reduced-member composition; all source authority is resolved before
+/// entry. v1 retains its typed resolver, native keeps its selected native JSON.
+fn finish_member_bootstrap(parts: MemberBootstrapParts) -> Result<Value> {
+    let MemberBootstrapParts {
+        run_key,
+        intent_declared,
+        principal,
+        source_context,
+        workspace,
+        current_world,
+        instructions,
+        engine,
+        roots,
+    } = parts;
     let next_steps = next_steps(intent_declared, &current_world, &run_key);
     let orientation = json!({
         "template_key": crate::instructions::ENGINE_ORIENTATION_TEMPLATE_KEY,
@@ -1350,11 +1399,18 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
         "content": crate::instructions::ENGINE_ORIENTATION,
         "ownership": "build-owned and guaranteed independently of portable instruction resolution",
     });
-    let instructions = member_instruction_stack(&db, &caller).await?;
-    let entry_count = instructions.entries.len();
+    let entry_count = instructions
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(Error::copy_unavailable)?
+        .len();
+    let instruction_status = instructions
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(Error::copy_unavailable)?;
     let standing_context = json!({
         "portable_instructions": {
-            "status": instructions.status,
+            "status": instruction_status,
             "entry_count": entry_count,
             "exact_entries_path": "/instructions/entries",
             "diagnostics_path": "/instructions/diagnostics",
@@ -1377,16 +1433,12 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
         "guidance": "Member-copy run key: minted locally without storage reads and never persisted. Pass it for call correlation within this session only; it carries no run history and survives no reconnect.",
         "whole_run_rollback": false,
     });
-    let engine = json!({
-        "name": ENGINE_NAME,
-        "version": ENGINE_VERSION,
-        "schema_version": CURRENT_ENGINE_SCHEMA_VERSION,
-        "user_version": user_version(&db).await?,
-    });
-    let roots = member_roots(&db, &root_id, &root).await?;
     let orientation_bytes =
         enforce_component("orientation", &orientation, MAX_BOOTSTRAP_ORIENTATION_BYTES)?;
-    let footing = json!({ "principal": &principal, "workspace": &workspace, "standing_context": &standing_context });
+    let mut footing = json!({ "principal": &principal, "workspace": &workspace, "standing_context": &standing_context });
+    if let Some(context) = &source_context {
+        footing["source_context"] = context.clone();
+    }
     let footing_bytes = enforce_component("footing", &footing, MAX_BOOTSTRAP_FOOTING_BYTES)?;
     let current_world_bytes = enforce_component(
         "current-world",
@@ -1466,7 +1518,7 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
     });
     enforce_component("diagnostics", &diagnostics, MAX_BOOTSTRAP_DIAGNOSTICS_BYTES)?;
 
-    let payload = json!({
+    let mut payload = json!({
         "contract": contract,
         "orientation": orientation,
         "principal": principal,
@@ -1477,17 +1529,15 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
         "next_steps": next_steps,
         "session": session,
         "diagnostics": diagnostics,
-        "engine": {
-            "name": ENGINE_NAME,
-            "version": ENGINE_VERSION,
-            "schema_version": CURRENT_ENGINE_SCHEMA_VERSION,
-            "user_version": user_version(&db).await?,
-        },
+        "engine": engine,
         "run": run,
         "roots": roots,
         "instructions": instructions,
         "pending_obligations": pending_obligations,
     });
+    if let Some(context) = source_context {
+        payload["source_context"] = context;
+    }
     let total_bytes = serialized_bytes(&payload)?;
     if total_bytes > MAX_BOOTSTRAP_TOTAL_BYTES {
         return Err(Error::engine(format!(
@@ -1495,6 +1545,40 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
         )));
     }
     Ok(payload)
+}
+
+/// The ordinary request wrapper and native member transport share the final
+/// catalog component/whole-payload bounds, without sharing request authority.
+pub(crate) fn attach_member_bootstrap_exposure(payload: &mut Value, exposure: Value) -> Result<()> {
+    if let Some(object) = payload.as_object_mut() {
+        let bytes = serde_json::to_vec(&exposure)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        if bytes > MAX_BOOTSTRAP_TOOL_EXPOSURE_BYTES {
+            return Err(Error::engine(format!(
+                "bootstrap tool-exposure component is {bytes} bytes; limit is {} bytes",
+                MAX_BOOTSTRAP_TOOL_EXPOSURE_BYTES
+            )));
+        }
+        object.insert("tool_exposure".into(), exposure);
+        let total_bytes = serde_json::to_vec(object)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        if total_bytes > MAX_BOOTSTRAP_TOTAL_BYTES {
+            return Err(Error::engine(format!("bootstrap payload is {total_bytes} bytes after tool exposure; compositional transport limit is {} bytes",MAX_BOOTSTRAP_TOTAL_BYTES)));
+        }
+    }
+    Ok(())
+}
+
+/// Native transport overlays are also counted before releasing its lease.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn enforce_member_bootstrap_total(payload: &Value) -> Result<()> {
+    let bytes = serialized_bytes(payload)?;
+    if bytes > MAX_BOOTSTRAP_TOTAL_BYTES {
+        return Err(Error::engine(format!("bootstrap payload is {bytes} bytes after tool exposure; compositional transport limit is {} bytes",MAX_BOOTSTRAP_TOTAL_BYTES)));
+    }
+    Ok(())
 }
 
 /// Slice presence: the admitted copy holds exactly E(m), so a row's
@@ -1736,12 +1820,28 @@ async fn member_current_world(db: &Db, caller: &Caller, observed_at: &str) -> Re
         })
         .collect::<std::collections::HashMap<_, _>>();
 
+    finish_member_current_world(
+        &rows,
+        &lifecycle_interpreter,
+        &superseded_by,
+        observed_at,
+        scan_truncated,
+    )
+}
+
+fn finish_member_current_world(
+    rows: &[sqlx::sqlite::SqliteRow],
+    lifecycle_interpreter: &LifecycleInterpreter,
+    superseded_by: &std::collections::HashMap<String, Value>,
+    observed_at: &str,
+    scan_truncated: bool,
+) -> Result<Value> {
     let mut recent = Vec::new();
     let mut open_work = Vec::new();
     let mut recent_total = 0usize;
     let mut open_work_total = 0usize;
     let mut omitted_unrepresentable = 0usize;
-    for row in &rows {
+    for row in rows {
         let id: String = row.try_get("id")?;
         recent_total += 1;
         let record_type: String = row.try_get("type")?;
@@ -1927,6 +2027,11 @@ async fn member_instruction_stack(
     .instructions)
 }
 
+#[cfg(feature = "v2-kernel-probe")]
+mod native_bootstrap;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use native_bootstrap::native_member_bootstrap;
+
 // ---------------------------------------------------------------------------
 // Tool 2 — get_structure
 // ---------------------------------------------------------------------------
@@ -1981,6 +2086,71 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
     .await;
     scratch.close().await;
     result
+}
+
+/// Existing member tree contract over the sealed native generation. The caller
+/// cannot select this mode with a canonical Db or a principal-less callback.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_get_structure(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    mut arguments: Value,
+) -> Result<Value> {
+    const TOOL: &str = "get_structure";
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    if lens::take_as_of(TOOL, &mut arguments)?.is_some() {
+        return Err(Error::unavailable_offline(TOOL, "as_of"));
+    }
+    let mut args: GetStructureArgs = parse_args(TOOL, arguments)?;
+    let root_alias =
+        crate::member_copy_kernel_v2::profile::virtual_root::MemberVirtualRoot::is_alias(
+            &args.root_id,
+        );
+    let held_exact: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM records WHERE id=?)")
+        .bind(args.root_id.clone())
+        .fetch_one(&mut **session.transaction())
+        .await?;
+    let virtual_alias = root_alias && !held_exact;
+    if virtual_alias {
+        if session.virtual_root().await?.is_none() {
+            return Err(Error::engine(crate::kernel::HIDDEN_OR_MISSING));
+        }
+    } else if !root_alias {
+        args.root_id =
+            super::lifecycle::native_member_resolve_reference(session, &args.root_id, TOOL).await?;
+    }
+    if !virtual_alias
+        && !crate::query::read::ordinary_record_read_eligible_native_member_in(
+            session.transaction(),
+            &args.root_id,
+        )
+        .await?
+    {
+        return Err(Error::engine(crate::kernel::HIDDEN_OR_MISSING));
+    }
+    let opts = tree::TreeOptions {
+        max_depth: args.max_depth.unwrap_or(DEFAULT_STRUCTURE_DEPTH),
+        include_archived: args.include_archived.unwrap_or(false),
+        max_children_per_node: args
+            .max_children_per_node
+            .unwrap_or(tree::DEFAULT_MAX_CHILDREN_PER_NODE),
+        exclude_types: args.exclude_types,
+    };
+    let mut nodes = serde_json::to_value(
+        tree::descendants_native_member(session, &args.root_id, opts.clone()).await?,
+    )?;
+    let nodes = nodes
+        .as_array_mut()
+        .expect("typed tree nodes serialize as array");
+    if nodes.is_empty() {
+        return Err(Error::engine(crate::kernel::HIDDEN_OR_MISSING));
+    }
+    super::lifecycle::annotate_superseded_by_in_tx(session.transaction(), caller, nodes).await?;
+    Ok(
+        json!({"root_id":args.root_id,"max_depth":opts.max_depth,"max_children_per_node":opts.max_children_per_node,"nodes":nodes}),
+    )
 }
 
 async fn get_structure_from_lens(
@@ -2685,16 +2855,39 @@ fn dashboard_entry_with_reason(
 /// that treated it as a destination would double-count them. It answers one
 /// question — which of the records I am being shown carry a lifecycle the
 /// engine could not interpret, and why.
-const UNCLASSIFIED_LIFECYCLE_NOTE: &str =
+pub(crate) const UNCLASSIFIED_LIFECYCLE_NOTE: &str =
     "Diagnostic census, not a bucket: these records are ALSO reported in \
      `active` or `stale`, bucketed on `last_activity_at` alone, because an \
      uninterpretable lifecycle is a governance gap rather than evidence that \
      the work is finished. Each entry names why interpretation failed.";
 
+mod dashboard_source;
+use dashboard_source::DashboardReadSource;
+
 async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    dashboard_from_source(&mut DashboardReadSource::Pool(&db), &caller, arguments).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_get_dashboard(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    dashboard_from_source(&mut DashboardReadSource::Native(session), caller, arguments).await
+}
+
+async fn dashboard_from_source(
+    source: &mut DashboardReadSource<'_>,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
     const TOOL: &str = "get_dashboard";
     let member = caller.is_member_copy();
-    let args: GetDashboardArgs = parse_args(TOOL, arguments)?;
+    let mut args: GetDashboardArgs = parse_args(TOOL, arguments)?;
     let stale_after_days = args.stale_after_days.unwrap_or(DEFAULT_STALE_AFTER_DAYS);
     if !(1..=MAX_STALE_AFTER_DAYS).contains(&stale_after_days) {
         return Err(Error::engine(format!(
@@ -2707,23 +2900,9 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
             "{TOOL}: 'limit' must be between 1 and {MAX_DASHBOARD_LIMIT}"
         )));
     }
-    let scope_set: Option<HashSet<String>> = match &args.scope {
+    let scope_set: Option<HashSet<String>> = match &mut args.scope {
         Some(root) => {
-            let ids = if member {
-                let exists: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND deleted_at IS NULL)",
-                )
-                .bind(root)
-                .fetch_one(db.pool())
-                .await?;
-                if !exists {
-                    return Err(super::record_not_found(TOOL, root));
-                }
-                tree::member_subtree_ids(&db, root, false).await?
-            } else {
-                require_record(&db, &caller, TOOL, root, Capability::View).await?;
-                tree::subtree_ids(&db, root).await?
-            };
+            let ids = source.scope(caller, root).await?;
             if ids.is_empty() {
                 return Err(Error::engine(format!(
                     "{TOOL}: scope record {root} does not exist"
@@ -2747,33 +2926,18 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // both miss every kind-specific vocabulary and rot the moment one changed.
     // The interpretation happens once per row below, through the governed
     // seam, so a new terminal token needs a vocabulary edit and nothing here.
-    let not_hidden_r = if member {
-        crate::query::member_not_hidden_predicate("r")
-    } else {
-        crate::query::not_hidden_predicate("r")
-    };
+    let live_r = source.live("r", member);
     let attention_sql = format!(
         "SELECT r.id, r.type, r.kind, r.name, r.home_id, r.lifecycle, r.maturity,
                 r.last_activity_at
           FROM records r
           WHERE r.deleted_at IS NULL AND r.lifecycle IS NOT NULL
-            AND {not_hidden_r}
-            AND NOT EXISTS (SELECT 1 FROM facet_values av
-                             WHERE av.record_id = r.id AND av.key = 'archived')
+            AND {live_r}
           ORDER BY r.last_activity_at DESC, r.id"
     );
-    let attention = sqlx::query(&attention_sql)
-        .fetch_all(db.write_pool())
-        .await?;
-    // One interpreter for the whole pass: it amortizes the schema-cascade and
-    // vocabulary reads that would otherwise repeat per row.
-    let principal = (!super::is_legacy_local(&caller)).then(|| super::principal(&caller));
-    let lifecycle_interpreter = if member {
-        let rows = crate::query::cascade::schema_config_rows_in_pool(db.pool(), None).await?;
-        LifecycleInterpreter::load_from_pool(db.pool(), rows).await?
-    } else {
-        LifecycleInterpreter::load(&db, principal).await?
-    };
+    let attention = source.rows(attention_sql).await?;
+    // One interpreter over the same selected schema for the whole pass.
+    let lifecycle_interpreter = source.interpreter(caller).await?;
     let mut active = Vec::new();
     let mut stale = Vec::new();
     let mut unclassified_lifecycle = Vec::new();
@@ -2784,7 +2948,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         if !in_scope(&id) {
             continue;
         }
-        if !member && !can_record(&db, &caller, &id, Capability::View).await? {
+        if !source.record_visible(caller, &id).await? {
             continue;
         }
         let record_type: String = row.try_get("type")?;
@@ -2849,17 +3013,11 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // whose other endpoint is live and unarchived. Tombstoning or archiving
     // the blocker releases the block.
     let live_other = |col: &str| {
-        let not_hidden_o = if member {
-            crate::query::member_not_hidden_predicate("o")
-        } else {
-            crate::query::not_hidden_predicate("o")
-        };
+        let live_o = source.live("o", member);
         format!(
             "EXISTS (SELECT 1 FROM records o
                       WHERE o.id = {col} AND o.deleted_at IS NULL
-                        AND {not_hidden_o}
-                        AND NOT EXISTS (SELECT 1 FROM facet_values av
-                                         WHERE av.record_id = o.id AND av.key = 'archived'))"
+                        AND {live_o})"
         )
     };
     let blocked_sql = format!(
@@ -2874,9 +3032,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
                      AND {depends_live}) AS waiting_on
           FROM records r
           WHERE r.deleted_at IS NULL
-            AND {not_hidden_r}
-            AND NOT EXISTS (SELECT 1 FROM facet_values av
-                             WHERE av.record_id = r.id AND av.key = 'archived')
+            AND {live_r}
             AND (EXISTS (SELECT 1 FROM links l
                           WHERE l.target_id = r.id AND l.relationship = 'blocks'
                             AND {blocks_live})
@@ -2889,12 +3045,12 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     );
     let mut blocked = Vec::new();
     let mut blocked_total = 0usize;
-    for row in &sqlx::query(&blocked_sql).fetch_all(db.write_pool()).await? {
+    for row in &source.rows(blocked_sql).await? {
         let id: String = row.try_get("id")?;
         if !in_scope(&id) {
             continue;
         }
-        if !member && !can_record(&db, &caller, &id, Capability::View).await? {
+        if !source.record_visible(caller, &id).await? {
             continue;
         }
         let mut entry = dashboard_entry(row, &lifecycle_interpreter)?;
@@ -2907,15 +3063,17 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         object.insert("waiting_on".into(), parse(row.try_get("waiting_on")?));
         for key in ["blocked_by", "waiting_on"] {
             if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
-                let visible = visible_ids(
-                    &db,
-                    &caller,
-                    items
-                        .iter()
-                        .filter_map(|item| item.get("id").and_then(Value::as_str).map(String::from))
-                        .collect(),
-                )
-                .await?;
+                let visible = source
+                    .visible(
+                        caller,
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                item.get("id").and_then(Value::as_str).map(String::from)
+                            })
+                            .collect(),
+                    )
+                    .await?;
                 items.retain(|item| {
                     item.get("id")
                         .and_then(Value::as_str)
@@ -2945,13 +3103,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // the truncate to stay bounded by the output rather than the candidate
     // scan.
     for bucket in [&mut active, &mut stale, &mut blocked] {
-        super::lifecycle::annotate_superseded_by_in_pools(
-            db.write_pool(),
-            db.write_pool(),
-            &caller,
-            bucket,
-        )
-        .await?;
+        source.superseded(caller, bucket).await?;
     }
 
     // Lifecycle census over the scope, via the pipeline engine.
@@ -2959,24 +3111,7 @@ async fn get_dashboard(db: Db, caller: Caller, arguments: Value) -> Result<Value
         ancestor_id: args.scope.clone(),
         ..pipeline::Filter::default()
     })];
-    let (census, _) = if super::is_legacy_local(&caller) {
-        pipeline::run_with_diagnostics(
-            &db,
-            &census_steps,
-            Some(pipeline::CountAxis::Lifecycle),
-            &pipeline::PipelineOptions::default(),
-        )
-        .await?
-    } else {
-        pipeline::run_with_diagnostics_as(
-            &db,
-            super::principal(&caller),
-            &census_steps,
-            Some(pipeline::CountAxis::Lifecycle),
-            &pipeline::PipelineOptions::default(),
-        )
-        .await?
-    };
+    let census = source.census(caller, &census_steps).await?;
 
     let mut output = json!({
         "scope": args.scope,
@@ -3072,6 +3207,97 @@ fn table_role(table: &str) -> &'static str {
     }
 }
 
+/// Shared column presentation only; the caller chooses the authorized schema
+/// and connection before this fold sees any values.
+fn describe_schema_column(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<Value> {
+    let name = row.try_get::<String, _>("name")?;
+    let semantics = crate::schema::discovery::column_semantics(table, &name);
+    let mut column = json!({
+        "name": name,
+        "type": row.try_get::<String, _>("type")?,
+        "notnull": row.try_get::<i64, _>("notnull")? != 0,
+        "pk": row.try_get::<i64, _>("pk")? != 0,
+    });
+    if let Some(metadata) = semantics {
+        column
+            .as_object_mut()
+            .expect("column metadata is an object")
+            .extend(
+                metadata
+                    .as_object()
+                    .expect("column semantics are an object")
+                    .clone(),
+            );
+    }
+    Ok(column)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_describe_schema(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    if caller
+        .member_schema_incomplete_for()
+        .iter()
+        .any(|scope| scope == "global")
+    {
+        return Err(Error::unavailable_offline(
+            "describe_schema",
+            "schema_incomplete",
+        ));
+    }
+    let args: DescribeSchemaArgs = parse_args("describe_schema", arguments)?;
+    // The existing member contract describes the actual shipped physical
+    // catalogue, not every canonical table and not the query_sql allowlist.
+    // The session's before/after fence verifies the exact closed profile DDL.
+    let rows = sqlx::query("SELECT name,sql FROM main.sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name")
+        .fetch_all(&mut **session.transaction()).await?;
+    let mut tables = Vec::new();
+    let mut statements = Vec::new();
+    for row in rows {
+        let table: String = row.try_get("name")?;
+        let ddl: String = row.try_get("sql")?;
+        let columns = sqlx::query(
+            r#"SELECT name,type,"notnull",pk FROM pragma_table_xinfo(?1,'main') ORDER BY cid"#,
+        )
+        .bind(&table)
+        .fetch_all(&mut **session.transaction())
+        .await?
+        .iter()
+        .map(|row| describe_schema_column(&table, row))
+        .collect::<Result<Vec<_>>>()?;
+        tables.push(json!({"name":table,"role":"immutable member-profile projection or verification metadata; not canonical authority","columns":columns}));
+        statements.push(ddl);
+    }
+    let schema_digest: String = sqlx::query_scalar(
+        "SELECT member_schema_digest FROM main.kernel_member_identity WHERE singleton=1",
+    )
+    .fetch_one(&mut **session.transaction())
+    .await?;
+    let user_version: i64 = sqlx::query_scalar("PRAGMA main.user_version")
+        .fetch_one(&mut **session.transaction())
+        .await?;
+    let mut result = json!({
+        "logical_relations":format!("query_sql serves {} member logical relations, not the physical tables below. Read catalog_relations and catalog_columns for its explicit authorized surface.", crate::mcp::member_scope::QUERY_SQL_SERVED_RELATIONS.len()),
+        "engine":{
+            "name":crate::standby::kernel_v2::ENGINE,"version":ENGINE_VERSION,"git_sha":GIT_SHA,
+            "schema_version":0,"supported_schema_baseline":0,"user_version":user_version,
+            "ddl_fingerprint":schema_digest,"profile":"member_read_kernel_v2",
+        },
+        "model":"Immutable caller-selected current-state member projection. Canonical events, policies, private ledgers and runtime history are not held. This physical catalogue does not grant query_sql access to its internal tables.",
+        "tables":tables,
+    });
+    if args.include_ddl.unwrap_or(false) {
+        result["ddl_statements"] = json!(statements);
+    }
+    Ok(result)
+}
+
 async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let args: DescribeSchemaArgs = parse_args("describe_schema", arguments)?;
     // A member copy ships a strict subset of the engine tables (member
@@ -3140,28 +3366,7 @@ async fn describe_schema(db: Db, caller: Caller, arguments: Value) -> Result<Val
             .fetch_all(db.write_pool())
             .await?
             .iter()
-            .map(|row| {
-                let name = row.try_get::<String, _>("name")?;
-                let semantics = crate::schema::discovery::column_semantics(table, &name);
-                let mut column = json!({
-                    "name": name,
-                    "type": row.try_get::<String, _>("type")?,
-                    "notnull": row.try_get::<i64, _>("notnull")? != 0,
-                    "pk": row.try_get::<i64, _>("pk")? != 0,
-                });
-                if let Some(metadata) = semantics {
-                    column
-                        .as_object_mut()
-                        .expect("column metadata is an object")
-                        .extend(
-                            metadata
-                                .as_object()
-                                .expect("column semantics are an object")
-                                .clone(),
-                        );
-                }
-                Ok(column)
-            })
+            .map(|row| describe_schema_column(table, row))
             .collect::<Result<Vec<_>>>()?;
         tables.push(json!({
             "name": table,

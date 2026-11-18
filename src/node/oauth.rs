@@ -19,8 +19,16 @@ use crate::error::{Error, Result};
 
 /// Expected standby OAuth contract, mirroring the Python renewer.
 pub const CONTRACT: &str = "native.local-standby-oauth.v1";
+/// Renewal grant contract for installs enrolled as the dedicated node client
+/// (`native login-node`). Only this contract carries the dedicated audience
+/// the grant was issued for; the legacy contract above always renews against
+/// the fixed standby resource, ignoring any extra `resource` field.
+pub const DEDICATED_CONTRACT: &str = "native.dedicated-node-oauth.v1";
 /// Expected token endpoint, mirroring the Python renewer.
 pub const TOKEN_ENDPOINT: &str = "https://plucky-discovery-38.authkit.app/oauth2/token";
+/// Resource used by the fixed Native standby OAuth contract. Keep it on
+/// renewal too: the issuer's default audience is not the Native MCP resource.
+pub const RESOURCE: &str = "https://plugin.withnative.ai/mcp";
 /// Renew once the token is within this of expiry (ms), mirroring the script.
 pub const RENEW_BEFORE_MS: i64 = 90_000;
 /// Bounds on `expires_in` accepted from the token endpoint (seconds).
@@ -275,6 +283,34 @@ pub(crate) fn grant_is_due(
     Ok(is_due(expires_at_of(&auth), now_ms()))
 }
 
+/// Keep a dedicated grant paired with its install and resource origin.
+/// Legacy nodes continue to handle an unavailable renewal file on demand.
+pub(crate) fn check_install_grant(
+    auth_path: &Path,
+    expected_endpoint: &str,
+    hosted_origin: &url::Origin,
+    enrolled: bool,
+) -> std::result::Result<(), RenewError> {
+    let auth = match read_auth_file(auth_path) {
+        Ok(auth) => auth,
+        Err(_) if !enrolled => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let dedicated = auth["contract"] == DEDICATED_CONTRACT;
+    let refused =
+        || RenewError::Refused("dedicated OAuth grant and node install must be paired".into());
+    if dedicated != enrolled {
+        return Err(refused());
+    }
+    if dedicated {
+        let (_, _, _, resource) = validate_auth_contract(&auth, expected_endpoint)?;
+        if !url::Url::parse(&resource).is_ok_and(|resource| &resource.origin() == hosted_origin) {
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
+
 /// Build the token-endpoint client: reqwest, no redirects, no retries.
 pub fn renew_client() -> std::result::Result<reqwest::Client, RenewError> {
     reqwest::Client::builder()
@@ -288,8 +324,9 @@ pub fn renew_client() -> std::result::Result<reqwest::Client, RenewError> {
 fn validate_auth_contract(
     auth: &serde_json::Value,
     expected_endpoint: &str,
-) -> std::result::Result<(String, String, String), RenewError> {
-    if auth.get("contract").and_then(|v| v.as_str()) != Some(CONTRACT) {
+) -> std::result::Result<(String, String, String, String), RenewError> {
+    let contract = auth.get("contract").and_then(|v| v.as_str());
+    if contract != Some(CONTRACT) && contract != Some(DEDICATED_CONTRACT) {
         return Err(RenewError::Refused(
             "unsupported oauth configuration".into(),
         ));
@@ -308,11 +345,43 @@ fn validate_auth_contract(
     if client_id.is_empty() || client_id.len() > MAX_TOKEN_LEN {
         return Err(RenewError::Refused("missing oauth grant".into()));
     }
+    // Only the dedicated enrollment contract carries the audience the grant
+    // was issued for; renewal echoes it back so the grant keeps its audience
+    // across rotations. The legacy contract always renews against the fixed
+    // standby audience, ignoring any extra `resource` field an externally
+    // produced file may carry.
+    let resource = if contract == Some(DEDICATED_CONTRACT) {
+        match auth.get("resource") {
+            Some(value) => match value.as_str() {
+                Some(resource) if valid_resource(resource) => resource.to_owned(),
+                _ => {
+                    return Err(RenewError::Refused(
+                        "unsupported oauth configuration".into(),
+                    ));
+                }
+            },
+            None => {
+                return Err(RenewError::Refused(
+                    "unsupported oauth configuration".into(),
+                ));
+            }
+        }
+    } else {
+        RESOURCE.to_owned()
+    };
     Ok((
         access.as_str().unwrap().to_owned(),
         refresh.as_str().unwrap().to_owned(),
         client_id.to_owned(),
+        resource,
     ))
+}
+
+/// Stored `resource` values are written by enrollment and echoed back to the
+/// token endpoint on renewal. The shape mirrors [`valid_token`]: opaque,
+/// bounded, no whitespace.
+fn valid_resource(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_TOKEN_LEN && !value.chars().any(char::is_whitespace)
 }
 
 pub(crate) fn check_refresh_response(
@@ -379,7 +448,7 @@ pub async fn renew_once(
 ) -> std::result::Result<RenewOutcome, RenewError> {
     let _lock = acquire_auth_lock(auth_path).await?;
     let mut auth = read_auth_file(auth_path)?;
-    let (access, refresh, client_id) = validate_auth_contract(&auth, expected_endpoint)?;
+    let (access, refresh, client_id, resource) = validate_auth_contract(&auth, expected_endpoint)?;
     if !is_due(expires_at_of(&auth), now_ms()) {
         atomic_private_write(token_path, access.as_bytes())?;
         return Ok(RenewOutcome::Fresh);
@@ -392,6 +461,7 @@ pub async fn renew_once(
             ("grant_type", "refresh_token"),
             ("client_id", client_id.as_str()),
             ("refresh_token", refresh.as_str()),
+            ("resource", resource.as_str()),
         ])
         .send()
         .await
@@ -445,6 +515,14 @@ pub async fn renew_once(
 /// giving up (a running renewer holds it only for one token POST).
 const LOGIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+pub(crate) struct LoginGrant<'a> {
+    pub(crate) token_endpoint: &'a str,
+    pub(crate) client_id: &'a str,
+    pub(crate) access_token: &'a str,
+    pub(crate) refresh_token: &'a str,
+    pub(crate) lifetime_secs: i64,
+}
+
 /// Publish the grant from an interactive `native login`: take the same
 /// `<auth>.lock` the renewer takes, write the auth file (rotating refresh
 /// grant first), then the access-token file the node sends. Both are atomic
@@ -459,22 +537,78 @@ pub async fn store_login_grant(
     refresh_token: &str,
     lifetime_secs: i64,
 ) -> std::result::Result<i64, RenewError> {
+    store_grant(
+        auth_path,
+        token_path,
+        LoginGrant {
+            token_endpoint,
+            client_id,
+            access_token,
+            refresh_token,
+            lifetime_secs,
+        },
+        None,
+    )
+    .await
+}
+
+/// Publish the grant from an enrolled node sign-in (`native login-node`)
+/// under the dedicated enrollment contract: the same lock, atomic 0600
+/// writes and repair semantics as [`store_login_grant`], plus the dedicated
+/// resource the grant was issued for. Renewal echoes that stored resource
+/// back instead of the fixed standby one, so the grant keeps its dedicated
+/// audience across rotations. The caller has already validated the token
+/// response with [`check_refresh_response`] and verified the enrollment with
+/// hosted.
+pub(crate) async fn store_enrollment_grant(
+    auth_path: &Path,
+    token_path: &Path,
+    grant: LoginGrant<'_>,
+    resource: &str,
+) -> std::result::Result<i64, RenewError> {
+    store_grant(auth_path, token_path, grant, Some(resource)).await
+}
+
+/// Shared grant writer: one lock acquisition, then the auth file (rotating
+/// refresh grant first) and the access-token file, both atomic 0600 writes.
+/// `None` writes the legacy standby shape; `Some` writes the dedicated
+/// enrollment contract carrying that resource.
+async fn store_grant(
+    auth_path: &Path,
+    token_path: &Path,
+    grant: LoginGrant<'_>,
+    dedicated_resource: Option<&str>,
+) -> std::result::Result<i64, RenewError> {
+    if let Some(resource) = dedicated_resource {
+        if !valid_resource(resource) {
+            return Err(RenewError::Refused(
+                "unsupported oauth configuration".into(),
+            ));
+        }
+    }
     let _lock = tokio::time::timeout(LOGIN_LOCK_WAIT, acquire_auth_lock(auth_path))
         .await
         .map_err(|_| RenewError::Refused("oauth lock busy".into()))??;
-    let expires_at = now_ms().saturating_add(lifetime_secs.saturating_mul(1000));
-    let auth = serde_json::json!({
-        "contract": CONTRACT,
-        "token_endpoint": token_endpoint,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "client_id": client_id,
+    let expires_at = now_ms().saturating_add(grant.lifetime_secs.saturating_mul(1000));
+    let mut auth = serde_json::json!({
+        "contract": if dedicated_resource.is_some() {
+            DEDICATED_CONTRACT
+        } else {
+            CONTRACT
+        },
+        "token_endpoint": grant.token_endpoint,
+        "access_token": grant.access_token,
+        "refresh_token": grant.refresh_token,
+        "client_id": grant.client_id,
         "expires_at": expires_at,
     });
+    if let Some(resource) = dedicated_resource {
+        auth["resource"] = serde_json::Value::String(resource.to_owned());
+    }
     let serialized = serde_json::to_vec(&auth)
         .map_err(|_| RenewError::Refused("oauth auth serialization failed".into()))?;
     atomic_private_write(auth_path, &serialized)?;
-    atomic_private_write(token_path, access_token.as_bytes())?;
+    atomic_private_write(token_path, grant.access_token.as_bytes())?;
     Ok(expires_at)
 }
 
@@ -627,6 +761,7 @@ mod tests {
         hits: StdArc<std::sync::atomic::AtomicUsize>,
         status: StatusCode,
         body: serde_json::Value,
+        seen: StdArc<std::sync::Mutex<Vec<String>>>,
     }
 
     async fn token_route(
@@ -635,7 +770,15 @@ mod tests {
     ) -> (StatusCode, axum::Json<serde_json::Value>) {
         fake.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         assert!(body.contains("grant_type=refresh_token"));
+        fake.seen.lock().unwrap().push(body);
         (fake.status, axum::Json(fake.body.clone()))
+    }
+
+    fn refresh_resource(body: &str) -> String {
+        url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<std::collections::HashMap<String, String>>()["resource"]
+            .clone()
     }
 
     async fn start_fake(status: StatusCode, body: serde_json::Value) -> (String, Fake) {
@@ -643,6 +786,7 @@ mod tests {
             hits: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
             status,
             body,
+            seen: StdArc::new(std::sync::Mutex::new(Vec::new())),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/oauth2/token", listener.local_addr().unwrap());
@@ -944,5 +1088,117 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, RenewOutcome::Fresh);
         assert_eq!(fake.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_grant_without_resource_renews_against_the_standby_resource() {
+        let (url, fake) = start_fake(
+            StatusCode::OK,
+            serde_json::json!({"access_token": "new-access", "refresh_token": "new-refresh",
+                "expires_in": 3600, "token_type": "Bearer"}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_path, token_path) = write_auth(dir.path(), &url, now_ms() - 1_000);
+        let outcome = renew_once(&auth_path, &token_path, &url, &test_client())
+            .await
+            .unwrap();
+        assert_eq!(outcome, RenewOutcome::Renewed);
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(refresh_resource(&seen[0]), RESOURCE);
+    }
+
+    #[tokio::test]
+    async fn enrollment_grant_keeps_its_dedicated_resource_on_renewal() {
+        let (url, fake) = start_fake(
+            StatusCode::OK,
+            serde_json::json!({"access_token": "new-access", "refresh_token": "new-refresh",
+                "expires_in": 3600, "token_type": "Bearer"}),
+        )
+        .await;
+        let dedicated = "https://node.example.test/node";
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let token_path = dir.path().join("native.token");
+        store_enrollment_grant(
+            &auth_path,
+            &token_path,
+            LoginGrant {
+                token_endpoint: &url,
+                client_id: "node-client-1",
+                access_token: "enrolled-access",
+                refresh_token: "enrolled-refresh",
+                lifetime_secs: 3600,
+            },
+            dedicated,
+        )
+        .await
+        .unwrap();
+        // The stored grant carries the dedicated contract and audience.
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
+        assert_eq!(stored["contract"], DEDICATED_CONTRACT);
+        assert_eq!(stored["resource"], dedicated);
+        assert_eq!(fs::read_to_string(&token_path).unwrap(), "enrolled-access");
+        // Backdate past the renewal window: the renewer must echo the stored
+        // resource, not the standby one.
+        let mut backdated = stored;
+        backdated["expires_at"] = serde_json::Value::from(now_ms() - 1_000);
+        atomic_private_write(&auth_path, &serde_json::to_vec(&backdated).unwrap()).unwrap();
+        let outcome = renew_once(&auth_path, &token_path, &url, &test_client())
+            .await
+            .unwrap();
+        assert_eq!(outcome, RenewOutcome::Renewed);
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(refresh_resource(&seen[0]), dedicated);
+    }
+
+    #[tokio::test]
+    async fn dedicated_grant_with_unknown_resource_is_refused_without_network() {
+        let (url, fake) = start_fake(
+            StatusCode::OK,
+            serde_json::json!({"access_token": "x", "refresh_token": "y",
+                "expires_in": 3600, "token_type": "Bearer"}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_path, token_path) = write_auth(dir.path(), &url, now_ms() - 1_000);
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
+        auth["contract"] = serde_json::Value::from(DEDICATED_CONTRACT);
+        auth["resource"] = serde_json::Value::from("not a resource");
+        atomic_private_write(&auth_path, &serde_json::to_vec(&auth).unwrap()).unwrap();
+        let error = renew_once(&auth_path, &token_path, &url, &test_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RenewError::Refused(_)));
+        assert_eq!(fake.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_grant_ignores_an_extra_resource_field() {
+        let (url, fake) = start_fake(
+            StatusCode::OK,
+            serde_json::json!({"access_token": "new-access", "refresh_token": "new-refresh",
+                "expires_in": 3600, "token_type": "Bearer"}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_path, token_path) = write_auth(dir.path(), &url, now_ms() - 1_000);
+        // An externally produced legacy file may carry an extra resource;
+        // the legacy contract still renews against the standby audience.
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
+        auth["resource"] = serde_json::Value::from("https://node.example.test/node");
+        atomic_private_write(&auth_path, &serde_json::to_vec(&auth).unwrap()).unwrap();
+        let outcome = renew_once(&auth_path, &token_path, &url, &test_client())
+            .await
+            .unwrap();
+        assert_eq!(outcome, RenewOutcome::Renewed);
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(refresh_resource(&seen[0]), RESOURCE);
     }
 }

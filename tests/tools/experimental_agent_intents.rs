@@ -302,6 +302,7 @@ fn descriptor_exposes_closed_nested_contracts_and_run_correlation() {
     let separately_registered = [
         ToolKind::StandbyStatus,
         ToolKind::OutboxStatus,
+        ToolKind::ManagePublication,
         ToolKind::ExportSnapshot,
         ToolKind::ManageMemberships,
         ToolKind::WorkspaceRead,

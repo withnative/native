@@ -1,4 +1,4 @@
-   Compiling cel-subset v0.14.5 (/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/engine-pr1b-policy-proof/crates/cel-subset)
+   Compiling cel-subset v0.14.5 (/fixtures/checkout/crates/cel-subset)
     Finished `release` profile [optimized] target(s) in 19.04s
      Running unittests src/lib.rs (target/release/deps/cel-fcc85d09bc5566a9)
 

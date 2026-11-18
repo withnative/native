@@ -38,7 +38,8 @@ use crate::member_copy_serving::ReceiptEligibility;
 
 const MEMBER_COPY_SCHEDULE_INTERVAL: Duration = Duration::from_secs(120);
 const MEMBER_COPY_MANUAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const MEMBER_COPY_ATTEMPT_BUDGET: Duration = Duration::from_secs(270);
+const MEMBER_COPY_ATTEMPT_BUDGET: Duration =
+    crate::member_copy_transport::MEMBER_COPY_ACQUISITION_BUDGET;
 const MEMBER_COPY_NETWORK_RECOVERY_PROBE: Duration = Duration::from_secs(10);
 
 struct BackgroundRefresh {
@@ -208,8 +209,8 @@ impl MemberCopyRuntime {
         self.refresh = Some(BackgroundRefresh { shutdown, task });
     }
 
-    /// Request stop, wait for the in-flight bounded attempt (never dropped
-    /// mid-admission), then quiesce the owner and clear the session.
+    /// Request stop, let the attempt's deadline cleanup reconcile any incoming
+    /// candidate, then quiesce the owner and clear the session.
     pub async fn shutdown(&mut self) {
         if let Some(refresh) = self.refresh.take() {
             refresh.stop().await;
@@ -269,7 +270,19 @@ async fn refresh_unless_stopping(
     if *receiver.borrow() {
         return None;
     }
-    Some(guard.refresh_bounded(MEMBER_COPY_ATTEMPT_BUDGET).await)
+    let mut stopping = receiver.clone();
+    Some(
+        guard
+            .refresh_bounded_or_stopped(MEMBER_COPY_ATTEMPT_BUDGET, async move {
+                loop {
+                    let requested = *stopping.borrow_and_update();
+                    if requested || stopping.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await,
+    )
 }
 
 async fn reconcile_with(
@@ -356,6 +369,7 @@ mod tests {
 
     fn device_consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -817,7 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_waits_for_serialized_refresh_then_quiesces() {
+    async fn shutdown_cancels_blocked_preparation_then_quiesces() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, origin) = world().await;
         let out = dir.path().join("producer.db");
@@ -841,12 +855,11 @@ mod tests {
             // `shutdown` is on `&mut self`; run it on the runtime task.
             runtime.shutdown().await;
         });
-        // Stored permit: the release cannot be lost even if it fires before the
-        // blocked future polls `acquire`.
-        transport.release.add_permits(1);
+        // Never release the blocked transport. Shutdown must use the existing
+        // candidate cleanup path rather than wait for the 90-minute budget.
         tokio::time::timeout(Duration::from_secs(5), shutdown)
             .await
-            .expect("guard: shutdown waited for the attempt")
+            .expect("guard: shutdown cancelled the blocked attempt")
             .expect("shutdown task");
     }
 

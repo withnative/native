@@ -1,0 +1,18 @@
+{
+  "schema": "native.app-kit.release.v1",
+  "version": "1.7.4",
+  "major": 1,
+  "layer": "core",
+  "factory": "native.app-kit.core.factory.v1",
+  "bridge": "native.html.bridge.v1",
+  "js": {
+    "file": "core.js",
+    "bytes": 117348,
+    "sha256": "64ab877190e1d67c30d680fc039abb92f24f414aae91610b0fbae5bd76dae2be"
+  },
+  "types": {
+    "file": "core.d.ts",
+    "bytes": 49940,
+    "sha256": "943f46d3a8d48d8a8e99a665d8b8b8121d5e03c6217e5542e7cf1545da56eed6"
+  }
+}

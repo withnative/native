@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
 use crate::{Error, Result};
 
@@ -1197,11 +1197,15 @@ async fn load_policy_from_pool(pool: &sqlx::SqlitePool) -> Result<Option<Persist
 async fn load_policy_from_tx(
     tx: &mut Transaction<'static, Sqlite>,
 ) -> Result<Option<PersistedPolicy>> {
-    if !policy_table_exists(&mut **tx).await? {
+    load_policy_on(tx).await
+}
+
+async fn load_policy_on(tx: &mut SqliteConnection) -> Result<Option<PersistedPolicy>> {
+    if !policy_table_exists(&mut *tx).await? {
         return Ok(None);
     }
     sqlx::query("SELECT policy_revision,enforcement,source_profile_id,source_profile_revision,source_mode,targets,revision_floors,allow_conversions,catalog_sha256 FROM storage_portability_policy WHERE singleton=1")
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?
         .map(decode_policy_row)
         .transpose()
@@ -1662,11 +1666,28 @@ where
         )
         .await
 }
+/// The initially SQLite-only cancellation fence cannot inherit a broader
+/// caller's capability label. Recheck its own unqualified capability against
+/// the current strict policy inside the writer transaction.
+pub(crate) async fn enforce_command_cancellation_on(tx: &mut SqliteConnection) -> Result<()> {
+    let policy = load_policy_on(tx).await?;
+    admit_request_operation(
+        policy.as_ref(),
+        &active_target(),
+        "held_command.cancel",
+        Some("native.held-command-cancellation.v1"),
+    )
+}
+
 /// Authoritative boundary called after `BEGIN IMMEDIATE` and before the first
 /// mutation. An unclassified direct writer fails closed only when strict mode
 /// is actually enabled; legacy/default databases retain their old behavior.
 pub(crate) async fn enforce_write_boundary(tx: &mut Transaction<'static, Sqlite>) -> Result<()> {
-    let policy = load_policy_from_tx(tx).await?;
+    enforce_write_boundary_on(tx).await
+}
+
+pub(crate) async fn enforce_write_boundary_on(tx: &mut SqliteConnection) -> Result<()> {
+    let policy = load_policy_on(tx).await?;
     let context = PORTABILITY_OPERATION.try_with(Clone::clone).ok();
     enforce_policy(
         policy.as_ref(),

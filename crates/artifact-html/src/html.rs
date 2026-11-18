@@ -60,7 +60,7 @@ pub const BODY_LIMIT: usize = 524_288;
 /// Body limit for installed app package bundles only: a record carrying the
 /// package marker facet (see `artifacts::PACKAGE_FACET`). Every other
 /// `native.html.v1` body stays at [`BODY_LIMIT`].
-pub const PACKAGE_BODY_LIMIT: usize = 1_048_576;
+pub const PACKAGE_BODY_LIMIT: usize = 2_097_152;
 /// The package marker: a `native.html.v1` record is an app package bundle, and
 /// so allowed [`PACKAGE_BODY_LIMIT`], only when it carries this facet with
 /// exactly this value. The kit's install plan sets it on the bundle record's
@@ -79,6 +79,20 @@ pub fn body_limit_for_package_marker(marker: Option<&str>) -> usize {
 }
 pub const DATA_ASSET_EACH_LIMIT: usize = 262_144;
 pub const DATA_ASSET_TOTAL_LIMIT: usize = 393_216;
+pub const PACKAGE_DATA_ASSET_EACH_LIMIT: usize = 524_288;
+pub const PACKAGE_DATA_ASSET_TOTAL_LIMIT: usize = 1_048_576;
+
+/// Asset budgets follow the caller-selected package body allowance.
+fn data_asset_limits(body_limit: usize) -> (usize, usize) {
+    if body_limit == PACKAGE_BODY_LIMIT {
+        (
+            PACKAGE_DATA_ASSET_EACH_LIMIT,
+            PACKAGE_DATA_ASSET_TOTAL_LIMIT,
+        )
+    } else {
+        (DATA_ASSET_EACH_LIMIT, DATA_ASSET_TOTAL_LIMIT)
+    }
+}
 pub const DOM_NODE_LIMIT: usize = 10_000;
 pub const CSS_RULE_LIMIT: usize = 5_000;
 pub const SLIDE_LIMIT: usize = 200;
@@ -109,6 +123,86 @@ const read=(nativeGetter,value)=>apply(nativeGetter,value,[]),eventAdd=EventTarg
 const pristineEvent=new Event("native-html-bootstrap"),messageData=getter(MessageEvent.prototype,"data"),messageSource=getter(MessageEvent.prototype,"source"),messageOrigin=getter(MessageEvent.prototype,"origin"),messagePorts=getter(MessageEvent.prototype,"ports"),eventTarget=getter(Event.prototype,"target"),eventTrusted=own(pristineEvent,"isTrusted")?.get||getter(Event.prototype,"isTrusted"),eventPrevented=getter(Event.prototype,"defaultPrevented"),nodeType=getter(Node.prototype,"nodeType"),keyValue=getter(KeyboardEvent.prototype,"key"),shiftValue=getter(KeyboardEvent.prototype,"shiftKey"),mouseCtrl=getter(MouseEvent.prototype,"ctrlKey"),mouseMeta=getter(MouseEvent.prototype,"metaKey"),mouseButton=getter(MouseEvent.prototype,"button"),pageTransitionPersisted=getter(PageTransitionEvent.prototype,"persisted"),eventType=getter(Event.prototype,"type"),keyRepeat=getter(KeyboardEvent.prototype,"repeat");
 const listen=(target,type,listener,options)=>apply(eventAdd,target,[type,listener,options]),unlisten=(target,type,listener,options)=>apply(eventRemove,target,[type,listener,options]),prevent=event=>apply(eventPrevent,event,[]),stop=event=>apply(eventStop,event,[]),post=(port,value,transfer)=>apply(portPost,port,transfer?[value,transfer]:[value]),start=port=>apply(portStart,port,[]),isElement=value=>!!value&&read(nodeType,value)===1,attribute=(element,name)=>apply(elementAttribute,element,[name]),closest=(element,selector)=>apply(elementClosest,element,[selector]),trusted=event=>!!eventTrusted&&read(eventTrusted,event)===true,prevented=event=>!!eventPrevented&&read(eventPrevented,event)===true;
 let channel=null, initialized=false, current=0, slides=[], queued=[], heldInput, heldSeq=null, heldDigest, heldViewState, inputSubscribers=[];
+/* The optional record lane is transferred only in the authenticated INIT.
+   Capture its transport before authored code can replace MessagePort methods.
+   This facade owns no row cache and never acknowledges a delivery. */
+const RECORD_OBSERVATION_FEATURE="app.records.observe.v1";
+const RECORD_PRESENTATION_FEATURE="app.records.observe.v2";
+let recordTransport=null,closeRecordTransport=()=>{};
+const recordInitValid=(data,ports)=>{const features=data.host_features,v1=isArray(features)&&apply(arrayIncludes,features,[RECORD_OBSERVATION_FEATURE]),v2=isArray(features)&&apply(arrayIncludes,features,[RECORD_PRESENTATION_FEATURE]);if(v1&&v2)return false;if(!v1&&!v2)return ports.length===1;const spec=data.record_observation;return ports.length===2&&!!spec&&typeof spec==="object"&&!isArray(spec)&&objectKeys(spec).length===1&&typeof spec.generation==="string"&&spec.generation.length>0&&spec.generation.length<=128};
+const RECORD_RECONNECT_FEATURE="app.records.reconnect.v1",recordInteger=Number.isSafeInteger,recordNow=Date.now,recordSlice=Array.prototype.slice;
+const installRecordTransport=(data,ports)=>{if(ports.length!==2)return;
+ let port=ports[1],closed=false,connected=true,started=false,sequence=0,request=0,attempts=0,timer=null,controlTimer=null,probeTimer=null,probeId=0,detach=()=>{},lastTraffic=recordNow();
+ let seenControl=0,seenDelivery=0,pendingControl=null,controlAck=null,dataAck=null;
+ const listeners=[],generation=data.record_observation.generation;
+ const resumable=apply(arrayIncludes,data.host_features,[RECORD_RECONNECT_FEATURE]);
+ const emit=(type,value)=>{for(const item of apply(recordSlice,listeners,[])){if(item.type===type)try{item.callback(freezeObject(value))}catch{}}};
+ const status=value=>emit("message",{data:freezeObject({type:"records-transport",generation,connected:value}),ports:[]});
+ const physical=value=>{if(!connected||closed)return;try{post(port,value);lastTraffic=recordNow()}catch{lost()}};
+ const outbound=value=>{
+  if(closed)return;
+  if(resumable&&value&&typeof value==="object"){
+   if(value.type==="records-watch"||value.type==="records-unwatch")pendingControl=value;
+   else if(value.type==="records-control-ack"){controlAck=value;if(pendingControl?.control_id===value.control_id)pendingControl=null}
+   else if(value.type==="records-ack")dataAck=value;
+  }
+  physical(value);
+  if(resumable&&connected&&pendingControl===value){clearTimer(controlTimer);controlTimer=setTimer(()=>{controlTimer=null;lost()},3000)}
+  if(resumable&&!connected&&!request&&(value?.type==="records-watch"||value?.type==="records-unwatch")){attempts=0;clearTimer(timer);timer=null;requestResume()}
+ };
+ const receive=event=>{
+  if(closed)return;lastTraffic=recordNow();const value=read(messageData,event),extra=read(messagePorts,event);
+  if(resumable&&extra.length===0&&value?.generation===generation){
+   if(value.type==="records-pong"){if(value.request_id===probeId){clearTimer(probeTimer);probeTimer=null;probeId=0;physical({type:"records-pong-ack",generation,request_id:value.request_id})}return}
+   if(value.type==="records-control"&&recordInteger(value.control_id)){
+    if(pendingControl?.control_id===value.control_id){clearTimer(controlTimer);controlTimer=null}
+    if(value.control_id<=seenControl){if(controlAck?.control_id===value.control_id)physical(controlAck);return}seenControl=value.control_id;
+   }else if(value.type==="records-delivery"&&recordInteger(value.delivery_id)){
+    if(value.delivery_id<=seenDelivery){if(dataAck?.delivery_id===value.delivery_id)physical(dataAck);return}seenDelivery=value.delivery_id;
+   }
+  }
+  emit("message",{data:value,ports:extra});
+ };
+ const bind=()=>{const bound=port;
+  const incoming=event=>{if(port===bound)receive(event)},end=event=>{if(port===bound){if(!resumable&&read(eventType,event)==="messageerror"){emit("messageerror",{});closeRecordTransport()}else lost()}};
+  listen(bound,"message",incoming);listen(bound,"messageerror",end);listen(bound,"close",end);
+  detach=()=>{unlisten(bound,"message",incoming);unlisten(bound,"messageerror",end);unlisten(bound,"close",end)};if(started)start(bound);
+ };
+ const requestResume=()=>{
+  if(closed||connected||request||attempts>=4||sequence>=9007199254740991)return;
+  attempts+=1;request=++sequence;
+  try{post(channel,{version:VERSION,type:"records-reconnect",generation,request_id:request})}catch{}
+  timer=setTimer(()=>{request=0;timer=null;if(attempts<4)timer=setTimer(()=>{timer=null;requestResume()},1000*(2**(attempts-1)))},3000);
+ };
+ const lost=()=>{
+  if(closed)return;clearTimer(controlTimer);controlTimer=null;clearTimer(probeTimer);probeTimer=null;probeId=0;
+  if(!resumable){emit("close",{});closeRecordTransport();return}
+  if(connected){connected=false;detach();try{apply(portClose,port,[])}catch{}status(false)}
+  requestResume();
+ };
+ const resumed=event=>{
+  const value=read(messageData,event),extra=read(messagePorts,event);
+  if(value?.version!==VERSION||value?.type!=="records-reconnected")return;
+  if(closed||value.generation!==generation||value.request_id!==request){for(const p of extra)apply(portClose,p,[]);return}
+  clearTimer(timer);timer=null;request=0;
+  if(extra.length!==1||value.code){
+   for(const p of extra)apply(portClose,p,[]);
+   emit("message",{data:{type:"records-end",generation,code:value.code==="scope_changed"?"scope_changed":"malformed"},ports:[]});closeRecordTransport();return;
+  }
+  detach();try{apply(portClose,port,[])}catch{}port=extra[0];connected=true;attempts=0;bind();status(true);
+  if(controlAck)physical(controlAck);if(dataAck)physical(dataAck);if(pendingControl)outbound(pendingControl);
+ };
+ const resume=event=>{if(closed||!resumable)return;if(connected){if(!probeId&&(read(eventType,event)==="online"||recordNow()-lastTraffic>15000)){probeId=++sequence;physical({type:"records-ping",generation,request_id:probeId});probeTimer=setTimer(()=>{probeTimer=null;probeId=0;lost()},3000)}}else if(!request){attempts=0;clearTimer(timer);timer=null;requestResume()}};
+ const visible=()=>{if(document.visibilityState==="visible")resume()};
+ const facade=freezeObject({postMessage:outbound,start(){started=true;if(!closed&&connected)start(port)},close(){closeRecordTransport()},
+  addEventListener(type,callback){if(closed)return;if((type!=="message"&&type!=="messageerror"&&type!=="close")||typeof callback!=="function")throw new TypeError("invalid record transport listener");for(const item of listeners)if(item.type===type&&item.callback===callback)return;if(listeners.length>=8)throw new TypeError("record transport listener limit");pushValue(listeners,{type,callback})},
+  removeEventListener(type,callback){for(let i=0;i<listeners.length;i++)if(listeners[i].type===type&&listeners[i].callback===callback){apply(arraySplice,listeners,[i,1]);return}}
+ });
+ closeRecordTransport=()=>{if(closed)return;closed=true;detach();clearTimer(timer);clearTimer(controlTimer);clearTimer(probeTimer);unlisten(channel,"message",resumed);unlisten(window,"online",resume);unlisten(window,"pageshow",resume);unlisten(document,"visibilitychange",visible);listeners.length=0;apply(portClose,port,[])};
+ recordTransport=freezeObject({generation,protocolVersion:apply(arrayIncludes,data.host_features,[RECORD_PRESENTATION_FEATURE])?2:1,port:facade});
+ bind();if(resumable){listen(channel,"message",resumed);listen(window,"online",resume);listen(window,"pageshow",resume);listen(document,"visibilitychange",visible)}
+ listen(channel,"messageerror",closeRecordTransport);listen(channel,"close",closeRecordTransport);listen(window,"pagehide",closeRecordTransport,true);listen(window,"unload",closeRecordTransport,true);
+};
 let resolveReady, rejectReady;
 const ready=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject});
 const jsonStringify=JSON.stringify,jsonParse=JSON.parse,isArray=Array.isArray,NativePromise=Promise,pendingIntents=Object.create(null);let pendingIntentCount=0;
@@ -225,10 +319,14 @@ const settleRead=data=>{if(typeof data.request_id!=="string"||!own(pendingReads,
    carrying {status, code, message}. At most 8 calls in flight, args at most
    256 KiB serialized, answer at most 1 MiB. There is no gesture rule. */
 const CALL_FEATURE="app.call.v2";let callFeature=false,callClosed=false,pendingCallCount=0,callSeq=0;const pendingCalls=Object.create(null);
-const callFailure=(status,code,message,applied)=>{const error=new Error(NativeString(message??"").slice(0,512));define(error,"status",{value:status,enumerable:true});define(error,"code",{value:code,enumerable:true});if(applied===true)define(error,"applied",{value:true,enumerable:true});return error};
+const callFailure=(status,code,message,applied,reconciliation)=>{const error=new Error(NativeString(message??"").slice(0,512));define(error,"status",{value:status,enumerable:true});define(error,"code",{value:code,enumerable:true});if(applied===true)define(error,"applied",{value:true,enumerable:true});if(status==="uncertain"&&reconciliation&&typeof reconciliation==="object"&&!isArray(reconciliation)){const receipt={};if(typeof reconciliation.idempotency_key==="string"&&reconciliation.idempotency_key.length<=200)receipt.idempotency_key=reconciliation.idempotency_key;if(own(reconciliation,"body")){try{const encoded=jsonStringify(reconciliation.body);if(typeof encoded!=="string")throw new Error("Not JSON");if(sessionUtf8Bytes(encoded)<=65536)receipt.body=jsonParse(encoded);else receipt.body_omitted="too_large"}catch{receipt.body_omitted="not_json"}}else if(reconciliation.body_omitted==="too_large"||reconciliation.body_omitted==="not_json")receipt.body_omitted=reconciliation.body_omitted;define(error,"reconciliation",{value:freeze(receipt),enumerable:true})}return error};
 const refuseCall=(request_id,code,message)=>{reportBoundedRefusal("html_call_refused",code);return freezeObject({request_id,confirmed:NativePromise.reject(callFailure("refused",code,message))})};
-const callOperation=(operation,args)=>{callSeq+=1;const request_id="call-"+callSeq;if(typeof operation!=="string"||operation.length<1||operation.length>128)return refuseCall(request_id,"malformed","call operation must be a non-empty string");const given=args===undefined?{}:args;if(!given||typeof given!=="object"||isArray(given))return refuseCall(request_id,"malformed","call args must be an object");let encoded;try{encoded=jsonStringify(given)}catch{return refuseCall(request_id,"malformed","call args must be JSON-serializable")}if(typeof encoded!=="string")return refuseCall(request_id,"malformed","call args must be JSON-serializable");if(encoded.length>262144)return refuseCall(request_id,"too_large","call args exceed bridge limit");const payload=jsonParse(encoded);if(!payload||typeof payload!=="object"||isArray(payload))return refuseCall(request_id,"malformed","call args must serialize to an object");if(callClosed)return refuseCall(request_id,"port_closed","the host port is closed");if(pendingCallCount>=8)return refuseCall(request_id,"busy","too many calls in flight");const confirmed=new NativePromise((resolve,reject)=>{pendingCalls[request_id]={resolve,reject};pendingCallCount+=1;try{send({version:VERSION,type:"call",request_id,operation,args:payload})}catch(error){delete pendingCalls[request_id];pendingCallCount-=1;reject(error)}});return freezeObject({request_id,confirmed})};
-const settleCall=data=>{if(typeof data.request_id!=="string"||!own(pendingCalls,data.request_id))return;let answer;try{const encoded=jsonStringify({status:data.status,code:data.code,message:data.message,result:data.result,applied:data.applied===true?true:undefined});answer=encoded.length>1048576?freezeObject({status:"error",code:"too_large"}):freeze(jsonParse(encoded))}catch{answer=freezeObject({status:"error",code:"malformed"})}const pending=pendingCalls[data.request_id];delete pendingCalls[data.request_id];pendingCallCount-=1;if(answer.status==="ok")pending.resolve(answer.result);else if(answer.status==="refused"||answer.status==="uncertain"||answer.status==="error")pending.reject(callFailure(answer.status,typeof answer.code==="string"?answer.code:null,answer.message,answer.applied));else pending.reject(callFailure("error","malformed",""))};
+const observedClaim=options=>{const claim=options&&typeof options==="object"?options.observed:undefined;if(!claim||typeof claim!=="object"||isArray(claim))return null;const act=claim.act,basis=claim.basis;if(!(act===null||typeof act==="number"&&act>=0&&act%1===0&&act<=9007199254740991))return null;if(basis!=="rendered"&&basis!=="delivered"&&basis!=="none")return null;return freezeObject({act,basis})};
+const callOperation=(operation,args,options)=>{callSeq+=1;const request_id="call-"+callSeq;if(typeof operation!=="string"||operation.length<1||operation.length>128)return refuseCall(request_id,"malformed","call operation must be a non-empty string");const given=args===undefined?{}:args;if(!given||typeof given!=="object"||isArray(given))return refuseCall(request_id,"malformed","call args must be an object");let encoded;try{encoded=jsonStringify(given)}catch{return refuseCall(request_id,"malformed","call args must be JSON-serializable")}if(typeof encoded!=="string")return refuseCall(request_id,"malformed","call args must be JSON-serializable");if(encoded.length>262144)return refuseCall(request_id,"too_large","call args exceed bridge limit");const payload=jsonParse(encoded);if(!payload||typeof payload!=="object"||isArray(payload))return refuseCall(request_id,"malformed","call args must serialize to an object");if(callClosed)return refuseCall(request_id,"port_closed","the host port is closed");if(pendingCallCount>=8)return refuseCall(request_id,"busy","too many calls in flight");const onSnapshot=typeof options?.onSnapshot==="function"?options.onSnapshot:null;const observed=observedClaim(options);const confirmed=new NativePromise((resolve,reject)=>{pendingCalls[request_id]={resolve,reject,onSnapshot};pendingCallCount+=1;try{send({version:VERSION,type:"call",request_id,operation,args:payload,...(onSnapshot?{read_snapshot:true}:{}),...(observed?{observed}:{})})}catch(error){delete pendingCalls[request_id];pendingCallCount-=1;reject(error)}});return freezeObject({request_id,confirmed})};
+/* A last-known read can paint before confirmed settles. It is opt-in,
+   presentation only, and cannot settle/reject or confirm the live call. */
+const settleCallSnapshot=data=>{if(typeof data.request_id!=="string"||!own(pendingCalls,data.request_id))return;const pending=pendingCalls[data.request_id];if(!pending.onSnapshot)return;const callback=pending.onSnapshot;pending.onSnapshot=null;try{const encoded=jsonStringify(data.result);if(typeof encoded!=="string"||encoded.length>1048576)return;callback(freeze(jsonParse(encoded)),freezeObject({storedAt:typeof data.stored_at==="number"?data.stored_at:null}))}catch{}};
+const settleCall=data=>{if(typeof data.request_id!=="string"||!own(pendingCalls,data.request_id))return;let answer;try{const encoded=jsonStringify({status:data.status,code:data.code,message:data.message,result:data.result,applied:data.applied===true?true:undefined,reconciliation:data.reconciliation});answer=encoded.length>1048576?freezeObject({status:"error",code:"too_large"}):freeze(jsonParse(encoded))}catch{answer=freezeObject({status:"error",code:"malformed"})}const pending=pendingCalls[data.request_id];delete pendingCalls[data.request_id];pendingCallCount-=1;if(answer.status==="ok")pending.resolve(answer.result);else if(answer.status==="refused"||answer.status==="uncertain"||answer.status==="error")pending.reject(callFailure(answer.status,typeof answer.code==="string"?answer.code:null,answer.message,answer.applied,answer.reconciliation));else pending.reject(callFailure("error","malformed",""))};
 const closeCalls=()=>{callClosed=true;for(const id of objectKeys(pendingCalls)){const pending=pendingCalls[id];delete pendingCalls[id];pending.reject(callFailure("uncertain","port_closed","the host port closed before the call was answered"))}pendingCallCount=0};
 /* Floating-chat presentation (task e27b79d). App calls
    native.presentation.setFloatingChat({suppress:boolean}); host feature
@@ -243,8 +341,138 @@ const refusePresentation=(reason,message)=>{reportBoundedRefusal("html_presentat
 const setFloatingChat=value=>{if(!presentationFeature||!channel||presentationClosed)return NativePromise.resolve(false);if(!value||typeof value!=="object"||isArray(value))refusePresentation("malformed","presentation preference must be {suppress:boolean}");const proto=parentOf(value);if(proto!==presentationObjectProto&&proto!==null)refusePresentation("malformed","presentation preference must be {suppress:boolean}");let keys;try{keys=apply(presentationOwnKeys,undefined,[value])}catch{refusePresentation("malformed","presentation preference must be {suppress:boolean}")}if(!isArray(keys)||keys.length!==1||keys[0]!=="suppress")refusePresentation("malformed","presentation preference must be {suppress:boolean}");const desc=own(value,"suppress");if(!desc||!desc.enumerable||!own(desc,"value")||typeof desc.value!=="boolean")refusePresentation("malformed","presentation preference must be {suppress:boolean}");let encoded;try{encoded=jsonStringify({suppress:desc.value})}catch{refusePresentation("malformed","presentation preference must be JSON-serializable")}if(typeof encoded!=="string"||encoded.length>256)refusePresentation("too_large","presentation preference exceeds bridge limit");if(presentationCount>=8){reportBoundedRefusal("html_presentation_refused","busy");return NativePromise.resolve(false)}presentationSeq+=1;const request_id="presentation-"+presentationSeq;const payload=jsonParse(encoded);return new NativePromise(resolve=>{pendingPresentation[request_id]=resolve;presentationCount+=1;try{send({version:VERSION,type:"presentation",request_id,presentation_version:PRESENTATION_FEATURE,suppress:payload.suppress})}catch(error){delete pendingPresentation[request_id];presentationCount-=1;resolve(false)}})};
 const settlePresentation=data=>{if(typeof data.request_id!=="string"||!own(pendingPresentation,data.request_id))return;const resolve=pendingPresentation[data.request_id];delete pendingPresentation[data.request_id];presentationCount-=1;try{resolve(data.status==="ok"&&data.accepted===true)}catch{}};
 const closePresentation=()=>{presentationClosed=true;for(const id of objectKeys(pendingPresentation)){const resolve=pendingPresentation[id];delete pendingPresentation[id];try{resolve(false)}catch{}}presentationCount=0};
-const presentationApi=freezeObject({setFloatingChat});
-const exposeNative=()=>{if(suppliedKit)return;try{define(window,"native",{value:freezeObject({...(callFeature?{call:callOperation}:{}),...(sessionFeature?{session:sessionApi}:{}),...(subscribeFeature?{query:queryOperation,subscribe:subscribeOperation}:{}),...(agentsFeature?{agents:agentsApi}:{}),...(agentSessionsFeature?{agentSessions:agentSessionsSurface()}:{}),...(presentationFeature?{presentation:presentationApi}:{}),...(skinFeature?{skin:skinApi}:{})}),writable:false,configurable:false})}catch{reportBoundedRefusal("html_call_refused","alias_unavailable")}};
+
+/* Independent negotiated per-document title setter. Captured primitives keep
+   validation stable after authored code runs. Shares bounded pending/teardown. */
+const TAB_TITLE_FEATURE="app.tab-title.v1";
+let tabTitleFeature=false;
+const titleReplace=String.prototype.replace,titleTrim=String.prototype.trim,titleCodePointAt=String.prototype.codePointAt,titleRegexTest=RegExp.prototype.test;
+const titleBad=/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+const setTabTitle=value=>{
+ if(!tabTitleFeature||!channel||presentationClosed)return NativePromise.resolve(false);
+ const fail=()=>refusePresentation("malformed","tab title must be {title:string|null}");
+ if(!value||typeof value!=="object"||isArray(value))fail();
+ const proto=parentOf(value);if(proto!==presentationObjectProto&&proto!==null)fail();
+ const keys=apply(presentationOwnKeys,undefined,[value]);if(keys.length!==1||keys[0]!=="title")fail();
+ const d=own(value,"title");if(!d||!d.enumerable||!own(d,"value"))fail();let title=d.value;
+ if(title!==null){
+  if(typeof title!=="string"||apply(titleRegexTest,titleBad,[title]))fail();
+  let count=0;for(let i=0;i<title.length;i++){const cp=apply(titleCodePointAt,title,[i]);if(cp>=0xd800&&cp<=0xdfff)fail();if(cp>65535)i++;count++}
+  title=apply(titleTrim,apply(titleReplace,title,[/\s+/gu," "]),[]);
+  if(!title)fail();count=0;for(let i=0;i<title.length;i++){if(apply(titleCodePointAt,title,[i])>65535)i++;count++}if(count>256)refusePresentation("too_large","tab title exceeds bridge limit");
+ }
+ if(presentationCount>=8)return NativePromise.resolve(false);
+ const request_id="tab-title-"+(++presentationSeq),message={version:VERSION,type:"tab-title",request_id,tab_title_version:TAB_TITLE_FEATURE,title};
+ const encoded=jsonStringify(message);let size=0;for(let i=0;i<encoded.length;i++){const cp=apply(titleCodePointAt,encoded,[i]);size+=cp<128?1:cp<2048?2:cp<65536?3:4;if(cp>65535)i++}if(size>2048)refusePresentation("too_large","tab title exceeds bridge limit");
+ return new NativePromise(resolve=>{pendingPresentation[request_id]=resolve;presentationCount++;try{send(message)}catch{delete pendingPresentation[request_id];presentationCount--;resolve(false)}});
+};
+let presentationApiValue;
+const presentationApi=()=>presentationApiValue||(presentationApiValue=freezeObject({...(presentationFeature?{setFloatingChat}:{}),...(tabTitleFeature?{setTabTitle}:{})}));
+
+/* Device state has a dedicated acknowledged lane; view-state stays transient. */
+// Device recovery only; this port never submits a body to the server.
+const BODY_DRAFT_FEATURE="app.body-draft.v1";
+let bodyDraftFeature=false,bodyDraftClosed=false,bodyDraftSeq=0;
+const bodyDraftPending=Object.create(null);
+const bodyDraftFailure=code=>freezeObject({status:"error",code});
+const bodyDraftRequest=(action,value)=>{
+ if(!bodyDraftFeature||bodyDraftClosed)return NativePromise.resolve(bodyDraftFailure("unavailable"));
+ let payload;try{const text=jsonStringify(value);if(typeof text!=="string"||text.length>2097152)return NativePromise.resolve(bodyDraftFailure("too_large"));payload=jsonParse(text)}catch{return NativePromise.resolve(bodyDraftFailure("malformed"))}
+ if(objectKeys(bodyDraftPending).length>=8)return NativePromise.resolve(bodyDraftFailure("busy"));
+ const request_id="body-draft-"+(++bodyDraftSeq);
+ return new NativePromise(resolve=>{const timer=setTimer(()=>{if(!bodyDraftPending[request_id])return;delete bodyDraftPending[request_id];resolve(bodyDraftFailure("timeout"))},10000);bodyDraftPending[request_id]={resolve,timer};try{send({...payload,version:VERSION,type:"body-draft",request_id,action})}catch{delete bodyDraftPending[request_id];clearTimer(timer);resolve(bodyDraftFailure("unavailable"))}});
+};
+const bodyDraftApi=freezeObject({get:record=>bodyDraftRequest("get",{record}),put:value=>bodyDraftRequest("put",value),clear:value=>bodyDraftRequest("clear",value)});
+const settleBodyDraft=data=>{const pending=bodyDraftPending[data.request_id];if(!pending)return;delete bodyDraftPending[data.request_id];clearTimer(pending.timer);let answer;try{const text=jsonStringify(data);if(text.length>8388608)throw 0;answer=jsonParse(text);delete answer.type;delete answer.version;delete answer.request_id}catch{answer={status:"error",code:"malformed"}}pending.resolve(freeze(answer))};
+const closeBodyDraft=()=>{bodyDraftClosed=true;for(const key of objectKeys(bodyDraftPending)){const p=bodyDraftPending[key];delete bodyDraftPending[key];clearTimer(p.timer);p.resolve(bodyDraftFailure("unavailable"))}};
+
+const APP_STATE_FEATURE="app.state.v1";
+let appStateFeature=false,appStateClosed=false,appStateSeq=0,appStateCount=0;
+const pendingAppState=Object.create(null);
+const appStateRequest=(action,value,options)=>{
+ if(!appStateFeature||appStateClosed)return NativePromise.resolve(freezeObject({status:"error",code:"unavailable"}));
+ let payload;try{const text=jsonStringify({value,options});if(typeof text!=="string")throw 0;payload=jsonParse(text)}catch{return NativePromise.resolve(freezeObject({status:"error",code:"malformed"}))}
+ const opts=payload.options??{};
+ if(!opts||typeof opts!=="object"||Array.isArray(opts)||objectKeys(opts).some(key=>!(action==="get"?["schema"]:action==="clear"?["expectedRevision","consume"]:["schema","expectedRevision","consume"]).includes(key))||(opts.consume!==undefined&&opts.consume!=="all"&&(!Array.isArray(opts.consume)||opts.consume.some(token=>typeof token!=="string"||token.length>128))))return NativePromise.resolve(freezeObject({status:"error",code:"malformed"}));
+ if(action==="set"){let text;try{text=jsonStringify(payload.value)}catch{}if(typeof text!=="string")return NativePromise.resolve(freezeObject({status:"error",code:"malformed"}));if(text.length>65536)return NativePromise.resolve(freezeObject({status:"error",code:"too_large"}))}
+ if(appStateCount>=8)return NativePromise.resolve(freezeObject({status:"error",code:"busy"}));
+ const request_id="app-state-"+(++appStateSeq);
+ return new NativePromise(resolve=>{pendingAppState[request_id]=resolve;appStateCount+=1;try{send({version:VERSION,type:"app-state",request_id,action,...payload})}catch{delete pendingAppState[request_id];appStateCount-=1;resolve(freezeObject({status:"error",code:"unavailable"}))}});
+};
+const appStateApi=freezeObject({get:(options)=>appStateRequest("get",undefined,options),set:(value,options)=>appStateRequest("set",value,options),clear:(options)=>appStateRequest("clear",undefined,options)});
+const settleAppState=data=>{const resolve=pendingAppState[data.request_id];if(!resolve)return;delete pendingAppState[data.request_id];appStateCount-=1;let answer;try{const text=jsonStringify(data);answer=text.length>2097152?{status:"error",code:"too_large"}:jsonParse(text);delete answer.type;delete answer.version;delete answer.request_id}catch{answer={status:"error",code:"malformed"}}resolve(freeze(answer))};
+const closeAppState=()=>{appStateClosed=true;for(const key of objectKeys(pendingAppState)){const resolve=pendingAppState[key];delete pendingAppState[key];resolve(freezeObject({status:"error",code:"unavailable"}))}appStateCount=0};
+const VIEWER_FEATURE="app.viewer.v1",VIEWER_VERSION="native.viewer.v1";
+let viewerFeature=false,viewerClosed=false,viewerValue=null,viewerSubscribers=[];
+const viewerOf=value=>{
+ if(value===null)return{value:null};
+ if(!value||typeof value!=="object"||isArray(value))return null;
+ const keys=objectKeys(value);
+ if(keys.length!==3||!keys.includes("version")||!keys.includes("person_id")||!keys.includes("name"))return null;
+ if(value.version!==VIEWER_VERSION)return null;
+ if(value.person_id!==null&&typeof value.person_id!=="string")return null;
+ if(value.name!==null&&typeof value.name!=="string")return null;
+ return{value:freezeObject({personId:value.person_id,name:value.name!==null&&value.name.length>4096?null:value.name})};
+};
+const receiveViewer=data=>{
+ if(!viewerFeature||viewerClosed)return;
+ const parsed=viewerOf(data&&typeof data==="object"?data.viewer:undefined);
+ if(!parsed){report("viewer_malformed",{});return}
+ if(parsed.value===null)return;
+ if(viewerValue&&viewerValue.personId===parsed.value.personId&&viewerValue.name===parsed.value.name)return;
+ viewerValue=parsed.value;
+ for(const callback of [...viewerSubscribers]){try{apply(callback,undefined,[viewerValue])}catch(error){report("viewer_callback_failed",{message:detailOf(error)})}}
+};
+const onViewer=callback=>{
+ if(typeof callback!=="function")throw new TypeError("viewer subscriber must be a function");
+ pushValue(viewerSubscribers,callback);
+ return()=>{const index=indexOfValue(viewerSubscribers,callback);if(index>=0)spliceValue(viewerSubscribers,index,1)};
+};
+const closeViewer=()=>{viewerClosed=true;viewerSubscribers=[]};
+const PENDING_FEATURE="app.pending.v1",PENDING_VERSION="app.pending.v1";
+let pendingFeature=false,pendingClosed=false,pendingSubscribers=[],pendingCount=0;const pendingHeld=Object.create(null);
+/* Writes the host holds for this app (design note b08bdf78, slice 7): the host pushes a snapshot, then deltas. Display only: an entry
+   is never a receipt, and `applied` is the host's word. Bounded: 256 entries of at most 256 KiB, copied and frozen. */
+const pendingEntryOf=value=>{
+ if(!value||typeof value!=="object"||isArray(value))return null;
+ if(typeof value.id!=="string"||value.id.length<1||value.id.length>128||typeof value.key!=="string"||value.key.length>200)return null;
+ if(value.operation!=="update_record"&&value.operation!=="create_record")return null;
+ if(value.phase!=="pending"&&value.phase!=="uncertain"&&value.phase!=="refused"&&value.phase!=="applied")return null;
+ if(!value.request||typeof value.request!=="object"||isArray(value.request))return null;
+ let text;try{text=jsonStringify(value)}catch{return null}
+ if(typeof text!=="string"||text.length>262144)return null;
+ return freeze(jsonParse(text));
+};
+const pendingList=()=>{const out=[];for(const id of objectKeys(pendingHeld))pushValue(out,pendingHeld[id]);return freezeObject(out)};
+const pendingNotify=()=>{const list=pendingList();for(const callback of [...pendingSubscribers]){try{apply(callback,undefined,[list])}catch(error){report("pending_callback_failed",{message:detailOf(error)})}}};
+const receivePending=data=>{
+ if(!pendingFeature||pendingClosed||!data||typeof data!=="object"||data.pending_version!==PENDING_VERSION)return;
+ if(data.kind==="snapshot"){
+  if(!isArray(data.entries)||data.entries.length>256){report("pending_malformed",{});return}
+  for(const id of objectKeys(pendingHeld))delete pendingHeld[id];
+  pendingCount=0;
+  for(const raw of data.entries){const entry=pendingEntryOf(raw);if(entry&&pendingCount<256&&!own(pendingHeld,entry.id)){pendingHeld[entry.id]=entry;pendingCount+=1}}
+ }else if(data.kind==="delta"){
+  if(!isArray(data.upsert)||!isArray(data.remove)||data.upsert.length>256||data.remove.length>256){report("pending_malformed",{});return}
+  for(const id of data.remove){if(typeof id==="string"&&own(pendingHeld,id)){delete pendingHeld[id];pendingCount-=1}}
+  for(const raw of data.upsert){const entry=pendingEntryOf(raw);if(!entry)continue;if(own(pendingHeld,entry.id)){pendingHeld[entry.id]=entry}else if(pendingCount<256){pendingHeld[entry.id]=entry;pendingCount+=1}}
+ }else return;
+ pendingNotify();
+};
+const pendingAct=(action,id)=>{if(!pendingFeature||pendingClosed||typeof id!=="string"||id.length<1||id.length>128)return false;send({version:VERSION,type:"pending-act",pending_version:PENDING_VERSION,action,id});return true};
+const pendingApi=freezeObject({
+ get entries(){return pendingList()},
+ subscribe(callback){
+  if(typeof callback!=="function")throw new TypeError("pending subscriber must be a function");
+  pushValue(pendingSubscribers,callback);
+  return()=>{const index=indexOfValue(pendingSubscribers,callback);if(index>=0)spliceValue(pendingSubscribers,index,1)};
+ },
+ retry(id){return pendingAct("retry",id)},
+ discard(id){return pendingAct("discard",id)},
+});
+const closePending=()=>{pendingClosed=true;pendingSubscribers=[]};
+
+const exposeNative=()=>{if(suppliedKit)return;try{const nativeApi={...(recordTransport?{recordObservation:recordTransport}:{}),...(callFeature?{call:callOperation}:{}),...(sessionFeature?{session:sessionApi}:{}),...(subscribeFeature?{query:queryOperation,subscribe:subscribeOperation}:{}),...(agentsFeature?{agents:agentsApi}:{}),...(agentSessionsFeature?{agentSessions:agentSessionsOfferedSurface()}:{}),...((presentationFeature||tabTitleFeature)?{presentation:presentationApi()}:{}),...(bodyDraftFeature?{bodyDraft:bodyDraftApi}:{}),...(appStateFeature?{appState:appStateApi}:{}),...(skinFeature?{skin:skinApi}:{}),...(pendingFeature?{pending:pendingApi}:{})};if(viewerFeature){define(nativeApi,"viewer",{get:()=>viewerValue,enumerable:true});nativeApi.onViewer=onViewer}define(window,"native",{value:freezeObject(nativeApi),writable:false,configurable:false})}catch{reportBoundedRefusal("html_call_refused","alias_unavailable")}};
 const onInput=callback=>{if(typeof callback!=="function")throw new TypeError("input subscriber must be a function");pushValue(inputSubscribers,callback);return()=>{const index=indexOfValue(inputSubscribers,callback);if(index>=0)spliceValue(inputSubscribers,index,1)}};
 /* Inbound reveal (task fb8564c). The host may reveal one already-authorized
    record to an opted-in frame AFTER backend admission; this is advisory only,
@@ -323,7 +551,8 @@ const closeSessions=()=>{sessionsClosed=true;for(const id of objectKeys(sessions
    and rejects with an Error carrying {status, code, message}. subscribe(
    {sql, params?}, onResult) returns an idempotent unsubscribe at once; the host
    pushes results, delivered as {status:"ready", rows, columns, truncated,
-   cached} and, for a failure, {status:"error", code, message, terminal}. A
+   cached, behind, act?} (act: the act the rows reflect, when the host knows it)
+   and, for a failure, {status:"error", code, message, terminal}. A
    terminal error (a refusal, the host ending the subscription, or the host
    port closing) frees the slot; a non-terminal one leaves it open. Refusals are
    never thrown: only a non-function callback is. A refused subscribe's one
@@ -337,7 +566,14 @@ const closeSessions=()=>{sessionsClosed=true;for(const id of objectKeys(sessions
    offset?} (app contract v2 R4): it travels as given, the host answers it from
    its local store when it can answer exactly or from the engine otherwise, and
    its result has the same {rows, columns, truncated} shape, one row per
-   record. The two forms do not mix. The query
+   record. The two forms do not mix. A second argument {lastKnown:true,
+   onPartial(held)} asks the host for what it already holds before the current
+   answer: held is {rows, columns, truncated, cached:true, behind} (behind: the
+   host cannot confirm it right now), delivered at most once and never after
+   the promise settles; the promise itself still resolves only with the current
+   answer. Wire: query gains last_known:true; the host may answer
+   {type:"query-partial", request_id, result, cached:true, behind?} first. A
+   host that does not know last_known sends only query-result. The query
    object is at most 256 KiB serialized, each result at most 1 MiB; at most 8
    queries in flight and 32 open subscriptions per frame. A query refused for
    its shape or a cap rejects with status "refused"; one that could not be
@@ -348,14 +584,15 @@ const SUBSCRIBE_FEATURE="app.subscribe.v2";let subscribeFeature=false,subscribeC
 const queryWire=given=>{let encoded,structured;try{if(!given||typeof given!=="object"||isArray(given)||objectKeys(given).some(key=>key!=="sql"&&key!=="params"&&key!=="steps"&&key!=="order"&&key!=="limit"&&key!=="offset"))return{code:"malformed",message:"query must be an object with sql and optional params, or steps and optional order, limit and offset"};structured=!!own(given,"steps");if(structured?!!own(given,"sql")||!!own(given,"params"):!!own(given,"order")||!!own(given,"limit")||!!own(given,"offset"))return{code:"malformed",message:"a query is either sql with params or steps with order, limit and offset"};encoded=structured?jsonStringify({steps:given.steps,order:given.order,limit:given.limit,offset:given.offset}):jsonStringify({sql:given.sql,parameters:given.params===undefined?[]:given.params})}catch{return{code:"malformed",message:"query must be JSON-serializable"}}if(typeof encoded!=="string")return{code:"malformed",message:"query must be JSON-serializable"};if(encoded.length>262144)return{code:"too_large",message:"query exceeds bridge limit"};const query=jsonParse(encoded);if(structured){if(!query||!isArray(query.steps)||query.steps.length<1)return{code:"malformed",message:"a structured query needs a non-empty steps array"};return{query}}if(!query||typeof query.sql!=="string"||query.sql.length<1||!isArray(query.parameters))return{code:"malformed",message:"query needs a non-empty sql string and an optional params array"};return{query}};
 const resultOf=value=>{if(!value||typeof value!=="object"||isArray(value)||!isArray(value.rows)||!isArray(value.columns))return"malformed";let encoded;try{encoded=jsonStringify({rows:value.rows,columns:value.columns,truncated:value.truncated===true})}catch{return"malformed"}if(typeof encoded!=="string")return"malformed";if(encoded.length>1048576)return"too_large";return freeze(jsonParse(encoded))};
 const refuseQuery=(code,message,status="refused")=>{reportBoundedRefusal("html_query_refused",code);return NativePromise.reject(callFailure(status,code,message))};
-const queryOperation=query=>{const wire=queryWire(query);if(!wire.query)return refuseQuery(wire.code,wire.message);if(subscribeClosed)return refuseQuery("port_closed","the host port is closed","error");if(pendingQueryCount>=8)return refuseQuery("busy","too many queries in flight");querySeq+=1;const request_id="query-"+querySeq;return new NativePromise((resolve,reject)=>{pendingQueries[request_id]={resolve,reject};pendingQueryCount+=1;try{send({version:VERSION,type:"query",request_id,query:wire.query})}catch(error){delete pendingQueries[request_id];pendingQueryCount-=1;reject(error)}})};
+const queryOperation=(query,options)=>{const wire=queryWire(query);if(!wire.query)return refuseQuery(wire.code,wire.message);if(subscribeClosed)return refuseQuery("port_closed","the host port is closed","error");if(pendingQueryCount>=8)return refuseQuery("busy","too many queries in flight");const partial=options&&typeof options==="object"&&options.lastKnown===true&&typeof options.onPartial==="function"?options.onPartial:null;querySeq+=1;const request_id="query-"+querySeq;return new NativePromise((resolve,reject)=>{pendingQueries[request_id]={resolve,reject,partial,partialDone:false};pendingQueryCount+=1;try{send({version:VERSION,type:"query",request_id,query:wire.query,...(partial?{last_known:true}:{})})}catch(error){delete pendingQueries[request_id];pendingQueryCount-=1;reject(error)}})};
+const settleQueryPartial=data=>{if(typeof data.request_id!=="string"||!own(pendingQueries,data.request_id))return;const pending=pendingQueries[data.request_id];if(!pending.partial||pending.partialDone)return;pending.partialDone=true;const result=resultOf(data.result);if(typeof result==="string")return;const held=freezeObject({rows:result.rows,columns:result.columns,truncated:result.truncated,cached:true,behind:data.behind===true});try{apply(pending.partial,undefined,[held])}catch(error){report("html_query_partial_failed",{message:detailOf(error)})}};
 const settleQuery=data=>{if(typeof data.request_id!=="string"||!own(pendingQueries,data.request_id))return;const pending=pendingQueries[data.request_id];delete pendingQueries[data.request_id];pendingQueryCount-=1;if(data.status==="ok"){const result=resultOf(data.result);if(typeof result==="string")pending.reject(callFailure("error",result,"the query result could not be delivered"));else pending.resolve(result)}else pending.reject(callFailure(data.status==="refused"?"refused":"error",typeof data.code==="string"?data.code.slice(0,128):null,data.message))};
 const subscriptionError=(code,message,terminal)=>freezeObject({status:"error",code,message:bounded(message),terminal});
 const deliverSubscription=(subscription,frame,refusal)=>{if(subscription.silenced&&!refusal)return;try{apply(subscription.callback,undefined,[frame])}catch(error){report("html_subscription_failed",{message:detailOf(error)})}};
 const endSubscription=(subscription,notify)=>{if(subscription.done)return;subscription.done=true;if(own(subscriptions,subscription.id)){delete subscriptions[subscription.id];openSubscriptionCount-=1;if(notify)try{send({version:VERSION,type:"unsubscribe",subscription_id:subscription.id})}catch{}}};
 const failSubscription=(subscription,code,message)=>{if(subscription.done)return;endSubscription(subscription,false);deliverSubscription(subscription,subscriptionError(code,message,true))};
 const subscribeOperation=(query,callback)=>{if(typeof callback!=="function")throw new TypeError("subscription callback must be a function");const subscription={id:null,callback,done:false,silenced:false,delivery:-1};const unsubscribe=()=>{subscription.silenced=true;endSubscription(subscription,true)};const refuse=(code,message)=>{subscription.done=true;reportBoundedRefusal("html_subscribe_refused",code);const frame=subscriptionError(code,message,true);NativePromise.resolve().then(()=>deliverSubscription(subscription,frame,true));return unsubscribe};const wire=queryWire(query);if(!wire.query)return refuse(wire.code,wire.message);if(subscribeClosed)return refuse("port_closed","the host port is closed");if(openSubscriptionCount>=32)return refuse("subscription_limit","too many open subscriptions");subscriptionSeq+=1;subscription.id="subscription-"+subscriptionSeq;subscriptions[subscription.id]=subscription;openSubscriptionCount+=1;try{send({version:VERSION,type:"subscribe",subscription_id:subscription.id,query:wire.query})}catch{endSubscription(subscription,false);return refuse("port_closed","the host port is closed")}return unsubscribe};
-const receiveSubscription=data=>{const subscription=typeof data.subscription_id==="string"&&own(subscriptions,data.subscription_id)?subscriptions[data.subscription_id]:null;if(!subscription||subscription.done)return;if(data.type==="subscription-error"){const code=typeof data.code==="string"?data.code.slice(0,128):"error";if(data.terminal===true)failSubscription(subscription,code,data.message);else deliverSubscription(subscription,subscriptionError(code,data.message,false));return}const delivery=data.delivery;if(typeof delivery!=="number"||delivery<0||delivery%1!==0||delivery<=subscription.delivery){reportBoundedRefusal("html_subscription_dropped","delivery");return}subscription.delivery=delivery;const result=resultOf(data.result);if(typeof result==="string"){deliverSubscription(subscription,subscriptionError(result,"the subscription result could not be delivered",false));return}deliverSubscription(subscription,freezeObject({status:"ready",rows:result.rows,columns:result.columns,truncated:result.truncated,cached:data.cached===true}))};
+const receiveSubscription=data=>{const subscription=typeof data.subscription_id==="string"&&own(subscriptions,data.subscription_id)?subscriptions[data.subscription_id]:null;if(!subscription||subscription.done)return;if(data.type==="subscription-error"){const code=typeof data.code==="string"?data.code.slice(0,128):"error";if(data.terminal===true)failSubscription(subscription,code,data.message);else deliverSubscription(subscription,subscriptionError(code,data.message,false));return}const delivery=data.delivery;if(typeof delivery!=="number"||delivery<0||delivery%1!==0||delivery<=subscription.delivery){reportBoundedRefusal("html_subscription_dropped","delivery");return}subscription.delivery=delivery;const result=resultOf(data.result);if(typeof result==="string"){deliverSubscription(subscription,subscriptionError(result,"the subscription result could not be delivered",false));return}const act=typeof data.act==="number"&&data.act>=0&&data.act%1===0&&data.act<=9007199254740991?data.act:null;deliverSubscription(subscription,freezeObject({status:"ready",rows:result.rows,columns:result.columns,truncated:result.truncated,cached:data.cached===true,behind:data.behind===true,...(act!==null?{act}:{})}))};
 const closeSubscriptions=()=>{subscribeClosed=true;for(const id of objectKeys(pendingQueries)){const pending=pendingQueries[id];delete pendingQueries[id];pending.reject(callFailure("error","port_closed","the host port closed before the query was answered"))}pendingQueryCount=0;for(const id of objectKeys(subscriptions)){const subscription=subscriptions[id];if(subscription)failSubscription(subscription,"port_closed","the host port closed")}};
 /* Asking an agent (app contract v2, Shapes bf7cfa5 v1.2). Offered only when
    the host's init lists "app.agents.v2", which the host grants only to its
@@ -450,6 +687,10 @@ const agentsApi=freezeObject({list:listAgents,ask:askAgent,onStatus:onAgentStatu
    text 1..12288 non-blank, sourceMessageId a canonical lowercase UUID owner-claimed reference (f38936b S7.3). Without that feature quoted resolves unavailable (send) or
    create_unsupported (create). A create waits up to 205 s, a send 145 s (a first-send dialog), a
    catalog 60 s, createStatus and cancel 50 s; every other call keeps 30 s.
+   app.agent-sessions.message-framing.v1 adds messageFraming:true and optional contentOrigin
+   (typed|generated) on send/create, carried as content_origin. Only a Desktop advertising
+   app-message-framing.v1 offers this; unsupported classified requests dispatch nothing.
+   Missing stays absent for retry compatibility and Desktop treats it as generated.
    Follow-up controls for Attention (app.agent-sessions.followup.v1, offered beside
    app.agent-sessions.v2 only when the shell says the Desktop has all four; without it
    agentSessions.followup does not exist). followup.status(), followup.continue(),
@@ -463,7 +704,7 @@ const agentsApi=freezeObject({list:listAgents,ask:askAgent,onStatus:onAgentStatu
    Wire, frame to host: {type:"agent-sessions-followup-status"|"-continue"|"-settings-get",
    request_id} and {type:"agent-sessions-followup-settings-set",request_id,enabled?,
    provider?,model?}; each is answered by its type plus "-result". */
-const AGENT_SESSIONS_FEATURE="app.agent-sessions.v2",AGENT_SESSIONS_CREATE_FEATURE="app.agent-sessions.create.v1",AGENT_SESSIONS_ADOPTED_FEATURE="app.agent-sessions.adopted.v1",AGENT_SESSIONS_OPEN_CONVERSATION_FEATURE="app.agent-sessions.open-conversation.v1",AGENT_SESSIONS_SAVED_FEATURE="app.agent-sessions.saved.v1",AGENT_SESSIONS_FOLLOWUP_FEATURE="app.agent-sessions.followup.v1";let agentSessionsFollowupFeature=false,agentSessionsSavedFeature=false,agentSessionsAdoptedFeature=false,agentSessionsCreateFeature=false,agentSessionsFeature=false,agentSessionsOpenConversationFeature=false,agentSessionsClosed=false,agentSessionsSeq=0,agentSessionsInflight=0;const agentSessionsPending=Object.create(null),agentSessionFollows=Object.create(null);let agentSessionListWatch=null;
+const AGENT_SESSIONS_FEATURE="app.agent-sessions.v2",AGENT_SESSIONS_CREATE_FEATURE="app.agent-sessions.create.v1",AGENT_SESSIONS_ADOPTED_FEATURE="app.agent-sessions.adopted.v1",AGENT_SESSIONS_MESSAGE_FRAMING_FEATURE="app.agent-sessions.message-framing.v1",AGENT_SESSIONS_OPEN_CONVERSATION_FEATURE="app.agent-sessions.open-conversation.v1",AGENT_SESSIONS_SAVED_FEATURE="app.agent-sessions.saved.v1",AGENT_SESSIONS_FOLLOWUP_FEATURE="app.agent-sessions.followup.v1";let agentSessionsMessageFramingFeature=false,agentSessionsFollowupFeature=false,agentSessionsSavedFeature=false,agentSessionsAdoptedFeature=false,agentSessionsCreateFeature=false,agentSessionsFeature=false,agentSessionsOpenConversationFeature=false,agentSessionsClosed=false,agentSessionsSeq=0,agentSessionsInflight=0;const agentSessionsPending=Object.create(null),agentSessionFollows=Object.create(null);let agentSessionListWatch=null;
 const SESSION_RESULT_CODES=["refused","invalid","unavailable","gone","busy"],SESSION_EVENT_KINDS=["snapshot","update","resync","ended"];
 const AGENT_SESSIONS_TIMEOUT_MS=30000;
 const nextAgentSessionsId=prefix=>{agentSessionsSeq+=1;let id=prefix+agentSessionsSeq;while(own(agentSessionsPending,id)){agentSessionsSeq+=1;id=prefix+agentSessionsSeq}return id};
@@ -474,24 +715,24 @@ const sessionAdvisoryIdOk=value=>typeof value==="string"&&value.length>0&&value.
 const sessionToolDetailOk=value=>typeof value==="string"&&value.length>0&&value.length<=256&&apply(regExpExec,/^\S+(?: \S+)*$/u,[value])!==null;
 const sessionAttentionOf=value=>{if(value===undefined)return undefined;if(value===null)return null;if(!value||typeof value!=="object"||isArray(value))return undefined;if(value.kind!=="blocked"&&value.kind!=="decision"&&value.kind!=="review"&&value.kind!=="done")return undefined;if(typeof value.message!=="string"||value.message.length>500)return undefined;return freezeObject({kind:value.kind,message:value.message})};
 const sessionPermissionOf=value=>{if(value===undefined)return undefined;if(value===null)return null;if(!value||typeof value!=="object"||isArray(value))return undefined;if(!sessionAdvisoryIdOk(value.requestId))return undefined;if(value.kind!=="question"&&value.kind!=="plan"&&value.kind!=="tool"&&value.kind!=="mode"&&value.kind!=="other")return undefined;if(value.title!==undefined&&(typeof value.title!=="string"||value.title.length>256))return undefined;return value.title===undefined?freezeObject({requestId:value.requestId,kind:value.kind}):freezeObject({requestId:value.requestId,kind:value.kind,title:value.title})};
-const sessionCapabilitiesOf=(value,reachable)=>{if(!reachable)return undefined;if(value===undefined)return undefined;if(!value||typeof value!=="object"||isArray(value))return undefined;const out={};if(value.markRead===true)out.markRead=true;if(value.listChanged===true)out.listChanged=true;if(value.scopedPermissions===true)out.scopedPermissions=true;if(value.create===true)out.create=true;if(value.chooseFolder===true)out.chooseFolder=true;return objectKeys(out).length?freezeObject(out):undefined};
+const sessionCapabilitiesOf=(value,reachable)=>{if(!reachable)return undefined;if(value===undefined)return undefined;if(!value||typeof value!=="object"||isArray(value))return undefined;const out={};if(value.markRead===true)out.markRead=true;if(value.listChanged===true)out.listChanged=true;if(value.scopedPermissions===true)out.scopedPermissions=true;if(value.startedBy===true)out.startedBy=true;if(value.create===true)out.create=true;if(value.chooseFolder===true)out.chooseFolder=true;return objectKeys(out).length?freezeObject(out):undefined};
 const sessionTextEncoder=(typeof TextEncoder==="function")?new TextEncoder():null;
 const sessionUtf8Bytes=text=>{if(sessionTextEncoder){try{return sessionTextEncoder.encode(text).length}catch{}}return text.length*4};
 const sessionRefusal=code=>freezeObject({ok:false,code});
 const sessionJson=(value,max)=>{try{const encoded=jsonStringify(value);if(typeof encoded!=="string"||encoded.length>max||sessionUtf8Bytes(encoded)>max)return null;return jsonParse(encoded)}catch{return null}};
-const sessionSummaryOf=item=>{if(!item||typeof item!=="object"||isArray(item)||!sessionIdOk(item.id)||!sessionIdOk(item.hostId)||!sessionIdOk(item.hostEpoch)||!sessionText(item.hostLabel,256))return null;if(!(item.title===null||sessionText(item.title,512)))return null;if(!sessionText(item.provider,128))return null;if(!(item.model===null||sessionText(item.model,256)))return null;if(!sessionText(item.status,128)||!sessionText(item.lastActivity,128))return null;const workspace=item.workspace;if(!workspace||typeof workspace!=="object"||isArray(workspace))return null;if(!(workspace.id===null||sessionIdOk(workspace.id)))return null;if(!(workspace.name===null||sessionText(workspace.name,500)))return null;return freezeObject({id:item.id,hostId:item.hostId,hostLabel:item.hostLabel,hostEpoch:item.hostEpoch,title:item.title,provider:item.provider,model:item.model,status:item.status,lastActivity:item.lastActivity,workspace:freezeObject({id:workspace.id,name:workspace.name}),...(typeof item.unread==="boolean"?{unread:item.unread}:{}),...((value=>value===undefined?{}:{attentionRequest:value})(sessionAttentionOf(item.attentionRequest))),...((value=>value===undefined?{}:{pendingPermission:value})(sessionPermissionOf(item.pendingPermission)))})};
+const sessionSummaryOf=item=>{if(!item||typeof item!=="object"||isArray(item)||!sessionIdOk(item.id)||!sessionIdOk(item.hostId)||!sessionIdOk(item.hostEpoch)||!sessionText(item.hostLabel,256))return null;if(!(item.title===null||sessionText(item.title,512)))return null;if(!sessionText(item.provider,128))return null;if(!(item.model===null||sessionText(item.model,256)))return null;if(!sessionText(item.status,128)||!sessionText(item.lastActivity,128))return null;const workspace=item.workspace;if(!workspace||typeof workspace!=="object"||isArray(workspace))return null;if(!(workspace.id===null||sessionIdOk(workspace.id)))return null;if(!(workspace.name===null||sessionText(workspace.name,500)))return null;return freezeObject({id:item.id,hostId:item.hostId,hostLabel:item.hostLabel,hostEpoch:item.hostEpoch,title:item.title,provider:item.provider,model:item.model,status:item.status,lastActivity:item.lastActivity,workspace:freezeObject({id:workspace.id,name:workspace.name}),...(typeof item.unread==="boolean"?{unread:item.unread}:{}),...((value=>value===undefined?{}:{attentionRequest:value})(sessionAttentionOf(item.attentionRequest))),...((value=>value===undefined?{}:{pendingPermission:value})(sessionPermissionOf(item.pendingPermission))),...(item.startedBy==="user"||item.startedBy==="agent"||item.startedBy==="schedule"?{startedBy:item.startedBy}:{})})};
 const sessionPageOf=page=>{if(!page||typeof page!=="object"||isArray(page)||!isArray(page.sessions)||!isArray(page.hosts)||page.sessions.length>100||page.hosts.length>32)return null;const sessions=[],hosts=[],seen=Object.create(null),targets=Object.create(null);for(const host of page.hosts){if(!host||!sessionIdOk(host.id)||own(seen,host.id)||!sessionText(host.label,256)||(host.status!=="reachable"&&host.status!=="unreachable")||!(host.epoch===null||sessionIdOk(host.epoch))||(host.status==="reachable"&&host.epoch===null))return null;seen[host.id]=host;const capabilities=sessionCapabilitiesOf(host.capabilities,host.status==="reachable");pushValue(hosts,freezeObject({id:host.id,label:host.label,status:host.status,epoch:host.epoch,...(capabilities===undefined?{}:{capabilities})}))}for(let index=0;index<page.sessions.length;index+=1){const summary=sessionSummaryOf(page.sessions[index]);if(!summary||!own(seen,summary.hostId)||seen[summary.hostId].status!=="reachable"||seen[summary.hostId].epoch!==summary.hostEpoch)return null;const key=jsonStringify([summary.hostId,summary.hostEpoch,summary.id]);if(own(targets,key))return null;targets[key]=true;pushValue(sessions,summary)}if(page.nextCursor!==undefined&&(typeof page.nextCursor!=="string"||page.nextCursor.length<1||page.nextCursor.length>4096))return null;const result=freezeObject({sessions:freezeObject(sessions),hosts:freezeObject(hosts),...(page.nextCursor===undefined?{}:{nextCursor:page.nextCursor})});return sessionUtf8Bytes(jsonStringify({ok:true,value:result}))<=262144?result:null};
 const sessionPageResultOf=value=>{const result=sessionJson(value,262144);if(result&&result.ok===true){const page=sessionPageOf(result.value);if(page)return freezeObject({ok:true,value:page});return sessionRefusal("unavailable")}if(result&&result.ok===false&&apply(arrayIncludes,SESSION_RESULT_CODES,[result.code]))return sessionRefusal(result.code);return sessionRefusal("unavailable")};
 const sessionFollowResultOf=value=>{const result=sessionJson(value,262144);if(result&&result.ok===true)return freezeObject({ok:true});if(result&&result.ok===false&&apply(arrayIncludes,SESSION_RESULT_CODES,[result.code]))return sessionRefusal(result.code);return sessionRefusal("unavailable")};
-const sessionItemOf=item=>{if(!item||typeof item!=="object"||isArray(item)||!sessionTimelineIdOk(item.id))return null;if(item.kind==="message"){if((item.role!=="user"&&item.role!=="assistant")||!sessionText(item.text,16384))return null;return freezeObject({id:item.id,kind:"message",role:item.role,text:item.text})}if(item.kind==="tool"){if(!sessionText(item.title,1024)||!sessionText(item.status,128))return null;return freezeObject({id:item.id,kind:"tool",title:item.title,status:item.status,...(sessionToolDetailOk(item.detail)?{detail:item.detail}:{})})}if(item.kind!=="status"||!sessionText(item.status,128))return null;return freezeObject({id:item.id,kind:"status",status:item.status})};
-const sessionEventOf=event=>{if(!event||typeof event!=="object"||isArray(event))return null;if(event.kind==="snapshot"||event.kind==="update"){if(!isArray(event.items)||event.items.length>100)return null;const items=[];for(let index=0;index<event.items.length;index+=1){const item=sessionItemOf(event.items[index]);if(!item)return null;pushValue(items,item)}const framed=freezeObject({kind:event.kind,items:freezeObject(items)});if(sessionUtf8Bytes(jsonStringify(framed))>262144)return null;return framed}if(event.kind==="ended"){if(!apply(arrayIncludes,SESSION_RESULT_CODES,[event.code]))return null;return freezeObject({kind:"ended",code:event.code})}if(event.kind!=="resync")return null;return freezeObject({kind:"resync"})};
+const sessionItemOf=item=>{if(!item||typeof item!=="object"||isArray(item)||!sessionTimelineIdOk(item.id))return null;if(item.kind==="message"){if((item.role!=="user"&&item.role!=="assistant")||!sessionText(item.text,16384)||(item.truncated!==undefined&&item.truncated!==true))return null;return freezeObject({id:item.id,kind:"message",role:item.role,text:item.text,...(item.truncated===true?{truncated:true}:{})})}if(item.kind==="tool"){if(!sessionText(item.title,1024)||!sessionText(item.status,128))return null;return freezeObject({id:item.id,kind:"tool",title:item.title,status:item.status,...(sessionToolDetailOk(item.detail)?{detail:item.detail}:{})})}if(item.kind!=="status"||!sessionText(item.status,128))return null;return freezeObject({id:item.id,kind:"status",status:item.status})};
+const sessionEventOf=event=>{if(!event||typeof event!=="object"||isArray(event))return null;if(event.kind==="snapshot"||event.kind==="update"){if(!isArray(event.items)||event.items.length>100||(event.historyTruncated!==undefined&&event.historyTruncated!==true))return null;const items=[];for(let index=0;index<event.items.length;index+=1){const item=sessionItemOf(event.items[index]);if(!item)return null;pushValue(items,item)}const framed=freezeObject({kind:event.kind,items:freezeObject(items),...(event.historyTruncated===true?{historyTruncated:true}:{})});if(sessionUtf8Bytes(jsonStringify(framed))>262144)return null;return framed}if(event.kind==="ended"){if(!apply(arrayIncludes,SESSION_RESULT_CODES,[event.code]))return null;return freezeObject({kind:"ended",code:event.code})}if(event.kind!=="resync")return null;return freezeObject({kind:"resync"})};
 const sendReceiptOf=(value,requestId)=>{const result=sessionJson(value,262144);if(result&&result.ok===true&&result.value&&typeof result.value==="object"&&!isArray(result.value)){if(result.value.requestId===requestId&&(result.value.delivery==="acknowledged"||result.value.delivery==="unknown"))return freezeObject({ok:true,value:freezeObject({requestId:result.value.requestId,delivery:result.value.delivery})});return freezeObject({ok:true,value:freezeObject({requestId,delivery:"unknown"})})}if(result&&result.ok===false&&apply(arrayIncludes,SESSION_RESULT_CODES,[result.code]))return sessionRefusal(result.code);return freezeObject({ok:true,value:freezeObject({requestId,delivery:"unknown"})})};
 const listAgentSessions=input=>{let cursor;try{cursor=input==null?undefined:input.cursor}catch{cursor=undefined}if(cursor!==undefined&&(typeof cursor!=="string"||cursor.length<1||cursor.length>4096)){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}const request_id=nextAgentSessionsId("agent-sessions-");return new NativePromise(resolve=>{const pending={kind:"list",resolve,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[request_id]!==pending)return;delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))},AGENT_SESSIONS_TIMEOUT_MS);agentSessionsPending[request_id]=pending;agentSessionsInflight+=1;try{const wire={version:VERSION,type:"agent-sessions-list",request_id};if(cursor!==undefined)wire.cursor=cursor;send(wire)}catch{clearTimer(pending.timer);delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))}})};
 const followAgentSession=(input,callback)=>{if(typeof callback!=="function")throw new TypeError("session follower must be a function");let session_id,host_id,host_epoch;try{session_id=input&&typeof input==="object"&&!isArray(input)?input.sessionId:null;host_id=input.hostId;host_epoch=input.hostEpoch}catch{session_id=null}if(!sessionIdOk(session_id)||!sessionIdOk(host_id)||!sessionIdOk(host_epoch)){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(objectKeys(agentSessionFollows).length>=4){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}const request_id=nextAgentSessionsId("agent-sessions-");agentSessionsSeq+=1;const subscription_id="agent-session-follow-"+agentSessionsSeq;return new NativePromise(resolve=>{agentSessionFollows[subscription_id]={host_id,host_epoch,session_id,callback,request_id};const pending={kind:"follow",resolve,subscription_id,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[request_id]!==pending)return;delete agentSessionsPending[request_id];agentSessionsInflight-=1;if(own(agentSessionFollows,subscription_id)){delete agentSessionFollows[subscription_id];try{send({version:VERSION,type:"agent-sessions-unsubscribe",subscription_id})}catch{}}resolve(sessionRefusal("unavailable"))},AGENT_SESSIONS_TIMEOUT_MS);agentSessionsPending[request_id]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-follow",request_id,host_id,host_epoch,session_id,subscription_id})}catch{clearTimer(pending.timer);delete agentSessionFollows[subscription_id];delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))}})};
 const disposeAgentSessionFollow=subscription_id=>()=>{if(!own(agentSessionFollows,subscription_id))return;delete agentSessionFollows[subscription_id];try{send({version:VERSION,type:"agent-sessions-unsubscribe",subscription_id})}catch{}};
-const sendAgentSession=input=>{let session_id,host_id,host_epoch,text,requestId,quotedRaw;try{if(!input||typeof input!=="object"||isArray(input))throw 0;session_id=input.sessionId;host_id=input.hostId;host_epoch=input.hostEpoch;text=input.text;requestId=input.requestId;quotedRaw=input.quoted}catch{session_id=null}if(!sessionIdOk(session_id)||!sessionIdOk(host_id)||!sessionIdOk(host_epoch)){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(typeof text!=="string"||text.trim().length===0||sessionUtf8Bytes(text)>16384){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(!sessionIdOk(requestId)){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}let quoted;if(quotedRaw!==undefined){quoted=sessionQuotedOf(quotedRaw);if(!quoted){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(!agentSessionsAdoptedFeature)return NativePromise.resolve(sessionRefusal("unavailable"))}if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}if(own(agentSessionsPending,requestId)){reportBoundedRefusal("html_agent_sessions_refused","refused");return NativePromise.resolve(sessionRefusal("refused"))}return new NativePromise(resolve=>{const pending={kind:"send",resolve,request_id:requestId,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[requestId]!==pending)return;delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(freezeObject({ok:true,value:freezeObject({requestId,delivery:"unknown"})}))},AGENT_SESSIONS_SEND_TIMEOUT_MS);agentSessionsPending[requestId]=pending;agentSessionsInflight+=1;try{const wire={version:VERSION,type:"agent-sessions-send",request_id:requestId,host_id,host_epoch,session_id,text};if(quoted!==undefined)wire.quoted=quoted;send(wire)}catch{clearTimer(pending.timer);delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(freezeObject({ok:true,value:freezeObject({requestId,delivery:"unknown"})}))}})};
+const sendAgentSession=input=>{let session_id,host_id,host_epoch,text,requestId,quotedRaw,contentOrigin;try{if(!input||typeof input!=="object"||isArray(input))throw 0;session_id=input.sessionId;host_id=input.hostId;host_epoch=input.hostEpoch;text=input.text;requestId=input.requestId;quotedRaw=input.quoted;contentOrigin=input.contentOrigin}catch{session_id=null}if(!sessionIdOk(session_id)||!sessionIdOk(host_id)||!sessionIdOk(host_epoch)){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(typeof text!=="string"||text.trim().length===0||sessionUtf8Bytes(text)>16384){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(!sessionIdOk(requestId)){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(contentOrigin!==undefined&&contentOrigin!=="typed"&&contentOrigin!=="generated")return NativePromise.resolve(sessionRefusal("invalid"));if(contentOrigin!==undefined&&!agentSessionsMessageFramingFeature)return NativePromise.resolve(sessionRefusal("unavailable"));let quoted;if(quotedRaw!==undefined){quoted=sessionQuotedOf(quotedRaw);if(!quoted){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(sessionRefusal("invalid"))}if(!agentSessionsAdoptedFeature)return NativePromise.resolve(sessionRefusal("unavailable"))}if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}if(own(agentSessionsPending,requestId)){reportBoundedRefusal("html_agent_sessions_refused","refused");return NativePromise.resolve(sessionRefusal("refused"))}return new NativePromise(resolve=>{const pending={kind:"send",resolve,request_id:requestId,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[requestId]!==pending)return;delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(freezeObject({ok:true,value:freezeObject({requestId,delivery:"unknown"})}))},AGENT_SESSIONS_SEND_TIMEOUT_MS);agentSessionsPending[requestId]=pending;agentSessionsInflight+=1;try{const wire={version:VERSION,type:"agent-sessions-send",request_id:requestId,host_id,host_epoch,session_id,text};if(quoted!==undefined)wire.quoted=quoted;if(contentOrigin!==undefined)wire.content_origin=contentOrigin;send(wire)}catch{clearTimer(pending.timer);delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(freezeObject({ok:true,value:freezeObject({requestId,delivery:"unknown"})}))}})};
 const markAgentSessionRead=input=>{let host_id,host_epoch,session_id,read_request_id;try{if(!input||typeof input!=="object"||isArray(input))throw 0;host_id=input.hostId;host_epoch=input.hostEpoch;session_id=input.sessionId;read_request_id=input.requestId}catch{host_id=null}if(!sessionIdOk(host_id)||!sessionIdOk(host_epoch)||!sessionIdOk(session_id)||!sessionIdOk(read_request_id))return NativePromise.resolve(sessionRefusal("invalid"));if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionsInflight>=16)return NativePromise.resolve(sessionRefusal("busy"));const request_id=nextAgentSessionsId("agent-sessions-read-");return new NativePromise(resolve=>{const pending={kind:"markRead",resolve,read_request_id,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[request_id]!==pending)return;delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(freezeObject({ok:true,value:freezeObject({requestId:read_request_id,delivery:"unknown"})}))},AGENT_SESSIONS_TIMEOUT_MS);agentSessionsPending[request_id]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-mark-read",request_id,read_request_id,host_id,host_epoch,session_id})}catch{clearTimer(pending.timer);delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(freezeObject({ok:true,value:freezeObject({requestId:read_request_id,delivery:"unknown"})}))}})};
-const SESSION_CREATE_CODES=["invalid_request","refused","busy","host_unreachable","host_epoch_changed","create_unsupported","provider_unavailable","model_unavailable","workspace_not_found","worktree_unsupported","create_failed","outcome_unknown"],SESSION_CREATE_KEYS=["requestId","hostId","hostEpoch","provider","model","modeId","thinkingOptionId","workspaceId","newWorktree","initialPrompt","quoted"];
+const SESSION_CREATE_CODES=["invalid_request","refused","busy","host_unreachable","host_epoch_changed","create_unsupported","provider_unavailable","model_unavailable","workspace_not_found","worktree_unsupported","create_failed","outcome_unknown"],SESSION_CREATE_KEYS=["requestId","hostId","hostEpoch","provider","model","modeId","thinkingOptionId","workspaceId","newWorktree","initialPrompt","quoted","contentOrigin"];
 const AGENT_SESSIONS_CATALOG_TIMEOUT_MS=60000,AGENT_SESSIONS_CREATE_TIMEOUT_MS=205*1000,AGENT_SESSIONS_SEND_TIMEOUT_MS=145*1000,AGENT_SESSIONS_STATUS_TIMEOUT_MS=50*1000;
 const createFailure=(code,message)=>freezeObject({ok:false,error:freezeObject({code,message})});
 const createUnknown=()=>createFailure("outcome_unknown","The session may have started. Retry with the same requestId to find out; it cannot start a second one.");
@@ -504,11 +745,11 @@ const catalogProviderOf=provider=>{if(!catalogObject(provider)||!catalogTextOk(p
 const catalogWorkspaceOf=workspace=>{if(!catalogObject(workspace)||!catalogWorkspaceIdOk(workspace.id)||!sessionText(workspace.name,500)||!sessionText(workspace.path,1024))return null;if(workspace.projectName!==undefined&&!sessionText(workspace.projectName,500))return null;if(workspace.kind!==undefined&&!apply(arrayIncludes,["ordinary","folder","worktree"],[workspace.kind]))return null;if(workspace.isGitRepo!==undefined&&typeof workspace.isGitRepo!=="boolean")return null;return freezeObject({id:workspace.id,name:workspace.name,path:workspace.path,...(workspace.kind===undefined?{}:{kind:workspace.kind}),...(workspace.projectName===undefined?{}:{projectName:workspace.projectName}),...(workspace.isGitRepo===undefined?{}:{isGitRepo:workspace.isGitRepo})})};
 const sessionCatalogOf=catalog=>{if(!catalogObject(catalog)||!isArray(catalog.hosts)||catalog.hosts.length>32)return null;const hosts=[],seen=Object.create(null);for(let index=0;index<catalog.hosts.length;index+=1){const host=catalog.hosts[index];if(!catalogObject(host)||!sessionIdOk(host.hostId)||own(seen,host.hostId)||!sessionText(host.hostLabel,256)||(host.status!=="reachable"&&host.status!=="unreachable")||!(host.hostEpoch===null||sessionIdOk(host.hostEpoch))||(host.status==="reachable"&&host.hostEpoch===null))return null;if(!isArray(host.providers)||host.providers.length>16||!isArray(host.workspaces)||host.workspaces.length>200)return null;if(host.workspacesTruncated!==undefined&&host.workspacesTruncated!==true)return null;seen[host.hostId]=true;const providers=[],workspaces=[];for(let at=0;at<host.providers.length;at+=1){const provider=catalogProviderOf(host.providers[at]);if(!provider)return null;pushValue(providers,provider)}for(let at=0;at<host.workspaces.length;at+=1){const workspace=catalogWorkspaceOf(host.workspaces[at]);if(!workspace)return null;pushValue(workspaces,workspace)}const row=freezeObject({hostId:host.hostId,hostLabel:host.hostLabel,hostEpoch:host.hostEpoch,status:host.status,providers:freezeObject(providers),workspaces:freezeObject(workspaces),...(host.workspacesTruncated===true?{workspacesTruncated:true}:{})});if(sessionUtf8Bytes(jsonStringify(row))>65536)return null;pushValue(hosts,row)}const result=freezeObject({hosts:freezeObject(hosts)});return sessionUtf8Bytes(jsonStringify({ok:true,value:result}))<=262144?result:null};
 const catalogResultOf=value=>{const result=sessionJson(value,262144);if(result&&result.ok===true){const catalog=sessionCatalogOf(result.value);if(catalog)return freezeObject({ok:true,value:catalog});return sessionRefusal("unavailable")}if(result&&result.ok===false&&apply(arrayIncludes,SESSION_RESULT_CODES,[result.code]))return sessionRefusal(result.code);return sessionRefusal("unavailable")};
-const createSummaryOf=item=>{if(!catalogObject(item)||!sessionIdOk(item.id)||!sessionIdOk(item.hostId)||!sessionIdOk(item.hostEpoch)||!sessionText(item.hostLabel,256)||!(item.title===null||sessionText(item.title,500))||!sessionText(item.provider,128)||!(item.model===null||sessionText(item.model,256))||!sessionText(item.status,128)||!sessionText(item.lastActivity,128))return null;const workspace=item.workspace;if(!catalogObject(workspace)||!(workspace.id===null||sessionIdOk(workspace.id))||!(workspace.name===null||sessionText(workspace.name,500)))return null;if(item.createdAt!==undefined&&!sessionText(item.createdAt,128))return null;if(item.parentId!==undefined&&!sessionIdOk(item.parentId))return null;if(item.unread!==undefined&&typeof item.unread!=="boolean")return null;const attention=item.attentionRequest;if(attention!==undefined&&attention!==null&&(!catalogObject(attention)||!(attention.kind==="blocked"||attention.kind==="decision"||attention.kind==="review"||attention.kind==="done")||!sessionText(attention.message,500)))return null;const permission=item.pendingPermission;if(permission!==undefined&&permission!==null&&(!catalogObject(permission)||!sessionAdvisoryIdOk(permission.requestId)||!(permission.kind==="question"||permission.kind==="plan"||permission.kind==="tool"||permission.kind==="mode"||permission.kind==="other")||(permission.title!==undefined&&!sessionText(permission.title,256))))return null;return freezeObject({id:item.id,hostId:item.hostId,hostLabel:item.hostLabel,hostEpoch:item.hostEpoch,title:item.title,provider:item.provider,model:item.model,status:item.status,lastActivity:item.lastActivity,workspace:freezeObject({id:workspace.id,name:workspace.name}),...(item.createdAt===undefined?{}:{createdAt:item.createdAt}),...(item.parentId===undefined?{}:{parentId:item.parentId}),...(item.unread===undefined?{}:{unread:item.unread}),...(attention===undefined?{}:{attentionRequest:attention===null?null:freezeObject({kind:attention.kind,message:attention.message})}),...(permission===undefined?{}:{pendingPermission:permission===null?null:freezeObject({requestId:permission.requestId,kind:permission.kind,...(permission.title===undefined?{}:{title:permission.title})})})})};
+const createSummaryOf=item=>{if(!catalogObject(item)||!sessionIdOk(item.id)||!sessionIdOk(item.hostId)||!sessionIdOk(item.hostEpoch)||!sessionText(item.hostLabel,256)||!(item.title===null||sessionText(item.title,500))||!sessionText(item.provider,128)||!(item.model===null||sessionText(item.model,256))||!sessionText(item.status,128)||!sessionText(item.lastActivity,128))return null;const workspace=item.workspace;if(!catalogObject(workspace)||!(workspace.id===null||sessionIdOk(workspace.id))||!(workspace.name===null||sessionText(workspace.name,500)))return null;if(item.createdAt!==undefined&&!sessionText(item.createdAt,128))return null;if(item.parentId!==undefined&&!sessionIdOk(item.parentId))return null;if(item.unread!==undefined&&typeof item.unread!=="boolean")return null;const attention=item.attentionRequest;if(attention!==undefined&&attention!==null&&(!catalogObject(attention)||!(attention.kind==="blocked"||attention.kind==="decision"||attention.kind==="review"||attention.kind==="done")||!sessionText(attention.message,500)))return null;const permission=item.pendingPermission;if(permission!==undefined&&permission!==null&&(!catalogObject(permission)||!sessionAdvisoryIdOk(permission.requestId)||!(permission.kind==="question"||permission.kind==="plan"||permission.kind==="tool"||permission.kind==="mode"||permission.kind==="other")||(permission.title!==undefined&&!sessionText(permission.title,256))))return null;return freezeObject({id:item.id,hostId:item.hostId,hostLabel:item.hostLabel,hostEpoch:item.hostEpoch,title:item.title,provider:item.provider,model:item.model,status:item.status,lastActivity:item.lastActivity,workspace:freezeObject({id:workspace.id,name:workspace.name}),...(item.createdAt===undefined?{}:{createdAt:item.createdAt}),...(item.parentId===undefined?{}:{parentId:item.parentId}),...(item.startedBy==="user"||item.startedBy==="agent"||item.startedBy==="schedule"?{startedBy:item.startedBy}:{}),...(item.unread===undefined?{}:{unread:item.unread}),...(attention===undefined?{}:{attentionRequest:attention===null?null:freezeObject({kind:attention.kind,message:attention.message})}),...(permission===undefined?{}:{pendingPermission:permission===null?null:freezeObject({requestId:permission.requestId,kind:permission.kind,...(permission.title===undefined?{}:{title:permission.title})})})})};
 const createResultOf=(value,pending)=>{const result=sessionJson(value,262144);if(result&&result.ok===true){const summary=createSummaryOf(result.value);if(summary&&summary.hostId===pending.host_id)return freezeObject({ok:true,value:summary})}else if(result&&result.ok===false&&catalogObject(result.error)&&apply(arrayIncludes,SESSION_CREATE_CODES,[result.error.code])&&sessionText(result.error.message,500))return createFailure(result.error.code,result.error.message);return createUnknown()};
 const catalogAgentSessions=()=>{if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}const request_id=nextAgentSessionsId("agent-sessions-catalog-");return new NativePromise(resolve=>{const pending={kind:"catalog",resolve,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[request_id]!==pending)return;delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))},AGENT_SESSIONS_CATALOG_TIMEOUT_MS);agentSessionsPending[request_id]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-catalog",request_id})}catch{clearTimer(pending.timer);delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))}})};
 const chooseFolderAgentSessions=input=>{if(!catalogObject(input)||objectKeys(input).length!==2||!own(input,"hostId")||!own(input,"hostEpoch")||!sessionIdOk(input.hostId)||!sessionIdOk(input.hostEpoch))return NativePromise.resolve(sessionRefusal("invalid"));const host_id=input.hostId,host_epoch=input.hostEpoch;if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(sessionRefusal("busy"))}const request_id=nextAgentSessionsId("agent-sessions-choose-folder-");return new NativePromise(resolve=>{const pending={kind:"chooseFolder",resolve,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[request_id]!==pending)return;delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))},335000);agentSessionsPending[request_id]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-choose-folder",request_id,host_id,host_epoch})}catch{clearTimer(pending.timer);delete agentSessionsPending[request_id];agentSessionsInflight-=1;resolve(sessionRefusal("unavailable"))}})};
-const createAgentSession=input=>{let requestId,hostId,hostEpoch,provider,model,modeId,thinkingOptionId,workspaceId,newWorktree,initialPrompt,quotedRaw,keys;try{if(!catalogObject(input))throw 0;keys=objectKeys(input);requestId=input.requestId;hostId=input.hostId;hostEpoch=input.hostEpoch;provider=input.provider;model=input.model;modeId=input.modeId;thinkingOptionId=input.thinkingOptionId;workspaceId=input.workspaceId;newWorktree=input.newWorktree;initialPrompt=input.initialPrompt;quotedRaw=input.quoted}catch{keys=null}if(!keys||!keys.every(key=>SESSION_CREATE_KEYS.includes(key))||!sessionIdOk(requestId)||!sessionIdOk(hostId)||!sessionIdOk(hostEpoch)||!catalogTextOk(provider)||!catalogTextOk(model)||!catalogWorkspaceIdOk(workspaceId)||(modeId!==undefined&&!catalogTextOk(modeId))||(thinkingOptionId!==undefined&&!catalogTextOk(thinkingOptionId))||(newWorktree!==undefined&&!(catalogObject(newWorktree)&&objectKeys(newWorktree).length===1&&catalogTextOk(newWorktree.baseBranch)))||typeof initialPrompt!=="string"||initialPrompt.trim().length===0||sessionUtf8Bytes(initialPrompt)>16384){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(createFailure("invalid_request","The start request is not valid"))}let quoted;if(quotedRaw!==undefined){quoted=sessionQuotedOf(quotedRaw);if(!quoted){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(createFailure("invalid_request","The start request is not valid"))}if(!agentSessionsAdoptedFeature)return NativePromise.resolve(createFailure("create_unsupported","Quoted words are not available here"))}if(own(agentSessionsPending,requestId)){reportBoundedRefusal("html_agent_sessions_refused","refused");return NativePromise.resolve(createUnknown())}if(agentSessionsClosed||!channel)return NativePromise.resolve(createFailure("create_unsupported","Starting sessions is not available here"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(createFailure("busy","Too many requests are in flight"))}const baseBranch=newWorktree===undefined?undefined:newWorktree.baseBranch;return new NativePromise(resolve=>{const pending={kind:"create",resolve,host_id:hostId,request_id:requestId,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[requestId]!==pending)return;delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(createUnknown())},AGENT_SESSIONS_CREATE_TIMEOUT_MS);agentSessionsPending[requestId]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-create",request_id:requestId,host_id:hostId,host_epoch:hostEpoch,provider,model,...(modeId===undefined?{}:{mode_id:modeId}),...(thinkingOptionId===undefined?{}:{thinking_option_id:thinkingOptionId}),workspace_id:workspaceId,...(baseBranch===undefined?{}:{new_worktree:{base_branch:baseBranch}}),initial_prompt:initialPrompt,...(quoted===undefined?{}:{quoted})})}catch{clearTimer(pending.timer);delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(createUnknown())}})};
+const createAgentSession=input=>{let requestId,hostId,hostEpoch,provider,model,modeId,thinkingOptionId,workspaceId,newWorktree,initialPrompt,quotedRaw,contentOrigin,keys;try{if(!catalogObject(input))throw 0;keys=objectKeys(input);requestId=input.requestId;hostId=input.hostId;hostEpoch=input.hostEpoch;provider=input.provider;model=input.model;modeId=input.modeId;thinkingOptionId=input.thinkingOptionId;workspaceId=input.workspaceId;newWorktree=input.newWorktree;initialPrompt=input.initialPrompt;quotedRaw=input.quoted;contentOrigin=input.contentOrigin}catch{keys=null}if(!keys||!keys.every(key=>SESSION_CREATE_KEYS.includes(key))||!sessionIdOk(requestId)||!sessionIdOk(hostId)||!sessionIdOk(hostEpoch)||!catalogTextOk(provider)||!catalogTextOk(model)||!catalogWorkspaceIdOk(workspaceId)||(modeId!==undefined&&!catalogTextOk(modeId))||(thinkingOptionId!==undefined&&!catalogTextOk(thinkingOptionId))||(newWorktree!==undefined&&!(catalogObject(newWorktree)&&objectKeys(newWorktree).length===1&&catalogTextOk(newWorktree.baseBranch)))||typeof initialPrompt!=="string"||initialPrompt.trim().length===0||sessionUtf8Bytes(initialPrompt)>16384){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(createFailure("invalid_request","The start request is not valid"))}if(contentOrigin!==undefined&&contentOrigin!=="typed"&&contentOrigin!=="generated")return NativePromise.resolve(createFailure("invalid_request","The start request is not valid"));if(contentOrigin!==undefined&&!agentSessionsMessageFramingFeature)return NativePromise.resolve(createFailure("create_unsupported","Message framing is not available here"));let quoted;if(quotedRaw!==undefined){quoted=sessionQuotedOf(quotedRaw);if(!quoted){reportBoundedRefusal("html_agent_sessions_refused","invalid");return NativePromise.resolve(createFailure("invalid_request","The start request is not valid"))}if(!agentSessionsAdoptedFeature)return NativePromise.resolve(createFailure("create_unsupported","Quoted words are not available here"))}if(own(agentSessionsPending,requestId)){reportBoundedRefusal("html_agent_sessions_refused","refused");return NativePromise.resolve(createUnknown())}if(agentSessionsClosed||!channel)return NativePromise.resolve(createFailure("create_unsupported","Starting sessions is not available here"));if(agentSessionsInflight>=16){reportBoundedRefusal("html_agent_sessions_refused","busy");return NativePromise.resolve(createFailure("busy","Too many requests are in flight"))}const baseBranch=newWorktree===undefined?undefined:newWorktree.baseBranch;return new NativePromise(resolve=>{const pending={kind:"create",resolve,host_id:hostId,request_id:requestId,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[requestId]!==pending)return;delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(createUnknown())},AGENT_SESSIONS_CREATE_TIMEOUT_MS);agentSessionsPending[requestId]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-create",request_id:requestId,host_id:hostId,host_epoch:hostEpoch,provider,model,...(modeId===undefined?{}:{mode_id:modeId}),...(thinkingOptionId===undefined?{}:{thinking_option_id:thinkingOptionId}),workspace_id:workspaceId,...(baseBranch===undefined?{}:{new_worktree:{base_branch:baseBranch}}),initial_prompt:initialPrompt,...(quoted===undefined?{}:{quoted}),...(contentOrigin===undefined?{}:{content_origin:contentOrigin})})}catch{clearTimer(pending.timer);delete agentSessionsPending[requestId];agentSessionsInflight-=1;resolve(createUnknown())}})};
 const stopAgentSessionListWatch=slot=>{if(agentSessionListWatch!==slot)return;agentSessionListWatch=null;try{send({version:VERSION,type:"agent-sessions-unwatch-list",subscription_id:slot.subscription_id})}catch{}};
 const watchAgentSessionList=callback=>{if(typeof callback!=="function")throw new TypeError("list watcher must be a function");if(agentSessionsClosed||!channel)return NativePromise.resolve(sessionRefusal("unavailable"));if(agentSessionListWatch||agentSessionsInflight>=16)return NativePromise.resolve(sessionRefusal("busy"));const request_id=nextAgentSessionsId("agent-sessions-watch-");agentSessionsSeq+=1;const subscription_id="agent-session-list-"+agentSessionsSeq;const slot={subscription_id,callback,revision:-1};agentSessionListWatch=slot;return new NativePromise(resolve=>{const pending={kind:"watchList",resolve,slot,timer:0};pending.timer=setTimer(()=>{if(agentSessionsPending[request_id]!==pending)return;delete agentSessionsPending[request_id];agentSessionsInflight-=1;stopAgentSessionListWatch(slot);resolve(sessionRefusal("unavailable"))},AGENT_SESSIONS_TIMEOUT_MS);agentSessionsPending[request_id]=pending;agentSessionsInflight+=1;try{send({version:VERSION,type:"agent-sessions-watch-list",request_id,subscription_id})}catch{clearTimer(pending.timer);delete agentSessionsPending[request_id];agentSessionsInflight-=1;stopAgentSessionListWatch(slot);resolve(sessionRefusal("unavailable"))}})};
 const permissionScalarOk=value=>typeof value==="string"&&value.length>=1&&value.length<=1024&&sessionUtf8Bytes(value)<=1024&&apply(regExpExec,/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,[value])===null;
@@ -560,6 +801,7 @@ const settleAgentSessionsFollowup=data=>{if(typeof data.request_id!=="string"||!
 const agentSessionsFollowupApi=freezeObject({status:()=>requestAgentSessionFollowup("status"),continue:()=>requestAgentSessionFollowup("continue"),getSettings:()=>requestAgentSessionFollowup("getSettings"),setSettings:input=>requestAgentSessionFollowup("setSettings",input)});
 const agentSessionsBaseSurface=()=>{const api=agentSessionsCreateFeature?(agentSessionsAdoptedFeature?agentSessionsAdoptedApi:agentSessionsCreateApi):agentSessionsApi;return agentSessionsOpenConversationFeature?freezeObject({...api,openConversation:(input,options)=>requestAgentSessionOpenConversation(input,options)}):api;};
 const agentSessionsSavedSurface=()=>{const api=agentSessionsBaseSurface();return agentSessionsSavedFeature?freezeObject({...api,save:input=>requestAgentSessionSaved("save",input),stopSaving:input=>requestAgentSessionSaved("stopSaving",input),saveStatus:input=>requestAgentSessionSaved("saveStatus",input),previewSaved:input=>requestAgentSessionSaved("previewSaved",input)}):api;};
+const agentSessionsOfferedSurface=()=>{const api=agentSessionsSurface();return agentSessionsMessageFramingFeature?freezeObject({...api,messageFraming:true}):api;};
 const agentSessionsSurface=()=>{const api=agentSessionsSavedSurface();return agentSessionsFollowupFeature?freezeObject({...api,followup:agentSessionsFollowupApi}):api;};
 /* ARM transport: confirmation-first and non-authorizing. The frame may ASK the
    trusted host to prepare a confirmation for one strict request; only the host
@@ -1047,11 +1289,11 @@ function initializeBody(data){try{const offered=own(data,"body_read"),features=o
   if(count&&own(count,"value")&&bodySafeInteger(count.value)&&count.value<=32){for(let i=0;i<count.value;i++){const d=own(features.value,NativeString(i));if(!d||!d.enumerable||!own(d,"value")||typeof d.value!=="string"){feature=false;break;}if(d.value==="records.body.read.v1")feature=true;}}}
  bodyLane.connect(channel,offered&&offered.enumerable&&own(offered,"value")?offered.value:undefined,feature);bodyLane.ready();
 }catch{bodyLane.close();}}
-define(window,"nativeArtifact",{value:freezeObject({ready,propose,arm,bodyAttempt:bodyAttemptApi,get commentKeepsBodyFrame(){return commentFrameFeature},publishLocation,publishUnsaved,read:readNeed,get call(){return callFeature?callOperation:undefined},get session(){return sessionFeature?sessionApi:undefined},get query(){return subscribeFeature?queryOperation:undefined},get subscribe(){return subscribeFeature?subscribeOperation:undefined},get agents(){return agentsFeature?agentsApi:undefined},get agentSessions(){return agentSessionsFeature?agentSessionsSurface():undefined},get skin(){return skinFeature?skinApi:undefined},get presentation(){return presentationFeature?presentationApi:undefined},body:bodyLane.api,onInput,onReveal,setViewState,registerContextReporter,get input(){return heldInput},get inputDelivery(){return freezeObject({basis:"delivery_only",digest:typeof heldDigest==="string"?heldDigest:null,deliverySeq:contextInteger(heldSeq)&&heldSeq>=0?heldSeq:null})},get viewState(){return heldViewState}}),writable:false,configurable:false});
+define(window,"nativeArtifact",{value:freezeObject({ready,propose,arm,bodyAttempt:bodyAttemptApi,get commentKeepsBodyFrame(){return commentFrameFeature},publishLocation,publishUnsaved,read:readNeed,get call(){return callFeature?callOperation:undefined},get session(){return sessionFeature?sessionApi:undefined},get query(){return subscribeFeature?queryOperation:undefined},get subscribe(){return subscribeFeature?subscribeOperation:undefined},get agents(){return agentsFeature?agentsApi:undefined},get agentSessions(){return agentSessionsFeature?agentSessionsOfferedSurface():undefined},get skin(){return skinFeature?skinApi:undefined},get presentation(){return (presentationFeature||tabTitleFeature)?presentationApi():undefined},get bodyDraft(){return bodyDraftFeature?bodyDraftApi:undefined},get appState(){return appStateFeature?appStateApi:undefined},body:bodyLane.api,onInput,onReveal,setViewState,registerContextReporter,get input(){return heldInput},get inputDelivery(){return freezeObject({basis:"delivery_only",digest:typeof heldDigest==="string"?heldDigest:null,deliverySeq:contextInteger(heldSeq)&&heldSeq>=0?heldSeq:null})},get viewState(){return heldViewState}}),writable:false,configurable:false});
 const kitFactory=__NATIVE_KIT_FACTORY__,kitRelease=__NATIVE_KIT_RELEASE__;
 let suppliedKit=null,disposeKit=()=>{};
 if(kitFactory){const owned=kitFactory(freezeObject({ready,onInput}),kitRelease);suppliedKit=owned.kit;disposeKit=owned.dispose;
-try{define(window,"native",{value:freezeObject({kit:suppliedKit,get call(){return callFeature?callOperation:undefined},get session(){return sessionFeature?sessionApi:undefined},get query(){return subscribeFeature?queryOperation:undefined},get subscribe(){return subscribeFeature?subscribeOperation:undefined},get agents(){return agentsFeature?agentsApi:undefined},get agentSessions(){return agentSessionsFeature?agentSessionsSurface():undefined},get skin(){return skinFeature?skinApi:undefined},get presentation(){return presentationFeature?presentationApi:undefined}}),writable:false,configurable:false});
+try{define(window,"native",{value:freezeObject({kit:suppliedKit,get call(){return callFeature?callOperation:undefined},get session(){return sessionFeature?sessionApi:undefined},get query(){return subscribeFeature?queryOperation:undefined},get subscribe(){return subscribeFeature?subscribeOperation:undefined},get agents(){return agentsFeature?agentsApi:undefined},get agentSessions(){return agentSessionsFeature?agentSessionsOfferedSurface():undefined},get skin(){return skinFeature?skinApi:undefined},get presentation(){return (presentationFeature||tabTitleFeature)?presentationApi():undefined},get bodyDraft(){return bodyDraftFeature?bodyDraftApi:undefined},get appState(){return appStateFeature?appStateApi:undefined},get recordObservation(){return recordTransport??undefined},get viewer(){return viewerFeature?viewerValue:undefined},get onViewer(){return viewerFeature?onViewer:undefined},get pending(){return pendingFeature?pendingApi:undefined}}),writable:false,configurable:false});
 listen(window,"pagehide",disposeKit,true);listen(window,"unload",disposeKit,true);}catch(error){disposeKit();throw error}}
 const bounded=value=>NativeString(value??"").slice(0,512);
 const send=value=>{if(channel)post(channel,value);else if(queued.length<32)pushValue(queued,value)};
@@ -1068,10 +1310,10 @@ function show(index){if(!slides.length)return;current=Math.max(0,Math.min(index,
 function command(action){if(action==="first")show(0);else if(action==="previous")show(current-1);else if(action==="next")show(current+1);else if(action==="last")show(slides.length-1)}
 function setupSlides(){const deck=document.querySelector("main[data-native-deck]");if(!deck)return;slides=[...deck.children].filter(node=>node.matches("section[data-native-slide]"));show(0);listen(window,"keydown",event=>{const target=read(eventTarget,event),key=read(keyValue,event),shift=read(shiftValue,event);if(prevented(event)||interactive(target))return;const backwards=key==="ArrowLeft"||key==="PageUp"||(key===" "&&shift);const forwards=key==="ArrowRight"||key==="PageDown"||(key===" "&&!shift);if(backwards||forwards||key==="Home"||key==="End"){prevent(event);command(key==="Home"?"first":key==="End"?"last":backwards?"previous":"next")}},true)}
 function navigationDisposition(event){return read(mouseCtrl,event)===true||read(mouseMeta,event)===true}
-function navigationMessage(link,newTab){const message={version:VERSION,type:"navigation",recordId:attribute(link,"data-native-record-id"),href:attribute(link,"data-native-external-url")};if(newTab===true)message.newTab=true;return message}
+function navigationMessage(link,newTab){const message={version:VERSION,type:"navigation",recordId:attribute(link,"data-native-record-id"),href:attribute(link,"data-native-external-url")};const app=attribute(link,"data-native-app");if(app!==null)message.app=app;if(newTab===true)message.newTab=true;return message}
 listen(window,"click",event=>{if(!trusted(event)||prevented(event))return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send(navigationMessage(link,navigationDisposition(event)))},true);
 listen(window,"auxclick",event=>{if(!trusted(event)||prevented(event))return;if(read(mouseButton,event)!==1)return;const target=read(eventTarget,event),link=isElement(target)?closest(target,"[data-native-record-id],[data-native-external-url]"):null;if(!link)return;prevent(event);send(navigationMessage(link,true))},true);
-function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(initialized||read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION||ports.length!==1)return;stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];listen(channel,"messageerror",disposeKit);listen(channel,"close",disposeKit);listen(channel,"message",message=>{const commandData=read(messageData,message);if(bodyLane.receive(commandData,read(messagePorts,message)))return;if(commandData?.version!==VERSION)return;if(commandData?.type==="native.skin")receiveSkin(commandData);else if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData);else if(commandData?.type==="body-attempt-result")settleBodyAttempt(commandData);else if(commandData?.type==="intent-result")settleIntent(commandData);else if(commandData?.type==="read-result")settleRead(commandData);else if(commandData?.type==="call-result")settleCall(commandData);else if(commandData?.type==="session-opened"||commandData?.type==="session-refused")settleSession(commandData,read(messagePorts,message));else if(commandData?.type==="query-result")settleQuery(commandData);else if(commandData?.type==="subscription-result"||commandData?.type==="subscription-error")receiveSubscription(commandData);else if(commandData?.type==="agents-list-result")settleAgentList(commandData);else if(commandData?.type==="agents-ask-result")settleAsk(commandData);else if(commandData?.type==="agents-status")deliverAgentStatus(commandData);else if(commandData?.type==="agent-sessions-list-result")settleAgentSessionsList(commandData);else if(commandData?.type==="agent-sessions-follow-result")settleAgentSessionsFollow(commandData);else if(commandData?.type==="agent-sessions-send-result")settleAgentSessionsSend(commandData);else if(commandData?.type==="agent-sessions-choose-folder-result")settleAgentSessionsChooseFolder(commandData);else if(commandData?.type==="agent-sessions-catalog-result")settleAgentSessionsCatalog(commandData);else if(commandData?.type==="agent-sessions-create-result")settleAgentSessionsCreate(commandData);else if(commandData?.type==="agent-sessions-create-status-result"||commandData?.type==="agent-sessions-cancel-result")settleAgentSessionsStartControl(commandData);else if(commandData?.type==="agent-sessions-save-result"||commandData?.type==="agent-sessions-stop-saving-result"||commandData?.type==="agent-sessions-save-status-result"||commandData?.type==="agent-sessions-preview-saved-result")settleAgentSessionsSaved(commandData);else if(commandData?.type==="agent-sessions-mark-read-result")settleAgentSessionsMarkRead(commandData);else if(commandData?.type==="agent-sessions-followup-status-result"||commandData?.type==="agent-sessions-followup-continue-result"||commandData?.type==="agent-sessions-followup-settings-get-result"||commandData?.type==="agent-sessions-followup-settings-set-result")settleAgentSessionsFollowup(commandData);else if(commandData?.type==="agent-sessions-watch-list-result")settleAgentSessionsWatchList(commandData);else if(commandData?.type==="agent-sessions-open-in-paseo-result"||commandData?.type==="agent-sessions-open-conversation-result"||commandData?.type==="agent-sessions-get-permission-form-result"||commandData?.type==="agent-sessions-respond-to-permission-result")settleAgentSessionsPermission(commandData);else if(commandData?.type==="agent-sessions-list-changed")deliverAgentSessionListChanged(commandData);else if(commandData?.type==="agent-sessions-list-watch-ended")deliverAgentSessionListWatchEnded(commandData);else if(commandData?.type==="agent-sessions-event")deliverAgentSessionEvent(commandData);else if(commandData?.type==="intent-arm-ack")settleArmAck(commandData);else if(commandData?.type==="intent-arm-result")settleArmResult(commandData);else if(commandData?.type==="presentation-result")settlePresentation(commandData);else if(commandData?.type==="reveal")deliverReveal(commandData);else if(commandData?.type==="reveal-clear")pendingReveal=null;else if(commandData?.type==="context-request"||commandData?.type==="context-cancel")receiveContext(commandData)});start(channel);listen(channel,"messageerror",closeSkin);listen(channel,"close",closeSkin);listen(window,"pagehide",closeSkin,true);listen(channel,"messageerror",closeBodyAttempts);listen(channel,"close",closeBodyAttempts);listen(window,"pagehide",closeBodyAttempts,true);listen(channel,"messageerror",closeCalls);listen(channel,"close",closeCalls);listen(window,"pagehide",closeCalls,true);listen(channel,"messageerror",closeSessions);listen(channel,"close",closeSessions);listen(window,"pagehide",closeSessions,true);listen(channel,"messageerror",closeSubscriptions);listen(channel,"close",closeSubscriptions);listen(window,"pagehide",closeSubscriptions,true);listen(channel,"messageerror",closeAgents);listen(channel,"close",closeAgents);listen(window,"pagehide",closeAgents,true);listen(channel,"messageerror",closeAgentSessions);listen(channel,"close",closeAgentSessions);listen(window,"pagehide",closeAgentSessions,true);listen(channel,"messageerror",closePresentation);listen(channel,"close",closePresentation);listen(window,"pagehide",closePresentation,true);listen(channel,"messageerror",bodyLane.close);listen(channel,"close",bodyLane.close);listen(window,"pagehide",bodyLane.close,true);listen(window,"unload",bodyLane.close,true);listen(channel,"messageerror",clearReveal);listen(channel,"close",clearReveal);listen(channel,"messageerror",closeContext);listen(channel,"close",closeContext);listen(window,"pagehide",event=>{pendingReveal=null;if(trusted(event)&&read(pageTransitionPersisted,event)!==true){closeContext();send({version:VERSION,type:"unloading"})}},true);listen(window,"unload",clearReveal,true);listen(window,"unload",closeContext,true);try{if(isArray(data.needs))for(const need of data.needs)if(intentId(need)&&offeredNeeds.length<32)pushValue(offeredNeeds,need);if(isArray(data.host_features))for(const feature of data.host_features)if(feature==="intent-arm-confirm.v1")armFeature=true;else if(feature===CONTEXT_FEATURE)contextFeature=true;else if(feature===LOCATION_FEATURE)locationFeature=true;else if(feature===UNSAVED_FEATURE)unsavedFeature=true;else if(feature===CALL_FEATURE)callFeature=true;else if(feature===SESSION_FEATURE)sessionFeature=true;else if(feature===SUBSCRIBE_FEATURE)subscribeFeature=true;else if(feature===AGENTS_FEATURE)agentsFeature=true;else if(feature===AGENT_SESSIONS_FEATURE)agentSessionsFeature=true;else if(feature===AGENT_SESSIONS_CREATE_FEATURE)agentSessionsCreateFeature=true;else if(feature===AGENT_SESSIONS_ADOPTED_FEATURE)agentSessionsAdoptedFeature=true;else if(feature===AGENT_SESSIONS_SAVED_FEATURE)agentSessionsSavedFeature=true;else if(feature===AGENT_SESSIONS_FOLLOWUP_FEATURE)agentSessionsFollowupFeature=true;else if(feature===AGENT_SESSIONS_OPEN_CONVERSATION_FEATURE)agentSessionsOpenConversationFeature=true;else if(feature===COMMENT_FRAME_FEATURE)commentFrameFeature=true;else if(feature===PRESENTATION_FEATURE)presentationFeature=true;else if(feature===SKIN_FEATURE)skinFeature=true;if(callFeature||sessionFeature||subscribeFeature||agentsFeature||agentSessionsFeature||presentationFeature||skinFeature)exposeNative();if(isArray(data.host_features)&&apply(arrayIncludes,data.host_features,[BODY_ATTEMPT_FEATURE])&&bodyAttemptId(data.body_attempt?.generation))bodyAttemptGeneration=data.body_attempt.generation;initializeBody(data);receiveSkin({skin_version:SKIN_SCHEMA,revision:data.skin_revision??0,skin:data.skin??null});const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;const incomingViewState=data.view_state;if(incomingViewState&&typeof incomingViewState==="object"&&!isArray(incomingViewState)&&"value"in incomingViewState){const envelope={value:incomingViewState.value};if(incomingViewState.schema!==undefined)envelope.schema=incomingViewState.schema;if(incomingViewState.from_body_digest!==undefined)envelope.from_body_digest=incomingViewState.from_body_digest;heldViewState=freeze(envelope)}const finish=()=>{skinParsed=true;paintSkin();setupSlides();resolveReady(heldViewState===undefined?freezeObject({input}):freezeObject({input,viewState:heldViewState}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length,features:[REVEAL_FEATURE,...(contextFeature?[CONTEXT_FEATURE]:[]),...(locationFeature?[LOCATION_FEATURE]:[]),...(unsavedFeature?[UNSAVED_FEATURE]:[]),...(bodyLane.api.offering?["records.body.read.v1"]:[]),...(skinFeature?[SKIN_FEATURE]:[])]});publishContextRegistration();for(const item of queued)post(channel,item);queued=[]};if(skinFeature&&skinDOM?.loading())listen(document,"DOMContentLoaded",finish,{once:true});else finish()}catch(error){disposeKit();rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
+function receive(event){const data=read(messageData,event),ports=read(messagePorts,event);if(read(messageSource,event)!==parent||read(messageOrigin,event)!==HOST||data?.type!=="native-html-init"||data?.version!==VERSION)return;if(initialized||!recordInitValid(data,ports)){for(let i=0;i<ports.length;i++)apply(portClose,ports[i],[]);return}stop(event);initialized=true;unlisten(window,"message",receive,true);channel=ports[0];installRecordTransport(data,ports);listen(channel,"messageerror",disposeKit);listen(channel,"close",disposeKit);listen(channel,"message",message=>{const commandData=read(messageData,message);if(bodyLane.receive(commandData,read(messagePorts,message)))return;if(commandData?.version!==VERSION)return;if(commandData?.type==="body-draft-result")settleBodyDraft(commandData);else if(commandData?.type==="app-state-result")settleAppState(commandData);else if(commandData?.type==="native.skin")receiveSkin(commandData);else if(commandData?.type==="command"&&["first","previous","next","last"].includes(commandData.action))command(commandData.action);else if(commandData?.type==="input")deliverInput(commandData);else if(commandData?.type==="body-attempt-result")settleBodyAttempt(commandData);else if(commandData?.type==="intent-result")settleIntent(commandData);else if(commandData?.type==="read-result")settleRead(commandData);else if(commandData?.type==="call-snapshot")settleCallSnapshot(commandData);else if(commandData?.type==="call-result")settleCall(commandData);else if(commandData?.type==="session-opened"||commandData?.type==="session-refused")settleSession(commandData,read(messagePorts,message));else if(commandData?.type==="query-result")settleQuery(commandData);else if(commandData?.type==="query-partial")settleQueryPartial(commandData);else if(commandData?.type==="subscription-result"||commandData?.type==="subscription-error")receiveSubscription(commandData);else if(commandData?.type==="agents-list-result")settleAgentList(commandData);else if(commandData?.type==="agents-ask-result")settleAsk(commandData);else if(commandData?.type==="agents-status")deliverAgentStatus(commandData);else if(commandData?.type==="agent-sessions-list-result")settleAgentSessionsList(commandData);else if(commandData?.type==="agent-sessions-follow-result")settleAgentSessionsFollow(commandData);else if(commandData?.type==="agent-sessions-send-result")settleAgentSessionsSend(commandData);else if(commandData?.type==="agent-sessions-choose-folder-result")settleAgentSessionsChooseFolder(commandData);else if(commandData?.type==="agent-sessions-catalog-result")settleAgentSessionsCatalog(commandData);else if(commandData?.type==="agent-sessions-create-result")settleAgentSessionsCreate(commandData);else if(commandData?.type==="agent-sessions-create-status-result"||commandData?.type==="agent-sessions-cancel-result")settleAgentSessionsStartControl(commandData);else if(commandData?.type==="agent-sessions-save-result"||commandData?.type==="agent-sessions-stop-saving-result"||commandData?.type==="agent-sessions-save-status-result"||commandData?.type==="agent-sessions-preview-saved-result")settleAgentSessionsSaved(commandData);else if(commandData?.type==="agent-sessions-mark-read-result")settleAgentSessionsMarkRead(commandData);else if(commandData?.type==="agent-sessions-followup-status-result"||commandData?.type==="agent-sessions-followup-continue-result"||commandData?.type==="agent-sessions-followup-settings-get-result"||commandData?.type==="agent-sessions-followup-settings-set-result")settleAgentSessionsFollowup(commandData);else if(commandData?.type==="agent-sessions-watch-list-result")settleAgentSessionsWatchList(commandData);else if(commandData?.type==="agent-sessions-open-in-paseo-result"||commandData?.type==="agent-sessions-open-conversation-result"||commandData?.type==="agent-sessions-get-permission-form-result"||commandData?.type==="agent-sessions-respond-to-permission-result")settleAgentSessionsPermission(commandData);else if(commandData?.type==="agent-sessions-list-changed")deliverAgentSessionListChanged(commandData);else if(commandData?.type==="agent-sessions-list-watch-ended")deliverAgentSessionListWatchEnded(commandData);else if(commandData?.type==="agent-sessions-event")deliverAgentSessionEvent(commandData);else if(commandData?.type==="intent-arm-ack")settleArmAck(commandData);else if(commandData?.type==="intent-arm-result")settleArmResult(commandData);else if(commandData?.type==="tab-title-result")settlePresentation(commandData);else if(commandData?.type==="presentation-result")settlePresentation(commandData);else if(commandData?.type==="viewer")receiveViewer(commandData);else if(commandData?.type==="pending")receivePending(commandData);else if(commandData?.type==="reveal")deliverReveal(commandData);else if(commandData?.type==="reveal-clear")pendingReveal=null;else if(commandData?.type==="context-request"||commandData?.type==="context-cancel")receiveContext(commandData)});start(channel);listen(channel,"messageerror",closeBodyDraft);listen(channel,"close",closeBodyDraft);listen(window,"unload",closeBodyDraft,true);listen(channel,"messageerror",closeAppState);listen(channel,"close",closeAppState);listen(window,"pagehide",closeAppState,true);listen(channel,"messageerror",closeViewer);listen(channel,"close",closeViewer);listen(window,"pagehide",closeViewer,true);listen(channel,"messageerror",closePending);listen(channel,"close",closePending);listen(window,"pagehide",closePending,true);listen(channel,"messageerror",closeSkin);listen(channel,"close",closeSkin);listen(window,"pagehide",closeSkin,true);listen(channel,"messageerror",closeBodyAttempts);listen(channel,"close",closeBodyAttempts);listen(window,"pagehide",closeBodyAttempts,true);listen(channel,"messageerror",closeCalls);listen(channel,"close",closeCalls);listen(window,"pagehide",closeCalls,true);listen(channel,"messageerror",closeSessions);listen(channel,"close",closeSessions);listen(window,"pagehide",closeSessions,true);listen(channel,"messageerror",closeSubscriptions);listen(channel,"close",closeSubscriptions);listen(window,"pagehide",closeSubscriptions,true);listen(channel,"messageerror",closeAgents);listen(channel,"close",closeAgents);listen(window,"pagehide",closeAgents,true);listen(channel,"messageerror",closeAgentSessions);listen(channel,"close",closeAgentSessions);listen(window,"pagehide",closeAgentSessions,true);listen(channel,"messageerror",closePresentation);listen(channel,"close",closePresentation);listen(window,"pagehide",closePresentation,true);listen(channel,"messageerror",bodyLane.close);listen(channel,"close",bodyLane.close);listen(window,"pagehide",bodyLane.close,true);listen(window,"unload",bodyLane.close,true);listen(channel,"messageerror",clearReveal);listen(channel,"close",clearReveal);listen(channel,"messageerror",closeContext);listen(channel,"close",closeContext);listen(window,"pagehide",event=>{pendingReveal=null;if(trusted(event)&&read(pageTransitionPersisted,event)!==true){closeContext();send({version:VERSION,type:"unloading"})}},true);listen(window,"unload",clearReveal,true);listen(window,"unload",closeContext,true);try{if(isArray(data.needs))for(const need of data.needs)if(intentId(need)&&offeredNeeds.length<32)pushValue(offeredNeeds,need);if(isArray(data.host_features))for(const feature of data.host_features)if(feature==="intent-arm-confirm.v1")armFeature=true;else if(feature===CONTEXT_FEATURE)contextFeature=true;else if(feature===LOCATION_FEATURE)locationFeature=true;else if(feature===UNSAVED_FEATURE)unsavedFeature=true;else if(feature===CALL_FEATURE)callFeature=true;else if(feature===SESSION_FEATURE)sessionFeature=true;else if(feature===SUBSCRIBE_FEATURE)subscribeFeature=true;else if(feature===AGENTS_FEATURE)agentsFeature=true;else if(feature===AGENT_SESSIONS_FEATURE)agentSessionsFeature=true;else if(feature===AGENT_SESSIONS_CREATE_FEATURE)agentSessionsCreateFeature=true;else if(feature===AGENT_SESSIONS_MESSAGE_FRAMING_FEATURE)agentSessionsMessageFramingFeature=true;else if(feature===AGENT_SESSIONS_ADOPTED_FEATURE)agentSessionsAdoptedFeature=true;else if(feature===AGENT_SESSIONS_SAVED_FEATURE)agentSessionsSavedFeature=true;else if(feature===AGENT_SESSIONS_FOLLOWUP_FEATURE)agentSessionsFollowupFeature=true;else if(feature===AGENT_SESSIONS_OPEN_CONVERSATION_FEATURE)agentSessionsOpenConversationFeature=true;else if(feature===COMMENT_FRAME_FEATURE)commentFrameFeature=true;else if(feature===PRESENTATION_FEATURE)presentationFeature=true;else if(feature===TAB_TITLE_FEATURE)tabTitleFeature=true;else if(feature===SKIN_FEATURE)skinFeature=true;else if(feature===BODY_DRAFT_FEATURE)bodyDraftFeature=true;else if(feature===APP_STATE_FEATURE)appStateFeature=true;else if(feature===VIEWER_FEATURE)viewerFeature=true;else if(feature===PENDING_FEATURE)pendingFeature=true;if(viewerFeature){const parsedViewer=viewerOf(data.viewer===undefined?null:data.viewer);viewerValue=parsedViewer?parsedViewer.value:null}if(recordTransport)exposeNative();else if(callFeature||sessionFeature||subscribeFeature||agentsFeature||agentSessionsFeature||presentationFeature||tabTitleFeature||skinFeature||appStateFeature||viewerFeature||pendingFeature)exposeNative();if(isArray(data.host_features)&&apply(arrayIncludes,data.host_features,[BODY_ATTEMPT_FEATURE])&&bodyAttemptId(data.body_attempt?.generation))bodyAttemptGeneration=data.body_attempt.generation;initializeBody(data);receiveSkin({skin_version:SKIN_SCHEMA,revision:data.skin_revision??0,skin:data.skin??null});const input=freeze(data.input);heldInput=input;if(typeof data.input_digest==="string")heldDigest=data.input_digest;const initRevision=data.revision;if(initRevision&&typeof initRevision==="object"&&typeof initRevision.content_event_seq==="number")heldSeq=initRevision.content_event_seq;const incomingViewState=data.view_state;if(incomingViewState&&typeof incomingViewState==="object"&&!isArray(incomingViewState)&&"value"in incomingViewState){const envelope={value:incomingViewState.value};if(incomingViewState.schema!==undefined)envelope.schema=incomingViewState.schema;if(incomingViewState.from_body_digest!==undefined)envelope.from_body_digest=incomingViewState.from_body_digest;heldViewState=freeze(envelope)}const finish=()=>{skinParsed=true;paintSkin();setupSlides();resolveReady(heldViewState===undefined?freezeObject({input}):freezeObject({input,viewState:heldViewState}));send({version:VERSION,type:"ready",profile:slides.length?"slides":"document",slides:slides.length,features:[REVEAL_FEATURE,...(contextFeature?[CONTEXT_FEATURE]:[]),...(locationFeature?[LOCATION_FEATURE]:[]),...(unsavedFeature?[UNSAVED_FEATURE]:[]),...(bodyLane.api.offering?["records.body.read.v1"]:[]),...(skinFeature?[SKIN_FEATURE]:[])]});publishContextRegistration();for(const item of queued)post(channel,item);queued=[]};if(skinFeature&&skinDOM?.loading())listen(document,"DOMContentLoaded",finish,{once:true});else finish()}catch(error){disposeKit();rejectReady(error);report("html_delivery_failed",{message:bounded(error)})}}
 listen(window,"message",receive,true);
 const hostPost=parent.postMessage;apply(hostPost,parent,[{type:"native-html-bootstrap",version:VERSION,features:[CONTEXT_FEATURE,"records.body.read.v1",SKIN_FEATURE]},HOST]);
 })();"#;
@@ -2622,7 +2864,7 @@ fn inspect_template_kit(
     Ok(())
 }
 
-fn decode_data_url(raw: &str) -> std::result::Result<usize, ValidationFailure> {
+fn decode_data_url(raw: &str, each_limit: usize) -> std::result::Result<usize, ValidationFailure> {
     let Some(rest) = raw.strip_prefix("data:") else {
         return Err(ValidationFailure::new(
             "html_asset_invalid",
@@ -2663,11 +2905,11 @@ fn decode_data_url(raw: &str) -> std::result::Result<usize, ValidationFailure> {
     } else {
         percent_decode_str(payload).collect()
     };
-    if bytes.len() > DATA_ASSET_EACH_LIMIT {
+    if bytes.len() > each_limit {
         return Err(ValidationFailure::new(
             "html_asset_too_large",
             "decoded data asset exceeds per-asset limit",
-            json!({"phase":"validation","limit":"data_asset_decoded_bytes_each","maximum":DATA_ASSET_EACH_LIMIT,"actual":bytes.len()}),
+            json!({"phase":"validation","limit":"data_asset_decoded_bytes_each","maximum":each_limit,"actual":bytes.len()}),
         ));
     }
     Ok(bytes.len())
@@ -2679,7 +2921,7 @@ pub fn validate(source: &str) -> std::result::Result<Manifest, ValidationFailure
 
 /// [`validate`] with the UTF-8 body limit chosen by the caller: [`BODY_LIMIT`]
 /// for ordinary documents, [`PACKAGE_BODY_LIMIT`] for a record carrying the
-/// package marker. Every other policy bound is unchanged.
+/// package marker. Package bodies also receive the package image/font budgets.
 pub fn validate_with_limit(
     source: &str,
     body_limit: usize,
@@ -2837,18 +3079,19 @@ pub fn validate_with_limit(
     if css_rules > CSS_RULE_LIMIT {
         violations.push(policy("CSS rule limit exceeded", "css-rules").into());
     }
+    let (asset_each_limit, asset_total_limit) = data_asset_limits(body_limit);
     let mut asset_total = 0usize;
     for asset in assets {
-        match decode_data_url(&asset) {
+        match decode_data_url(&asset, asset_each_limit) {
             Ok(decoded) => asset_total += decoded,
             Err(failure) => violations.push(failure.into()),
         }
-        if asset_total > DATA_ASSET_TOTAL_LIMIT {
+        if asset_total > asset_total_limit {
             violations.push(
                 ValidationFailure::new(
                     "html_asset_too_large",
                     "decoded data assets exceed aggregate limit",
-                    json!({"phase":"validation","limit":"data_asset_decoded_bytes_total","maximum":DATA_ASSET_TOTAL_LIMIT,"actual":asset_total}),
+                    json!({"phase":"validation","limit":"data_asset_decoded_bytes_total","maximum":asset_total_limit,"actual":asset_total}),
                 )
                 .into(),
             );
@@ -2970,8 +3213,9 @@ fn cache_key(source: &str, body_limit: usize) -> String {
     let body_digest = Sha256::digest(source.as_bytes());
     let bootstrap_digest = Sha256::digest(BOOTSTRAP.as_bytes());
     let adapter_revision = ADAPTER_REVISION.to_be_bytes();
+    let (asset_each_limit, asset_total_limit) = data_asset_limits(body_limit);
     let limits = format!(
-        "{body_limit}:{DATA_ASSET_EACH_LIMIT}:{DATA_ASSET_TOTAL_LIMIT}:{DOM_NODE_LIMIT}:{CSS_RULE_LIMIT}:{SLIDE_LIMIT}"
+        "{body_limit}:{asset_each_limit}:{asset_total_limit}:{DOM_NODE_LIMIT}:{CSS_RULE_LIMIT}:{SLIDE_LIMIT}"
     );
     let parts: [&[u8]; 10] = [
         b"native.artifact-html-cache.v1",
@@ -3950,6 +4194,56 @@ mod tests {
         )
     }
 
+    #[test]
+    fn package_asset_budgets_preserve_ordinary_limits_and_cache_isolation() {
+        // Unescaped ASCII payloads keep aggregate-boundary fixtures below the
+        // ordinary body cap; budgets count decoded bytes, not encoded source.
+        let image = |size| format!("<img alt=\"\" src=\"data:image/png,{}\">", "A".repeat(size));
+        let font = |size| {
+            format!(
+                "<style>@font-face{{font-family:test;src:url(data:font/woff2,{})}}</style>",
+                "A".repeat(size)
+            )
+        };
+        let ordinary_each = document(&image(DATA_ASSET_EACH_LIMIT));
+        assert!(validate(&ordinary_each).is_ok());
+        let larger_image = document(&image(DATA_ASSET_EACH_LIMIT + 1));
+        assert!(validate_cached_with_limit(&larger_image, PACKAGE_BODY_LIMIT).is_ok());
+        assert!(validate_cached(&larger_image).is_err());
+        let ordinary_total = document(&format!(
+            "{}{}",
+            image(DATA_ASSET_EACH_LIMIT),
+            font(DATA_ASSET_TOTAL_LIMIT - DATA_ASSET_EACH_LIMIT)
+        ));
+        assert!(validate(&ordinary_total).is_ok());
+        let larger_total = document(&format!(
+            "{}{}",
+            image(DATA_ASSET_EACH_LIMIT),
+            font(DATA_ASSET_TOTAL_LIMIT - DATA_ASSET_EACH_LIMIT + 1)
+        ));
+        assert!(validate_cached_with_limit(&larger_total, PACKAGE_BODY_LIMIT).is_ok());
+        assert!(validate_cached(&larger_total).is_err());
+        let package_total = document(&format!(
+            "{}{}",
+            image(PACKAGE_DATA_ASSET_EACH_LIMIT),
+            font(PACKAGE_DATA_ASSET_EACH_LIMIT)
+        ));
+        let manifest = validate_with_limit(&package_total, PACKAGE_BODY_LIMIT).unwrap();
+        assert_eq!(
+            manifest.data_asset_decoded_bytes_total,
+            PACKAGE_DATA_ASSET_TOTAL_LIMIT
+        );
+        let over_each = document(&image(PACKAGE_DATA_ASSET_EACH_LIMIT + 1));
+        assert!(validate_with_limit(&over_each, PACKAGE_BODY_LIMIT).is_err());
+        let over_total = document(&format!(
+            "{}{}{}",
+            image(PACKAGE_DATA_ASSET_EACH_LIMIT),
+            font(PACKAGE_DATA_ASSET_EACH_LIMIT),
+            image(1)
+        ));
+        assert!(validate_with_limit(&over_total, PACKAGE_BODY_LIMIT).is_err());
+    }
+
     fn named_document(inputs: Value, capability_requests: Value) -> String {
         let declaration = serde_json::to_string(&json!({
             "schema": MANIFEST_SCHEMA,
@@ -4111,7 +4405,7 @@ addEventListener('message',event=>{{
         assert!(validate_with_limit(&package_source, PACKAGE_BODY_LIMIT).is_ok());
         let manifest = validate(&source).unwrap();
         let current: Value =
-            serde_json::from_str(include_str!("../kit-releases/1.1.0/manifest.json")).unwrap();
+            serde_json::from_str(include_str!("../kit-releases/1.7.14/manifest.json")).unwrap();
         assert!(inject(&source, "https://parent.test", &manifest)
             .unwrap()
             .contains(current["js"]["sha256"].as_str().unwrap()));
@@ -4994,9 +5288,9 @@ addEventListener('message',event=>{{
         assert!(BOOTSTRAP.contains("else if(feature===CALL_FEATURE)callFeature=true;"));
         assert!(BOOTSTRAP.contains("const CALL_FEATURE=\"app.call.v2\""));
         assert!(BOOTSTRAP.contains(
-            "if(callFeature||sessionFeature||subscribeFeature||agentsFeature||agentSessionsFeature||presentationFeature||skinFeature)exposeNative();"
+            "if(callFeature||sessionFeature||subscribeFeature||agentsFeature||agentSessionsFeature||presentationFeature||tabTitleFeature||skinFeature||appStateFeature||viewerFeature||pendingFeature)exposeNative();"
         ));
-        assert!(BOOTSTRAP.contains("freezeObject({...(callFeature?{call:callOperation}:{})"));
+        assert!(BOOTSTRAP.contains("...(callFeature?{call:callOperation}:{})"));
         assert!(!BOOTSTRAP.contains("apply(arrayIncludes,offeredNeeds,[operation])"));
         // Bounded: 8 in flight, 256 KiB of args, a 1 MiB answer, matched by id.
         assert!(BOOTSTRAP.contains("pendingCallCount>=8"));
@@ -5014,7 +5308,57 @@ addEventListener('message',event=>{{
         assert!(BOOTSTRAP.contains("callFailure(\"uncertain\",\"port_closed\""));
         assert!(BOOTSTRAP.contains("call args must serialize to an object"));
         assert!(BOOTSTRAP
-            .contains("send({version:VERSION,type:\"call\",request_id,operation,args:payload})"));
+            .contains("send({version:VERSION,type:\"call\",request_id,operation,args:payload,...(onSnapshot?{read_snapshot:true}:{}),...(observed?{observed}:{})})"));
+    }
+
+    #[test]
+    fn bootstrap_offers_pending_only_behind_the_host_feature() {
+        // app.pending.v1 (slice 7): the host's held writes, pushed as a snapshot and then deltas. The surface exists only when the
+        // host's init lists the feature; entries are display only and bounded.
+        assert!(BOOTSTRAP.contains(
+            "const PENDING_FEATURE=\"app.pending.v1\",PENDING_VERSION=\"app.pending.v1\""
+        ));
+        assert!(BOOTSTRAP.contains("else if(feature===PENDING_FEATURE)pendingFeature=true;"));
+        assert!(BOOTSTRAP.contains("...(pendingFeature?{pending:pendingApi}:{})"));
+        assert!(BOOTSTRAP.contains("get pending(){return pendingFeature?pendingApi:undefined}"));
+        assert!(BOOTSTRAP.contains("commandData?.type===\"pending\")receivePending(commandData)"));
+        // Entries are copied, frozen and bounded: 256 of them, each at most 256 KiB.
+        assert!(BOOTSTRAP.contains("text.length>262144"));
+        assert!(BOOTSTRAP.contains("data.entries.length>256"));
+        assert!(BOOTSTRAP.contains("pendingCount<256"));
+        // The only thing a frame can say back is to retry or discard one entry the host showed it.
+        assert!(BOOTSTRAP.contains("send({version:VERSION,type:\"pending-act\",pending_version:PENDING_VERSION,action,id})"));
+        assert!(BOOTSTRAP.contains("retry(id){return pendingAct(\"retry\",id)}"));
+        assert!(BOOTSTRAP.contains("discard(id){return pendingAct(\"discard\",id)}"));
+        // Subscriptions are released on close, messageerror and pagehide.
+        assert!(BOOTSTRAP.contains("listen(channel,\"messageerror\",closePending);listen(channel,\"close\",closePending);listen(window,\"pagehide\",closePending,true);"));
+    }
+
+    #[test]
+    fn bootstrap_offers_viewer_only_behind_the_host_feature() {
+        // app.viewer.v1: the viewer getter and onViewer exist only when the
+        // host's init lists the feature; the value is display only.
+        assert!(BOOTSTRAP.contains(
+            "const VIEWER_FEATURE=\"app.viewer.v1\",VIEWER_VERSION=\"native.viewer.v1\""
+        ));
+        assert!(BOOTSTRAP.contains("else if(feature===VIEWER_FEATURE)viewerFeature=true;"));
+        // The getter is installed on window.native before that object is frozen.
+        assert!(BOOTSTRAP.contains("define(nativeApi,\"viewer\",{get:()=>viewerValue,enumerable:true});nativeApi.onViewer=onViewer"));
+        assert!(BOOTSTRAP.contains("get viewer(){return viewerFeature?viewerValue:undefined}"));
+        assert!(BOOTSTRAP.contains("get onViewer(){return viewerFeature?onViewer:undefined}"));
+        // Init validates the exact keys and types; an over-long name becomes null, never trimmed or truncated.
+        assert!(BOOTSTRAP.contains("keys.length!==3||!keys.includes(\"version\")||!keys.includes(\"person_id\")||!keys.includes(\"name\")"));
+        assert!(BOOTSTRAP.contains("value.name!==null&&value.name.length>4096?null:value.name"));
+        assert!(BOOTSTRAP.contains("if(viewerFeature){const parsedViewer=viewerOf(data.viewer===undefined?null:data.viewer);viewerValue=parsedViewer?parsedViewer.value:null}"));
+        // Updates never set the value back to null; a malformed update is dropped and reported.
+        assert!(BOOTSTRAP.contains("commandData?.type===\"viewer\")receiveViewer(commandData)"));
+        assert!(BOOTSTRAP.contains("report(\"viewer_malformed\",{})"));
+        assert!(BOOTSTRAP.contains("if(parsed.value===null)return;"));
+        // Subscriptions are released on close, messageerror and pagehide.
+        assert!(BOOTSTRAP.contains("listen(channel,\"messageerror\",closeViewer);listen(channel,\"close\",closeViewer);listen(window,\"pagehide\",closeViewer,true);"));
+        assert!(
+            BOOTSTRAP.contains("const closeViewer=()=>{viewerClosed=true;viewerSubscribers=[]};")
+        );
     }
 
     #[test]
@@ -5096,8 +5440,12 @@ addEventListener('message',event=>{{
         ));
         // The fixed wire shapes, frame to host. The frame's `params` travel as
         // the engine's positional `parameters`; no as_of sequence is exposed.
+        // `last_known` rides only a query that asked for last-known (`{lastKnown:true, onPartial}`).
+        assert!(BOOTSTRAP.contains(
+            "send({version:VERSION,type:\"query\",request_id,query:wire.query,...(partial?{last_known:true}:{})})"
+        ));
         assert!(BOOTSTRAP
-            .contains("send({version:VERSION,type:\"query\",request_id,query:wire.query})"));
+            .contains("commandData?.type===\"query-partial\")settleQueryPartial(commandData)"));
         assert!(BOOTSTRAP.contains(
             "send({version:VERSION,type:\"subscribe\",subscription_id:subscription.id,query:wire.query})"
         ));
@@ -5215,7 +5563,7 @@ addEventListener('message',event=>{{
             BOOTSTRAP.contains("AGENT_SESSIONS_ADOPTED_FEATURE=\"app.agent-sessions.adopted.v1\"")
         );
         assert!(BOOTSTRAP.contains(
-            "else if(feature===AGENT_SESSIONS_ADOPTED_FEATURE)agentSessionsAdoptedFeature=true;"
+            "else if(feature===AGENT_SESSIONS_MESSAGE_FRAMING_FEATURE)agentSessionsMessageFramingFeature=true;else if(feature===AGENT_SESSIONS_ADOPTED_FEATURE)agentSessionsAdoptedFeature=true;"
         ));
         assert!(BOOTSTRAP.contains(
             "const agentSessionsAdoptedApi=freezeObject({...agentSessionsCreateApi,createStatus:input=>requestAgentSessionStartControl(\"createStatus\",input),cancel:input=>requestAgentSessionStartControl(\"cancel\",input)});"
@@ -5245,7 +5593,9 @@ addEventListener('message',event=>{{
         assert!(BOOTSTRAP.contains(
             "||commandData?.type===\"agent-sessions-cancel-result\")settleAgentSessionsStartControl(commandData)"
         ));
-        assert!(BOOTSTRAP.contains("...(quoted===undefined?{}:{quoted})})}catch{"));
+        assert!(BOOTSTRAP.contains(
+            "initial_prompt:initialPrompt,...(quoted===undefined?{}:{quoted}),...(contentOrigin===undefined?{}:{content_origin:contentOrigin})})}catch{"
+        ));
         // Quoted is validated to the Desktop's bounds before anything is posted, and is refused
         // (unavailable for a send, create_unsupported for a start) without the adopted feature.
         assert!(BOOTSTRAP.contains("const sessionQuotedOf=value=>{const items=sessionJson(value,262144);if(!isArray(items)||items.length>8)return null;"));
@@ -5411,10 +5761,11 @@ addEventListener('message',event=>{{
         assert!(BOOTSTRAP
             .contains("else if(feature===AGENT_SESSIONS_FEATURE)agentSessionsFeature=true;else if(feature===AGENT_SESSIONS_CREATE_FEATURE)agentSessionsCreateFeature=true;"));
         assert!(BOOTSTRAP.contains(
-            "get agentSessions(){return agentSessionsFeature?agentSessionsSurface():undefined}"
+            "get agentSessions(){return agentSessionsFeature?agentSessionsOfferedSurface():undefined}"
         ));
-        assert!(BOOTSTRAP
-            .contains("...(agentSessionsFeature?{agentSessions:agentSessionsSurface()}:{})"));
+        assert!(BOOTSTRAP.contains(
+            "...(agentSessionsFeature?{agentSessions:agentSessionsOfferedSurface()}:{})"
+        ));
         assert!(BOOTSTRAP.contains(
             "const agentSessionsApi=freezeObject({protocolVersion:2,list:listAgentSessions,follow:followAgentSession,send:sendAgentSession,markRead:markAgentSessionRead,watchList:watchAgentSessionList,openInPaseo:input=>requestAgentSessionPermission(\"openInPaseo\",input),getPermissionForm:input=>requestAgentSessionPermission(\"getPermissionForm\",input),respondToPermission:input=>requestAgentSessionPermission(\"respondToPermission\",input)});"
         ));
@@ -5455,7 +5806,7 @@ addEventListener('message',event=>{{
         assert!(BOOTSTRAP
             .contains("send({version:VERSION,type:\"agent-sessions-unsubscribe\",subscription_id"));
         assert!(BOOTSTRAP.contains(
-            "const wire={version:VERSION,type:\"agent-sessions-send\",request_id:requestId,host_id,host_epoch,session_id,text};if(quoted!==undefined)wire.quoted=quoted;send(wire)"
+            "const wire={version:VERSION,type:\"agent-sessions-send\",request_id:requestId,host_id,host_epoch,session_id,text};if(quoted!==undefined)wire.quoted=quoted;if(contentOrigin!==undefined)wire.content_origin=contentOrigin;send(wire)"
         ));
         assert!(BOOTSTRAP.contains("type:\"agent-sessions-mark-read\",request_id,read_request_id,host_id,host_epoch,session_id"));
         assert!(BOOTSTRAP.contains("type:\"agent-sessions-watch-list\",request_id,subscription_id"));
@@ -5543,6 +5894,15 @@ addEventListener('message',event=>{{
         assert!(BOOTSTRAP.contains("sessionText(host.label,256)"));
         assert!(BOOTSTRAP.contains("sessionTimelineIdOk(item.id)"));
         assert!(BOOTSTRAP.contains("typeof item.unread===\"boolean\"?{unread:item.unread}:{}"));
+        assert!(BOOTSTRAP.contains("value.startedBy===true)out.startedBy=true"));
+        assert!(BOOTSTRAP.contains("item.startedBy===\"user\"||item.startedBy===\"agent\"||item.startedBy===\"schedule\"?{startedBy:item.startedBy}:{}"));
+        // The mark rides both the list rows and the create reply: one snippet, two copies.
+        assert_eq!(
+            BOOTSTRAP
+                .matches("item.startedBy===\"user\"||item.startedBy===\"agent\"||item.startedBy===\"schedule\"?{startedBy:item.startedBy}:{}")
+                .count(),
+            2
+        );
         assert!(
             BOOTSTRAP.contains("clearTimer(pending.timer);delete agentSessionsPending[requestId]")
         );
@@ -5808,9 +6168,15 @@ addEventListener('message',event=>{{
         assert!(!BOOTSTRAP.contains("viewStateReported"));
         assert_eq!(
             BOOTSTRAP.matches("setTimer(").count(),
-            18,
-            "only gesture release, shared refusal throttle, feature-gated pre-ACK ARM wait, negotiated context deadline, bounded Body attempt deadline, eight bounded agent-session deadlines, and the catalog, folder choice, start, start-control and saved-session deadlines arm wall clocks"
+            23,
+            "only gesture release, shared refusal throttle, feature-gated pre-ACK ARM wait, negotiated context deadline, bounded Body attempt deadline, bounded device draft request deadline (unload bookkeeping uses a microtask after synchronous hide checkpoints, never a flush timer), eight bounded agent-session deadlines, the catalog, folder choice, start, start-control and saved-session deadlines, plus negotiated record reconnect liveness/control/reply deadlines and bounded backoff, arm wall clocks"
         );
+        // Draft expiry releases its slot once. Matching answers and document teardown clear the deadline.
+        assert!(BOOTSTRAP.contains("const timer=setTimer(()=>{if(!bodyDraftPending[request_id])return;delete bodyDraftPending[request_id];resolve(bodyDraftFailure(\"timeout\"))},10000)"));
+        assert!(BOOTSTRAP.contains("const settleBodyDraft=data=>{const pending=bodyDraftPending[data.request_id];if(!pending)return;delete bodyDraftPending[data.request_id];clearTimer(pending.timer)"));
+        assert!(BOOTSTRAP.contains("const closeBodyDraft=()=>{bodyDraftClosed=true;for(const key of objectKeys(bodyDraftPending)){const p=bodyDraftPending[key];delete bodyDraftPending[key];clearTimer(p.timer);p.resolve(bodyDraftFailure(\"unavailable\"))}}"));
+        assert!(BOOTSTRAP.contains("listen(window,\"unload\",closeBodyDraft,true)"));
+        assert!(BOOTSTRAP.contains("closeContext();send({version:VERSION,type:\"unloading\"})"), "pagehide announces unloading synchronously but keeps the draft lane open for the app bubble listener; unload closes it");
         // The read, watch and scoped-permission deadlines belong to tracked finite
         // operations. Each releases its pending
         // slot on expiry, settle once on a matching answer, and are cleared
@@ -5838,8 +6204,8 @@ addEventListener('message',event=>{{
         assert!(!BOOTSTRAP.contains("40000"));
         assert_eq!(
             BOOTSTRAP.matches("15000").count(),
-            2,
-            "only the pre-ACK ARM wait comment and constant keep 15 s"
+            3,
+            "the pre-ACK ARM wait comment and constant, plus the record resume idle threshold, keep 15 s"
         );
         assert!(BOOTSTRAP.contains(
             "const setTimer=setTimeout,clearTimer=clearTimeout,requestFrame=requestAnimationFrame;"
@@ -5852,7 +6218,7 @@ addEventListener('message',event=>{{
         // The additional context deadline uses primitives captured before
         // authored scripts execute, rather than looking up mutable clocks
         // when a private-port request arrives.
-        assert_eq!(BOOTSTRAP.matches("Date.now").count(), 1);
+        assert_eq!(BOOTSTRAP.matches("Date.now").count(), 2);
         assert_eq!(BOOTSTRAP.matches("performance.now").count(), 1);
         assert!(BOOTSTRAP
             .contains("contextNow=Date.now,contextClock=performance.now.bind(performance)"));
@@ -6541,12 +6907,17 @@ addEventListener('message',event=>{{
         // This current pin covers the composed body reader, default text
         // reporter, bounded Body-attempt negotiation, multi-host agent sessions v2,
         // floating-chat presentation, bounded session unread/request/detail
-        // projections, synchronous admitted kit delivery, bounded app
+        // projections, the startedBy origin mark and its host capability (list and create paths),
+        // synchronous admitted kit delivery, bounded app
         // close-risk reports, reentrancy-safe port-closed teardown,
-        // host-injected app skins, and the Desktop-owned folder chooser.
+        // host-injected app skins, the Desktop-owned folder chooser, and
+        // capability-gated typed/generated message framing on send/create, and
+        // explicit long-message and history cutoff metadata in session events.
+        // Frame errors carry bounded reconciliation receipts. Record observation
+        // launches can negotiate a second port with an explicit v1/v2 protocol.
         assert_eq!(
             bootstrap_digest(),
-            "949dd85a45308648b938ba716f39a0c72c545a78a3c617390c04015639f5d1fa"
+            "c5ccf6011615a0590cec7429de93bee6ab214e09cd08955d4e7f9c80bcfc79d1"
         );
     }
 

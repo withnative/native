@@ -41,7 +41,8 @@
       "identity_bearing_qualifiers": [],
       "assertion_admission_classes": [{"id":"subject_authorised_support","stance":"support","route":"edit_subject_view_object","authority_anchor":"subject"}],
       "reducer": {"id":"default","version":1},
-      "labels": {"forward":"blocks","inverse":"is blocked by","proposition":"blocks"}
+      "labels": {"forward":"blocks","inverse":"is blocked by","proposition":"blocks"},
+      "read_disclosure": {"direction":"inverse","kind":"claim","open_source_only":true,"max_items":3,"summary_template":"blocked by {list} (open)"}
     },
     {
       "schema_version": 1,

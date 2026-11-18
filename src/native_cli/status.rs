@@ -22,12 +22,23 @@ use serde_json::{json, Value};
 use super::node_client::{clean, down, read_config, structured, Connection, Limits};
 pub use super::node_client::{NodeInfo, NodeState};
 
+mod discovery;
+pub use discovery::resolve_config_path;
+
 /// The schema name carried by `--json` output.
 pub const SCHEMA: &str = "native.status.v1";
 /// The target recovery point, if the node does not say (it always does).
 const DEFAULT_RPO_SECONDS: u64 = 300;
 /// Most recent held writes listed.
 const RECENT_WRITES: usize = 5;
+const WAITING_STATES: [&str; 6] = [
+    "pending",
+    "hosted_pending",
+    "uncertain",
+    "not_sent",
+    "refused",
+    "unrecognised",
+];
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
@@ -45,6 +56,9 @@ pub struct ModeInfo {
     pub serving: String,
     pub status_only_reason: Option<String>,
     pub summary: String,
+    /// Optional observations stay inside mode; native.status.v1 has a closed root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_compatibility: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,14 +82,22 @@ pub struct LocalCopy {
     /// `accepted_generation` (when the copy is not serving).
     pub age_basis: Option<String>,
     pub rpo_seconds: u64,
-    /// `true` past the RPO or while following is paused, `false` within it,
-    /// `null` when it cannot be said (no age).
+    /// Legacy operational flag: `true` past the check-age target or while
+    /// following is paused; this is not a claim of missing content.
     pub stale: Option<bool>,
     /// Following hosted is paused (hosted uses a newer interchange revision).
     pub following_paused: bool,
     pub last_refresh_failure: Option<RefreshFailure>,
+    pub last_refresh_success_at: Option<String>,
+    pub sync_observation: Value,
+    pub revision_comparison: Value,
+    pub in_flight_refresh: Option<Value>,
     pub consecutive_failures: Option<u64>,
     pub degraded_reasons: Vec<String>,
+    /// Full verification passes since the node process started, and their
+    /// total wall time. `None` when the node predates the projection.
+    pub verification_passes: Option<u64>,
+    pub verification_total_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,7 +150,7 @@ pub struct Report {
 }
 
 pub struct StatusOptions {
-    pub config_dir: PathBuf,
+    pub config_path: PathBuf,
     /// How long to wait for the node to connect and to answer each call.
     pub timeout: Duration,
     /// The service line, gathered by the caller (it asks the service manager).
@@ -150,11 +172,10 @@ pub async fn collect(options: StatusOptions) -> Report {
 
 async fn collect_with(options: StatusOptions, limits: Limits) -> Report {
     let StatusOptions {
-        config_dir,
+        config_path,
         timeout,
         service,
     } = options;
-    let config_path = config_dir.join(crate::native_cli::setup::NODE_FILE);
     let config = match read_config(&config_path) {
         Ok(config) => config,
         Err(node) => return report_down(node, service),
@@ -200,7 +221,7 @@ async fn observe(
         .exchange(standby_call, false)
         .await
         .map_err(|why| node.not_answering(&why))?;
-    let node_call = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"node_status","arguments":{"limit":RECENT_WRITES,"order":"newest_first"}}});
+    let node_call = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"node_status","arguments":{"limit":RECENT_WRITES,"order":"newest_first","state":WAITING_STATES}}});
     let node_reply = node
         .exchange(node_call, false)
         .await
@@ -264,12 +285,21 @@ fn build(
         Some(state) => state,
         None => "unknown".to_owned(),
     };
-    let mode = mode_info(
+    let mut mode = mode_info(
         &hosted,
         standby.as_ref().ok(),
         copy.as_ref(),
         standby_note.as_deref(),
     );
+
+    mode.client_compatibility = (node.get("client_compatibility").is_some()
+        || node.pointer("/hosted/replication_compatibility").is_some())
+    .then(|| {
+        json!({
+            "node":node.get("client_compatibility"),
+            "replication":node.pointer("/hosted/replication_compatibility")
+        })
+    });
 
     match hosted.as_str() {
         "reachable" => {}
@@ -298,7 +328,7 @@ fn build(
                         .to_owned(),
                 );
             } else if copy.stale == Some(true) {
-                problems.push("the local copy is stale (beyond the recovery target)".to_owned());
+                problems.push("the local copy's last matching check exceeds the recovery target; missing changes are not established by age".to_owned());
             } else if copy.serving && copy.freshness != "fresh" {
                 problems.push(format!(
                     "the local copy's freshness is not confirmed ({})",
@@ -339,6 +369,14 @@ fn build(
                     text_of(status, "/refresh/diagnostics")
                         .unwrap_or_else(|| "not reported".into())
                 ));
+            }
+            if copy
+                .in_flight_refresh
+                .as_ref()
+                .and_then(|a| a["overdue"].as_bool())
+                == Some(true)
+            {
+                problems.push("a refresh exceeded its deadline; run `native status --diagnose`, then `native restart` if it remains stuck".into());
             }
             match copy.consecutive_failures {
                 Some(0) => {}
@@ -448,6 +486,7 @@ fn mode_info(
         serving: serving.to_owned(),
         status_only_reason,
         summary: format!("{hosted_phrase}; {local_phrase}"),
+        client_compatibility: None,
     }
 }
 
@@ -545,10 +584,29 @@ fn local_copy(status: &Value, hosted_revision_unsupported: bool) -> LocalCopy {
         stale,
         following_paused,
         last_refresh_failure,
+        last_refresh_success_at: text_of(status, "/refresh/last_success_at"),
+        sync_observation: status
+            .get("sync_observation")
+            .cloned()
+            .unwrap_or(Value::Null),
+        revision_comparison: status
+            .pointer("/node_routing/revision_comparison")
+            .cloned()
+            .unwrap_or(Value::Null),
+        in_flight_refresh: status
+            .pointer("/refresh/in_flight")
+            .filter(|v| v.is_object())
+            .cloned(),
         consecutive_failures: status
             .pointer("/refresh/consecutive_failure_count")
             .and_then(Value::as_u64),
         degraded_reasons: reasons,
+        verification_passes: status
+            .pointer("/verification_passes")
+            .and_then(Value::as_u64),
+        verification_total_seconds: status
+            .pointer("/verification_total_seconds")
+            .and_then(Value::as_u64),
     }
 }
 
@@ -576,23 +634,16 @@ fn held_writes(node: &Value) -> HeldWrites {
         counts.insert("unrecognised".into(), unrecognised);
     }
     let pending = count_of(node, "/queue/pending").max(counts.get("pending").copied().unwrap_or(0));
-    let waiting: u64 = [
-        "pending",
-        "hosted_pending",
-        "uncertain",
-        "not_sent",
-        "refused",
-        "unrecognised",
-    ]
-    .iter()
-    .map(|state| {
-        if *state == "pending" {
-            pending
-        } else {
-            counts.get(*state).copied().unwrap_or(0)
-        }
-    })
-    .sum();
+    let waiting: u64 = WAITING_STATES
+        .iter()
+        .map(|state| {
+            if *state == "pending" {
+                pending
+            } else {
+                counts.get(*state).copied().unwrap_or(0)
+            }
+        })
+        .sum();
 
     // Newest first, never bodies: only these named fields are read.
     let writes = node
@@ -620,6 +671,12 @@ fn held_writes(node: &Value) -> HeldWrites {
     };
     let recent: Vec<HeldWrite> = ordered
         .into_iter()
+        // Older nodes can include receipts even when a state filter was sent.
+        .filter(|write| {
+            write["state"]
+                .as_str()
+                .is_some_and(|state| WAITING_STATES.contains(&state))
+        })
         .take(RECENT_WRITES)
         .map(|write| HeldWrite {
             operation: text_of(write, "/operation")
@@ -634,7 +691,7 @@ fn held_writes(node: &Value) -> HeldWrites {
         })
         .collect();
     let more = if recent_available {
-        total.saturating_sub(recent.len() as u64)
+        waiting.saturating_sub(recent.len() as u64)
     } else {
         0
     };
@@ -692,8 +749,74 @@ pub fn render_text(report: &Report) -> String {
     if let Some(mode) = &report.mode {
         out.push(format!("Mode:        {}", mode.summary));
     }
+    if report
+        .mode
+        .as_ref()
+        .and_then(|mode| mode.client_compatibility.as_ref())
+        .is_some_and(|value| {
+            ["node", "replication"]
+                .iter()
+                .any(|scope| value[*scope]["status"] == "demand_recorded")
+        })
+    {
+        out.push("Update:      demand recorded; updater unavailable".into());
+    }
     if let Some(copy) = &report.local_copy {
         out.push(format!("Local copy:  {}", copy_line(copy)));
+        if let Some(attempt) = &copy.in_flight_refresh {
+            out.push(format!(
+                "Refresh:     {} ({}, {}s elapsed; deadline {}s){}",
+                attempt["phase"].as_str().unwrap_or("unknown phase"),
+                attempt["cause"].as_str().unwrap_or("unknown cause"),
+                attempt["elapsed_seconds"],
+                attempt["deadline_seconds"],
+                if attempt["overdue"] == true {
+                    " — exceeded its deadline"
+                } else {
+                    ""
+                }
+            ));
+            if attempt["overdue"] == true {
+                out.push(
+                    "Next step:   native status --diagnose; run native restart if it remains stuck"
+                        .into(),
+                );
+            }
+        }
+        if let Some(at) = &copy.last_refresh_success_at {
+            out.push(format!(
+                "Last successful refresh/check (includes unchanged): {at}"
+            ));
+        }
+        for (label, field) in [
+            (
+                "Last matching hosted check/capture",
+                "last_matching_hosted_check_at",
+            ),
+            (
+                "Last local materialization",
+                "last_local_materialization_at",
+            ),
+            ("Last source data change", "last_data_change_at"),
+        ] {
+            out.push(format!(
+                "{label}: {}",
+                copy.sync_observation[field].as_str().unwrap_or("unknown")
+            ));
+        }
+        let comparison = &copy.revision_comparison;
+        let description = match comparison["state"].as_str() {
+            Some("matches_latest_known") => "matches the latest known hosted revision",
+            Some("behind_latest_known") => "hosted has confirmed newer revisions",
+            Some("ahead_of_latest_known") => "local revision exceeds the last known hosted head",
+            _ => "comparison unavailable",
+        };
+        out.push(format!(
+            "Revision:    {description}; current lag and time lag unknown"
+        ));
+        if let Some(at) = comparison["last_successful_hosted_check_at"].as_str() {
+            out.push(format!("Last successful hosted head check: {at}"));
+        }
         if let Some(failure) = &copy.last_refresh_failure {
             let mut line = String::from("             last refresh failed");
             if let Some(class) = &failure.class {
@@ -706,6 +829,15 @@ pub fn render_text(report: &Report) -> String {
                 line.push_str(&format!(" [{n} in a row]"));
             }
             out.push(line);
+        }
+        if let Some(passes) = copy.verification_passes {
+            let total = copy
+                .verification_total_seconds
+                .map(human_age)
+                .unwrap_or_else(|| "unknown".into());
+            out.push(format!(
+                "Verification:  {passes} full passes ({total} total)"
+            ));
         }
     } else {
         out.push("Local copy:  none".to_owned());
@@ -731,7 +863,7 @@ pub fn render_text(report: &Report) -> String {
         }
         if held.more > 0 {
             out.push(format!(
-                "             ... and {} more (see node_status)",
+                "             ... and {} more (see native status --json)",
                 held.more
             ));
         }
@@ -746,10 +878,10 @@ fn copy_line(copy: &LocalCopy) -> String {
     let rpo = human_age(copy.rpo_seconds);
     let age = copy.age_seconds.map(human_age);
     let main = match (copy.serving, &age) {
-        (true, Some(age)) => format!("synced {age} ago"),
-        (true, None) => "serving, age unknown".to_owned(),
+        (true, Some(age)) => format!("last matching check/capture {age} ago"),
+        (true, None) => "serving, matching check age unknown".to_owned(),
         (false, Some(age)) if copy.accepted => {
-            format!("not serving; accepted copy synced {age} ago")
+            format!("not serving; accepted copy last matching check/capture {age} ago")
         }
         (false, _) if copy.accepted => "not serving; accepted copy of unknown age".to_owned(),
         (false, _) => "no accepted copy yet".to_owned(),
@@ -758,8 +890,10 @@ fn copy_line(copy: &LocalCopy) -> String {
         "stale: following is paused because hosted uses a newer interchange revision".to_owned()
     } else {
         match (copy.stale, copy.serving) {
-            (Some(true), true) => format!("stale, beyond the {rpo} target"),
-            (Some(false), true) => format!("fresh, within the {rpo} target"),
+            (Some(true), true) => {
+                format!("check age beyond the {rpo} target; missing changes unknown")
+            }
+            (Some(false), true) => format!("check age within the {rpo} target"),
             // A copy that is not serving is not "fresh": only its age is known.
             (Some(true), false) => format!("older than the {rpo} target"),
             (Some(false), false) => format!("age within the {rpo} target"),
@@ -774,14 +908,7 @@ fn held_line(held: &HeldWrites) -> String {
         return "none waiting".to_owned();
     }
     let mut parts = Vec::new();
-    for state in [
-        "pending",
-        "hosted_pending",
-        "uncertain",
-        "not_sent",
-        "refused",
-        "unrecognised",
-    ] {
+    for state in WAITING_STATES {
         let n = if state == "pending" {
             held.pending
         } else {
@@ -807,15 +934,102 @@ fn held_line(held: &HeldWrites) -> String {
 
 /// The `native service status` line, as a [`ServiceInfo`], or `None` when the
 /// service manager cannot be consulted at all.
+///
+/// On macOS the report is tied to the selected config: a loaded current or
+/// hand-managed legacy launchd job is reported only when its live argv serves
+/// that config, and an installed job that serves another config is not passed
+/// off as this config's service. Observation is bounded, and this never infers
+/// management of a job `native service` did not write.
 pub fn service_info(config_dir: &Path) -> Option<ServiceInfo> {
-    use crate::native_cli::service::{self, Installed};
+    use crate::native_cli::service;
     let ctx = service::ServiceContext::detect(config_dir, false).ok()?;
     let report = service::status(&ctx, &service::SystemRunner).ok()?;
-    Some(ServiceInfo {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getuid has no preconditions or pointer arguments.
+        let uid = unsafe { libc::getuid() };
+        let jobs =
+            discovery::observe_mac_jobs("launchctl".as_ref(), uid, discovery::MAC_OBSERVE_TIMEOUT);
+        let selected = config_dir.join(super::setup::NODE_FILE);
+        Some(mac_service_info(&selected, &report, &jobs))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(ServiceInfo {
+            line: report.to_string(),
+            installed: Some(report.installed == service::Installed::Ours),
+            running: report.running,
+        })
+    }
+}
+
+/// Decide the macOS service line for `selected` from the installed report and
+/// the bounded launchd observations. An owned plist alone is not enough: when
+/// a current job is loaded and its live argv names another config, this config
+/// has no service, so the owned state is not attributed to it.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn mac_service_info(
+    selected: &Path,
+    report: &crate::native_cli::service::StatusReport,
+    jobs: &[discovery::MacServiceJob],
+) -> ServiceInfo {
+    use crate::native_cli::service::{Installed, LAUNCHD_LABEL};
+    let current = jobs.iter().find(|job| job.label == LAUNCHD_LABEL);
+    let matching = || {
+        jobs.iter()
+            .filter(|job| discovery::same_config(&job.config, selected))
+    };
+    let serving = matching()
+        .find(|job| job.state.as_deref() == Some("running"))
+        .or_else(|| matching().next());
+    if report.installed == Installed::Ours && serving.is_some_and(|job| job.label == LAUNCHD_LABEL)
+    {
+        return ServiceInfo {
+            line: report.to_string(),
+            installed: Some(true),
+            running: report.running,
+        };
+    }
+    if let Some(job) = serving {
+        let (running, word) = match job.state.as_deref() {
+            Some("running") => (Some(true), "running".to_owned()),
+            Some(other) => (Some(false), format!("not running ({other})")),
+            None => (None, "state unknown".to_owned()),
+        };
+        let from = job
+            .path
+            .as_ref()
+            .map(|path| format!(" ({})", path.display()))
+            .unwrap_or_default();
+        return ServiceInfo {
+            line: format!(
+                "external launchd job {}, {word} (not managed by `native service`){from}",
+                job.label
+            ),
+            installed: Some(true),
+            running,
+        };
+    }
+    if report.installed == Installed::Ours {
+        return ServiceInfo {
+            line: if current.is_none() {
+                "current launchd service is installed; cannot confirm it serves this config"
+                    .to_owned()
+            } else {
+                format!(
+                    "no loaded launchd job found serving this config ({})",
+                    selected.display()
+                )
+            },
+            installed: None,
+            running: None,
+        };
+    }
+    ServiceInfo {
         line: report.to_string(),
-        installed: Some(report.installed == Installed::Ours),
-        running: report.running,
-    })
+        installed: Some(false),
+        running: None,
+    }
 }
 
 #[cfg(test)]

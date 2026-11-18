@@ -5,7 +5,7 @@
       "fixtures",
       "p1",
       "0",
-      "/tmp/ontology-rules-ownership-20261003/native-fixtures-p1.json"
+      "/fixtures/output/native-fixtures-p1.json"
     ],
     "started_utc": "2026-10-03T08:59:20.934951+00:00",
     "finished_utc": "2026-10-03T08:59:49.799775+00:00",
@@ -19,7 +19,7 @@
       "calibrate",
       "p1",
       "0",
-      "/tmp/ontology-rules-ownership-20261003/native-calibrate-p1.json"
+      "/fixtures/output/native-calibrate-p1.json"
     ],
     "started_utc": "2026-10-03T08:59:49.800353+00:00",
     "finished_utc": "2026-10-03T08:59:50.943896+00:00",
@@ -33,7 +33,7 @@
       "regex",
       "p1",
       "0",
-      "/tmp/ontology-rules-ownership-20261003/native-regex-p1.json"
+      "/fixtures/output/native-regex-p1.json"
     ],
     "started_utc": "2026-10-03T08:59:50.944691+00:00",
     "finished_utc": "2026-10-03T08:59:51.721782+00:00",
@@ -47,7 +47,7 @@
       "generated",
       "p1",
       "10000",
-      "/tmp/ontology-rules-ownership-20261003/native-generated-p1.json"
+      "/fixtures/output/native-generated-p1.json"
     ],
     "started_utc": "2026-10-03T09:01:15.058854+00:00",
     "finished_utc": "2026-10-03T09:06:30.716922+00:00",

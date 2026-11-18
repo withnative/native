@@ -1,6 +1,105 @@
 use super::*;
 use crate::{events::KERNEL_ROOT_ID, mcp::render};
 
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "candidate_index_tests.rs"]
+mod candidate_index_tests;
+
+#[tokio::test]
+async fn kernel_v2_document_create_mints_id_and_replays_keyed_receipt() {
+    let w = world().await;
+    let package = crate::v2_standard::document_package();
+    let identity = package.identity().unwrap();
+    kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&identity),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let args = json!({"type":"Document","kind":"note","name":"Untitled document",
+        "body":"","home_id":home,"reason":"Docs create contract regression",
+        "idempotency_key":"docs-logical-attempt"});
+    let mut caller_id = args.clone();
+    caller_id["id"] = json!("13425364-7576-4788-8990-aabbccddeeff");
+    let error = call_as(&w, "acct:admin", "create_record", caller_id)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("id is only supported for messaging sends"),
+        "{error}"
+    );
+
+    let receipt = call_as(&w, "acct:admin", "create_record", args.clone())
+        .await
+        .unwrap();
+    let id = receipt["id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(id).is_ok());
+    // Losing the first response cannot lose the transaction's durable receipt.
+    let before_replay = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    let replay = call_as(&w, "acct:admin", "create_record", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(replay, receipt);
+    assert_eq!(
+        before_replay,
+        kernel::dump_all_kernel_tables(&w.db).await.unwrap()
+    );
+    let mut changed = args.clone();
+    changed["name"] = json!("Different request");
+    let error = call_as(&w, "acct:admin", "create_record", changed)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("idempotency_key reused for different request"),
+        "{error}"
+    );
+    let mut distinct = args;
+    distinct["idempotency_key"] = json!("docs-another-attempt");
+    let another = call_as(&w, "acct:admin", "create_record", distinct)
+        .await
+        .unwrap();
+    assert_ne!(another["id"], receipt["id"]);
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_catalogue_refuses_saved_and_composed_reads() {
+    let w = world().await;
+    let args = json!({"sql":"SELECT executor FROM catalog_operations ORDER BY executor"});
+    let error = super::sql::query_stored_saved_sql(&w.db, &w.admin, args)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("catalog_operations"), "{error}");
+    let mut tx = w.db.write_pool().begin().await.unwrap();
+    let reads = std::collections::BTreeSet::from([(
+        "catalog_operations".to_owned(),
+        "executor".to_owned(),
+    )]);
+    let error = super::sql::install(&mut tx, &w.admin, &reads)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("serving executor catalogue"),
+        "{error}"
+    );
+}
+
 pub(super) fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     crate::mcp::register_builtin_tools(&mut registry).unwrap();
@@ -97,6 +196,205 @@ async fn world() -> World {
         hidden: ids[2].clone(),
     }
 }
+#[tokio::test]
+async fn record_hook_v2_matches_records_view_currency() {
+    let w = world().await;
+    let page = call_as(
+        &w,
+        "acct:admin",
+        "query_record",
+        json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+    )
+    .await
+    .unwrap();
+    let direct = call_as(
+        &w,
+        "acct:admin",
+        "query_sql",
+        json!({
+            "sql": "SELECT id, created_at, updated_at_ms, is_current, lifecycle FROM records WHERE id = ?1",
+            "parameters": [{"type": "text", "value": w.first}]
+        }),
+    )
+    .await
+    .unwrap();
+    let row = &page["records"][0];
+    let view = &direct["rows"][0];
+    assert_eq!(row["id"], view["id"], "page={page} direct={direct}");
+    assert_eq!(
+        row["created_at"], view["created_at"],
+        "page={page} direct={direct}"
+    );
+    assert_eq!(
+        row["updated_at_ms"], view["updated_at_ms"],
+        "page={page} direct={direct}"
+    );
+    assert_eq!(
+        row["is_current"], view["is_current"],
+        "page={page} direct={direct}"
+    );
+    assert_eq!(
+        row["lifecycle"], view["lifecycle"],
+        "page={page} direct={direct}"
+    );
+    assert!(row.get("body").is_none());
+    assert!(row.get("body_digest").is_none());
+    assert!(row.get("lifecycle_interpretation").is_some());
+    let hidden = call_as(
+        &w,
+        "acct:viewer",
+        "query_record",
+        json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.hidden]}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hidden["records"].as_array().unwrap().len(), 0);
+    assert!(hidden.get("total").is_none());
+    assert_eq!(hidden["returned"], 0);
+    assert_eq!(hidden["has_more"], false);
+    let metadata = call_as(
+        &w,
+        "acct:admin",
+        "query_record",
+        json!({
+            "projection": "metadata",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(metadata["records"][0].get("updated_at_ms").is_none());
+    assert!(metadata["records"][0].get("is_current").is_none());
+    let prefixed = call_as(
+        &w,
+        "acct:admin",
+        "query_record",
+        json!({
+            "projection": "record_hook.v1",
+            "body_chars": 3,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+    )
+    .await
+    .unwrap();
+    let direct = call_as(
+        &w,
+        "acct:admin",
+        "query_sql",
+        json!({
+            "sql": "SELECT substr(body, 1, ?1) AS body, length(body) AS body_length FROM records WHERE id = ?2",
+            "parameters": [
+                {"type": "integer", "value": "3"},
+                {"type": "text", "value": w.first}
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prefixed["records"][0]["body"], "rev");
+    assert_eq!(prefixed["records"][0]["body_length"], 7);
+    assert_eq!(prefixed["records"][0]["body"], direct["rows"][0]["body"]);
+    assert_eq!(
+        prefixed["records"][0]["body_length"],
+        direct["rows"][0]["body_length"]
+    );
+    assert!(prefixed["records"][0].get("body_digest").is_none());
+    kernel::revise_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        json!({"body": "ab😀cd"}).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    let emoji = call_as(
+        &w,
+        "acct:admin",
+        "query_record",
+        json!({
+            "projection": "record_hook.v1",
+            "body_chars": 3,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+    )
+    .await
+    .unwrap();
+    let emoji_direct = call_as(
+        &w,
+        "acct:admin",
+        "query_sql",
+        json!({
+            "sql": "SELECT substr(body, 1, ?1) AS body, length(body) AS body_length FROM records WHERE id = ?2",
+            "parameters": [
+                {"type": "integer", "value": "3"},
+                {"type": "text", "value": w.first}
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(emoji["records"][0]["body"], "ab😀");
+    assert_eq!(emoji["records"][0]["body_length"], 5);
+    assert_eq!(emoji["records"][0]["body"], emoji_direct["rows"][0]["body"]);
+    assert_eq!(
+        emoji["records"][0]["body_length"],
+        emoji_direct["rows"][0]["body_length"]
+    );
+    let absent = call_as(
+        &w,
+        "acct:admin",
+        "query_record",
+        json!({
+            "projection": "record_hook.v1",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(absent["records"][0].get("body").is_none());
+    assert!(absent["records"][0].get("body_length").is_none());
+    for args in [
+        json!({
+            "projection": "metadata",
+            "body_chars": 3,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+        json!({
+            "projection": "record_hook.v1",
+            "body_chars": 3,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first, w.second]}]
+        }),
+        json!({
+            "projection": "record_hook.v1",
+            "body_chars": 3,
+            "steps": [{"step": "filter", "types": ["Document"], "home_id": "home-1"}]
+        }),
+        json!({
+            "projection": "record_hook.v1",
+            "body_chars": 0,
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+        json!({
+            "projection": "record_hook.v1",
+            "body_chars": "3",
+            "steps": [{"step": "filter", "types": ["Document"], "ids": [w.first]}]
+        }),
+    ] {
+        assert!(
+            call_as(&w, "acct:admin", "query_record", args)
+                .await
+                .is_err(),
+            "selector should be refused"
+        );
+    }
+}
+
 async fn call(world: &World, name: &str, args: Value) -> Result<Value> {
     call_as(world, "acct:viewer", name, args).await
 }
@@ -555,6 +853,134 @@ async fn kernel_v2_comment_resolve_rules_match_v1() {
         nested.to_string().contains("directly on a root"),
         "{nested:#}"
     );
+    world.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_comment_null_lifecycle_is_refused_without_changing_state() {
+    let world = world().await;
+    install_comment_carrier(&world).await;
+    let root = call_as(
+        &world,
+        "acct:admin",
+        "create_record",
+        json!({
+            "type": "Annotation", "kind": "comment", "body": "Question", "lifecycle": "open",
+            "links": [{"target_id": world.first, "relationship": "part_of"}]
+        }),
+    )
+    .await
+    .unwrap();
+    let id = root["id"].as_str().unwrap();
+    for state in ["open", "resolved"] {
+        if state == "resolved" {
+            call_as(
+                &world,
+                "acct:admin",
+                "update_record",
+                json!({
+                    "id": id, "lifecycle": "resolved", "summary": "Answered"
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        for patch in [
+            json!({"id": id, "lifecycle": null}),
+            json!({"id": id, "lifecycle": null, "summary": null}),
+        ] {
+            assert!(call_as(&world, "acct:admin", "update_record", patch)
+                .await
+                .is_err());
+            let read = call_as(&world, "acct:admin", "get_record", json!({"ids": [id]}))
+                .await
+                .unwrap();
+            assert_eq!(read["records"][0]["lifecycle"], state);
+            assert_eq!(
+                read["records"][0]["summary"],
+                if state == "resolved" {
+                    json!("Answered")
+                } else {
+                    Value::Null
+                }
+            );
+        }
+    }
+    world.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_comment_reopen_requires_edit_and_clears_summary() {
+    let world = world().await;
+    install_comment_carrier(&world).await;
+    let root = call_as(
+        &world,
+        "acct:admin",
+        "create_record",
+        json!({
+            "type": "Annotation", "kind": "comment", "body": "Question", "lifecycle": "open",
+            "links": [{"target_id": world.first, "relationship": "part_of"}]
+        }),
+    )
+    .await
+    .unwrap();
+    let id = root["id"].as_str().unwrap();
+    call_as(
+        &world,
+        "acct:admin",
+        "update_record",
+        json!({
+            "id": id, "lifecycle": "resolved", "summary": "Answered"
+        }),
+    )
+    .await
+    .unwrap();
+    // View authorizes a reply, but never a lifecycle write to its root.
+    let reply = call(
+        &world,
+        "create_record",
+        json!({
+            "type": "Annotation", "kind": "comment", "body": "Another question",
+            "links": [{"target_id": id, "relationship": "part_of"}]
+        }),
+    )
+    .await
+    .unwrap();
+    let reopen = json!({"id": id, "lifecycle": "open", "summary": null,
+        "idempotency_key": "comment-reopen"});
+    let denied = call(&world, "update_record", reopen.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("requires edit capability"),
+        "{denied}"
+    );
+    for args in [
+        json!({"id": id, "lifecycle": "open"}),
+        json!({"id": id, "lifecycle": "open", "summary": "Answered"}),
+        json!({"id": reply["id"], "lifecycle": "open", "summary": null}),
+    ] {
+        assert!(call_as(&world, "acct:admin", "update_record", args)
+            .await
+            .is_err());
+    }
+    let mut stale = reopen.clone();
+    stale["if_unmodified_since"] = json!("2000-01-01T00:00:00Z");
+    stale["idempotency_key"] = json!("comment-reopen-stale");
+    assert!(call_as(&world, "acct:admin", "update_record", stale)
+        .await
+        .is_err());
+    call_as(&world, "acct:admin", "update_record", reopen.clone())
+        .await
+        .unwrap();
+    call_as(&world, "acct:admin", "update_record", reopen)
+        .await
+        .unwrap();
+    let read = call_as(&world, "acct:admin", "get_record", json!({"ids": [id]}))
+        .await
+        .unwrap();
+    assert_eq!(read["records"][0]["lifecycle"], "open");
+    assert!(read["records"][0]["summary"].is_null(), "{read}");
     world.db.close().await;
 }
 
@@ -1863,8 +2289,8 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
     ))
     .await;
     let out = out.unwrap();
-    // Includes attachment-scoped blobs and the caller-visible typed-time relation.
-    assert_eq!(out["row_count"], 24);
+    // Includes attachment-scoped blobs, typed times, and the caller viewer.
+    assert_eq!(out["row_count"], 26);
     let names = out["rows"]
         .as_array()
         .unwrap()
@@ -1880,6 +2306,7 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
             "runs",
             "run_intents",
             "actors",
+            "viewer",
             "comment_anchors",
             "vocabularies",
             "vocabulary_values",
@@ -1897,6 +2324,7 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
             "messages_awaiting_reply",
             "catalog_relations",
             "catalog_columns",
+            "catalog_operations",
             "catalog_view_definitions",
         ])
     );
@@ -2175,6 +2603,231 @@ async fn kernel_v2_sql_star_and_generic_currency_are_visibility_scoped() {
     w.db.close().await;
 }
 
+// Keep the supplied kit's query exact: its otherwise small record read observes
+// is_current, including body, logical home and lifecycle alongside metadata.
+fn scoped_currency_kit_query(id: &str) -> Value {
+    json!({"sql":"SELECT id, name, type, kind, lifecycle, summary, home_id, created_at, updated_at, updated_at_ms, is_current, substr(body, 1, 120000) AS body, length(body) AS body_length FROM records WHERE id = ?1 AND deleted_at IS NULL AND archived = 0 AND type IN (?2, ?3, ?4, ?5, ?6) AND COALESCE(kind, '') NOT IN ('artifact', 'attachment', 'query', 'selection') ORDER BY id ASC LIMIT 1",
+        "parameters":[{"type":"text","value":id},{"type":"text","value":"Document"},{"type":"text","value":"Collection"},{"type":"text","value":"Resolution"},{"type":"text","value":"WorkItem"},{"type":"text","value":"Outcome"}]})
+}
+
+async fn scoped_currency_pair(
+    w: &World,
+    credential: &str,
+    args: Value,
+) -> (Value, super::sql::Stats, super::sql::Stats) {
+    let (narrow, stats) =
+        super::sql::measured(call_as(w, credential, "query_sql", args.clone())).await;
+    let (full, full_stats) = super::sql::measured(super::sql::with_full_record_scope_staging(
+        call_as(w, credential, "query_sql", args),
+    ))
+    .await;
+    let narrow = narrow.unwrap();
+    let full = full.unwrap();
+    for field in ["columns", "rows", "row_count", "truncated", "assumed_order"] {
+        assert_eq!(
+            narrow[field], full[field],
+            "{credential}: {field}; narrow={stats:?}; full={full_stats:?}"
+        );
+    }
+    (narrow, stats, full_stats)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_scoped_currency_kit_read_stages_only_direct_visible_sources() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let folder = call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Currency folder","home_id":home}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call_as(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({"id":w.first,"home_id":folder}),
+    )
+    .await
+    .unwrap();
+    let mut unrelated = Vec::new();
+    for index in 0..32 {
+        unrelated.push(
+            kernel::create_as(
+                &w.db,
+                &w.admin,
+                "fixture.mcp",
+                "note",
+                json!({"title":format!("Unrelated {index}")})
+                    .as_object()
+                    .unwrap(),
+                &home,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    for pair in unrelated.windows(2) {
+        kernel::add_generic_link_as(&w.db, &w.admin, &pair[0], &pair[1], "supersedes", None)
+            .await
+            .unwrap();
+    }
+    // Hidden source, a successor of the direct source, and a successor of the
+    // placement dependency must not widen the one-hop frontier.
+    for (source, target) in [
+        (&w.second, &w.first),
+        (&w.hidden, &w.first),
+        (&unrelated[0], &w.second),
+        (&unrelated[1], &folder),
+    ] {
+        kernel::add_generic_link_as(&w.db, &w.admin, source, target, "supersedes", None)
+            .await
+            .unwrap();
+    }
+    for (credential, expected_sources) in [("acct:viewer", 1), ("acct:admin", 2)] {
+        let (out, stats, full) =
+            scoped_currency_pair(&w, credential, scoped_currency_kit_query(&w.first)).await;
+        assert_eq!(out["rows"][0]["is_current"], Value::Null);
+        assert_eq!(out["rows"][0]["home_id"], folder);
+        assert_eq!(stats.staged_currency_records, expected_sources, "{stats:?}");
+        assert!(stats.staged_records <= expected_sources + 2, "{stats:?}");
+        assert!(full.staged_records >= 35, "{full:?}");
+        assert!(
+            stats.staged_records < full.staged_records,
+            "narrow={stats:?}; full={full:?}"
+        );
+        eprintln!("scoped currency work {credential}: narrow={stats:?}; full={full:?}");
+    }
+    // A hidden target never seeds a raw-link frontier, even when a visible
+    // source supersedes it. SELECT * also exercises both currency columns.
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.hidden, "supersedes", None)
+        .await
+        .unwrap();
+    let (out, stats, _) = scoped_currency_pair(&w,"acct:viewer",json!({"sql":"SELECT * FROM records WHERE id=?1","parameters":[{"type":"text","value":w.hidden}]})).await;
+    assert_eq!(out["rows"], json!([]));
+    assert_eq!(stats.staged_records, 0, "{stats:?}");
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_scoped_currency_cycles_revocation_deletion_and_replay_match_full() {
+    let w = world().await;
+    let source_home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let source = kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        json!({"title":"Revocable source"}).as_object().unwrap(),
+        &source_home,
+    )
+    .await
+    .unwrap();
+    for (from, to) in [
+        (&w.first, &w.first),
+        (&w.first, &w.second),
+        (&w.second, &w.first),
+        (&source, &w.first),
+        (&w.hidden, &w.second),
+    ] {
+        kernel::add_generic_link_as(&w.db, &w.admin, from, to, "supersedes", None)
+            .await
+            .unwrap();
+    }
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    // The canonical projector forbids duplicate active triples. A refused
+    // imported duplicate must leave the existing source count unchanged.
+    let duplicate = kernel::generic_links::import_generic_link_as(
+        &w.db,
+        &host,
+        &kernel::GenericLink {
+            link_id: "currency-duplicate-source".into(),
+            source_id: w.second.clone(),
+            target_id: w.first.clone(),
+            relationship: "supersedes".into(),
+            note: None,
+            created_at: "2026-11-09T00:00:00Z".into(),
+            actor: None,
+        },
+    )
+    .await;
+    assert!(matches!(duplicate, Err(Error::Conflict(_))));
+    // An archived, itself-superseded source still contributes under the
+    // existing currency definition; it is not filtered by the caller's type.
+    let revision = kernel::read_record_as(&w.db, &w.admin, &w.second)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    kernel::set_archived_as(&w.db, &w.admin, &w.second, true, revision)
+        .await
+        .unwrap();
+    let args = json!({"sql":"SELECT r.id,r.home_id,r.lifecycle,r.successor_count,r.is_current,(SELECT count(*) FROM facet_values f WHERE f.record_id=r.id) AS facets FROM records r WHERE r.id=?1 OR r.id=?2 ORDER BY r.id","parameters":[{"type":"text","value":w.first},{"type":"text","value":w.second}]});
+    for credential in ["acct:viewer", "acct:admin"] {
+        let (out, _, _) = scoped_currency_pair(&w, credential, args.clone()).await;
+        let first = out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == w.first)
+            .unwrap();
+        assert_eq!(first["successor_count"], 3);
+    }
+    kernel::replace_home_policy(&w.db, &w.admin, &source_home, &[])
+        .await
+        .unwrap();
+    let (out, _, _) = scoped_currency_pair(&w, "acct:viewer", args.clone()).await;
+    assert_eq!(
+        out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == w.first)
+            .unwrap()["successor_count"],
+        2
+    );
+    call_as(
+        &w,
+        "acct:admin",
+        "delete_record",
+        json!({"id":w.second,"reason":"Currency must ignore a deleted successor"}),
+    )
+    .await
+    .unwrap();
+    for credential in ["acct:viewer", "acct:admin"] {
+        scoped_currency_pair(&w, credential, args.clone()).await;
+    }
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    for credential in ["acct:viewer", "acct:admin"] {
+        scoped_currency_pair(&w, credential, args.clone()).await;
+        scoped_currency_pair(&w,credential,json!({"sql":"SELECT * FROM records WHERE id=?1 AND (is_current=1 OR successor_count>0) ORDER BY successor_count","parameters":[{"type":"text","value":w.first}]})).await;
+    }
+    w.db.close().await;
+}
+
 #[tokio::test]
 async fn kernel_v2_sql_run_ledger_preserves_owner_visibility_and_intent_order() {
     let w = world().await;
@@ -2317,6 +2970,17 @@ async fn kernel_v2_sql_imported_home_names_only_visible_folder_records() {
         .unwrap();
     let out=call(&w,"query_sql",json!({"sql":"SELECT home_id FROM records WHERE id=?1","parameters":[{"type":"text","value":w.first}]})).await.unwrap();
     assert_eq!(out["rows"][0]["home_id"], w.second);
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        let (out, _, _) = bounded_placement_get_pair(
+            &w,
+            "acct:viewer",
+            &w.viewer,
+            json!({"ids":[w.first],"children_limit":50}),
+        )
+        .await;
+        assert_eq!(out["records"][0]["home_id"], w.second);
+    }
     let private: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
         .bind(&w.hidden)
         .fetch_one(w.db.pool())
@@ -2330,6 +2994,18 @@ async fn kernel_v2_sql_imported_home_names_only_visible_folder_records() {
         .unwrap();
     let out=call(&w,"query_sql",json!({"sql":"SELECT home_id FROM records WHERE id=?1","parameters":[{"type":"text","value":w.first}]})).await.unwrap();
     assert!(out["rows"][0]["home_id"].is_null());
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        let (out, _, _) = bounded_placement_get_pair(
+            &w,
+            "acct:viewer",
+            &w.viewer,
+            json!({"ids":[w.first,w.second],"children_limit":50}),
+        )
+        .await;
+        assert!(out["records"][0]["home_id"].is_null());
+        assert_eq!(out["records"][1]["status"], "not_found");
+    }
     w.db.close().await;
 }
 
@@ -2464,6 +3140,17 @@ async fn kernel_v2_sql_relations_visibility_and_guards() {
     .await
     .unwrap();
     assert_eq!(out["rows"][0]["n"], 2);
+    kernel::sql_event_projection::catch_up(&w.db).await.unwrap();
+    {
+        let mut conn = w.db.pool().acquire().await.unwrap();
+        assert!(kernel::sql_event_projection::frontier_on(
+            &mut conn,
+            w.db.sql_event_projection_generation()
+        )
+        .await
+        .unwrap()
+        .is_some());
+    }
     // Authored expressions must never run on hidden source rows, even if
     // SQLite pushes a predicate ahead of a join. These stored strings are
     // deliberately invalid JSON; hidden and missing both return zero.
@@ -4615,6 +5302,234 @@ async fn kernel_v2_browser_batched_history_preserves_record_disclosure_and_paylo
         }
     }
     assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    w.db.close().await;
+}
+/// Collection kind:query envelopes stay body-free past the 500-row page
+/// boundary: 600 members open identically with empty and 64KiB bodies, keep
+/// the envelope contract (ordering, visibility, facets, summary, maturity,
+/// persistence, lifecycle interpretation) and carry no body payload.
+#[tokio::test]
+async fn kernel_v2_collection_envelope_ignores_member_bodies() {
+    let w = world().await;
+    // Collection records ride the v1 compat carrier, as in the saved
+    // collection fixture below.
+    install_comment_carrier(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    const MEMBERS: usize = 600;
+    let mut ids = Vec::with_capacity(MEMBERS);
+    for n in 0..MEMBERS {
+        let name = format!("Envelope member {n:04}");
+        let id = kernel::create_as(
+            &w.db,
+            &w.admin,
+            "fixture.mcp",
+            "note",
+            json!({"title": name, "body": ""}).as_object().unwrap(),
+            &home,
+        )
+        .await
+        .unwrap();
+        kernel::observe_facet_as(
+            &w.db,
+            &w.admin,
+            &id,
+            &kernel::FacetObservation {
+                key: "source".into(),
+                value: Some("envelope-probe".into()),
+                value_num: None,
+                vocab_ref: None,
+                as_of: crate::store::now_iso(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    // One more candidate the viewer must never see: membership is authorized,
+    // so it stays out of every page and never reaches the batched fetch.
+    let hidden_home = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let hidden_probe = kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        json!({"title": "Envelope member hidden", "body": ""})
+            .as_object()
+            .unwrap(),
+        &hidden_home,
+    )
+    .await
+    .unwrap();
+    ids.push(hidden_probe.clone());
+    // A short substring filter names the whole 600-row corpus (including the
+    // hidden probe, which authorization still filters) without listing 601
+    // UUIDs in the saved definition.
+    let query = json!({"v":"0.2","query":{"steps":[{"step":"filter","name_contains":"Envelope member"}],"order":"name_asc"}}).to_string();
+    let coll = call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"query","name":"Envelope bodies","home_id":home,"facets":{"query":query},"reason":"envelope body-freedom fixture"}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (key, value) in [
+        ("query", query),
+        ("input_membership", "all_matching".to_owned()),
+    ] {
+        kernel::observe_facet_as(
+            &w.db,
+            &w.admin,
+            &coll,
+            &kernel::FacetObservation {
+                key: key.into(),
+                value: Some(value),
+                value_num: None,
+                vocab_ref: None,
+                as_of: crate::store::now_iso(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let (opened_empty, probe_empty) = super::read_surface::envelope_diagnostics::scoped(call(
+        &w,
+        "open_collection",
+        json!({"id": coll}),
+    ))
+    .await;
+    let opened_empty = opened_empty.unwrap();
+    assert_eq!(opened_empty["status"], "opened", "{opened_empty:#}");
+    // The whole open hydrates zero body bytes: member rows ride the private
+    // envelope width, and the one remaining full read (the collection
+    // descriptor) carries no body. The definition facet read is the only
+    // per-record transaction; member facets arrive in two page-scoped
+    // fetches across the 500-row boundary.
+    assert_eq!(probe_empty.body_bytes, 0);
+    assert_eq!(probe_empty.facet_transactions, 1);
+    assert_eq!(probe_empty.envelope_pages, 2);
+    let members_empty = opened_empty["input"]["records"].as_array().unwrap();
+    // 600 visible members cross the 500-row page boundary; the hidden probe
+    // is filtered by authorization, not by paging.
+    assert_eq!(members_empty.len(), MEMBERS);
+    assert_eq!(members_empty[0]["name"], "Envelope member 0000");
+    assert_eq!(members_empty[MEMBERS - 1]["name"], "Envelope member 0599");
+    assert!(!opened_empty.to_string().contains(&hidden_probe));
+    for record in members_empty {
+        for field in [
+            "id",
+            "type",
+            "kind",
+            "name",
+            "summary",
+            "lifecycle_interpretation",
+            "maturity",
+            "persistence",
+            "facets",
+        ] {
+            assert!(record.get(field).is_some(), "{field}");
+        }
+        assert!(record.get("body").is_none());
+        assert!(record.get("body_digest").is_none());
+        assert!(record.get("historical_claims").is_none());
+        assert_eq!(record["persistence"], "enduring");
+        assert_eq!(record["facets"]["source"], "envelope-probe");
+    }
+    let bytes_empty = serde_json::to_vec(&opened_empty).unwrap().len();
+    // Grow every member body to 64KiB. A body-free envelope must not move.
+    let big = "B".repeat(65536);
+    for id in ids.iter().filter(|id| *id != &hidden_probe) {
+        kernel::revise_as(
+            &w.db,
+            &w.admin,
+            id,
+            json!({"body": big}).as_object().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let (opened_big, probe_big) = super::read_surface::envelope_diagnostics::scoped(call(
+        &w,
+        "open_collection",
+        json!({"id": coll}),
+    ))
+    .await;
+    let opened_big = opened_big.unwrap();
+    assert_eq!(probe_big.body_bytes, 0);
+    assert_eq!(probe_big.facet_transactions, 1);
+    assert_eq!(probe_big.envelope_pages, 2);
+    let bytes_big = serde_json::to_vec(&opened_big).unwrap().len();
+    eprintln!("collection envelope members={MEMBERS} empty_bytes={bytes_empty} big_bytes={bytes_big} loads={} pages={}", probe_big.body_loads, probe_big.envelope_pages);
+    assert!(
+        !serde_json::to_string(&opened_big)
+            .unwrap()
+            .contains(&big[..1024]),
+        "no member body bytes reach the envelope"
+    );
+    assert_eq!(opened_empty, opened_big);
+    // Old-style oracle: the exact work the previous resolver performed for
+    // real on the same 64KiB fixture — full-hydration paging plus one facet
+    // transaction per member. This is the work the envelope no longer pays.
+    // The oracle filters by the same substring, so it pages the same corpus.
+    let visible_ids: Vec<String> = ids
+        .iter()
+        .filter(|id| *id != &hidden_probe)
+        .cloned()
+        .collect();
+    let (oracle, probe_oracle) =
+        super::read_surface::envelope_diagnostics::scoped(async {
+            let mut hydrated = Vec::new();
+            let mut offset = 0;
+            loop {
+                let page = super::read_surface::query_record(
+                    &w.db,
+                    &w.viewer,
+                    json!({"steps":[{"step":"filter","name_contains":"Envelope member"}],"order":"name_asc","limit":500,"offset":offset}),
+                )
+                .await
+                .unwrap();
+                let members = page["records"].as_array().unwrap().clone();
+                if members.is_empty() {
+                    break;
+                }
+                offset += members.len() as i64;
+                hydrated.extend(members);
+                if page["has_more"] != true {
+                    break;
+                }
+            }
+            for id in &visible_ids {
+                super::metadata_reads::facet_values(&w.db, &w.viewer, id)
+                    .await
+                    .unwrap();
+            }
+            hydrated
+        })
+        .await;
+    assert_eq!(oracle.len(), MEMBERS);
+    let oracle_bytes = serde_json::to_vec(&oracle).unwrap().len();
+    eprintln!("collection envelope oracle rows={} hydrated_bytes={oracle_bytes} body_loads={} body_bytes={} facet_transactions={}", oracle.len(), probe_oracle.body_loads, probe_oracle.body_bytes, probe_oracle.facet_transactions);
+    assert_eq!(probe_oracle.body_loads, MEMBERS as u64);
+    assert_eq!(probe_oracle.body_bytes, MEMBERS as u64 * 65536);
+    assert_eq!(probe_oracle.facet_transactions, MEMBERS as u64);
+    assert_eq!(probe_oracle.envelope_pages, 0);
+    assert!(
+        oracle_bytes > 30_000_000,
+        "the oracle really hydrated member bodies"
+    );
     w.db.close().await;
 }
 async fn saved_collection_fixture() -> (World, Db, String, Vec<String>) {
@@ -6957,13 +7872,32 @@ async fn kernel_v2_suggestions_stale_and_reject_replay_match_v1() {
             .await
             .unwrap()
     );
+    // A keyed accept commits once and replays identically on the kernel
+    // engine, matching V1's receipt.
+    let fresh = make_suggestion(&w, &v1, None, "replacement", "none").await;
+    let keyed = json!({"action":"accept","suggestion_ids":[fresh],"reason":"keyed accept","idempotency_key":"accept-proof"});
+    let first = compare_suggestion(&w, &v1, keyed.clone()).await;
+    assert_eq!(first["status"], "accepted", "{first}");
+    let replayed = call_as(&w, "acct:admin", "resolve_suggestions", keyed.clone())
+        .await
+        .unwrap();
+    assert_eq!(replayed, first);
     let mut changed = args.clone();
     changed["reason"] = json!("changed");
     assert!(call_as(&w, "acct:admin", "resolve_suggestions", changed)
         .await
         .is_err());
-    for args in [
+    // A keyed accept of an already-resolved suggestion is a structured
+    // conflict on both engines: the key replays only what it first wrote,
+    // and this key wrote nothing.
+    let resolved = compare_suggestion(
+        &w,
+        &v1,
         json!({"action":"accept","suggestion_ids":[id],"reason":"keyed","idempotency_key":"accept"}),
+    )
+    .await;
+    assert_eq!(resolved["status"], "conflict", "{resolved}");
+    for args in [
         json!({"action":"reject","suggestion_ids":[id],"reason":"preview","dry_run":true}),
         json!({"action":"accept","suggestion_ids":[id],"reason":"unsupported","replacement":{"text":"forbidden"}}),
     ] {
@@ -8489,6 +9423,337 @@ async fn kernel_v2_browser_bounded_get_matches_full_staging_for_filing_and_windo
 
 #[cfg(feature = "v2-kernel-probe")]
 #[tokio::test]
+async fn kernel_v2_browser_bounded_get_move_destinations_match_full_placement() {
+    let w = Box::pin(world()).await;
+    Box::pin(install_comment_carrier(&w)).await;
+    let package = crate::v2_standard::document_package();
+    let identity = package.identity().unwrap();
+    Box::pin(kernel::install_package_as(&w.db, &w.admin, &package))
+        .await
+        .unwrap();
+    Box::pin(kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&identity),
+        &package.declared_reads,
+    ))
+    .await
+    .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let mut folders = Vec::new();
+    for name in ["Move source", "Move destination"] {
+        folders.push(
+            bounded_placement_call(
+                &w,
+                "acct:admin",
+                "create_record",
+                json!({"type":"Collection","kind":"folder","name":name,"home_id":home}),
+            )
+            .await
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let create_note = |name: &str, parent: &str, private: bool| {
+        let mut args = json!({"type":"Document","kind":"note","name":name,"body":"placement fixture","home_id":parent});
+        if private {
+            args["access_policy"] = json!("account_only");
+        }
+        args
+    };
+    let mover = bounded_placement_call(
+        &w,
+        "acct:admin",
+        "create_record",
+        create_note("Moving child", &home, false),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let private = bounded_placement_call(
+        &w,
+        "acct:admin",
+        "create_record",
+        create_note("Private child", &folders[0], true),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let private_home = kernel::read_record_as(&w.db, &w.admin, &private)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    assert_ne!(private_home, folders[0]);
+    let descendant = bounded_placement_call(
+        &w,
+        "acct:admin",
+        "create_record",
+        create_note("Unmoved descendant", &folders[0], false),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let descendant_home = kernel::read_record_as(&w.db, &w.admin, &descendant)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    // Historical destination membership is deliberately a superset: moving
+    // away cannot retain the child in the previous parent's exact window.
+    for (index, destination) in [&folders[0], &folders[1], &folders[0]]
+        .into_iter()
+        .enumerate()
+    {
+        bounded_placement_call(
+            &w,
+            "acct:admin",
+            "update_record",
+            json!({"id":mover,"home_id":destination}),
+        )
+        .await
+        .unwrap();
+        // A projected receipt can name a logical parent independently of
+        // storage. This ordinary fixture has no mapped self-home, so only
+        // the logical-destination union can nominate it as a folder child.
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT ?1,id,'kernel.record_rehomed.v2',json_object('new_home_id',home_id,'logical_home_id',?2,'parent_update',NULL),?3,created_at,1,'legacy_unknown' FROM kernel_records WHERE id=?4")
+            .bind(format!("bounded-logical-move:{index}")).bind(destination).bind(&w.admin).bind(&w.second).execute(w.db.write_pool()).await.unwrap();
+        bounded_placement_call(
+            &w,
+            "acct:admin",
+            "update_record",
+            json!({"id":private,"home_id":destination}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kernel::read_record_as(&w.db, &w.admin, &private)
+                .await
+                .unwrap()
+                .unwrap()
+                .home_id,
+            private_home
+        );
+        for (credential, actor) in [("acct:admin", &w.admin), ("acct:viewer", &w.viewer)] {
+            let (out, _, _) = bounded_placement_get_pair(
+                &w,
+                credential,
+                actor,
+                json!({"ids":folders,"children_limit":50}),
+            )
+            .await;
+            for record in out["records"].as_array().unwrap() {
+                let children = record["children"].as_array().unwrap();
+                assert_eq!(
+                    children.iter().any(|row| row["id"] == mover),
+                    record["id"] == *destination
+                );
+                assert_eq!(
+                    children.iter().any(|row| row["id"] == w.second),
+                    record["id"] == *destination
+                );
+                assert_eq!(
+                    children.iter().any(|row| row["id"] == private),
+                    credential == "acct:admin" && record["id"] == *destination
+                );
+            }
+        }
+    }
+    // A newer legacy receipt with no logical destination restores physical
+    // filing, even though older moves still nominate this row for both folders.
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'bounded-logical-fallback',id,'kernel.record_rehomed.v1',json_object('new_home_id',home_id),?2,created_at,1,'legacy_unknown' FROM kernel_records WHERE id=?1")
+        .bind(&w.second).bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+    for (credential, actor) in [("acct:admin", &w.admin), ("acct:viewer", &w.viewer)] {
+        let (out, _, _) = bounded_placement_get_pair(
+            &w,
+            credential,
+            actor,
+            json!({"ids":[folders[0],folders[1],w.second],"children_limit":50}),
+        )
+        .await;
+        for record in &out["records"].as_array().unwrap()[..2] {
+            assert!(!record["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == w.second));
+        }
+        assert_eq!(out["records"][2]["home_id"], home);
+    }
+    // Moving the folder changes its own placement and reparents its bound
+    // policy home; the descendant's own physical home remains unchanged.
+    bounded_placement_call(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({"id":folders[0],"home_id":folders[1]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        kernel::read_record_as(&w.db, &w.admin, &descendant)
+            .await
+            .unwrap()
+            .unwrap()
+            .home_id,
+        descendant_home
+    );
+    // Retained v1 moves may have no logical destination. In that case current
+    // physical/mapped placement still supplies the child's candidate branch.
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'bounded-legacy-move',id,'kernel.record_rehomed.v1',json_object('new_home_id',home_id),?2,created_at,1,'legacy_unknown' FROM kernel_records WHERE id=?1")
+        .bind(&descendant).bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+    for (credential, actor) in [("acct:admin", &w.admin), ("acct:viewer", &w.viewer)] {
+        bounded_placement_get_pair(
+            &w,
+            credential,
+            actor,
+            json!({"ids":[folders[0],folders[1],descendant,private],"children_limit":50}),
+        )
+        .await;
+    }
+    // A visible row can retain a hidden logical parent under an independent
+    // imported policy home. Its body stays visible and its parent stays hidden.
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let mapped = kernel::hq::v1_import_home_id(&w.hidden);
+    kernel::hq::import_home_as(
+        &w.db,
+        &host,
+        &mapped,
+        &w.hidden,
+        KERNEL_ROOT_ID,
+        &w.admin,
+        Some(&[(&w.viewer, "view")]),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&mapped)
+        .bind(&w.first)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let (out, _, _) = bounded_placement_get_pair(
+        &w,
+        "acct:viewer",
+        &w.viewer,
+        json!({"ids":[w.first,w.hidden],"children_limit":50}),
+    )
+    .await;
+    assert_eq!(out["records"][0]["status"], "found");
+    assert!(out["records"][0]["home_id"].is_null());
+    assert_eq!(out["records"][1]["status"], "not_found");
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+// These tests await many registry calls. Erase their large debug future types
+// at construction so they do not all occupy the outer test's stack frame.
+fn bounded_placement_call<'a>(
+    w: &'a World,
+    credential: &'a str,
+    tool: &'a str,
+    args: Value,
+) -> futures::future::BoxFuture<'a, Result<Value>> {
+    Box::pin(call_as(w, credential, tool, args))
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn bounded_placement_get_pair<'a>(
+    w: &'a World,
+    credential: &'a str,
+    actor: &'a str,
+    args: Value,
+) -> futures::future::BoxFuture<'a, (Value, sql::Stats, sql::Stats)> {
+    Box::pin(async move {
+        let reads = [
+            ("records", "id"),
+            ("records", "type"),
+            ("records", "kind"),
+            ("records", "name"),
+            ("records", "archived"),
+            ("records", "created_at"),
+            ("records", "home_id"),
+            ("links", "source_id"),
+            ("links", "target_id"),
+            ("links", "relationship"),
+        ];
+        let (full, full_stats) = Box::pin(sql::measured(kernel::read_cache::scope_request(
+            sql::with_read_session(
+                &w.db,
+                actor,
+                &reads,
+                super::get_record_in_session(&w.db, actor, args.clone()),
+            ),
+        )))
+        .await;
+        let (narrow, narrow_stats) =
+            sql::measured(bounded_placement_call(w, credential, "get_record", args)).await;
+        let narrow = narrow.unwrap();
+        // The registry attaches transport run context; the internal full-session
+        // oracle returns only the data payload. Compare every other top-level key.
+        let mut full = full.unwrap();
+        let mut narrow_payload = narrow.clone();
+        full.as_object_mut().unwrap().remove("run_context");
+        narrow_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("run_context");
+        assert_eq!(narrow_payload, full, "{credential}");
+        (narrow, narrow_stats, full_stats)
+    })
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_bounded_get_unrelated_move_history_does_not_stage_records() {
+    let w = Box::pin(world()).await;
+    small_read_unrelated_fixture(&w).await;
+    for (credential, actor) in [("acct:admin", &w.admin), ("acct:viewer", &w.viewer)] {
+        let args = json!({"ids":[w.first],"children_limit":50});
+        let (before, before_stats, _) =
+            bounded_placement_get_pair(&w, credential, actor, args.clone()).await;
+        // These serving fixtures include explicit logical destinations and
+        // old v1 receipts with only physical destinations. Neither visits the
+        // requested parent; all 300 used to enter the blanket move union.
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT ?1||r.id||':'||x,r.id,CASE WHEN x=2 THEN 'kernel.record_rehomed.v2' ELSE 'kernel.record_rehomed.v1' END,CASE WHEN x=3 THEN json_object('new_home_id',r.home_id) ELSE json_object('new_home_id',r.home_id,'logical_home_id',r.home_id,'parent_update',NULL) END,?2,r.created_at,1,'legacy_unknown' FROM n CROSS JOIN kernel_records r WHERE r.id LIKE 'small:unrelated:%'")
+            .bind(format!("bounded-unrelated:{credential}:" )).bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+        let (after, after_stats, full_stats) =
+            bounded_placement_get_pair(&w, credential, actor, args).await;
+        assert_eq!(after, before);
+        assert_eq!(after_stats.installations, 1);
+        assert_eq!(after_stats.staged_records, before_stats.staged_records);
+        assert_eq!(
+            after_stats.staged_metadata_records,
+            before_stats.staged_metadata_records
+        );
+        assert!(
+            after_stats.staged_records + 300 <= full_stats.staged_records,
+            "narrow={after_stats:?}, full={full_stats:?}"
+        );
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
 async fn kernel_v2_browser_readiness_requires_indexes_and_current_headers() {
     let w = world().await;
     for index in [
@@ -8972,6 +10237,49 @@ async fn kernel_v2_browser_counted_query_never_decodes_a_hidden_carrier() {
             .await
             .is_err(),
         "a visible malformed carrier still reports its decoding failure"
+    );
+    w.db.close().await;
+}
+
+/// The counted window now reads its exact total from the page itself
+/// (`count(*) OVER ()`), falling back to a separate count only for an empty
+/// page past offset 0. Totals and windows must still match the group scan at
+/// every offset, including past the end.
+#[tokio::test]
+async fn kernel_v2_counted_window_total_matches_group_scan_at_every_offset() {
+    let w = world().await;
+    for offset in [0, 1, 2, 5, 1_000] {
+        for limit in [1, 2, 100] {
+            let args = json!({"steps":[{"step":"filter","types":["Document"]}],"limit":limit,"offset":offset});
+            let actual = call(&w, "query_record", args.clone()).await.unwrap();
+            let expected = kernel::search_v2::FORCE_GROUP_SCAN
+                .scope(true, call(&w, "query_record", args))
+                .await
+                .unwrap();
+            assert_eq!(actual, expected, "offset {offset} limit {limit}");
+        }
+    }
+    let full = call(
+        &w,
+        "query_record",
+        json!({"steps":[{"step":"filter","types":["Document"]}],"limit":100}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        full["total"].as_u64().unwrap() >= 2,
+        "fixture needs several documents: {full}"
+    );
+    let past_end = call(
+        &w,
+        "query_record",
+        json!({"steps":[{"step":"filter","types":["Document"]}],"limit":5,"offset":1_000}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        past_end["total"], full["total"],
+        "an empty page past the end still reports the exact total"
     );
     w.db.close().await;
 }
@@ -10199,7 +11507,7 @@ async fn kernel_v2_named_views_catalog_is_visible_verified_and_hosted_only() {
     kernel::named_views::publish(&w.db, &w.admin, &w.hidden, "view_hidden")
         .await
         .unwrap();
-    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name,identity,caller_relative,profiles,comment FROM catalog_relations WHERE relation_name LIKE 'view_%' ORDER BY relation_name"})).await.unwrap();
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name,identity,caller_relative,profiles,comment FROM catalog_relations WHERE substr(relation_name,1,5)='view_' ORDER BY relation_name"})).await.unwrap();
     // Slice 1 carriers fold for compatibility, but retained discovery does
     // not reconstruct immutable revisions from present-day facets.
     assert_eq!(out["row_count"], 0);
@@ -10221,7 +11529,7 @@ async fn kernel_v2_named_views_catalog_is_visible_verified_and_hosted_only() {
             .await
             .unwrap();
     let (catalog, stats) = super::sql::measured(super::sql::query_sql(&offline, &w.viewer,
-        json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"}))).await;
+        json!({"sql":"SELECT relation_name FROM catalog_relations WHERE substr(relation_name,1,5)='view_'"}))).await;
     assert_eq!(catalog.unwrap()["row_count"], 0);
     assert_eq!(stats.named_registry_loads, 0);
     assert!(super::sql::query_sql(
@@ -10246,7 +11554,7 @@ async fn kernel_v2_named_views_catalog_is_visible_verified_and_hosted_only() {
         &["records"],
     );
     named_view_save(&w, &w.first, &changed).await;
-    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"})).await.unwrap();
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name FROM catalog_relations WHERE substr(relation_name,1,5)='view_'"})).await.unwrap();
     assert_eq!(out["row_count"], 0);
 }
 
@@ -11163,7 +12471,7 @@ async fn kernel_v2_named_views_bad_binding_isolated_from_catalog_and_good_view()
             .unwrap();
         for relation in ["catalog_relations", "catalog_columns"] {
             let out = super::sql::query_sql(&w.db, &w.viewer,
-                json!({"sql":format!("SELECT relation_name FROM {relation} WHERE relation_name LIKE 'view_%' ORDER BY relation_name")})).await.unwrap();
+                json!({"sql":format!("SELECT relation_name FROM {relation} WHERE substr(relation_name,1,5)='view_' ORDER BY relation_name")})).await.unwrap();
             assert_eq!(out["row_count"], 0);
             assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
         }
@@ -11197,7 +12505,7 @@ async fn kernel_v2_named_views_bad_binding_isolated_from_catalog_and_good_view()
         bad_definition["sql"] = json!(bad_sql);
         named_view_save(&w, &w.first, &bad_definition).await;
         let out = super::sql::query_sql(&w.db, &w.viewer,
-            json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"})).await.unwrap();
+            json!({"sql":"SELECT relation_name FROM catalog_relations WHERE substr(relation_name,1,5)='view_'"})).await.unwrap();
         assert_eq!(out["row_count"], 0);
         assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
         let error =
@@ -11288,3 +12596,7836 @@ async fn named_view_detail_catalog_refuses_stored_unpinned_and_pinned_reads() {
     .await
     .unwrap();
 }
+
+#[path = "containment_cache_proof.rs"]
+mod containment_cache_proof;
+
+#[tokio::test]
+async fn kernel_v2_viewer_matches_actor_names_without_history() {
+    let w = world().await;
+    let newcomer =
+        kernel::create_principal(&w.db, "account", "Fallback", "acct:newcomer", &w.admin)
+            .await
+            .unwrap();
+    let query = |sql: &str| json!({"sql":sql});
+    let viewer_sql = "SELECT person_id, display_name FROM viewer";
+    let author_sql = "SELECT person_id, display_name FROM actors WHERE actor=current_principal()";
+    let before = call_as(&w, "acct:newcomer", "query_sql", query(viewer_sql))
+        .await
+        .unwrap();
+    assert_eq!(
+        before["rows"],
+        json!([{"person_id":null,"display_name":"Fallback"}])
+    );
+    assert_eq!(
+        call_as(
+            &w,
+            "acct:newcomer",
+            "query_sql",
+            query("SELECT count(*) AS n FROM viewer")
+        )
+        .await
+        .unwrap()["rows"][0]["n"],
+        1
+    );
+    assert_eq!(
+        call_as(&w, "acct:newcomer", "query_sql", query(author_sql))
+            .await
+            .unwrap()["rows"],
+        json!([])
+    );
+    // The admin's first write already exists in world(). Test every person
+    // state against that caller's actual author row in the same snapshot.
+    sqlx::query("INSERT INTO kernel_message_people(person_id,principal_id) VALUES(?,?)")
+        .bind(&w.first)
+        .bind(&w.admin)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    for name in [
+        Some("Alice".to_owned()),
+        None,
+        Some("x".repeat(1501)),
+        Some("  Alice \t ".to_owned()),
+    ] {
+        sqlx::query(
+            "UPDATE kernel_record_fields SET value_json=? WHERE record_id=? AND name='title'",
+        )
+        .bind(serde_json::to_string(&name).unwrap())
+        .bind(&w.first)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+        let viewer = call_as(&w, "acct:admin", "query_sql", query(viewer_sql))
+            .await
+            .unwrap();
+        let author = call_as(&w, "acct:admin", "query_sql", query(author_sql))
+            .await
+            .unwrap();
+        assert_eq!(viewer["rows"], author["rows"]);
+        assert_eq!(
+            viewer["rows"][0]["display_name"],
+            json!(name.unwrap_or_else(|| "Admin".into()))
+        );
+    }
+    // An earlier hidden directory row must not mask a later visible person.
+    // The caller can see many workspace records, but viewer stages just its
+    // candidate people (one visible record here).
+    for (source, person) in [("viewer:0", &w.hidden), ("viewer:1", &w.first)] {
+        sqlx::query("INSERT INTO kernel_v1_state(section,source_id,origin,payload,account_principal,record_id,observed_at,event_seq) VALUES('account_directory',?,'test','{}',?,?,'2026-11-06T00:00:00Z',1)")
+            .bind(source).bind(&w.viewer).bind(person).execute(w.db.write_pool()).await.unwrap();
+    }
+    let (visible_viewer, stats) =
+        sql::measured(call_as(&w, "acct:viewer", "query_sql", query(viewer_sql))).await;
+    assert_eq!(visible_viewer.unwrap()["rows"][0]["person_id"], w.first);
+    assert_eq!(stats.staged_records, 1);
+    sqlx::query(
+        "DELETE FROM kernel_v1_state WHERE account_principal=? AND section='account_directory'",
+    )
+    .bind(&w.viewer)
+    .execute(w.db.write_pool())
+    .await
+    .unwrap();
+    // Retained import state can have several directory source rows for
+    // one principal. The viewer stays a singleton and names an actual author.
+    for (source, person) in [
+        ("viewer:a", &w.first),
+        ("viewer:b", &w.first),
+        ("viewer:z", &w.second),
+    ] {
+        sqlx::query("INSERT INTO kernel_v1_state(section,source_id,origin,payload,account_principal,record_id,observed_at,event_seq) VALUES('account_directory',?,'test','{}',?,?,'2026-11-06T00:00:00Z',1)")
+            .bind(source).bind(&w.admin).bind(person).execute(w.db.write_pool()).await.unwrap();
+    }
+    let singleton = call_as(&w, "acct:admin", "query_sql", query(viewer_sql))
+        .await
+        .unwrap();
+    let authors = call_as(&w, "acct:admin", "query_sql", query(author_sql))
+        .await
+        .unwrap();
+    assert_eq!(singleton["rows"].as_array().unwrap().len(), 1);
+    assert!(authors["rows"]
+        .as_array()
+        .unwrap()
+        .contains(&singleton["rows"][0]));
+    assert_eq!(singleton["rows"][0]["person_id"], w.first);
+    sqlx::query("DELETE FROM kernel_v1_state WHERE section='account_directory' AND source_id LIKE 'viewer:%'")
+        .execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("DELETE FROM kernel_message_people WHERE principal_id=?")
+        .bind(&w.admin)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let viewer = call_as(&w, "acct:admin", "query_sql", query(viewer_sql))
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer["rows"],
+        call_as(&w, "acct:admin", "query_sql", query(author_sql))
+            .await
+            .unwrap()["rows"]
+    );
+    let own_home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&newcomer, "edit")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    kernel::create_as(
+        &w.db,
+        &newcomer,
+        "fixture.mcp",
+        "note",
+        json!({"title":"First write"}).as_object().unwrap(),
+        &own_home,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        call_as(&w, "acct:newcomer", "query_sql", query(viewer_sql))
+            .await
+            .unwrap()["rows"],
+        call_as(&w, "acct:newcomer", "query_sql", query(author_sql))
+            .await
+            .unwrap()["rows"]
+    );
+    // A person outside this caller's visible homes cannot supply its name.
+    sqlx::query("INSERT INTO kernel_message_people(person_id,principal_id) VALUES(?,?)")
+        .bind(&w.hidden)
+        .bind(&newcomer)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        call_as(&w, "acct:newcomer", "query_sql", query(viewer_sql))
+            .await
+            .unwrap()["rows"],
+        before["rows"]
+    );
+    assert_eq!(
+        call_as(&w, "acct:newcomer", "query_sql", query(viewer_sql))
+            .await
+            .unwrap()["rows"],
+        call_as(&w, "acct:newcomer", "query_sql", query(author_sql))
+            .await
+            .unwrap()["rows"]
+    );
+    sqlx::query("DELETE FROM kernel_message_people WHERE principal_id=?")
+        .bind(&newcomer)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO kernel_message_people(person_id,principal_id) VALUES(?,?)")
+        .bind(&w.second)
+        .bind(&w.admin)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    call_as(
+        &w,
+        "acct:admin",
+        "delete_record",
+        json!({"id":w.second,"reason":"viewer lifecycle parity"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        call_as(&w, "acct:admin", "query_sql", query(viewer_sql))
+            .await
+            .unwrap()["rows"],
+        call_as(&w, "acct:admin", "query_sql", query(author_sql))
+            .await
+            .unwrap()["rows"]
+    );
+}
+
+#[tokio::test]
+async fn kernel_v2_get_links_preserve_provider_source_identity_direction_and_visibility() {
+    use crate::v2_standard::relates_to::{Command, Source};
+    let w = world().await;
+    let package = crate::v2_standard::relates_to::package();
+    let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&installed),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let source = kernel::create_record_as(&w.db, &w.admin, &home)
+        .await
+        .unwrap();
+    let target = kernel::create_record_as(&w.db, &w.admin, &home)
+        .await
+        .unwrap();
+    let mut sources = Vec::new();
+    // Two distinct assertions in one direction must not collapse by triple.
+    for (id, from, to) in [
+        ("retained-a", &source, &target),
+        ("retained-b", &source, &target),
+        ("retained-reverse", &target, &source),
+    ] {
+        sources.push(Source {
+            source_id: id.into(),
+            from: from.clone(),
+            to: to.clone(),
+            claimed_author: None,
+            claimed_timestamp: Some("2026-09-03T12:34:56+01:00".into()),
+            note: Some(format!("note for {id}")),
+        });
+    }
+    let request = kernel::prepare_provider_as(
+        &w.db,
+        &w.admin,
+        &source,
+        &target,
+        "retained-links",
+        Command::Assert { sources },
+    )
+    .await
+    .unwrap();
+    let assertion = kernel::commit_provider_as(&w.db, &w.admin, &request)
+        .await
+        .unwrap();
+    let request = kernel::prepare_provider_as(
+        &w.db,
+        &w.admin,
+        &source,
+        &w.hidden,
+        "hidden-link",
+        Command::Assert { sources: vec![] },
+    )
+    .await
+    .unwrap();
+    kernel::commit_provider_as(&w.db, &w.admin, &request)
+        .await
+        .unwrap();
+
+    #[cfg(feature = "v2-kernel-probe")]
+    for credential in ["acct:admin", "acct:viewer"] {
+        let args = json!({"id":source});
+        let expected = call_as(&w, credential, "render_record", args.clone())
+            .await
+            .unwrap();
+        let (actual, details) = small_read_detailed_call(
+            true,
+            true,
+            false,
+            None,
+            call_as(&w, credential, "render_record", args),
+        )
+        .await;
+        assert_eq!(actual.unwrap(), expected);
+        assert!(!details["candidates"].as_array().unwrap().is_empty());
+        assert_eq!(details["links"].as_array().unwrap().len(), 1);
+        assert_eq!(details["links"][0]["succeeded"], true);
+    }
+
+    let sql = call(&w, "query_sql", json!({"sql":"SELECT id,source_id,target_id,relationship,note,created_at FROM links WHERE source_id=?1 OR target_id=?1 ORDER BY relationship,created_at,id,source_id,target_id", "parameters":[{"type":"text","value":source}]})).await.unwrap();
+    assert_eq!(sql["row_count"], 3);
+    let get = call(&w, "get_record", json!({"ids":[source,target]}))
+        .await
+        .unwrap();
+    for (record, outgoing, incoming) in [(&get["records"][0], 2, 1), (&get["records"][1], 1, 2)] {
+        assert_eq!(record["links_out_count"], outgoing);
+        assert_eq!(record["links_in_count"], incoming);
+        for row in record["links_out"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(record["links_in"].as_array().unwrap())
+        {
+            assert!(sql["rows"].as_array().unwrap().contains(row));
+            assert_eq!(row["created_at"], "2026-09-03T11:34:56.000Z");
+        }
+    }
+    let page = call(
+        &w,
+        "get_record",
+        json!({"ids":[source],"links_limit":1,"links_offset":1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page["records"][0]["links_out_count"], 2);
+    assert_eq!(
+        page["records"][0]["links_out"],
+        json!([get["records"][0]["links_out"][1]])
+    );
+    assert_eq!(page["records"][0]["links_in"], json!([]));
+    let list = call(
+        &w,
+        "manage_links",
+        json!({"action":"list","record_id":source}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list["links_out"], get["records"][0]["links_out"]);
+    assert_eq!(list["links_in"], get["records"][0]["links_in"]);
+
+    let request = kernel::prepare_provider_as(
+        &w.db,
+        &w.admin,
+        &source,
+        &target,
+        "retract-retained",
+        Command::Retract {
+            assertion_id: assertion.assertion_id,
+        },
+    )
+    .await
+    .unwrap();
+    kernel::commit_provider_as(&w.db, &w.admin, &request)
+        .await
+        .unwrap();
+    let get = call(&w, "get_record", json!({"ids":[source]}))
+        .await
+        .unwrap();
+    assert_eq!(get["records"][0]["links_out"], json!([]));
+    assert_eq!(get["records"][0]["links_in"], json!([]));
+
+    // A native assertion still exposes its symmetric pair, now with the same
+    // stable identities and host-stamped creation time as SQL.
+    let request = kernel::prepare_provider_as(
+        &w.db,
+        &w.admin,
+        &source,
+        &target,
+        "native-link",
+        Command::Assert { sources: vec![] },
+    )
+    .await
+    .unwrap();
+    kernel::commit_provider_as(&w.db, &w.admin, &request)
+        .await
+        .unwrap();
+    let get = call(&w, "get_record", json!({"ids":[source]}))
+        .await
+        .unwrap();
+    let sql = call(&w, "query_sql", json!({"sql":"SELECT id,source_id,target_id,relationship,note,created_at FROM links WHERE source_id=?1 OR target_id=?1 ORDER BY id", "parameters":[{"type":"text","value":source}]})).await.unwrap();
+    assert_eq!(sql["row_count"], 2);
+    for row in get["records"][0]["links_out"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(get["records"][0]["links_in"].as_array().unwrap())
+    {
+        assert!(row["id"].is_string());
+        assert!(row["created_at"].is_string());
+        assert!(sql["rows"].as_array().unwrap().contains(row));
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_direct_removal_attachment_is_guarded_retains_bytes_and_replays() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    let attached = call_as(
+        &w,
+        "acct:admin",
+        "attach_text",
+        json!({
+            "record_id":w.first,"text":"retained detached bytes","filename":"detached.txt"
+        }),
+    )
+    .await
+    .unwrap();
+    let id = attached["attachment_id"].as_str().unwrap();
+    let head: i64 = sqlx::query_scalar("SELECT max(seq) FROM content_events WHERE record_id=?")
+        .bind(id)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let bytes: Vec<u8> = sqlx::query_scalar("SELECT b.bytes FROM kernel_blobs b JOIN kernel_attachment_blobs a ON a.sha256=b.sha256 WHERE a.record_id=?")
+        .bind(id).fetch_one(w.db.pool()).await.unwrap();
+    let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    for (credential, args) in [
+        ("acct:viewer", json!({"action":"detach","attachment_id":id})),
+        (
+            "acct:admin",
+            json!({"action":"detach","attachment_id":id,"if_content_seq":head-1}),
+        ),
+        (
+            "acct:admin",
+            json!({"action":"detach","attachment_id":w.first}),
+        ),
+    ] {
+        assert!(call_as(&w, credential, "manage_attachments", args)
+            .await
+            .is_err());
+        assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    }
+    let member = Caller::authenticated("acct:admin")
+        .with_hosting_context("synthetic-admin", "removal-fixture")
+        .with_hosting_member(true)
+        .with_hosting_owner(false);
+    assert!(!member.counter_footing().is_owner());
+    let result = registry()
+        .call_engine(
+            EngineHandle::KernelV2(w.db.clone()),
+            member,
+            "manage_attachments",
+            json!({"action":"detach","attachment_id":id,"if_content_seq":head}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        crate::mcp::counter_fence::find_counters(&result).is_empty(),
+        "{result}"
+    );
+    uuid::Uuid::parse_str(result["event_id"].as_str().unwrap()).unwrap();
+    assert_eq!(result["detached"], true);
+    assert_eq!(result["blob_retained"], true);
+    assert_eq!(result["blob_id"], attached["blob"]["id"]);
+    assert!(kernel::read_record_as(&w.db, &w.admin, id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .is_some());
+    let retained: Vec<u8> = sqlx::query_scalar("SELECT b.bytes FROM kernel_blobs b JOIN kernel_attachment_blobs a ON a.sha256=b.sha256 WHERE a.record_id=?")
+        .bind(id).fetch_one(w.db.pool()).await.unwrap();
+    assert_eq!(bytes, retained);
+    let after = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    assert!(call_as(
+        &w,
+        "acct:admin",
+        "manage_attachments",
+        json!({"action":"detach","attachment_id":id})
+    )
+    .await
+    .is_err());
+    assert_eq!(after, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(after, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_direct_removal_citation_preserves_comment_and_replays() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    call_as(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({
+            "id":w.first,"body_set":"alpha brave revised passage"
+        }),
+    )
+    .await
+    .unwrap();
+    let root = call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({
+            "type":"Annotation","kind":"comment","body":"quoted comment",
+            "links":[{"relationship":"part_of","target_id":w.first}],
+            "target":anchored_target(&w.first,"revised",12,19)
+        }),
+    )
+    .await
+    .unwrap();
+    let id = root["id"].as_str().unwrap();
+    let head: i64 = sqlx::query_scalar("SELECT max(seq) FROM content_events WHERE record_id=?")
+        .bind(id)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    for (credential, args) in [
+        (
+            "acct:viewer",
+            json!({"action":"remove","citation_id":id,"reason":"remove quote"}),
+        ),
+        (
+            "acct:admin",
+            json!({"action":"remove","citation_id":id,"reason":" "}),
+        ),
+        (
+            "acct:admin",
+            json!({"action":"remove","citation_id":id,"reason":"remove quote","if_content_seq":head-1}),
+        ),
+    ] {
+        assert!(call_as(&w, credential, "manage_citations", args)
+            .await
+            .is_err());
+        assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    }
+    let member = Caller::authenticated("acct:admin")
+        .with_hosting_context("synthetic-admin", "removal-fixture")
+        .with_hosting_member(true)
+        .with_hosting_owner(false);
+    assert!(!member.counter_footing().is_owner());
+    let result = registry().call_engine(EngineHandle::KernelV2(w.db.clone()), member,
+        "manage_citations", json!({"action":"remove","citation_id":id,"reason":"remove obsolete quote","if_content_seq":head})
+    ).await.unwrap();
+    assert!(
+        crate::mcp::counter_fence::find_counters(&result).is_empty(),
+        "{result}"
+    );
+    uuid::Uuid::parse_str(result["event_id"].as_str().unwrap()).unwrap();
+    assert_eq!(result["action"], "removed");
+    assert!(kernel::read_record_as(&w.db, &w.admin, id)
+        .await
+        .unwrap()
+        .is_some());
+    let targets: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM kernel_comment_anchors WHERE annotation_id=?")
+            .bind(id)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(targets, 0);
+    let after = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    assert!(call_as(
+        &w,
+        "acct:admin",
+        "manage_citations",
+        json!({"action":"remove","citation_id":id,"reason":"repeat"})
+    )
+    .await
+    .is_err());
+    assert_eq!(after, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(after, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    w.db.close().await;
+}
+
+fn assert_record_read_contract(name: &str) {
+    use crate::mcp::{executor_prototype::ExecutorPrototypeStdioServer, ExperimentalExecutors};
+    let pinned = ExecutorPrototypeStdioServer::pin_hosted_catalogue_for_engine(
+        &registry(),
+        &ExperimentalExecutors::empty(),
+        crate::mcp::McpSurfaceMode::Executor,
+        EngineKind::KernelV2,
+    )
+    .unwrap();
+    assert!(pinned.classify_call("records_read", Some(name)).is_some());
+}
+
+async fn small_read_fixture_record(w: &World, id: &str, home: &str, fields: Value) {
+    sqlx::query("INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT ?1,?2,owner_id,primary_type,kind,?1,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at FROM kernel_records WHERE id=?3")
+        .bind(id).bind(home).bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT ?1,j.key,json_quote(j.value),r.created_seq FROM kernel_records r CROSS JOIN json_each(?2) j WHERE r.id=?3")
+        .bind(id).bind(fields.to_string()).bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+    // Keep raw scale fixtures valid for ordinary authorized metadata reads,
+    // including disclosure names. Native creation folds this row atomically.
+    sqlx::query("INSERT INTO kernel_record_metadata(record_id,persistence,maturity,last_activity_at,event_seq) SELECT ?1,persistence,maturity,last_activity_at,event_seq FROM kernel_record_metadata WHERE record_id=?2")
+        .bind(id).bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+}
+
+async fn small_read_unrelated_fixture(w: &World) {
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<300) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('small:unrelated:%03d',x),?1,r.owner_id,r.primary_type,r.kind,printf('small:unrelated:%03d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?2")
+        .bind(&home).bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn kernel_v2_bootstrap_roots_match_tree_without_unrelated_record_staging() {
+    let w = Box::pin(world()).await;
+    kernel::replace_home_policy(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &[(&w.admin, "manage"), (&w.viewer, "view")],
+    )
+    .await
+    .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    // Native moves use kernel:root; imported native:root aliases are exercised
+    // by the policy fixture. Other children keep their physical ACL home and
+    // use the latest logical move destination.
+    for id in ["root:direct", "root:archived", "root:moved", "root:away"] {
+        small_read_fixture_record(&w, id, &home, json!({"title":id})).await;
+    }
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id='root:direct'")
+        .bind(KERNEL_ROOT_ID)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    for (index, (id, parent)) in [
+        ("root:archived", KERNEL_ROOT_ID),
+        ("root:moved", KERNEL_ROOT_ID),
+        ("root:away", KERNEL_ROOT_ID),
+        ("root:away", home.as_str()),
+        (w.hidden.as_str(), KERNEL_ROOT_ID),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT ?1,id,'kernel.record_rehomed.v2',json_object('new_home_id',home_id,'logical_home_id',?2,'parent_update',NULL),?3,created_at,1,'legacy_unknown' FROM kernel_records WHERE id=?4")
+            .bind(format!("root-preview-move:{index}")).bind(parent).bind(&w.admin).bind(id)
+            .execute(w.db.write_pool()).await.unwrap();
+    }
+    // These are serving-projection fixtures, not complete mutation histories.
+    sqlx::query("INSERT INTO kernel_lifecycle(record_id,archived) VALUES('root:archived',1)")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    // A direct root annotation is visible but belongs to a dedicated family,
+    // so it must not inflate the ordinary tree child count.
+    small_read_fixture_record(
+        &w,
+        "root:annotation",
+        KERNEL_ROOT_ID,
+        json!({"title":"root annotation"}),
+    )
+    .await;
+    sqlx::query("UPDATE kernel_records SET primary_type='Annotation',kind='comment' WHERE id='root:annotation'")
+        .execute(w.db.write_pool()).await.unwrap();
+    for actor in [&w.admin, &w.viewer] {
+        let (before, before_stats) = Box::pin(sql::measured(super::read_surface::bootstrap_roots(
+            &w.db, actor,
+        )))
+        .await;
+        let before = before.unwrap();
+        let count = if actor == &w.admin { 3 } else { 2 };
+        assert_eq!(before[0]["child_count"], count);
+        // Add an unrelated, visible corpus only once; compare with an empty
+        // added corpus first and then with the generic tree oracle for both.
+        if actor == &w.admin {
+            small_read_unrelated_fixture(&w).await;
+        }
+        let (narrow, narrow_stats) = Box::pin(sql::measured(super::read_surface::bootstrap_roots(
+            &w.db, actor,
+        )))
+        .await;
+        let (full, full_stats) = Box::pin(sql::measured(super::read_surface::get_structure(
+            &w.db,
+            actor,
+            json!({"root_id":"native:root","max_depth":0,"max_children_per_node":0}),
+        )))
+        .await;
+        let narrow = narrow.unwrap();
+        assert_eq!(narrow, before);
+        assert_eq!(narrow, full.unwrap()["nodes"]);
+        assert_eq!(narrow_stats.staged_records, before_stats.staged_records);
+        assert_eq!(
+            narrow_stats.staged_metadata_records,
+            before_stats.staged_metadata_records
+        );
+        assert!(
+            narrow_stats.staged_records + 300 <= full_stats.staged_records,
+            "narrow={narrow_stats:?}, full={full_stats:?}"
+        );
+    }
+    let (before, before_stats) = Box::pin(sql::measured(super::read_surface::bootstrap_roots(
+        &w.db, &w.viewer,
+    )))
+    .await;
+    // The reused anchor envelope conservatively retains Collections as
+    // placement witnesses. Measure that residual work honestly: this repair
+    // avoids unrelated ordinary records, but is not independent of all
+    // unrelated containers or policy homes.
+    for index in 0..12 {
+        let id = format!("root:nested-folder:{index}");
+        small_read_fixture_record(&w, &id, &home, json!({"title":id})).await;
+        sqlx::query("UPDATE kernel_records SET primary_type='Collection',kind='folder' WHERE id=?")
+            .bind(&id)
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+    }
+    let (after, after_stats) = Box::pin(sql::measured(super::read_surface::bootstrap_roots(
+        &w.db, &w.viewer,
+    )))
+    .await;
+    assert_eq!(after.unwrap(), before.unwrap());
+    let added = after_stats.staged_records as i128 - before_stats.staged_records as i128;
+    eprintln!("bootstrap root preview: added nested Collections=12, added staged records={added}");
+    assert!(after_stats.staged_records <= before_stats.staged_records + 12);
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_small_name_staging_matches_full_relation_and_exact_ambiguity() {
+    let w = world().await;
+    small_read_unrelated_fixture(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    for (id, placement, fields) in [
+        ("small:duplicate", &home, json!({"title":"Alpha"})),
+        ("small:hidden-duplicate", &private, json!({"title":"Alpha"})),
+        (
+            "small:shadowed",
+            &home,
+            json!({"title":"Display","name":"Alpha"}),
+        ),
+        (
+            "small:empty-title",
+            &home,
+            json!({"title":"","name":"Alpha"}),
+        ),
+        (
+            "small:fallback",
+            &home,
+            json!({"title":null,"name":"Fallback"}),
+        ),
+    ] {
+        small_read_fixture_record(&w, id, placement, fields).await;
+    }
+    for index in 0..105 {
+        small_read_fixture_record(
+            &w,
+            &format!("small:crowded:{index:03}"),
+            &home,
+            json!({"title":"Crowded"}),
+        )
+        .await;
+    }
+    let args = json!({"names":["Alpha","alpha","Display","Fallback","Crowded","Alpha"]});
+    let (full, full_stats) = sql::measured(record_reads::with_full_small_read_staging(call(
+        &w,
+        "resolve_many",
+        args.clone(),
+    )))
+    .await;
+    let (narrow, narrow_stats) = sql::measured(call(&w, "resolve_many", args)).await;
+    let narrow = narrow.unwrap();
+    assert_eq!(narrow, full.unwrap());
+    assert_eq!(narrow["results"][0]["match_count"], 2);
+    assert_eq!(narrow["results"][1]["status"], "not_found");
+    assert_eq!(narrow["results"][2]["match"]["id"], "small:shadowed");
+    assert_eq!(narrow["results"][3]["match"]["id"], "small:fallback");
+    assert_eq!(narrow["results"][4]["match_count"], 105);
+    assert_eq!(
+        narrow["results"][4]["matches"].as_array().unwrap().len(),
+        105
+    );
+    assert_eq!(narrow_stats.installations, 1);
+    assert!(
+        narrow_stats.staged_records + 300 <= full_stats.staged_records,
+        "full={full_stats:?}, narrow={narrow_stats:?}"
+    );
+    assert_eq!(narrow_stats.staged_records, 110);
+}
+
+#[tokio::test]
+async fn record_reads_small_render_staging_matches_full_links_names_and_successors() {
+    use crate::v2_standard::relates_to::Command;
+    let w = world().await;
+    small_read_unrelated_fixture(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let anchor = kernel::create_record_as(&w.db, &w.admin, &home)
+        .await
+        .unwrap();
+    let endpoint = kernel::create_record_as(&w.db, &w.admin, &home)
+        .await
+        .unwrap();
+    for (id, title) in [(&anchor, "Render anchor"), (&endpoint, "Provider endpoint")] {
+        sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'title',json_quote(?2),created_seq FROM kernel_records WHERE id=?1")
+            .bind(id).bind(title).execute(w.db.write_pool()).await.unwrap();
+    }
+    let package = crate::v2_standard::relates_to::package();
+    let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&installed),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    let request = kernel::prepare_provider_as(
+        &w.db,
+        &w.admin,
+        &anchor,
+        &endpoint,
+        "small-render-provider",
+        Command::Assert { sources: vec![] },
+    )
+    .await
+    .unwrap();
+    kernel::commit_provider_as(&w.db, &w.admin, &request)
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &anchor,
+        &w.second,
+        "arbitrary-relationship",
+        None,
+    )
+    .await
+    .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &anchor, "supersedes", None)
+        .await
+        .unwrap();
+    for index in 0..5 {
+        let id = format!("small:successor:{index}");
+        small_read_fixture_record(
+            &w,
+            &id,
+            &home,
+            json!({"title":format!("Successor {index}")}),
+        )
+        .await;
+        kernel::add_generic_link_as(&w.db, &w.admin, &id, &anchor, "supersedes", None)
+            .await
+            .unwrap();
+    }
+    // The SQL links relation retains both legacy and generic provenance.
+    sqlx::query("INSERT INTO kernel_links(source_id,target_id,relationship,created_seq) SELECT 'small:successor:0',?1,'supersedes',created_seq FROM kernel_records WHERE id=?1")
+        .bind(&anchor).execute(w.db.write_pool()).await.unwrap();
+    let args = json!({"id":anchor});
+    let (full, full_stats) = sql::measured(record_reads::with_full_small_read_staging(call(
+        &w,
+        "render_record",
+        args.clone(),
+    )))
+    .await;
+    let (narrow, narrow_stats) = sql::measured(call(&w, "render_record", args)).await;
+    let narrow = narrow.unwrap();
+    assert_eq!(narrow, full.unwrap());
+    let markdown = narrow["markdown"].as_str().unwrap();
+    for name in ["Provider endpoint", "Beta", "arbitrary-relationship"] {
+        assert!(markdown.contains(name), "{markdown}");
+    }
+    assert!(!markdown.contains("Secret"), "{markdown}");
+    assert_eq!(narrow_stats.installations, 1);
+    assert!(
+        narrow_stats.staged_records + 300 <= full_stats.staged_records,
+        "full={full_stats:?}, narrow={narrow_stats:?}"
+    );
+    // Inspect the structured result too: the renderer shows at most 3 of 6
+    // SQL successor rows even though Get deduplicates their link envelope.
+    let actor = w.viewer.clone();
+    let id = anchor.clone();
+    let successors = sql::with_part_of_read_session(
+        &w.db,
+        &w.viewer,
+        &[("records", "id")],
+        std::slice::from_ref(&anchor),
+        sql::in_snapshot(&w.db, &w.viewer, move |conn| {
+            Box::pin(async move { record_reads::render_successors_on(conn, &actor, &id).await })
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(successors.total_count, 6);
+    assert_eq!(successors.items.len(), 3);
+}
+
+#[tokio::test]
+async fn record_reads_resolve_many_visible_shape_and_hidden_cardinality() {
+    assert_record_read_contract("resolve_many");
+    let w = world().await;
+    let out = call(
+        &w,
+        "resolve_many",
+        json!({"names":["Alpha","Secret","Alpha","alpha"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["results"][0]["match"]["id"], w.first);
+    assert_eq!(out["results"][1]["status"], "not_found");
+    assert_eq!(out["results"][2]["match"]["id"], w.first);
+    assert_eq!(
+        out["counts"],
+        json!({"resolved":2,"not_found":2,"ambiguous":0,"not_held":0})
+    );
+    assert!(!out.to_string().contains(&w.hidden));
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    install_comment_carrier(&w).await;
+    let duplicate = kernel::create_json_as(
+        &w.db,
+        &w.admin,
+        crate::v2_standard::v1_compat::FAMILY,
+        crate::v2_standard::v1_compat::KIND,
+        &json!({"v1_type":"Document","v1_kind":"note","title":"Alpha"}).to_string(),
+        &private,
+    )
+    .await
+    .unwrap();
+    let out = call(&w, "resolve_many", json!({"names":["Alpha"]}))
+        .await
+        .unwrap();
+    assert_eq!(out["results"][0]["status"], "resolved");
+    assert!(!out.to_string().contains(&w.hidden));
+    assert!(!out.to_string().contains(&duplicate));
+}
+
+#[tokio::test]
+async fn record_reads_render_record_visible_shape_and_hidden_links() {
+    assert_record_read_contract("render_record");
+    let w = world().await;
+    let out = call(&w, "render_record", json!({"id":w.first}))
+        .await
+        .unwrap();
+    assert_eq!(out["id"], w.first);
+    let markdown = out["markdown"].as_str().unwrap();
+    assert!(markdown.starts_with("# Alpha\n"));
+    assert!(markdown.contains("revised"));
+    assert!(markdown.contains(&w.second));
+    assert!(!markdown.contains(&w.hidden));
+    assert!(!markdown.contains("Secret"));
+    assert!(call(&w, "render_record", json!({"id":w.hidden}))
+        .await
+        .is_err());
+    assert!(call(
+        &w,
+        "render_record",
+        json!({"id":w.first,"include_interpretation":true})
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("interpretation"));
+}
+
+#[tokio::test]
+async fn record_reads_dashboard_visible_shape_and_hidden_counts() {
+    assert_record_read_contract("get_dashboard");
+    let w = world().await;
+    let baseline = call(&w, "get_dashboard", json!({})).await.unwrap();
+    assert_eq!(baseline["lifecycle_census"]["total"], 2);
+    assert_eq!(baseline["active_total"], 0);
+    assert_eq!(baseline["stale_total"], 0);
+    assert!(!baseline.to_string().contains(&w.hidden));
+    assert!(!baseline.to_string().contains("Secret"));
+    assert!(call(&w, "get_dashboard", json!({"scope":w.hidden}))
+        .await
+        .is_err());
+    assert_eq!(
+        call(&w, "get_dashboard", json!({"scope":w.first}))
+            .await
+            .unwrap()["lifecycle_census"]["total"],
+        1
+    );
+    assert!(call(&w, "get_dashboard", json!({"limit":0})).await.is_err());
+    assert!(call(&w, "get_dashboard", json!({"stale_after_days":36501}))
+        .await
+        .is_err());
+    assert!(call(&w, "get_dashboard", json!({"limit":101}))
+        .await
+        .is_err());
+    assert!(call(
+        &w,
+        "get_dashboard",
+        json!({"limit":100,"stale_after_days":36500})
+    )
+    .await
+    .is_ok());
+    install_comment_carrier(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let mut tasks = Vec::new();
+    for (name, home) in [("Visible task", home), ("Private task", private)] {
+        tasks.push(
+            kernel::create_json_as(
+                &w.db,
+                &w.admin,
+                crate::v2_standard::v1_compat::FAMILY,
+                crate::v2_standard::v1_compat::KIND,
+                &json!({"v1_type":"WorkItem","v1_kind":"task","title":name,"lifecycle":"open"})
+                    .to_string(),
+                &home,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let out = call(&w, "get_dashboard", json!({"limit":1})).await.unwrap();
+    assert_eq!(
+        out["active_total"].as_i64().unwrap() + out["stale_total"].as_i64().unwrap(),
+        1
+    );
+    assert_eq!(out["unclassified_lifecycle"]["total_count"], 1);
+    assert_eq!(out["lifecycle_census"]["total"], 3);
+    assert!(!out.to_string().contains(&tasks[1]));
+    assert!(out.to_string().contains(&tasks[0]));
+    assert!(!out.to_string().contains(&w.hidden));
+    assert!(!out.to_string().contains("Secret"));
+}
+
+#[tokio::test]
+async fn record_reads_resolution_filters_and_visible_ambiguity() {
+    let w = world().await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    install_comment_carrier(&w).await;
+    let duplicate = kernel::create_json_as(
+        &w.db,
+        &w.admin,
+        crate::v2_standard::v1_compat::FAMILY,
+        crate::v2_standard::v1_compat::KIND,
+        &json!({"v1_type":"Document","v1_kind":"note","title":"Alpha"}).to_string(),
+        &home,
+    )
+    .await
+    .unwrap();
+    let out = call(
+        &w,
+        "resolve_many",
+        json!({"names":["Alpha"],"type":"Document","kind":"note"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["results"][0]["status"], "ambiguous");
+    assert_eq!(out["results"][0]["match_count"], 2);
+    let revision = kernel::read_record_as(&w.db, &w.admin, &duplicate)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    kernel::set_archived_as(&w.db, &w.admin, &duplicate, true, revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&w, "resolve_many", json!({"names":["Alpha"]}))
+            .await
+            .unwrap()["results"][0]["status"],
+        "resolved"
+    );
+    assert_eq!(
+        call(
+            &w,
+            "resolve_many",
+            json!({"names":["Alpha"],"include_archived":true})
+        )
+        .await
+        .unwrap()["results"][0]["match_count"],
+        2
+    );
+    assert_eq!(
+        call(
+            &w,
+            "resolve_many",
+            json!({"names":["Alpha"],"type":"Entity"})
+        )
+        .await
+        .unwrap()["results"][0]["status"],
+        "not_found"
+    );
+    assert_eq!(
+        call(
+            &w,
+            "resolve_many",
+            json!({"names":["Alpha"],"kind":"other"})
+        )
+        .await
+        .unwrap()["results"][0]["status"],
+        "not_found"
+    );
+    for args in [
+        json!({"names":[]}),
+        json!({"names":[""]}),
+        json!({"names":["Alpha"],"type":"Invalid"}),
+        json!({"names":["Alpha"],"kind":""}),
+    ] {
+        assert!(call(&w, "resolve_many", args).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn record_reads_dashboard_and_render_ignore_hidden_blockers_and_successors() {
+    let w = world().await;
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "blocks", None)
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    // A visible blocker pointing at a hidden record must not create a bucket.
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.hidden, "blocks", None)
+        .await
+        .unwrap();
+    let out = call(&w, "get_dashboard", json!({})).await.unwrap();
+    assert_eq!(out["blocked_total"], 0);
+    assert_eq!(out["blocked"], json!([]));
+    let rendered = call(&w, "render_record", json!({"id":w.first}))
+        .await
+        .unwrap();
+    assert!(!rendered.to_string().contains("superseded"));
+    assert!(!rendered.to_string().contains(&w.hidden));
+    assert!(!rendered.to_string().contains("Secret"));
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.first, "blocks", None)
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    let out = call(&w, "get_dashboard", json!({})).await.unwrap();
+    assert_eq!(out["blocked_total"], 1);
+    assert_eq!(
+        out["blocked"][0]["blocked_by"],
+        json!([{"id":w.second,"relationship":"blocks"}])
+    );
+    assert_eq!(out["blocked"][0]["superseded_by"]["total_count"], 1);
+    let reference = out["blocked"][0]["superseded_by"]["items"][0]["display_reference"]
+        .as_str()
+        .unwrap();
+    assert!(w.second.replace('-', "").starts_with(reference));
+    let rendered = call(&w, "render_record", json!({"id":w.first}))
+        .await
+        .unwrap();
+    assert!(rendered["markdown"].as_str().unwrap().contains("Beta"));
+    assert!(rendered["markdown"].as_str().unwrap().contains(reference));
+    assert!(!rendered.to_string().contains(&w.hidden));
+    assert!(!rendered.to_string().contains("Secret"));
+    let revision = kernel::read_record_as(&w.db, &w.admin, &w.second)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    kernel::set_archived_as(&w.db, &w.admin, &w.second, true, revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&w, "get_dashboard", json!({})).await.unwrap()["blocked_total"],
+        0
+    );
+}
+
+fn disclosure_rule<'a>(record: &'a Value, relationship: &str) -> Option<&'a Value> {
+    record
+        .get("read_disclosures")?
+        .as_array()?
+        .iter()
+        .find(|rule| rule["relationship"] == relationship)
+}
+
+/// Governed open/done lifecycle for WorkItem:task, mirroring the dashboard
+/// scale fixture: without this the interpreter reports unclassified.
+async fn install_governed_task_lifecycle(w: &World) {
+    let vocab = "disclosure:WorkItem:task";
+    let data = json!({"shapes":{"WorkItem:task":{"facets":{"lifecycle":{"axis":{"key":"WorkItem:task","label":"Status"},"vocab_ref":vocab}}}}});
+    let schema = json!({"id":"schema:disclosure-task","layer":"pack","created_at":"2026-11-01T00:00:00Z","data":data.to_string()});
+    let mut rows = vec![
+        ("schema_config", schema),
+        ("vocabularies", json!({"id":vocab,"name":vocab})),
+    ];
+    for (raw, terminality) in [("open", "open"), ("done", "terminal_positive")] {
+        rows.push((
+            "vocabulary_values",
+            json!({"id":format!("{vocab}:{raw}"),"vocabulary_id":vocab,"value":raw,"status":"active","terminality":terminality}),
+        ));
+    }
+    for (section, value) in rows {
+        sqlx::query("INSERT INTO kernel_v1_state(section,source_id,origin,payload,observed_at,event_seq) VALUES(?,?,'disclosure',?,'2026-11-01T00:00:00Z',0)")
+            .bind(section)
+            .bind(value["id"].as_str().unwrap())
+            .bind(value.to_string())
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+    }
+}
+
+async fn disclosure_task(w: &World, title: &str, lifecycle: &str, home: &str) -> String {
+    kernel::create_json_as(
+        &w.db,
+        &w.admin,
+        crate::v2_standard::v1_compat::FAMILY,
+        crate::v2_standard::v1_compat::KIND,
+        &json!({"v1_type":"WorkItem","v1_kind":"task","title":title,"lifecycle":lifecycle})
+            .to_string(),
+        home,
+    )
+    .await
+    .unwrap()
+}
+
+async fn disclosure_note(w: &World, title: &str, home: &str) -> String {
+    kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        json!({"title": title, "body": "original"})
+            .as_object()
+            .unwrap(),
+        home,
+    )
+    .await
+    .unwrap()
+}
+
+/// Append a historical envelope at an explicit clock. Content events are
+/// append-only, so temporal fixtures insert rather than rewrite them.
+async fn append_event(w: &World, id: &str, record: &str, typ: &str, actor: &str, at: &str) {
+    sqlx::query("INSERT INTO main.content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES (?,?,?,'{}',?,?,1,'legacy_unknown')")
+        .bind(id)
+        .bind(record)
+        .bind(typ)
+        .bind(actor)
+        .bind(at)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+}
+
+/// Adopt the v1 compatibility carrier for fixtures that create v1-shaped
+/// records such as WorkItem tasks.
+async fn install_v1_compat(w: &World) {
+    let package = crate::v2_standard::v1_compat::package();
+    let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&installed),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn read_disclosures_get_covers_slice_rules_with_bounds_and_visibility() {
+    let w = world().await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    // Four visible successors plus one hidden: newest-first window of 3 with
+    // a visible-only remainder. Explicit clocks keep the order stable.
+    let mut successors = Vec::new();
+    for (name, day) in [("S1", "10"), ("S2", "11"), ("S3", "12"), ("S4", "13")] {
+        let id = disclosure_note(&w, name, &home).await;
+        kernel::add_generic_link_as(&w.db, &w.admin, &id, &w.first, "supersedes", None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE main.kernel_generic_links SET created_at=? WHERE source_id=? AND target_id=? AND relationship='supersedes'")
+            .bind(format!("2026-01-{day}T00:00:00.000Z"))
+            .bind(&id)
+            .bind(&w.first)
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        successors.push(id);
+    }
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    // draws_from: one source newer than the anchor's last body write, one
+    // source backdated older. Only the newer work is disclosed. Source
+    // creation clocks are pinned explicitly so same-millisecond ties cannot
+    // flake the verdict; content events stay append-only.
+    let newer = disclosure_note(&w, "Newer", &home).await;
+    let older = disclosure_note(&w, "Older", &home).await;
+    sqlx::query("UPDATE main.kernel_records SET created_at='2030-01-01T00:00:00.000Z' WHERE id=?")
+        .bind(&newer)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE main.kernel_records SET created_at='2001-01-01T00:00:00.000Z' WHERE id=?")
+        .bind(&older)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    for source in [&newer, &older] {
+        kernel::add_generic_link_as(&w.db, &w.admin, source, &w.first, "draws_from", None)
+            .await
+            .unwrap();
+    }
+    // part_of forward: the anchor names what it is part of.
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.first, &w.second, "part_of", None)
+        .await
+        .unwrap();
+    // links_limit: 0 suppresses the link windows but never the disclosures.
+    let out = call(
+        &w,
+        "get_record",
+        json!({"ids": [w.first], "links_limit": 0}),
+    )
+    .await
+    .unwrap();
+    let record = &out["records"][0];
+    assert_eq!(record["links_out"], json!([]));
+    assert_eq!(record["links_in"], json!([]));
+    let superseded = disclosure_rule(record, "supersedes").expect("supersedes disclosure");
+    assert_eq!(superseded["kind"], "claim");
+    assert_eq!(superseded["total_count"], 4);
+    let items: Vec<&str> = superseded["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        items,
+        vec![
+            successors[3].as_str(),
+            successors[2].as_str(),
+            successors[1].as_str()
+        ]
+    );
+    assert!(!superseded.to_string().contains(&w.hidden));
+    assert!(superseded["summary"]
+        .as_str()
+        .unwrap()
+        .starts_with("superseded by "));
+    assert!(items.iter().all(|id| superseded["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == *id && item["display_reference"].is_string())));
+    let draws = disclosure_rule(record, "draws_from").expect("draws_from disclosure");
+    assert_eq!(draws["kind"], "fact");
+    assert_eq!(draws["total_count"], 1);
+    assert_eq!(draws["items"][0]["id"], newer);
+    assert_eq!(draws["items"][0]["name"], "Newer");
+    assert!(draws["summary"]
+        .as_str()
+        .unwrap()
+        .starts_with("newer work builds on this: "));
+    let part_of = disclosure_rule(record, "part_of").expect("part_of disclosure");
+    assert_eq!(part_of["total_count"], 1);
+    assert_eq!(part_of["items"][0]["id"], w.second);
+    assert!(disclosure_rule(record, "blocks").is_none());
+    assert!(disclosure_rule(record, "relates_to").is_none());
+    // Untouched records carry no disclosure key at all.
+    let plain = call(&w, "get_record", json!({"ids": [w.second]}))
+        .await
+        .unwrap();
+    assert!(plain["records"][0].get("read_disclosures").is_none());
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn read_disclosures_blocks_require_governed_open_and_visibility() {
+    let w = world().await;
+    install_v1_compat(&w).await;
+    install_governed_task_lifecycle(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let open = disclosure_task(&w, "Open blocker", "open", &home).await;
+    let done = disclosure_task(&w, "Done blocker", "done", &home).await;
+    let unclassified = disclosure_note(&w, "Plain note", &home).await;
+    let hidden_open = disclosure_task(&w, "Hidden blocker", "open", &private).await;
+    for source in [&open, &done, &unclassified, &hidden_open] {
+        kernel::add_generic_link_as(&w.db, &w.admin, source, &w.first, "blocks", None)
+            .await
+            .unwrap();
+    }
+    // Viewer: only the governed-open visible source is named and counted.
+    let out = call(&w, "get_record", json!({"ids": [w.first]}))
+        .await
+        .unwrap();
+    let blocks = disclosure_rule(&out["records"][0], "blocks").expect("blocks disclosure");
+    assert_eq!(blocks["total_count"], 1);
+    assert_eq!(blocks["items"][0]["id"], open);
+    // Admin sees the hidden open blocker too, without disturbing the rest.
+    let admin = call_as(&w, "acct:admin", "get_record", json!({"ids": [w.first]}))
+        .await
+        .unwrap();
+    let blocks = disclosure_rule(&admin["records"][0], "blocks").expect("blocks disclosure");
+    assert_eq!(blocks["total_count"], 2);
+    assert!(!blocks.to_string().contains(&done));
+    assert!(!blocks.to_string().contains(&unclassified));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn read_disclosures_ride_search_and_query_record_hits() {
+    let w = world().await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let successor = disclosure_note(&w, "Successor", &home).await;
+    kernel::add_generic_link_as(&w.db, &w.admin, &successor, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    let hits = call(&w, "search", json!({"query": "Alpha"})).await.unwrap();
+    let hit = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["id"] == w.first)
+        .expect("Alpha hit");
+    let rule = disclosure_rule(hit, "supersedes").expect("hit disclosure");
+    assert_eq!(rule["total_count"], 1);
+    assert_eq!(rule["items"][0]["id"], successor);
+    let listed = call(
+        &w,
+        "query_record",
+        json!({"steps": [{"step": "filter", "ids": [w.first]}]}),
+    )
+    .await
+    .unwrap();
+    let row = listed["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == w.first)
+        .expect("listed row");
+    let rule = disclosure_rule(row, "supersedes").expect("row disclosure");
+    assert_eq!(rule["total_count"], 1);
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn read_disclosures_preserve_imported_source_time_over_migration_clock() {
+    use crate::identity::hosted::{
+        reconcile_hosted_identity, HostedMembershipArrival, HostedMembershipRole,
+        HostedMembershipSource,
+    };
+    // Genuine v1 source with old source times: no projection rows are forged.
+    let dir = tempfile::tempdir().unwrap();
+    let source = crate::create_database(dir.path().join("source.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let account = reconcile_hosted_identity(
+        &source,
+        "read-fence-owner@example.test",
+        "read-fence-owner",
+        &HostedMembershipArrival::new(
+            HostedMembershipRole::Owner,
+            HostedMembershipSource::Direct,
+            "2026-10-28T00:00:00Z".into(),
+        )
+        .unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    registry()
+        .call(
+            source.clone(),
+            Caller::local(),
+            "manage_record_policy",
+            json!({"action":"grant","record_id":"native:root","subject":{"kind":"account","account_id":account},"capability":"manage","reason":"Establish source importer owner"}),
+        )
+        .await
+        .unwrap();
+    let record = registry()
+        .call(
+            source.clone(),
+            Caller::authenticated(account.clone()),
+            "create_record",
+            json!({"type":"Document","kind":"note","name":"Imported source","body":"genuine V1 source body","home_id":"native:root","reason":"Prepare imported disclosure target"}),
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Backdate the SOURCE times before snapshotting: the migration itself
+    // runs now, so a migration clock would read "now" here.
+    sqlx::query("UPDATE records SET created_at='2020-01-01T00:00:00.000Z', updated_at='2020-01-01T00:00:00.000Z' WHERE id=?")
+        .bind(&record)
+        .execute(source.write_pool())
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join("members.txt"), format!("{account}\n")).unwrap();
+    let report = crate::v1_import::run(crate::v1_import::Options {
+        source: dir.path().join("source.db"),
+        target: dir.path().join("target.db"),
+        seeds: vec![],
+        all: true,
+        history: true,
+        resume: false,
+        members_file: Some(dir.path().join("members.txt")),
+    })
+    .await
+    .unwrap();
+    assert!(
+        report.refusals.is_empty(),
+        "{}",
+        serde_json::to_string(&report.refusals).unwrap()
+    );
+    assert!(
+        report.review.is_empty(),
+        "{}",
+        serde_json::to_string(&report.review).unwrap()
+    );
+    let db = kernel::open_v2_database(dir.path().join("target.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let provenance: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(e.payload,'$.legacy.payload.updated_at') FROM kernel_legacy_sql_events h JOIN main.content_events e ON e.seq=h.seq WHERE h.record_id=? AND h.source_stream='snapshot_provenance' ORDER BY h.seq DESC LIMIT 1",
+    )
+    .bind(&record)
+    .fetch_one(db.write_pool())
+    .await
+    .unwrap();
+    assert_eq!(provenance.as_deref(), Some("2020-01-01T00:00:00.000Z"));
+    let home = kernel::read_record_as(&db, &report.principals[&account], &record)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    // Newer native work created after migration, then backdated between the
+    // source time and the migration clock: migration-time semantics would
+    // hide it, source-time semantics disclose it.
+    let newer = registry()
+        .call_engine(
+            EngineHandle::KernelV2(db.clone()),
+            Caller::authenticated(account.clone()),
+            "create_record",
+            json!({"type":"Document","kind":"note","name":"Newer work","body":"builds on the import","home_id":home,"reason":"Newer work over an old import"}),
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sqlx::query("UPDATE main.kernel_records SET created_at='2021-01-01T00:00:00.000Z' WHERE id=?")
+        .bind(&newer)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(
+        &db,
+        &report.principals[&account],
+        &newer,
+        &record,
+        "draws_from",
+        None,
+    )
+    .await
+    .unwrap();
+    let out = registry()
+        .call_engine(
+            EngineHandle::KernelV2(db.clone()),
+            Caller::authenticated(account.clone()),
+            "get_record",
+            json!({"ids": [record]}),
+        )
+        .await
+        .unwrap();
+    let rule = disclosure_rule(&out["records"][0], "draws_from").expect("imported draws_from");
+    assert_eq!(rule["total_count"], 1);
+    assert_eq!(rule["items"][0]["id"], newer);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn read_disclosures_name_candidates_without_hydrating_bodies() {
+    let w = world().await;
+    install_v1_compat(&w).await;
+    install_governed_task_lifecycle(&w).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let named = disclosure_note(&w, "Named candidate", &home).await;
+    let blocker = disclosure_task(&w, "Open blocker", "open", &home).await;
+    let links = vec![
+        json!({
+            "source_id": named,
+            "target_id": w.first,
+            "relationship": "supersedes",
+            "created_at": "2026-01-01T00:00:00.000Z"
+        }),
+        json!({
+            "source_id": blocker,
+            "target_id": w.first,
+            "relationship": "blocks",
+            "created_at": "2026-01-02T00:00:00.000Z"
+        }),
+    ];
+    let refs = [(w.first.as_str(), links.as_slice())];
+    let mut snapshot = w.db.pool().begin().await.unwrap();
+    let (rules, disclosure_loads) = kernel::body_read_probe::scoped(
+        super::read_disclosures::disclosures_for(&mut snapshot, &w.admin, &refs),
+    )
+    .await;
+    let rules = rules.unwrap();
+    let superseded = rules[&w.first]
+        .iter()
+        .find(|rule| rule["relationship"] == "supersedes")
+        .expect("supersedes disclosure");
+    assert_eq!(superseded["items"][0]["name"], "Named candidate");
+    let blocks = rules[&w.first]
+        .iter()
+        .find(|rule| rule["relationship"] == "blocks")
+        .expect("blocks disclosure");
+    assert_eq!(blocks["total_count"], 1);
+    assert_eq!(blocks["items"][0]["id"], blocker);
+    // Naming and governed-open counting are presentation over metadata: a
+    // disclosure pass must not hydrate a candidate body.
+    assert_eq!(disclosure_loads, 0);
+    // Control: the same probe observes the real kernel body query.
+    let (view, full_loads) =
+        kernel::body_read_probe::scoped(kernel::read_record_on(&mut snapshot, &w.admin, &named))
+            .await;
+    assert!(view.unwrap().is_some());
+    assert_eq!(full_loads, 1);
+    snapshot.rollback().await.unwrap();
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn read_disclosures_ignore_importer_and_metadata_envelope_clocks() {
+    let w = world().await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    // Newer work sits between the anchor's ordinary content and every ignored
+    // envelope below. If any migration or housekeeping clock moved the anchor,
+    // it would disappear.
+    let source = disclosure_note(&w, "Newer work", &home).await;
+    sqlx::query("UPDATE main.kernel_records SET created_at='2028-01-01T00:00:00.000Z' WHERE id=?")
+        .bind(&source)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &source, &w.first, "draws_from", None)
+        .await
+        .unwrap();
+    // The sealed import host's UUID-preserving record event is still a
+    // migration clock; so are import deltas and every housekeeping envelope.
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    append_event(
+        &w,
+        "clock-import-created",
+        &w.first,
+        "kernel.record_created.v1",
+        &host,
+        "2029-01-01T00:00:00.000Z",
+    )
+    .await;
+    append_event(
+        &w,
+        "clock-import-delta",
+        &w.first,
+        "kernel.import_state_delta.v1",
+        &host,
+        "2029-02-01T00:00:00.000Z",
+    )
+    .await;
+    append_event(
+        &w,
+        "clock-metadata",
+        &w.first,
+        "kernel.metadata_set.v1",
+        &w.admin,
+        "2029-03-01T00:00:00.000Z",
+    )
+    .await;
+    append_event(
+        &w,
+        "clock-rehome",
+        &w.first,
+        "kernel.record_rehomed.v1",
+        &w.admin,
+        "2029-04-01T00:00:00.000Z",
+    )
+    .await;
+    let out = call(&w, "get_record", json!({"ids": [w.first]}))
+        .await
+        .unwrap();
+    let draws = disclosure_rule(&out["records"][0], "draws_from")
+        .expect("migration and housekeeping clocks must not hide newer work");
+    assert_eq!(draws["total_count"], 1);
+    assert_eq!(draws["items"][0]["id"], source);
+    // A genuine native content write does move the substantive clock.
+    append_event(
+        &w,
+        "clock-native-body",
+        &w.first,
+        "kernel.body_set.v1",
+        &w.admin,
+        "2031-01-01T00:00:00.000Z",
+    )
+    .await;
+    let out = call(&w, "get_record", json!({"ids": [w.first]}))
+        .await
+        .unwrap();
+    assert!(disclosure_rule(&out["records"][0], "draws_from").is_none());
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn read_disclosures_imported_clock_ignores_metadata_only_source_updates() {
+    let w = world().await;
+    let template = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap();
+    let home = template.home_id.clone();
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let id = uuid::Uuid::new_v4().to_string();
+    // A raw imported record avoids unrelated definition-identity admission:
+    // this regression exercises body/provenance and owner-only source resumes.
+    let state = kernel::ImportRecordState {
+        body: Some("source body".into()),
+        ..Default::default()
+    };
+    kernel::import_record_as(&w.db, &host, &id, &home, Some(w.admin.as_str()), &state)
+        .await
+        .unwrap();
+    // The source creation time is stable; only the payload `updated_at` moves.
+    let provenance = |id: &str, updated: &str| kernel::LegacyEvent {
+        source: None,
+        id: format!("clock-provenance-{updated}"),
+        event_type: "v1.snapshot_provenance".into(),
+        payload: json!({
+            "record_id": id,
+            "created_at": "2020-01-01T00:00:00.000Z",
+            "updated_at": updated
+        }),
+        created_at: "2020-01-01T00:00:00.000Z".into(),
+        actor: Some("v1:source".into()),
+        run_key: None,
+    };
+    kernel::import_event_as(
+        &w.db,
+        &host,
+        &id,
+        &provenance(&id, "2020-01-01T00:00:00.000Z"),
+    )
+    .await
+    .unwrap();
+    // Newer work sits between the source content time and the later
+    // metadata-only source clock.
+    let source = disclosure_note(&w, "Newer work", &home).await;
+    sqlx::query("UPDATE main.kernel_records SET created_at='2022-01-01T00:00:00.000Z' WHERE id=?")
+        .bind(&source)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &source, &id, "draws_from", None)
+        .await
+        .unwrap();
+    // Genuine v1 resume that changes only the owner: same body and content
+    // fields, but a later source `updated_at`.
+    kernel::hq::resume_record_with_blob_as(
+        &w.db,
+        &host,
+        &id,
+        &home,
+        Some(w.viewer.as_str()),
+        &state,
+        None,
+    )
+    .await
+    .unwrap();
+    kernel::import_event_as(
+        &w.db,
+        &host,
+        &id,
+        &provenance(&id, "2025-01-01T00:00:00.000Z"),
+    )
+    .await
+    .unwrap();
+    let out = call(&w, "get_record", json!({"ids": [id]})).await.unwrap();
+    let draws = disclosure_rule(&out["records"][0], "draws_from")
+        .expect("a metadata-only source update must not hide newer work");
+    assert_eq!(draws["total_count"], 1);
+    assert_eq!(draws["items"][0]["id"], source);
+    // A genuine source content change does move the imported clock.
+    let mut revised = state.clone();
+    revised.body = Some("revised source body".into());
+    kernel::hq::resume_record_with_blob_as(
+        &w.db,
+        &host,
+        &id,
+        &home,
+        Some(w.viewer.as_str()),
+        &revised,
+        None,
+    )
+    .await
+    .unwrap();
+    kernel::import_event_as(
+        &w.db,
+        &host,
+        &id,
+        &provenance(&id, "2026-01-01T00:00:00.000Z"),
+    )
+    .await
+    .unwrap();
+    let out = call(&w, "get_record", json!({"ids": [id]})).await.unwrap();
+    assert!(disclosure_rule(&out["records"][0], "draws_from").is_none());
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_dashboard_candidate_cap_is_after_scope_and_lifecycle_filters() {
+    let w = world().await;
+    // Two visible ordinary records exceed this cap, but neither needs attention.
+    let out = record_reads::TEST_DASHBOARD_CANDIDATE_LIMIT
+        .scope(1, call(&w, "get_dashboard", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(out["lifecycle_census"]["total"], 2);
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.first, "blocks", None)
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.first, &w.second, "blocks", None)
+        .await
+        .unwrap();
+    let refused = record_reads::TEST_DASHBOARD_CANDIDATE_LIMIT
+        .scope(1, call(&w, "get_dashboard", json!({})))
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("candidate set exceeds 1"));
+    let scoped = record_reads::TEST_DASHBOARD_CANDIDATE_LIMIT
+        .scope(1, call(&w, "get_dashboard", json!({"scope":w.first})))
+        .await
+        .unwrap();
+    assert_eq!(scoped["lifecycle_census"]["total"], 1);
+    assert_eq!(scoped["blocked_total"], 1);
+}
+
+#[tokio::test]
+async fn record_reads_render_counts_and_hidden_containment() {
+    let w = world().await;
+    // A private child/inbound edge must affect neither the renderer's list nor
+    // its total. Hidden comment-kind records obey the same View gate.
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "part_of", None)
+        .await
+        .unwrap();
+    install_comment_carrier(&w).await;
+    let created = call_as(&w, "acct:admin", "create_record", json!({"type":"Annotation","kind":"comment","body":"secret remark","links":[{"target_id":w.first,"relationship":"part_of"}]})).await.unwrap();
+    let comment = created["id"].as_str().unwrap().to_owned();
+    // Comments derive visibility from exactly one bearer. A malformed retained
+    // comment with an extra bearer must fail closed, including its counts.
+    sqlx::query("INSERT INTO kernel_generic_links(link_id,source_id,target_id,relationship,note,created_at,actor,active,event_seq,imported) SELECT 'private-extra-bearer',source_id,?,'part_of',note,created_at,actor,active,event_seq,imported FROM kernel_generic_links WHERE source_id=? AND relationship='part_of' AND active=1")
+        .bind(&w.hidden).bind(&comment).execute(w.db.write_pool()).await.unwrap();
+    let get = call(&w, "get_record", json!({"ids":[w.first]}))
+        .await
+        .unwrap();
+    let enriched = record_reads::render_enrichment(&get["records"][0]);
+    assert_eq!(enriched.links_in_count, 0);
+    assert_eq!(enriched.child_count, 0);
+    assert_eq!(enriched.comment_count, 0);
+    let rendered = call(&w, "render_record", json!({"id":w.first}))
+        .await
+        .unwrap();
+    let markdown = rendered["markdown"].as_str().unwrap();
+    assert!(!markdown.contains("## Links (incoming)"), "{markdown}");
+    assert!(!markdown.contains("## Children"), "{markdown}");
+    assert!(!markdown.contains("showing "), "{markdown}");
+    for hidden in [&w.hidden, &comment, "Private comment", "secret remark"] {
+        assert!(!rendered.to_string().contains(hidden));
+    }
+    // Exercise the same all-links render session with a visible child too:
+    // hidden rows must not inflate either section's displayed total.
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.first, "part_of", None)
+        .await
+        .unwrap();
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let visible_home = kernel::hq::v1_import_home_id(&w.first);
+    kernel::hq::import_home_as(
+        &w.db,
+        &host,
+        &visible_home,
+        &w.first,
+        KERNEL_ROOT_ID,
+        &w.admin,
+        Some(&[(&w.viewer, "view")]),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&visible_home)
+        .bind(&w.second)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let rendered = call(&w, "render_record", json!({"id":w.first}))
+        .await
+        .unwrap();
+    let markdown = rendered["markdown"].as_str().unwrap();
+    for heading in ["## Links (incoming)", "## Children"] {
+        let section = markdown
+            .split_once(heading)
+            .unwrap_or_else(|| panic!("missing {heading}: {markdown}"))
+            .1;
+        let section = section.split("\n## ").next().unwrap();
+        assert!(section.contains("Beta"), "{markdown}");
+        assert!(section.contains(&w.second), "{markdown}");
+    }
+    assert!(!markdown.contains("showing "), "{markdown}");
+    assert!(!markdown.contains(&w.hidden), "{markdown}");
+    assert!(!markdown.contains(&comment), "{markdown}");
+    // Imported placement allows a visible child under a hidden logical parent.
+    let mapped = kernel::hq::v1_import_home_id(&w.hidden);
+    kernel::hq::import_home_as(
+        &w.db,
+        &host,
+        &mapped,
+        &w.hidden,
+        KERNEL_ROOT_ID,
+        &w.admin,
+        Some(&[(&w.viewer, "view")]),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&mapped)
+        .bind(&w.second)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let get = call(&w, "get_record", json!({"ids":[w.second]}))
+        .await
+        .unwrap();
+    assert_eq!(get["records"][0]["status"], "found");
+    let rendered = call(&w, "render_record", json!({"id":w.second}))
+        .await
+        .unwrap();
+    assert!(!rendered.to_string().contains(&w.hidden));
+    assert!(!rendered.to_string().contains("Secret"));
+}
+
+/// Bulk projections model read costs without timing 16,500 canonical writes.
+#[tokio::test]
+async fn record_reads_dashboard_hq_scale() {
+    if std::env::var_os("NATIVE_MEASURE_SQL").is_some() {
+        use tracing_subscriber::prelude::*;
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                        meta.target() == "native_ce::read_staging"
+                    })),
+            )
+            .try_init();
+    }
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    let mut home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    for _ in 0..4 {
+        home = kernel::create_home(&w.db, &home, None, &w.admin)
+            .await
+            .unwrap();
+    }
+    for (typ, kind) in [
+        ("WorkItem", "task"),
+        ("WorkItem", "issue"),
+        ("WorkItem", "project"),
+        ("Document", "task"),
+    ] {
+        let vocab = format!("dashboard:{typ}:{kind}");
+        let data = json!({"shapes":{format!("{typ}:{kind}"):{"facets":{"lifecycle":{"axis":{"key":format!("{typ}:{kind}"),"label":"Status"},"vocab_ref":vocab}}}}});
+        let schema = json!({"id":format!("schema:{typ}:{kind}"),"layer":"pack","created_at":"2026-11-01T00:00:00Z","data":data.to_string()});
+        let mut rows = vec![
+            ("schema_config", schema),
+            ("vocabularies", json!({"id":vocab,"name":vocab})),
+        ];
+        for (raw, terminality) in [("open", "open"), ("done", "terminal_positive")] {
+            rows.push(("vocabulary_values",json!({"id":format!("{vocab}:{raw}"),"vocabulary_id":vocab,"value":raw,"status":"active","terminality":terminality})));
+        }
+        for (section, value) in rows {
+            sqlx::query("INSERT INTO kernel_v1_state(section,source_id,origin,payload,observed_at,event_seq) VALUES(?,?,'dashboard',?,'2026-11-01T00:00:00Z',0)")
+                .bind(section).bind(value["id"].as_str().unwrap()).bind(value.to_string()).execute(w.db.write_pool()).await.unwrap();
+        }
+    }
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<16500) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('dashboard:%05d',x),CASE WHEN x%2=0 THEN ?2 ELSE r.home_id END,r.owner_id,'WorkItem','record',printf('dashboard:%05d',x),'native.v1.record',1,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?1")
+        .bind(&w.first).bind(&home).execute(w.db.write_pool()).await.unwrap();
+    for (name, value) in [("v1_type", "\"WorkItem\""), ("v1_kind", "\"task\"")] {
+        sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,?, ?,created_seq FROM kernel_records WHERE id LIKE 'dashboard:%'").bind(name).bind(value).execute(w.db.write_pool()).await.unwrap();
+    }
+    sqlx::query("UPDATE kernel_record_fields SET value_json=json_quote(CASE CAST(substr(record_id,11) AS INTEGER)%3 WHEN 0 THEN 'task' WHEN 1 THEN 'issue' ELSE 'project' END) WHERE name='v1_kind' AND record_id LIKE 'dashboard:%'").execute(w.db.write_pool()).await.unwrap();
+    // Same lifecycle and bearer, but distinct type/kind vocabularies: dropping
+    // either type or kind from the interpretation cache key must be observable.
+    sqlx::query("UPDATE kernel_record_fields SET value_json='\"Document\"' WHERE name='v1_type' AND record_id LIKE 'dashboard:%' AND CAST(substr(record_id,11) AS INTEGER)%6=0").execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'lifecycle',json_quote(CASE (CAST(substr(id,11) AS INTEGER)/3)%3 WHEN 0 THEN 'open' WHEN 1 THEN 'done' ELSE 'unknown' END),created_seq FROM kernel_records WHERE id LIKE 'dashboard:%' AND CAST(substr(id,11) AS INTEGER)<=3600").execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_generic_links(link_id,source_id,target_id,relationship,created_at,active,event_seq,imported) SELECT 'edge:'||id,id,?,CASE CAST(substr(id,11) AS INTEGER)%3 WHEN 0 THEN 'blocks' WHEN 1 THEN 'supersedes' ELSE 'depends_on' END,created_at,1,created_seq,1 FROM kernel_records WHERE id LIKE 'dashboard:%' AND CAST(substr(id,11) AS INTEGER)<=300").bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let mapped = kernel::hq::v1_import_home_id(&w.second);
+    kernel::hq::import_home_as(
+        &w.db,
+        &host,
+        &mapped,
+        &w.second,
+        KERNEL_ROOT_ID,
+        &w.admin,
+        Some(&[(&w.viewer, "view")]),
+    )
+    .await
+    .unwrap();
+    kernel::hq::import_event_as(
+        &w.db,
+        &host,
+        &w.second,
+        &kernel::hq::LegacyEvent {
+            source: None,
+            id: "dashboard-provenance".into(),
+            event_type: "v1.snapshot_provenance".into(),
+            payload: json!({"policy_anchor":w.second,"original_home":w.first}),
+            created_at: "2026-11-01T00:00:00Z".into(),
+            actor: None,
+            run_key: None,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&mapped)
+        .bind(&w.second)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    // Exercise the self-bearer exception as well as the shared physical homes.
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'lifecycle','\"open\"',created_seq FROM kernel_records WHERE id=?").bind(&w.second).execute(w.db.write_pool()).await.unwrap();
+    kernel::ensure_record_metadata(&w.db).await.unwrap();
+    for credential in ["acct:admin", "acct:viewer"] {
+        for (op, args) in [
+            ("get_dashboard", json!({"limit":100})),
+            ("resolve_many", json!({"names":["Alpha"]})),
+            ("render_record", json!({"id":w.first})),
+        ] {
+            let started = std::time::Instant::now();
+            let (out, stats) = sql::measured(call_as(&w, credential, op, args)).await;
+            eprintln!(
+                "HQ {credential} {op} elapsed={:?} stats={stats:?} error={:?}",
+                started.elapsed(),
+                out.as_ref().err()
+            );
+            let out = out.unwrap();
+            if op == "get_dashboard" {
+                assert_eq!(
+                    out["lifecycle_census"]["total"],
+                    if credential == "acct:admin" {
+                        16503
+                    } else {
+                        16502
+                    }
+                );
+                assert_eq!(
+                    out["active_total"].as_i64().unwrap() + out["stale_total"].as_i64().unwrap(),
+                    2401
+                );
+                assert_eq!(out["blocked_total"], 101);
+                assert_eq!(out["unclassified_lifecycle"]["total_count"], 1201);
+                let samples = out["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(out["stale"].as_array().unwrap())
+                    .filter(|item| item["id"].as_str().unwrap().starts_with("dashboard:"))
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(samples.len(), 20);
+                let actor = if credential == "acct:admin" {
+                    &w.admin
+                } else {
+                    &w.viewer
+                };
+                let actor_owned = actor.clone();
+                sql::in_snapshot(&w.db, actor, move |conn| Box::pin(async move {
+                    let mut groups = std::collections::BTreeSet::new();
+                    for item in samples {
+                        let id = item["id"].as_str().unwrap();
+                        let typ = item["type"].as_str().unwrap();
+                        let kind = item["kind"].as_str().unwrap();
+                        let raw: String = sqlx::query_scalar("SELECT json_extract(value_json,'$') FROM main.kernel_record_fields WHERE record_id=? AND name='lifecycle'")
+                            .bind(id).fetch_one(&mut *conn).await?;
+                        let scalar = kernel::v1_state::lifecycle_on(conn, &actor_owned, typ, Some(kind), id, Some(&raw)).await?;
+                        assert_eq!(item["lifecycle_interpretation"], scalar, "{id}");
+                        if raw == "open" {
+                            assert_eq!(scalar["axis"]["key"], format!("{typ}:{kind}"));
+                        }
+                        groups.insert((typ.to_owned(), kind.to_owned()));
+                    }
+                    assert_eq!(groups.len(), 4);
+                    Ok(())
+                })).await.unwrap();
+                assert_eq!(stats.installations, 1);
+                assert!(!out.to_string().contains(&w.hidden));
+            }
+        }
+    }
+    // Make the imported self-bearer's original logical home observable in
+    // interpretation, and compare it with the canonical scalar path for both
+    // callers. This overlay is visible through Alpha, not the physical home.
+    let schema = json!({"id":"schema:self-home","layer":"user","created_at":"2026-11-01T00:00:00Z","applies_to_collection_id":w.first,
+        "data":json!({"shapes":{"Document:note":{"facets":{"lifecycle":{"axis":{"key":"self_home","label":"Self home"},"vocab_ref":"dashboard:WorkItem:task"}}}}}).to_string()});
+    sqlx::query("INSERT INTO kernel_v1_state(section,source_id,origin,payload,observed_at,event_seq) VALUES('schema_config','schema:self-home','dashboard',?,'2026-11-01T00:00:00Z',0)").bind(schema.to_string()).execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("UPDATE kernel_record_metadata SET last_activity_at='2026-01-01T00:00:00Z' WHERE record_id=?").bind(&w.second).execute(w.db.write_pool()).await.unwrap();
+    for (credential, actor) in [("acct:admin", &w.admin), ("acct:viewer", &w.viewer)] {
+        let out = call_as(&w, credential, "get_dashboard", json!({}))
+            .await
+            .unwrap();
+        let item = out["stale"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == w.second)
+            .unwrap();
+        let id = w.second.clone();
+        let actor_owned = actor.clone();
+        let scalar = sql::in_snapshot(&w.db, actor, move |conn| {
+            Box::pin(async move {
+                kernel::v1_state::lifecycle_on(
+                    conn,
+                    &actor_owned,
+                    "Document",
+                    Some("note"),
+                    &id,
+                    Some("open"),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(item["lifecycle_interpretation"], scalar);
+        assert_eq!(scalar["axis"]["key"], "self_home");
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_visibility_defaults_bounds_and_lexical_count() {
+    assert_record_read_contract("scan");
+    let w = world().await;
+    let out = call(&w, "scan", json!({"query":"original","high_degree_min":1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        out["axes"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "authored_by",
+            "lexical",
+            "recent",
+            "high_degree",
+            "containers"
+        ]
+    );
+    assert!(out["census"]["by_type"].get("untyped_count").is_none());
+    assert!(out["census"]["by_type"]
+        .get("interpretation_note")
+        .is_none());
+    assert_eq!(out["corpus_size"], 2);
+    assert_eq!(out["axes"]["lexical"]["count"], 1);
+    assert_eq!(out["axes"]["high_degree"]["count"], 2);
+    assert_eq!(out["axes"]["high_degree"]["samples"][0]["degree"], 1);
+    assert_eq!(out["axes"]["authored_by"]["count"], 0);
+    assert_eq!(
+        out["census"]["provenance"]["buckets"],
+        json!([{"key":"unknown","count":2}])
+    );
+    assert_eq!(out["thresholds"]["recent_window_days"], 14);
+    assert_eq!(out["thresholds"]["saturation_threshold"], 0.10);
+    for key in ["by_type", "by_kind", "by_lifecycle", "provenance"] {
+        assert_eq!(out["census"][key]["total"], 2);
+    }
+    let encoded = out.to_string();
+    let rendered = render::render("scan", &out).unwrap();
+    for forbidden in [
+        &w.hidden,
+        &w.admin,
+        &w.viewer,
+        "acct:admin",
+        "Admin",
+        "Viewer",
+    ] {
+        assert!(!encoded.contains(forbidden), "{forbidden}: {encoded}");
+        assert!(!rendered.contains(forbidden));
+    }
+    assert!(out["axes"]["high_degree"]["samples"][0]["record_path"].is_string());
+    assert!(out["axes"]["high_degree"]["samples"][0]["lifecycle_interpretation"].is_object());
+    for args in [
+        json!({"recent_window_days":0}),
+        json!({"recent_window_days":36501}),
+        json!({"high_degree_min":0}),
+        json!({"authored_by":"acct:admin"}),
+        json!({"scope":w.hidden}),
+    ] {
+        assert!(call(&w, "scan", args).await.is_err());
+    }
+    let defaults = call(&w, "scan", json!({})).await.unwrap();
+    assert_eq!(defaults["axes"]["high_degree"]["count"], 0);
+    assert_eq!(defaults["thresholds"]["high_degree_min"], 8);
+    assert_eq!(defaults["thresholds"]["sample_limit"], 3);
+    assert_eq!(
+        call(&w, "scan", json!({"types":["Entity"]})).await.unwrap()["corpus_size"],
+        0
+    );
+    assert_eq!(
+        call(&w, "scan", json!({"query":"   "})).await.unwrap()["axes"].get("lexical"),
+        None
+    );
+    assert_eq!(
+        call_as(
+            &w,
+            "acct:admin",
+            "scan",
+            json!({"authored_by":"acct:admin"})
+        )
+        .await
+        .unwrap()["axes"]["authored_by"]["count"],
+        3
+    );
+    assert!(call_as(
+        &w,
+        "acct:admin",
+        "scan",
+        json!({"authored_by":"acct:missing"})
+    )
+    .await
+    .is_err());
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let bare = kernel::create_record_as(&w.db, &w.admin, &home)
+        .await
+        .unwrap();
+    let untyped = call(&w, "scan", json!({"scope":bare})).await.unwrap();
+    assert_eq!(untyped["corpus_size"], 1);
+    assert_eq!(untyped["census"]["by_type"]["untyped_count"], 1);
+    let workspace = call(&w, "scan", json!({})).await.unwrap();
+    assert_eq!(workspace["corpus_size"], 3);
+    assert_eq!(workspace["census"]["by_type"]["untyped_count"], 1);
+    assert_eq!(untyped["axes"]["recent"]["samples"][0]["type"], "untyped");
+    let owner_untyped = call_as(&w, "acct:admin", "scan", json!({"scope":bare}))
+        .await
+        .unwrap();
+    assert_eq!(owner_untyped["convergence"][0]["id"], bare);
+    assert_eq!(
+        untyped["census"]["by_type"]["buckets"],
+        json!([{"key":null,"count":1}])
+    );
+    assert!(render::render("scan", &untyped)
+        .unwrap()
+        .contains("untyped records"));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_legacy_classes_and_restricted_genesis() {
+    let w = world().await;
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    for (record, actor, run, subjects) in [
+        (&w.first, "acct:viewer", None, vec![w.first.clone()]),
+        (
+            &w.second,
+            "acct:admin",
+            Some("secret-worker-run"),
+            vec![w.second.clone()],
+        ),
+    ] {
+        kernel::hq::import_event_as(&w.db,&host,record,&kernel::hq::LegacyEvent {
+            id:format!("create-{record}"),event_type:"record.created".into(),payload:json!({}),created_at:"2020-01-01T00:00:00Z".into(),actor:Some(actor.into()),run_key:run.map(str::to_owned),
+            source:Some(json!({"origin":"synthetic","stream":"content_events","metadata":{"record_id":record},"subjects":subjects})),
+        }).await.unwrap();
+    }
+    kernel::hq::import_event_as(&w.db,&host,&w.first,&kernel::hq::LegacyEvent {
+        id:"later-hidden-edit".into(),event_type:"record.updated".into(),payload:json!({}),created_at:"2021-01-01T00:00:00Z".into(),actor:Some("acct:viewer".into()),run_key:None,
+        source:Some(json!({"origin":"synthetic","stream":"content_events","metadata":{"record_id":w.first},"subjects":[w.first,w.hidden]})),
+    }).await.unwrap();
+    let out = call(&w, "scan", json!({"authored_by":"acct:viewer"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        out["census"]["provenance"]["buckets"],
+        json!([{"key":"agent","count":1},{"key":"you","count":1}])
+    );
+    assert_eq!(out["axes"]["authored_by"]["count"], 1);
+    assert_eq!(
+        out["axes"]["authored_by"]["samples"][0]["authored_at"],
+        "2020-01-01T00:00:00Z"
+    );
+    for text in [out.to_string(), render::render("scan", &out).unwrap()] {
+        for forbidden in [
+            &host,
+            &w.admin,
+            &w.viewer,
+            "secret-worker-run",
+            "acct:viewer",
+            "acct:admin",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+    }
+    // An admitted source birth replaces the import/native genesis. A source
+    // restricted birth is unknown, never host attribution.
+    let w2 = world().await;
+    let host2 = kernel::resolve_principal_by_binding(&w2.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    kernel::hq::import_event_as(&w2.db,&host2,&w2.first,&kernel::hq::LegacyEvent {
+        id:"restricted-create".into(),event_type:"record.created".into(),payload:json!({}),created_at:"2020-01-01T00:00:00Z".into(),actor:Some("acct:viewer".into()),run_key:Some("hidden-run-key".into()),
+        source:Some(json!({"origin":"synthetic","stream":"content_events","metadata":{"record_id":w2.first},"subjects":[w2.first]})),
+    }).await.unwrap();
+    // Fabricate a retained restricted header to exercise its independent gate.
+    sqlx::query("UPDATE kernel_legacy_history SET restricted=1,owner='acct:admin' WHERE seq=(SELECT seq FROM kernel_legacy_sql_events WHERE source_id='restricted-create')").execute(w2.db.write_pool()).await.unwrap();
+    let out = call(&w2, "scan", json!({})).await.unwrap();
+    assert_eq!(
+        out["census"]["provenance"]["buckets"],
+        json!([{"key":"unknown","count":2}])
+    );
+    assert!(!out.to_string().contains("hidden-run-key"));
+    let root = call_as(&w2, "acct:admin", "scan", json!({})).await.unwrap();
+    assert!(root["census"]["provenance"]["buckets"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"key":"you","count":2})));
+    w.db.close().await;
+    w2.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_scope_archives_children_and_convergence() {
+    let w = world().await;
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let home = kernel::hq::v1_import_home_id(&w.first);
+    kernel::hq::import_home_as(
+        &w.db,
+        &host,
+        &home,
+        &w.first,
+        KERNEL_ROOT_ID,
+        &w.admin,
+        Some(&[]),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=?,owner_id=? WHERE id=?")
+        .bind(&home)
+        .bind(&w.viewer)
+        .bind(&w.second)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    // The private record has logical placement under Alpha but stays hidden.
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "part_of", None)
+        .await
+        .unwrap();
+    // The closed child home admits Beta through its owner floor while
+    // Secret remains hidden under the same logical parent.
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&home)
+        .bind(&w.hidden)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let out = call(&w, "scan", json!({"scope":w.first,"high_degree_min":1}))
+        .await
+        .unwrap();
+    assert_eq!(out["corpus_size"], 2);
+    assert_eq!(out["axes"]["containers"]["count"], 1);
+    assert_eq!(out["axes"]["containers"]["samples"][0]["child_count"], 1);
+    assert_eq!(out["convergence"][0]["id"], w.first);
+    let short = out["axes"]["containers"]["samples"][0]["display_reference"].clone();
+    assert_eq!(
+        call(&w, "scan", json!({"scope":short})).await.unwrap()["corpus_size"],
+        2
+    );
+    let rev = kernel::read_record_as(&w.db, &w.viewer, &w.second)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    kernel::set_archived_as(&w.db, &w.viewer, &w.second, true, rev)
+        .await
+        .unwrap();
+    assert_eq!(call(&w, "scan", json!({})).await.unwrap()["corpus_size"], 1);
+    assert_eq!(
+        call(&w, "scan", json!({"include_archived":true}))
+            .await
+            .unwrap()["corpus_size"],
+        2
+    );
+    assert_eq!(
+        call(&w, "scan", json!({"scope":w.first,"include_archived":true}))
+            .await
+            .unwrap()["corpus_size"],
+        1
+    );
+    let error = call(
+        &w,
+        "scan",
+        json!({"scope":w.second,"include_archived":true}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("archived"));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_thousands_of_records_exact_pools_and_sample_cap() {
+    let w = world().await;
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3000) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('scan:%05d',x),r.home_id,r.owner_id,r.primary_type,r.kind,printf('scan-accession:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?")
+        .bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'title',json_quote(id),created_seq FROM kernel_records WHERE id LIKE 'scan:%'").execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_search_fts(record_id,title,summary,body) SELECT id,'scan','','' FROM kernel_records WHERE id LIKE 'scan:%'").execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'scan-event:'||id,id,'kernel.record_revised.v1','{}',?,'2026-11-08T00:00:00Z',1,'legacy_unknown' FROM kernel_records WHERE id LIKE 'scan:%'").bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let home = kernel::hq::v1_import_home_id(&w.first);
+    kernel::hq::import_home_as(
+        &w.db,
+        &host,
+        &home,
+        &w.first,
+        KERNEL_ROOT_ID,
+        &w.admin,
+        Some(&[(&w.viewer, "view")]),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id LIKE 'scan:%'")
+        .bind(home)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let out = call(
+        &w,
+        "scan",
+        json!({"query":"scan","scope":w.first,"high_degree_min":1}),
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "scan 3001 scoped records from 3002 visible records: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(out["corpus_size"], 3001);
+    assert_eq!(out["axes"]["high_degree"]["quality"], "focused");
+    assert_eq!(out["axes"]["authored_by"]["quality"], "empty");
+    assert_eq!(out["axes"]["lexical"]["quality"], "saturated");
+    assert_eq!(out["census"]["by_type"]["total"], 3001);
+    let root = call_as(&w, "acct:admin", "scan", json!({})).await.unwrap();
+    assert_eq!(root["axes"]["authored_by"]["count"], 3003);
+    assert_eq!(out["axes"]["lexical"]["count"], 3000);
+    assert_eq!(
+        out["axes"]["lexical"]["samples"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        root["axes"]["authored_by"]["samples"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(root["axes"]["authored_by"]["quality"], "saturated");
+    for axis in out["axes"].as_object().unwrap().values() {
+        assert!(axis["samples"].as_array().unwrap().len() <= 3);
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_native_self_and_owner_named_account() {
+    let w = world().await;
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "edit")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let id = kernel::create_as(
+        &w.db,
+        &w.viewer,
+        "fixture.mcp",
+        "note",
+        json!({"title":"Own note"}).as_object().unwrap(),
+        &home,
+    )
+    .await
+    .unwrap();
+    let out = call(&w, "scan", json!({})).await.unwrap();
+    assert_eq!(out["axes"]["authored_by"]["count"], 1, "{out}");
+    assert_eq!(out["axes"]["authored_by"]["samples"][0]["id"], id);
+    assert!(out["census"]["provenance"]["buckets"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"key":"you","count":1})));
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    kernel::replace_home_policy(&w.db, &w.admin, &private, &[(&w.viewer, "view")])
+        .await
+        .unwrap();
+    kernel::link_as(&w.db, &w.viewer, &id, "relates_to", &w.hidden)
+        .await
+        .unwrap();
+    kernel::replace_home_policy(&w.db, &w.admin, &private, &[])
+        .await
+        .unwrap();
+    let after = call(&w, "scan", json!({})).await.unwrap();
+    assert_eq!(
+        after["axes"]["authored_by"], out["axes"]["authored_by"],
+        "a now-hidden endpoint must not supply authored evidence"
+    );
+    // Root/home ownership does not bypass an explicit record visibility
+    // boundary. Grant View before expecting the owner's named-account read.
+    let hidden_from_owner = call_as(
+        &w,
+        "acct:admin",
+        "scan",
+        json!({"authored_by":"acct:viewer"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hidden_from_owner["axes"]["authored_by"]["count"], 0);
+    kernel::replace_home_policy(
+        &w.db,
+        &w.admin,
+        &home,
+        &[(&w.viewer, "edit"), (&w.admin, "view")],
+    )
+    .await
+    .unwrap();
+    let root = call_as(
+        &w,
+        "acct:admin",
+        "scan",
+        json!({"authored_by":"acct:viewer"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(root["axes"]["authored_by"]["count"], 1, "{root}");
+    assert!(root["census"]["provenance"]["buckets"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"key":"other_account","count":1})));
+    assert_eq!(root["axes"]["authored_by"]["samples"][0]["id"], id);
+    assert!(call(&w, "scan", json!({"authored_by":"acct:admin"}))
+        .await
+        .is_err());
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_successors_and_hidden_endpoint_invariance() {
+    let w = world().await;
+    let baseline = call(&w, "scan", json!({"high_degree_min":1}))
+        .await
+        .unwrap();
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    let hidden = call(&w, "scan", json!({"high_degree_min":1}))
+        .await
+        .unwrap();
+    for key in [
+        "corpus_size",
+        "census",
+        "axes",
+        "convergence",
+        "convergence_basis",
+    ] {
+        assert_eq!(baseline[key], hidden[key], "hidden endpoint changed {key}");
+    }
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    let out = call(&w, "scan", json!({"high_degree_min":1}))
+        .await
+        .unwrap();
+    let sample = out["axes"]["high_degree"]["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == w.first)
+        .unwrap();
+    assert_eq!(sample["superseded_by"]["total_count"], 1);
+    assert_eq!(sample["superseded_by"]["items"][0]["id"], w.second);
+    assert!(!out.to_string().contains(&w.hidden));
+    let mut marked = out.clone();
+    marked["axes"]["lexical"] =
+        json!({"count":10,"samples":[],"quality":"focused","sample_selection_bounded":true});
+    assert!(render::render("scan", &marked)
+        .unwrap()
+        .contains("pool count is exact"));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_import_genesis_credits_original_author() {
+    let w = world().await;
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let definition = json!({"family":"fixture.scan.imported","version":1,"interpreter":"native.defn/4","primary_type":"Document","kinds":[{"token":"note","description":"Scan import","maturity":"current","identity":{"mode":"record"},"fields":[{"name":"title","type":"text","required":true}],"links":[]}]});
+    let pin = kernel::install_definition_as(
+        &w.db,
+        &w.admin,
+        "fixture.scan.imported",
+        1,
+        &serde_json::to_vec(&definition).unwrap(),
+    )
+    .await
+    .unwrap();
+    kernel::adopt_definition_as(&w.db, &w.admin, &pin.family, Some(&pin))
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    kernel::import_record_as(
+        &w.db,
+        &host,
+        &id,
+        &home,
+        Some(&w.admin),
+        &kernel::ImportRecordState {
+            definition: Some(kernel::ImportDefinition {
+                pin,
+                primary_type: "Document".into(),
+                kind: "note".into(),
+                fields: json!({"title":"Imported note"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let before = call(&w, "scan", json!({"scope":id})).await.unwrap();
+    assert_eq!(
+        before["census"]["provenance"]["buckets"],
+        json!([{"key":"unknown","count":1}])
+    );
+    kernel::hq::import_event_as(&w.db,&host,&id,&kernel::hq::LegacyEvent {
+        id:"source-create".into(),event_type:"record.created".into(),payload:json!({}),created_at:"2020-01-01T00:00:00Z".into(),actor:Some("acct:viewer".into()),run_key:None,
+        source:Some(json!({"origin":"synthetic","stream":"content_events","metadata":{"record_id":id},"subjects":[id]})),
+    }).await.unwrap();
+    let after = call(&w, "scan", json!({"scope":id})).await.unwrap();
+    assert_eq!(
+        after["census"]["provenance"]["buckets"],
+        json!([{"key":"you","count":1}])
+    );
+    assert_eq!(after["axes"]["authored_by"]["count"], 1);
+    w.db.close().await;
+}
+
+#[test]
+fn record_reads_scan_convergence_orders_count_name_and_id() {
+    let z = json!({"id":"4","type":"Document","name":"Zeta"});
+    let b1 = json!({"id":"1","type":"Document","name":"Beta"});
+    let b2 = json!({"id":"2","type":"Document","name":"Beta"});
+    let g = json!({"id":"3","type":"Document","name":"Gamma"});
+    let axes = json!({
+        "lexical":{"samples":[z,b2,g]},
+        "recent":{"samples":[z,b1,g]},
+        "high_degree":{"samples":[z,b1,b2]},
+        "containers":{"samples":[z]},
+    });
+    let result = crate::mcp::tools::querying::build_scan_convergence(axes.as_object().unwrap());
+    assert_eq!(
+        result
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["4", "1", "2", "3"]
+    );
+    assert_eq!(result[0]["axis_count"], 4);
+    assert!(result[1..].iter().all(|v| v["axis_count"] == 2));
+}
+
+#[tokio::test]
+async fn record_reads_scan_long_unadmitted_chain() {
+    let w = world().await;
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    kernel::hq::import_event_as(&w.db,&host,&w.first,&kernel::hq::LegacyEvent {
+        id:"scan-chain-birth".into(),event_type:"record.created".into(),payload:json!({}),created_at:"2020-01-01T00:00:00Z".into(),actor:Some("acct:viewer".into()),run_key:None,
+        source:Some(json!({"origin":"synthetic","stream":"content_events","metadata":{"record_id":w.first},"subjects":[w.first]})),
+    }).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES('admitted-scan-edit',?,'kernel.record_revised.v1','{}',?,'2020-02-01T00:00:00Z',1,'legacy_unknown')")
+        .bind(&w.first).bind(&w.viewer).execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'hidden-chain:'||x,?1,'kernel.link_removed.v1',json_object('target_id',?2),?3,'2021-01-01T00:00:00Z',1,'legacy_unknown' FROM n")
+        .bind(&w.first).bind(&w.hidden).bind(&w.viewer).execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES('scan-no-admitted-history',?1,'kernel.link_removed.v1',json_object('target_id',?2),?3,'2021-01-01T00:00:00Z',1,'legacy_unknown')")
+        .bind(&w.second).bind(&w.hidden).bind(&w.viewer).execute(w.db.write_pool()).await.unwrap();
+    let out = call(&w, "scan", json!({})).await.unwrap();
+    assert_eq!(out["axes"]["authored_by"]["count"], 1);
+    assert_eq!(
+        out["axes"]["authored_by"]["samples"][0]["authored_at"],
+        "2020-02-01T00:00:00Z"
+    );
+    assert!(!out.to_string().contains("hidden-chain"));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_lexical_sample_reaches_real_candidate_bound() {
+    let w = world().await;
+    // Body-only hits never fill the title tier's early-exit condition.
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5100) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('bound:%05d',x),r.home_id,r.owner_id,r.primary_type,r.kind,printf('bound-accession:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?")
+        .bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'title',json_quote(id),created_seq FROM kernel_records WHERE id LIKE 'bound:%'").execute(w.db.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_search_fts(record_id,title,summary,body) SELECT id,id,'','boundneedle' FROM kernel_records WHERE id LIKE 'bound:%'").execute(w.db.write_pool()).await.unwrap();
+    // This exercises the real 5,000-candidate boundary, not latency. Keep
+    // staging on its production budget; allow snapshot work extra time
+    // under parallel test contention.
+    let out = sql::TEST_SNAPSHOT_BUDGET
+        .scope(
+            std::time::Duration::from_secs(10),
+            call(&w, "scan", json!({"query":"boundneedle"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["axes"]["lexical"]["count"], 5100);
+    assert_eq!(
+        out["axes"]["lexical"]["samples"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(out["axes"]["lexical"]["sample_selection_bounded"], true);
+    assert!(render::render("scan", &out)
+        .unwrap()
+        .contains("search candidate bound"));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn record_reads_scan_attribution_budget_exhaustion_is_explicit() {
+    let w = world().await;
+    // Give the caller admitted authored history so convergence would otherwise
+    // include this axis; exhaustion must discard that contribution.
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES('budget-visible-edit',?1,'kernel.record_revised.v1','{}',?2,'2026-01-01T00:00:00Z',1,'legacy_unknown')")
+        .bind(&w.first).bind(&w.viewer).execute(w.db.write_pool()).await.unwrap();
+    let args = json!({"query":"Alpha","high_degree_min":1});
+    let normal = call(&w, "scan", args.clone()).await.unwrap();
+    assert!(normal["census"]["provenance"]["buckets"].is_array());
+    assert!(normal.get("convergence_basis").is_none());
+    assert_eq!(normal["axes"]["authored_by"]["count"], 1);
+    assert!(normal["convergence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["axes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("authored_by"))));
+    let exhausted = sql::TEST_SCAN_ATTRIBUTION_BUDGET
+        .scope(std::time::Duration::ZERO, call(&w, "scan", args.clone()))
+        .await
+        .unwrap();
+    let marker = json!({"status":"unavailable","reason":"attribution_budget_exhausted",
+        "interpretation_note":"Attribution exceeded its time budget; provenance and authored_by are unavailable, including authored_by contributions to convergence."});
+    assert_eq!(exhausted["census"]["provenance"], marker);
+    assert_eq!(exhausted["axes"]["authored_by"], marker);
+    assert_eq!(exhausted["corpus_size"], normal["corpus_size"]);
+    for axis in ["lexical", "recent", "high_degree", "containers"] {
+        assert_eq!(exhausted["axes"][axis], normal["axes"][axis]);
+    }
+    for name in ["by_type", "by_kind", "by_lifecycle"] {
+        assert_eq!(exhausted["census"][name], normal["census"][name]);
+    }
+    let mut available_axes = normal["axes"].as_object().unwrap().clone();
+    available_axes.shift_remove("authored_by");
+    assert_eq!(
+        exhausted["convergence"],
+        json!(crate::mcp::tools::querying::build_scan_convergence(
+            &available_axes
+        ))
+    );
+    assert_eq!(
+        exhausted["convergence_basis"],
+        json!({
+            "kind":"served_axes",
+            "axes":crate::mcp::tools::querying::served_scan_axes(&available_axes),
+            "excluded_axes":["authored_by"],
+        })
+    );
+    // Exit after populated headers, admitted event rows, and latest positions.
+    // These leave partially filled TEMP tables in the shared snapshot; the
+    // remaining scan still succeeds and a subsequent read sees no residue.
+    for checkpoint in [4, 7, 9] {
+        let midflight = sql::TEST_SCAN_ATTRIBUTION_EXIT_AT
+            .scope(std::cell::Cell::new(checkpoint), async {
+                let result = call(&w, "scan", args.clone()).await;
+                assert_eq!(
+                    sql::TEST_SCAN_ATTRIBUTION_EXIT_AT.with(std::cell::Cell::get),
+                    0
+                );
+                result
+            })
+            .await
+            .unwrap();
+        for key in [
+            "corpus_size",
+            "census",
+            "axes",
+            "convergence",
+            "convergence_basis",
+        ] {
+            assert_eq!(
+                midflight[key], exhausted[key],
+                "checkpoint {checkpoint}: {key}"
+            );
+        }
+    }
+    let text = render::render("scan", &exhausted).unwrap();
+    assert!(text.contains("provenance: unavailable (attribution_budget_exhausted)"));
+    assert!(text.contains("authored_by: unavailable (attribution_budget_exhausted)"));
+    assert!(text.contains("authored_by contributions to convergence are unavailable"));
+    assert!(!text.contains("authored_by: 0"));
+    assert!(!text.contains("provenance: 0"));
+    // Even with a zero budget, selector validation is never bypassed.
+    assert!(sql::TEST_SCAN_ATTRIBUTION_BUDGET
+        .scope(
+            std::time::Duration::ZERO,
+            call(&w, "scan", json!({"authored_by":"acct:missing"}))
+        )
+        .await
+        .is_err());
+    // Hidden history changes neither the fixed marker nor the visible answer.
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES('budget-hidden-event',?1,'kernel.link_removed.v1',json_object('target_id',?2),?3,'2026-01-01T00:00:00Z',1,'legacy_unknown')")
+        .bind(&w.first).bind(&w.hidden).bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+    let after = sql::TEST_SCAN_ATTRIBUTION_BUDGET
+        .scope(std::time::Duration::ZERO, call(&w, "scan", args))
+        .await
+        .unwrap();
+    for key in [
+        "corpus_size",
+        "census",
+        "axes",
+        "convergence",
+        "convergence_basis",
+    ] {
+        assert_eq!(after[key], exhausted[key], "{key}");
+    }
+    // The override is task-local; the normal response remains unchanged.
+    assert_eq!(
+        call(&w, "scan", json!({"query":"Alpha","high_degree_min":1}))
+            .await
+            .unwrap()["census"]["provenance"],
+        normal["census"]["provenance"]
+    );
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn small_read_detailed_call<'a, F>(
+    candidates: bool,
+    links: bool,
+    trial_indexes: bool,
+    barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    work: F,
+) -> futures::future::BoxFuture<'a, (F::Output, Value)>
+where
+    F: std::future::Future + Send + 'a,
+    F::Output: Send,
+{
+    Box::pin(async move {
+        use kernel::generic_links::diagnostics::{with_link_read_diagnostics, Options};
+        if candidates && links {
+            let ((out, link_details), candidate_details) = sql::with_candidate_diagnostics(
+                trial_indexes,
+                with_link_read_diagnostics(
+                    Options {
+                        explain: true,
+                        before_batch: barrier,
+                    },
+                    work,
+                ),
+            )
+            .await;
+            (
+                out,
+                json!({"candidates":candidate_details,"links":link_details}),
+            )
+        } else if candidates {
+            let (out, details) = sql::with_candidate_diagnostics(trial_indexes, work).await;
+            (out, json!({"candidates":details}))
+        } else if links {
+            let (out, details) = with_link_read_diagnostics(
+                Options {
+                    explain: true,
+                    before_batch: barrier,
+                },
+                work,
+            )
+            .await;
+            (out, json!({"links":details}))
+        } else {
+            (work.await, Value::Null)
+        }
+    })
+}
+
+/// Canonical provider fixture: fixed selected degree, independently sized
+/// unrelated aggregate fleet. Setup is never included in serving latency.
+#[cfg(feature = "v2-kernel-probe")]
+fn small_read_provider_fixture<'a>(
+    w: &'a World,
+    home: &'a str,
+    unrelated: usize,
+    slots: usize,
+) -> futures::future::BoxFuture<'a, (String, String)> {
+    Box::pin(async move {
+        assert!(unrelated <= slots);
+        use crate::v2_standard::relates_to::{Command, Source};
+        let package = crate::v2_standard::relates_to::package();
+        let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+            .await
+            .unwrap();
+        kernel::adopt_package_at(
+            &w.db,
+            &w.admin,
+            KERNEL_ROOT_ID,
+            &package,
+            Some(&installed),
+            &package.declared_reads,
+        )
+        .await
+        .unwrap();
+        let anchor = kernel::create_record_as(&w.db, &w.admin, home)
+            .await
+            .unwrap();
+        let target = kernel::create_record_as(&w.db, &w.admin, home)
+            .await
+            .unwrap();
+        let empty = kernel::create_record_as(&w.db, &w.admin, home)
+            .await
+            .unwrap();
+        let sources = [
+            ("diag-provider-a", &anchor, &target),
+            ("diag-provider-b", &anchor, &target),
+            ("diag-provider-reverse", &target, &anchor),
+        ]
+        .into_iter()
+        .map(|(id, from, to)| Source {
+            source_id: id.into(),
+            from: from.clone(),
+            to: to.clone(),
+            claimed_author: None,
+            claimed_timestamp: Some("2026-09-03T12:34:56+01:00".into()),
+            note: Some(format!("note for {id}")),
+        })
+        .collect();
+        let request = kernel::prepare_provider_as(
+            &w.db,
+            &w.admin,
+            &anchor,
+            &target,
+            "diag-provider-selected",
+            Command::Assert { sources },
+        )
+        .await
+        .unwrap();
+        kernel::commit_provider_as(&w.db, &w.admin, &request)
+            .await
+            .unwrap();
+        let request = kernel::prepare_provider_as(
+            &w.db,
+            &w.admin,
+            &anchor,
+            &w.hidden,
+            "diag-provider-hidden",
+            Command::Assert { sources: vec![] },
+        )
+        .await
+        .unwrap();
+        kernel::commit_provider_as(&w.db, &w.admin, &request)
+            .await
+            .unwrap();
+        if slots > 0 {
+            let fleet_anchor = kernel::create_record_as(&w.db, &w.admin, home)
+                .await
+                .unwrap();
+            for index in 0..slots {
+                let endpoint = kernel::create_record_as(&w.db, &w.admin, home)
+                    .await
+                    .unwrap();
+                if index >= unrelated {
+                    continue;
+                }
+                let request = kernel::prepare_provider_as(
+                    &w.db,
+                    &w.admin,
+                    &fleet_anchor,
+                    &endpoint,
+                    &format!("diag-provider-fleet:{index}"),
+                    Command::Assert { sources: vec![] },
+                )
+                .await
+                .unwrap();
+                kernel::commit_provider_as(&w.db, &w.admin, &request)
+                    .await
+                    .unwrap();
+            }
+        }
+        (anchor, empty)
+    })
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn small_read_candidate_index_fixture(w: &World) -> futures::future::BoxFuture<'_, Value> {
+    Box::pin(async move {
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(w.db.write_pool())
+            .await
+            .unwrap();
+        let mut costs = Vec::new();
+        for (name, ddl) in [
+            ("idx_trial_record_names", "CREATE INDEX idx_trial_record_names ON kernel_record_fields(json_extract(value_json,'$') COLLATE BINARY,record_id) WHERE name IN ('title','name')"),
+            ("idx_trial_move_destinations", "CREATE INDEX idx_trial_move_destinations ON content_events(json_extract(payload,'$.logical_home_id'),record_id) WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')"),
+        ] {
+            let pages: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(w.db.write_pool()).await.unwrap();
+            let free: i64 = sqlx::query_scalar("PRAGMA freelist_count").fetch_one(w.db.write_pool()).await.unwrap();
+            let started = std::time::Instant::now();
+            sqlx::query(ddl).execute(w.db.write_pool()).await.unwrap();
+            let create_us = started.elapsed().as_micros() as u64;
+            let pages_after: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(w.db.write_pool()).await.unwrap();
+            let free_after: i64 = sqlx::query_scalar("PRAGMA freelist_count").fetch_one(w.db.write_pool()).await.unwrap();
+            costs.push(json!({"index":name,"create_us":create_us,"page_size":page_size,"allocated_bytes_delta":((pages_after-free_after)-(pages-free))*page_size,"storage_measurement":"logical allocated main-database pages; not physical I/O or WAL bytes"}));
+        }
+        json!(costs)
+    })
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn small_read_index_write_probe<'a>(
+    w: &'a World,
+    id: &'a str,
+    home: &'a str,
+    folder: &'a str,
+    pairs: usize,
+) -> futures::future::BoxFuture<'a, Value> {
+    Box::pin(async move {
+        let mut rename = Vec::new();
+        let mut moves = Vec::new();
+        for wave in 0..=pairs {
+            for name in [
+                format!("Diagnostic rename {wave}"),
+                "Diagnostic write probe".into(),
+            ] {
+                let started = std::time::Instant::now();
+                call_as(
+                    w,
+                    "acct:admin",
+                    "update_record",
+                    json!({"id":id,"name":name}),
+                )
+                .await
+                .unwrap();
+                if wave > 0 {
+                    rename.push(started.elapsed().as_micros() as u64);
+                }
+            }
+            for destination in [folder, home] {
+                let started = std::time::Instant::now();
+                call_as(
+                    w,
+                    "acct:admin",
+                    "update_record",
+                    json!({"id":id,"home_id":destination}),
+                )
+                .await
+                .unwrap();
+                if wave > 0 {
+                    moves.push(started.elapsed().as_micros() as u64);
+                }
+            }
+        }
+        let actual = kernel::read_record_as(&w.db, &w.admin, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.home_id, home);
+        json!({"rename_call_us":rename,"move_call_us":moves,"warmup_requests":4,"failures":0,"method":"sequential canonical MCP updates; one warmup pair excluded per operation; histories grow and order is not randomized"})
+    })
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn record_reads_disposable_indexes_preserve_names_moves_and_canonical_writes() {
+    let w = Box::pin(world()).await;
+    Box::pin(install_comment_carrier(&w)).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    for (id, placement, fields) in [
+        ("trial:duplicate", &home, json!({"title":"Alpha"})),
+        ("trial:hidden", &private, json!({"title":"Alpha"})),
+        (
+            "trial:shadowed",
+            &home,
+            json!({"title":"Display","name":"Alpha"}),
+        ),
+        ("trial:null", &home, json!({"title":null,"name":"Fallback"})),
+        (
+            "trial:numeric",
+            &home,
+            json!({"title":10,"name":"Numeric fallback"}),
+        ),
+        (
+            "trial:empty",
+            &home,
+            json!({"title":"","name":"Hidden fallback"}),
+        ),
+        (
+            "trial:escaped",
+            &home,
+            json!({"title":"Quoted \"name\"\nλ"}),
+        ),
+    ] {
+        Box::pin(small_read_fixture_record(&w, id, placement, fields)).await;
+    }
+    let package = crate::v2_standard::document_package();
+    let installed = Box::pin(kernel::install_package_as(&w.db, &w.admin, &package))
+        .await
+        .unwrap();
+    Box::pin(kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&installed),
+        &package.declared_reads,
+    ))
+    .await
+    .unwrap();
+    let folder = Box::pin(call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Write destination","home_id":home}),
+    ))
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let record = Box::pin(call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Document","kind":"note","name":"Diagnostic write probe","home_id":home}),
+    ))
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    small_read_index_write_probe(&w, &record, &home, &folder, 1).await;
+    small_read_candidate_index_fixture(&w).await;
+    small_read_index_write_probe(&w, &record, &home, &folder, 1).await;
+    let fresh_folder = Box::pin(call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Post-index destination","home_id":home}),
+    ))
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Box::pin(call_as(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({"id":record,"name":"Post-index renamed","home_id":fresh_folder}),
+    ))
+    .await
+    .unwrap();
+    for credential in ["acct:admin", "acct:viewer"] {
+        let args = json!({"names":["Alpha","alpha","Fallback","Display","10","Numeric fallback","Hidden fallback","Quoted \"name\"\nλ","Post-index renamed","Diagnostic write probe","Diagnostic rename 0","Diagnostic rename 1","Missing"]});
+        let expected = record_reads::with_full_small_read_staging(call_as(
+            &w,
+            credential,
+            "resolve_many",
+            args.clone(),
+        ))
+        .await
+        .unwrap();
+        let (actual, details) = small_read_detailed_call(
+            true,
+            false,
+            true,
+            None,
+            call_as(&w, credential, "resolve_many", args),
+        )
+        .await;
+        assert_eq!(actual.unwrap(), expected);
+        assert_eq!(details["candidates"][0]["trial_indexes"], true);
+        for id in [&record, &folder, &fresh_folder] {
+            let args = json!({"id":id});
+            let expected = record_reads::with_full_small_read_staging(call_as(
+                &w,
+                credential,
+                "render_record",
+                args.clone(),
+            ))
+            .await
+            .unwrap();
+            let (actual, _) = small_read_detailed_call(
+                true,
+                false,
+                true,
+                None,
+                call_as(&w, credential, "render_record", args),
+            )
+            .await;
+            assert_eq!(actual.unwrap(), expected);
+        }
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn record_reads_detailed_probes_preserve_orphan_receipts_and_missing_anchors() {
+    let w = Box::pin(world()).await;
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let (anchor, _) = small_read_provider_fixture(&w, &home, 2, 2).await;
+    // A retained event need not have a live projected subject. Serving ignores
+    // that receipt; diagnostics must report it without inventing a record.
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) VALUES('diag-orphan-move','diag:absent-subject','kernel.record_rehomed.v2',json_object('new_home_id',?1,'logical_home_id',?2,'parent_update',NULL),?3,'2026-01-01T00:00:00Z',1,'legacy_unknown')")
+        .bind(&home).bind(&anchor).bind(&w.admin).execute(w.db.write_pool()).await.unwrap();
+    for credential in ["acct:admin", "acct:viewer"] {
+        let args = json!({"id":anchor});
+        let expected = record_reads::with_full_small_read_staging(call_as(
+            &w,
+            credential,
+            "render_record",
+            args.clone(),
+        ))
+        .await
+        .unwrap();
+        let (actual, details) = small_read_detailed_call(
+            true,
+            true,
+            false,
+            None,
+            call_as(&w, credential, "render_record", args),
+        )
+        .await;
+        assert_eq!(actual.unwrap(), expected);
+        assert_eq!(details["candidates"][0]["orphan_lookup_ids"], 1);
+        assert_eq!(details["links"][0]["succeeded"], true);
+        let args = json!({"names":["Alpha","alpha","Secret","Missing"]});
+        let expected = record_reads::with_full_small_read_staging(call_as(
+            &w,
+            credential,
+            "resolve_many",
+            args.clone(),
+        ))
+        .await
+        .unwrap();
+        let (actual, details) = small_read_detailed_call(
+            true,
+            false,
+            false,
+            None,
+            call_as(&w, credential, "resolve_many", args),
+        )
+        .await;
+        assert_eq!(actual.unwrap(), expected);
+        assert_eq!(details["candidates"][0]["kind"], "names");
+    }
+    let missing = vec!["diag:absent-anchor".to_owned()];
+    let missing_owned = missing.clone();
+    let actor_owned = w.viewer.clone();
+    let (result, details) = small_read_detailed_call(
+        false,
+        true,
+        false,
+        None,
+        sql::with_part_of_read_session(
+            &w.db,
+            &w.viewer,
+            &[("records", "id")],
+            &missing,
+            sql::in_snapshot(&w.db, &w.viewer, move |conn| {
+                Box::pin(async move {
+                    kernel::generic_links::visible_link_rows_for_on(
+                        conn,
+                        &actor_owned,
+                        &missing_owned,
+                    )
+                    .await
+                })
+            }),
+        ),
+    )
+    .await;
+    assert!(result.unwrap().is_empty());
+    assert_eq!(details["links"][0]["rows"], 0);
+    assert_eq!(details["links"][0]["succeeded"], true);
+    w.db.close().await;
+}
+
+// Disposable serving projections plus immutable import witnesses. This models
+// directory disclosure cost without qualifying importer/replay behavior.
+async fn seed_claim_directory_diagnostic(w: &World) {
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let package = crate::v2_standard::v1_compat::package();
+    let mut tx = w.db.write_pool().begin().await.unwrap();
+    for (id, source) in [
+        ("claims:person-visible", &w.first),
+        ("claims:person-hidden", &w.hidden),
+    ] {
+        sqlx::query("INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT ?1,home_id,owner_id,'V1','record',?1,?2,1,?3,'native.defn/5',created_seq,created_at FROM kernel_records WHERE id=?4")
+            .bind(id).bind(crate::v2_standard::v1_compat::FAMILY).bind(&package.definitions[0].digest).bind(source).execute(&mut *tx).await.unwrap();
+        for (field, value) in [("v1_type", "Entity"), ("v1_kind", "person")] {
+            sqlx::query("INSERT INTO kernel_record_fields SELECT id,?,json_quote(?),created_seq FROM kernel_records WHERE id=?")
+                .bind(field).bind(value).bind(id).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,causal_envelope_version,causal_status) VALUES(?,?,'kernel.import_state.v1','{}',?,1,'legacy_unknown')")
+            .bind(format!("claims-witness:{id}")).bind(id).bind(&host).execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<99) INSERT INTO kernel_v1_state SELECT 'account_directory',printf('claims-directory:%d',x),'synthetic','{}',printf('claims:visible:%d',x),'claims:person-visible','2026-11-09T00:00:00Z',0 FROM n")
+        .execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_v1_state VALUES('account_directory','claims-directory:hidden','synthetic','{}','claims:hidden','claims:person-hidden','2026-11-09T00:00:00Z',0)")
+        .execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    kernel::ensure_record_metadata(&w.db).await.unwrap();
+}
+
+#[tokio::test]
+async fn kernel_v2_empty_claims_skip_directory_work_and_preserve_disclosure() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+    let w = world().await;
+    seed_claim_directory_diagnostic(&w).await;
+    let mut tx = w.db.write_pool().begin().await.unwrap();
+    let mut work = Vec::new();
+    // Each mode gets a fresh request memo and the same pinned database state.
+    // The eager arm is the original empty-claims order, including admission.
+    for eager in [true, false] {
+        let meter = Arc::new(AtomicU64::new(0));
+        let count = meter.clone();
+        tx.lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        kernel::read_cache::scope_request(kernel::read_cache::with_capabilities(async {
+            if eager {
+                kernel::app_installs::admit_dispatched_on(&mut tx, &w.viewer).await.unwrap();
+                kernel::kernel_require(&mut tx, &w.viewer, &w.first, crate::authorization::Capability::View).await.unwrap();
+                kernel::v1_state::disclosed_accounts_on(&mut tx, &w.viewer).await.unwrap();
+                let rows: Vec<(String,String,Option<String>)> = sqlx::query_as("SELECT payload,observed_at,account_principal FROM kernel_v1_state WHERE section='claims' AND record_id=? ORDER BY source_id")
+                    .bind(&w.first).fetch_all(&mut *tx).await.unwrap();
+                assert!(rows.is_empty());
+            } else {
+                assert!(kernel::v1_state::claims_on(&mut tx, &w.viewer, &w.first).await.unwrap().is_empty());
+            }
+            let key = kernel::read_cache::key_on(&mut tx, &w.viewer, "disclosed_accounts").await.unwrap();
+            assert_eq!(kernel::read_cache::get::<std::collections::BTreeSet<String>>(&key).is_some(), eager,
+                "an empty claims read must not load the account disclosure directory");
+        })).await;
+        tx.lock_handle().await.unwrap().remove_progress_handler();
+        work.push(meter.load(Ordering::Relaxed));
+    }
+    assert!(
+        work[1] < work[0],
+        "empty claims still paid eager directory VM work: {work:?}"
+    );
+    eprintln!(
+        "{}",
+        json!({"empty_claims_vm_steps":{"eager_directory":work[0],"empty_fast_path":work[1],"directory_rows":101}})
+    );
+    for id in [&w.hidden, &"claims:missing".to_owned()] {
+        assert!(
+            kernel::v1_state::claims_on(&mut tx, &w.viewer, id)
+                .await
+                .is_err(),
+            "{id}"
+        );
+    }
+    for (source, account, payload) in [
+        (
+            "a-own",
+            Some(w.viewer.as_str()),
+            json!({"id":"own","released_at":null}).to_string(),
+        ),
+        (
+            "b-visible",
+            Some("claims:visible:0"),
+            json!({"id":"visible","released_at":"2026-11-08T01:00:00Z"}).to_string(),
+        ),
+        // Hidden and unattributed claims must remain absent from the result.
+        (
+            "c-hidden",
+            Some("claims:hidden"),
+            json!({"id":"hidden"}).to_string(),
+        ),
+        (
+            "d-unattributed",
+            None,
+            json!({"id":"unattributed"}).to_string(),
+        ),
+    ] {
+        sqlx::query("INSERT INTO kernel_v1_state VALUES('claims',?,'synthetic',?,?,?,'2026-11-09T00:00:00Z',0)")
+            .bind(source).bind(payload).bind(account).bind(&w.first).execute(&mut *tx).await.unwrap();
+    }
+    assert_eq!(
+        kernel::read_cache::with_capabilities(kernel::v1_state::claims_on(
+            &mut tx, &w.viewer, &w.first
+        ))
+        .await
+        .unwrap(),
+        vec![
+            json!({"id":"own","released_at":null,"historical":true,"occupied":false,"source_observed_at":"2026-11-09T00:00:00Z","effective_released_at":"2026-11-09T00:00:00Z","release_basis":"cutover_nonoccupying"}),
+            json!({"id":"visible","released_at":"2026-11-08T01:00:00Z","historical":true,"occupied":false,"source_observed_at":"2026-11-09T00:00:00Z","effective_released_at":"2026-11-08T01:00:00Z","release_basis":"source_release"}),
+        ]
+    );
+    tx.rollback().await.unwrap();
+    w.db.close().await;
+}
+
+/// Isolate readiness from renderer staging, admission and endpoint shaping.
+/// Fixed record slots retain equal record/home dimensions across fleet sizes.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_reads_provider_readiness_diagnostics() {
+    use kernel::generic_links::diagnostics::{measure_dispatch_control, measure_readiness};
+    use sqlx::Connection;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let scales: Vec<usize> = std::env::var("NATIVE_READINESS_SCALES")
+        .unwrap_or_else(|_| "0,2".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    assert!(!scales.is_empty() && scales.iter().all(|n| *n <= 2000));
+    let slots = *scales.iter().max().unwrap();
+    let waves: usize = std::env::var("NATIVE_READINESS_WAVES").map_or(1, |v| v.parse().unwrap());
+    assert!((1..=100).contains(&waves));
+    assert!(crate::db::governed_sql_pool_size() >= 4);
+    for providers in scales {
+        let w = Box::pin(world()).await;
+        let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+            .bind(&w.first)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+        let _ = small_read_provider_fixture(&w, &home, providers, slots).await;
+        let dimensions: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM kernel_records),(SELECT count(*) FROM kernel_roots),(SELECT count(*) FROM kernel_provider_state),(SELECT count(*) FROM kernel_provider_link_heads),(SELECT count(*) FROM kernel_provider_link_rows)"
+        ).fetch_one(w.db.pool()).await.unwrap();
+        let mut plans = Vec::new();
+        for (name, query) in [
+            ("coverage", kernel::provider_link_reads::COVERAGE_SQL),
+            (
+                "pins",
+                "SELECT DISTINCT pins_json FROM kernel_provider_link_heads",
+            ),
+        ] {
+            let rows: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {query}"))
+                    .fetch_all(w.db.pool())
+                    .await
+                    .unwrap();
+            plans.push(json!({"name":name,"rows":rows}));
+        }
+        eprintln!(
+            "{}",
+            json!({"readiness_fixture":{"added_providers":providers,"provider_slots":slots,"records":dimensions.0,"homes":dimensions.1,"provider_states":dimensions.2,"projection_heads":dimensions.3,"projection_rows":dimensions.4,"plans":plans,"debug_assertions":cfg!(debug_assertions),"fixture":"canonical provider commits; no writes during measured samples; direct readiness is not a full renderer request"}})
+        );
+        // Retain all four leases across warmups and samples. Acquisition is
+        // excluded, statements can stay warm, and no nested pool slot is used.
+        let mut connections = Vec::new();
+        for _ in 0..4 {
+            let mut connection = w.db.governed_pool().acquire().await.unwrap();
+            // Abandonment must retire any still-installed observer and guard.
+            connection.close_on_drop();
+            connections.push(connection);
+        }
+        for wave in 0..waves + 2 {
+            let mut cases = [(0, 1), (4, 1), (9, 1), (0, 4), (4, 4), (9, 4)];
+            cases.rotate_left(wave % 6);
+            if wave % 2 == 1 {
+                cases.reverse();
+            }
+            for (control_statements, callers) in cases {
+                let control = control_statements > 0;
+                let barrier = Arc::new(tokio::sync::Barrier::new(callers));
+                let mut workers = Vec::new();
+                for worker in 0..callers {
+                    let mut connection = connections.pop().unwrap();
+                    let barrier = barrier.clone();
+                    workers.push(tokio::spawn(async move {
+                        let pin_started = Instant::now();
+                        let mut tx = connection.begin().await.unwrap();
+                        let snapshot: i64 = sqlx::query_scalar("SELECT count(*) FROM kernel_provider_link_heads")
+                            .fetch_one(&mut *tx).await.unwrap();
+                        let pin_us = pin_started.elapsed().as_micros();
+                        let barrier_started = Instant::now();
+                        tokio::time::timeout(Duration::from_secs(2), barrier.wait()).await.unwrap();
+                        let barrier_us = barrier_started.elapsed().as_micros();
+                        // Arm this isolated operation's budget once, after
+                        // pinning/barrier. The trace observer must retain it.
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        tx.lock_handle().await.unwrap().set_progress_handler(1000, move || Instant::now() < deadline);
+                        let started = Instant::now();
+                        let (result, diagnostic) = if control {
+                            measure_dispatch_control(&mut tx, control_statements).await
+                        } else {
+                            measure_readiness(&mut tx).await
+                        };
+                        let elapsed_us = started.elapsed().as_micros();
+                        tx.lock_handle().await.unwrap().remove_progress_handler();
+                        let error = result.err().map(|e| e.to_string());
+                        let rollback = tx.rollback().await.err().map(|e| e.to_string());
+                        eprintln!("{}",json!({"readiness_sample":{"added_providers":providers,"wave":wave,"warmup":wave<2,"worker":worker,"callers":callers,"control":control,"control_statements":if control {Some(control_statements)} else {None},"snapshot_heads":snapshot,"pin_us":pin_us,"barrier_us":barrier_us,"call_us":elapsed_us,"diagnostic":diagnostic,"error":error,"rollback_error":rollback}}));
+                        assert!(error.is_none() && rollback.is_none(), "{error:?} {rollback:?}");
+                        connection
+                    }));
+                }
+                for worker in workers {
+                    connections.push(worker.await.unwrap());
+                }
+            }
+        }
+        drop(connections);
+        w.db.close().await;
+    }
+}
+
+/// The production link queries on a governed snapshot, with cold/warm SQLx
+/// statement caches and a separate synthetic TEMP-invalidation stress control.
+/// Normal CI uses a small fixture; larger repetitions are explicitly selected.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_reads_link_preparation_diagnostics() {
+    use kernel::generic_links::diagnostics::{
+        measure_preparation_control, with_link_query_preparation, with_link_read_diagnostics,
+        Options, QueryPreparation,
+    };
+    use sqlx::Connection;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn multiset(rows: &[Value]) -> Vec<String> {
+        let mut rows: Vec<_> = rows.iter().map(Value::to_string).collect();
+        rows.sort();
+        rows
+    }
+    async fn cookies(conn: &mut sqlx::SqliteConnection) -> Result<(i64, i64)> {
+        let main = sqlx::query_scalar("PRAGMA main.schema_version")
+            .persistent(false)
+            .fetch_one(&mut *conn)
+            .await?;
+        let temp = sqlx::query_scalar("PRAGMA temp.schema_version")
+            .persistent(false)
+            .fetch_one(conn)
+            .await?;
+        Ok((main, temp))
+    }
+    let providers: usize =
+        std::env::var("NATIVE_LINK_PREPARATION_PROVIDERS").map_or(2, |v| v.parse().unwrap());
+    let waves: usize =
+        std::env::var("NATIVE_LINK_PREPARATION_WAVES").map_or(1, |v| v.parse().unwrap());
+    assert!(providers <= 2000 && (1..=100).contains(&waves));
+    assert!(crate::db::governed_sql_pool_size() >= 4);
+    let w = Arc::new(Box::pin(world()).await);
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let (provider_anchor, _) = small_read_provider_fixture(&w, &home, providers, providers).await;
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.second,
+        &w.first,
+        "supersedes",
+        Some("visible preparation fixture".into()),
+    )
+    .await
+    .unwrap();
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.hidden,
+        &w.first,
+        "supersedes",
+        Some("hidden preparation fixture".into()),
+    )
+    .await
+    .unwrap();
+    let anchors = vec![w.first.clone(), provider_anchor];
+    let dimensions: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM kernel_records),(SELECT count(*) FROM kernel_roots),(SELECT count(*) FROM kernel_provider_state),(SELECT count(*) FROM kernel_provider_link_heads),(SELECT count(*) FROM kernel_provider_link_rows)"
+    ).fetch_one(w.db.pool()).await.unwrap();
+    eprintln!(
+        "{}",
+        json!({"link_preparation_fixture":{
+            "added_providers":providers,"records":dimensions.0,"homes":dimensions.1,
+            "provider_states":dimensions.2,"projection_heads":dimensions.3,
+            "projection_rows":dimensions.4,"debug_assertions":cfg!(debug_assertions),
+            "workers":4,"warmup_waves":2,"measured_waves":waves,
+            "method":"exact helper after excluded priming; same governed snapshot and guard; no timed EXPLAIN; cold/warm means SQL statement cache only; synthetic TEMP DDL occurs between optional prepare and execute, separately timed"
+        }})
+    );
+    for (role, actor) in [("owner", w.admin.clone()), ("member", w.viewer.clone())] {
+        let mut expected_rows = None;
+        for wave in 0..waves + 2 {
+            let mut cases = Vec::new();
+            for callers in [1, 4] {
+                for warm_cache in [false, true] {
+                    for invalidate_temp in [false, true] {
+                        for arm in 0..4 {
+                            cases.push((callers, warm_cache, invalidate_temp, arm));
+                        }
+                    }
+                }
+            }
+            let positions = cases.len();
+            cases.rotate_left(wave % positions);
+            if wave % 2 == 1 {
+                cases.reverse();
+            }
+            for (callers, warm_cache, invalidate_temp, arm) in cases {
+                let barrier = Arc::new(tokio::sync::Barrier::new(callers));
+                let mut workers = Vec::new();
+                for worker in 0..callers {
+                    let w = w.clone();
+                    let actor = actor.clone();
+                    let anchors = anchors.clone();
+                    let barrier = barrier.clone();
+                    workers.push(tokio::spawn(async move {
+                        let actor_on = actor.clone();
+                        let anchors_on = anchors.clone();
+                        let control = arm >= 2;
+                        let mode = if arm % 2 == 0 { QueryPreparation::Ordinary }
+                            else { QueryPreparation::PrepareFirst };
+                        let started = Instant::now();
+                        let sample = kernel::read_cache::scope_request(sql::with_part_of_read_session(
+                            &w.db, &actor, &[("records", "id")], &anchors,
+                            sql::in_snapshot(&w.db, &actor, move |conn| Box::pin(async move {
+                                // Prime the same helper/admission/scope before every arm.
+                                // Only SQLite's statement-cache state differs at measurement.
+                                conn.clear_cached_statements().await?;
+                                let prime_started = Instant::now();
+                                let rows = kernel::generic_links::visible_link_rows_for_on(
+                                    conn, &actor_on, &anchors_on).await?;
+                                if control {
+                                    let (result, _) = measure_preparation_control(
+                                        conn, QueryPreparation::Ordinary, false).await;
+                                    result?;
+                                }
+                                let prime_us = prime_started.elapsed().as_micros() as u64;
+                                let clear_started = Instant::now();
+                                if !warm_cache { conn.clear_cached_statements().await?; }
+                                let cache_clear_us = clear_started.elapsed().as_micros() as u64;
+                                let before = cookies(conn).await?;
+                                let cache_before = conn.cached_statements_size();
+                                if warm_cache { assert!(cache_before > 0); }
+                                else { assert_eq!(cache_before, 0); }
+                                let wait_started = Instant::now();
+                                tokio::time::timeout(Duration::from_secs(2), barrier.wait()).await
+                                    .map_err(|_| Error::engine("preparation diagnostic barrier expired"))?;
+                                let barrier_us = wait_started.elapsed().as_micros() as u64;
+                                let measured = Instant::now();
+                                let (diagnostic, call_us) = if control {
+                                    let (result, diagnostic) = measure_preparation_control(
+                                        conn, mode, invalidate_temp).await;
+                                    let call_us = measured.elapsed().as_micros() as u64;
+                                    result?;
+                                    (diagnostic, call_us)
+                                } else {
+                                    let (actual, mut diagnostics) = with_link_read_diagnostics(
+                                        Options { explain:false, before_batch:None },
+                                        with_link_query_preparation(mode, invalidate_temp,
+                                            kernel::generic_links::visible_link_rows_for_on(
+                                                conn, &actor_on, &anchors_on)),
+                                    ).await;
+                                    let call_us = measured.elapsed().as_micros() as u64;
+                                    assert_eq!(multiset(&actual?), multiset(&rows));
+                                    assert_eq!(diagnostics.len(), 1);
+                                    (diagnostics.remove(0), call_us)
+                                };
+                                let cache_after = conn.cached_statements_size();
+                                let after = cookies(conn).await?;
+                                assert_eq!(before.0, after.0, "main schema changed");
+                                if invalidate_temp { assert!(after.1 > before.1); }
+                                else { assert_eq!(before.1, after.1); }
+                                assert!(diagnostic.succeeded);
+                                assert!(diagnostic.plans.is_empty());
+                                assert!(diagnostic.statement_timeline.iter().all(|s| s.finished_ns.is_some()));
+                                Ok((rows, json!({"prime_us":prime_us,"cache_clear_us":cache_clear_us,
+                                    "barrier_us":barrier_us,"call_us":call_us,
+                                    "cache_before":cache_before,"cache_after":cache_after,
+                                    "schema_before":before,"schema_after":after,"diagnostic":diagnostic})))
+                            })),
+                        )).await.unwrap();
+                        use sha2::Digest;
+                        let result_hash = format!("{:x}", sha2::Sha256::digest(
+                            serde_json::to_vec(&multiset(&sample.0)).unwrap()));
+                        eprintln!("{}",json!({"link_preparation_sample":{
+                            "role":role,"wave":wave,"warmup":wave<2,"worker":worker,
+                            "callers":callers,"warm_cache":warm_cache,
+                            "invalidate_temp":invalidate_temp,"arm":arm,
+                            "result_rows":sample.0.len(),"result_multiset_sha256":result_hash,
+                            "session_us":started.elapsed().as_micros() as u64,"sample":sample.1
+                        }}));
+                        sample.0
+                    }));
+                }
+                for worker in workers {
+                    let rows = multiset(&worker.await.unwrap());
+                    if let Some(expected) = &expected_rows {
+                        assert_eq!(&rows, expected);
+                    } else {
+                        assert!(!rows.is_empty());
+                        expected_rows = Some(rows);
+                    }
+                }
+            }
+        }
+    }
+    w.db.close().await;
+}
+
+/// Observe ordinary renderer sessions without priming, cache clearing, explicit
+/// preparation or synthetic invalidation. Plain calls control probe overhead.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_reads_renderer_cache_lifecycle_diagnostics() {
+    use kernel::generic_links::diagnostics::{
+        with_link_read_diagnostics, with_link_statement_metadata, Options,
+    };
+    use sha2::Digest;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn dimension(name: &str, default: usize, max: usize) -> usize {
+        let value = std::env::var(name).map_or(default, |v| v.parse().unwrap());
+        assert!(value <= max, "{name}");
+        value
+    }
+    let providers = dimension("NATIVE_RENDERER_CACHE_PROVIDERS", 2, 2000);
+    let records = dimension("NATIVE_RENDERER_CACHE_RECORDS", 0, 25_000);
+    let homes = dimension("NATIVE_RENDERER_CACHE_HOMES", 0, 500);
+    let waves = dimension("NATIVE_RENDERER_CACHE_WAVES", 1, 100);
+    assert!(waves > 0 && crate::db::governed_sql_pool_size() >= 4);
+    let w = Arc::new(Box::pin(world()).await);
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let private: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.hidden)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let (provider_anchor, empty) =
+        small_read_provider_fixture(&w, &home, providers, providers).await;
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.second,
+        &w.first,
+        "supersedes",
+        Some("visible lifecycle fixture".into()),
+    )
+    .await
+    .unwrap();
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.hidden,
+        &w.first,
+        "supersedes",
+        Some("hidden lifecycle fixture".into()),
+    )
+    .await
+    .unwrap();
+    let mut home_ids = vec![home.clone()];
+    for _ in 0..homes {
+        home_ids.push(
+            kernel::create_home(&w.db, &home, None, &w.admin)
+                .await
+                .unwrap(),
+        );
+    }
+    if records > 0 {
+        // Disposable serving projection scale, following the existing small-read
+        // diagnostic; retained history/replay correctness is outside this fixture.
+        let mut tx = w.db.write_pool().begin().await.unwrap();
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('cache:%05d',x),CASE WHEN x%10=0 THEN ?4 ELSE json_extract(?3,'$['||((x-1)%?5)||']') END,r.owner_id,r.primary_type,r.kind,printf('cache:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?2")
+            .bind(records as i64).bind(&w.first).bind(serde_json::to_string(&home_ids).unwrap())
+            .bind(&private).bind(home_ids.len() as i64).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'title',json_quote('Lifecycle fixture '||id),created_seq FROM kernel_records WHERE id LIKE 'cache:%'")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        kernel::ensure_record_metadata(&w.db).await.unwrap();
+    }
+    let dimensions: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM kernel_records),(SELECT count(*) FROM kernel_roots),(SELECT count(*) FROM content_events),(SELECT count(*) FROM kernel_provider_link_heads),(SELECT count(*) FROM kernel_provider_link_rows)"
+    ).fetch_one(w.db.pool()).await.unwrap();
+    eprintln!(
+        "{}",
+        json!({"renderer_cache_fixture":{
+            "records":dimensions.0,"homes":dimensions.1,"events":dimensions.2,
+            "projection_heads":dimensions.3,"projection_rows":dimensions.4,
+            "added_providers":providers,"added_bulk_records":records,"added_homes":homes,
+            "measured_waves":waves,"warmup_waves":2,"debug_assertions":cfg!(debug_assertions),
+            "fixture":"canonical selected links/providers plus optional bulk serving projections; fixed degree; not a retained-history/HQ clone",
+            "method":"ordinary render_record dispatch; observed vs plain; start barrier before request; no synthetic DDL, cache clear, priming or explicit preparation"
+        }})
+    );
+    let registry = Arc::new(registry());
+    let targets = [
+        ("linked", w.first.clone()),
+        ("provider", provider_anchor),
+        ("empty", empty),
+    ];
+    let mut expected = std::collections::BTreeMap::new();
+    for wave in 0..waves + 2 {
+        let mut cases = Vec::new();
+        for (role, credential) in [("owner", "acct:admin"), ("member", "acct:viewer")] {
+            for (case, id) in &targets {
+                for callers in [1, 4] {
+                    for observed in [true, false] {
+                        cases.push((role, credential, *case, id.clone(), callers, observed));
+                    }
+                }
+            }
+        }
+        let positions = cases.len();
+        cases.rotate_left(wave % positions);
+        if wave % 2 == 1 {
+            cases.reverse();
+        }
+        for (role, credential, case, id, callers, observed) in cases {
+            let barrier = Arc::new(tokio::sync::Barrier::new(callers));
+            let mut workers = Vec::new();
+            for worker in 0..callers {
+                let db = w.db.clone();
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                let id = id.clone();
+                workers.push(tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+                        .await
+                        .unwrap();
+                    let started = Instant::now();
+                    let invoke = registry.call_engine(
+                        EngineHandle::KernelV2(db),
+                        Caller::authenticated(credential),
+                        "render_record",
+                        json!({"id":id}),
+                    );
+                    let (answer, links, lifecycle, call_us) = if observed {
+                        let ((answer, links), lifecycle) = sql::with_session_lifecycle(
+                            with_link_statement_metadata(with_link_read_diagnostics(
+                                Options {
+                                    explain: false,
+                                    before_batch: None,
+                                },
+                                invoke,
+                            )),
+                        )
+                        .await;
+                        let call_us = started.elapsed().as_micros() as u64;
+                        (answer, json!(links), json!(lifecycle), call_us)
+                    } else {
+                        let answer = invoke.await;
+                        let call_us = started.elapsed().as_micros() as u64;
+                        (answer, Value::Null, Value::Null, call_us)
+                    };
+                    let answer = answer.unwrap();
+                    if observed {
+                        assert!(!links.as_array().unwrap().is_empty());
+                        assert_eq!(lifecycle.as_array().unwrap().len(), 5);
+                        for sample in lifecycle.as_array().unwrap() {
+                            assert!(sample["error"].is_null(), "{sample}");
+                            assert!(sample["connection_id"].is_u64());
+                        }
+                        for detail in links.as_array().unwrap() {
+                            assert_eq!(detail["succeeded"], true);
+                            let metadata = detail["query_metadata"].as_array().unwrap();
+                            assert_eq!(metadata.len(), 3);
+                            for entry in metadata {
+                                assert_eq!(
+                                    entry["before"]["connection_id"],
+                                    lifecycle[0]["connection_id"]
+                                );
+                                assert_eq!(
+                                    entry["after"]["connection_id"],
+                                    lifecycle[0]["connection_id"]
+                                );
+                                assert_eq!(
+                                    entry["before"]["main_cookie"],
+                                    entry["after"]["main_cookie"]
+                                );
+                                assert_eq!(
+                                    entry["before"]["temp_cookie"],
+                                    entry["after"]["temp_cookie"]
+                                );
+                                assert_eq!(
+                                    entry["after"]["matching_statements"]
+                                        .as_array()
+                                        .unwrap()
+                                        .len(),
+                                    1
+                                );
+                                assert!(!entry["deltas"].as_array().unwrap().is_empty());
+                            }
+                            assert!(detail["plans"].as_array().unwrap().is_empty());
+                            assert!(detail["statement_timeline"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|s| !s["finished_ns"].is_null()));
+                        }
+                        assert_eq!(lifecycle[0]["phase"], "acquire_before_begin");
+                        assert_eq!(lifecycle[4]["phase"], "after_finish");
+                        assert_eq!(lifecycle[0]["autocommit"], true);
+                        assert_eq!(lifecycle[0]["temp_user_objects"], 0);
+                        assert_eq!(lifecycle[3]["autocommit"], true);
+                        assert_eq!(lifecycle[3]["temp_user_objects"], 0);
+                        assert_eq!(lifecycle[4]["autocommit"], true);
+                        assert_eq!(lifecycle[4]["temp_user_objects"], 0);
+                        assert_eq!(lifecycle[4]["reusable"], true);
+                        for sample in lifecycle.as_array().unwrap() {
+                            assert_eq!(sample["connection_id"], lifecycle[0]["connection_id"]);
+                            assert_eq!(
+                                sample["main_schema_cookie"],
+                                lifecycle[0]["main_schema_cookie"]
+                            );
+                            assert_eq!(
+                                sample["cache_count_before_probe"],
+                                sample["cache_count_after_probe"]
+                            );
+                        }
+                    }
+                    let bytes = serde_json::to_vec(&answer).unwrap();
+                    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+                    eprintln!(
+                        "{}",
+                        json!({"renderer_cache_sample":{
+                            "wave":wave,"warmup":wave<2,"role":role,"case":case,"callers":callers,
+                            "worker":worker,"observed":observed,"call_us":call_us,
+                            "response_bytes":bytes.len(),"response_sha256":hash,"links":links,
+                            "lifecycle":lifecycle
+                        }})
+                    );
+                    answer
+                }));
+            }
+            for worker in workers {
+                let answer = worker.await.unwrap();
+                if let Some(prior) = expected.get(&(role, case)) {
+                    assert_eq!(&answer, prior);
+                } else {
+                    expected.insert((role, case), answer);
+                }
+            }
+            // Let ordinary asynchronous pool release progress; do not acquire,
+            // retain, pin or force a particular physical lease between requests.
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(expected.len(), 6);
+    w.db.close().await;
+}
+
+/// Paired ordinary renderer calls for the generic-only visibility SQL trial.
+/// Endpoint degree varies within one fixture; no request primes or clears caches.
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_reads_generic_visibility_trial_diagnostics() {
+    use kernel::generic_links::diagnostics::{
+        with_generic_visibility_variant, with_link_read_diagnostics, with_link_statement_metadata,
+        Options,
+    };
+    use sha2::Digest;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn dimension(name: &str, default: usize, max: usize) -> usize {
+        let value = std::env::var(name).map_or(default, |v| v.parse().unwrap());
+        assert!(value <= max, "{name}");
+        value
+    }
+    let degrees: Vec<usize> = std::env::var("NATIVE_GENERIC_VISIBILITY_DEGREES")
+        .unwrap_or_else(|_| "0,8,128".into())
+        .split(',')
+        .map(|v| v.trim().parse().unwrap())
+        .collect();
+    assert!(!degrees.is_empty() && degrees.iter().all(|v| [0, 8, 128, 1024].contains(v)));
+    assert_eq!(
+        degrees
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        degrees.len()
+    );
+    let providers = dimension("NATIVE_RENDERER_CACHE_PROVIDERS", 2, 2000);
+    let records = dimension("NATIVE_RENDERER_CACHE_RECORDS", 0, 25_000);
+    let homes = dimension("NATIVE_RENDERER_CACHE_HOMES", 0, 500);
+    let waves = dimension("NATIVE_RENDERER_CACHE_WAVES", 1, 100);
+    assert!(waves > 0 && crate::db::governed_sql_pool_size() >= 4);
+    let w = Arc::new(Box::pin(world()).await);
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let private: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.hidden)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let _ = small_read_provider_fixture(&w, &home, providers, providers).await;
+    let maximum_degree = *degrees.iter().max().unwrap();
+    let mut endpoints = Vec::new();
+    for index in 0..maximum_degree {
+        endpoints.push(
+            kernel::create_as(
+                &w.db,
+                &w.admin,
+                "fixture.mcp",
+                "note",
+                json!({"title":format!("Generic endpoint {index}"),"body":"endpoint"})
+                    .as_object()
+                    .unwrap(),
+                if index % 2 == 0 { &home } else { &private },
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let mut targets = Vec::new();
+    for degree in &degrees {
+        let id = kernel::create_as(
+            &w.db,
+            &w.admin,
+            "fixture.mcp",
+            "note",
+            json!({"title":format!("Generic degree {degree}"),"body":"anchor"})
+                .as_object()
+                .unwrap(),
+            &home,
+        )
+        .await
+        .unwrap();
+        targets.push((*degree, id));
+    }
+    // Selected records and generic links use canonical writes. Only optional
+    // unrelated bulk scale below uses disposable serving projections.
+    for (degree, anchor) in &targets {
+        for (index, endpoint) in endpoints.iter().take(*degree).enumerate() {
+            let (source, target) = if index % 2 == 0 {
+                (anchor, endpoint)
+            } else {
+                (endpoint, anchor)
+            };
+            kernel::add_generic_link_as(
+                &w.db,
+                &w.admin,
+                source,
+                target,
+                "diagnostic_edge",
+                Some(format!("degree {degree}, edge {index}")),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let mut home_ids = vec![home.clone()];
+    for _ in 0..homes {
+        home_ids.push(
+            kernel::create_home(&w.db, &home, None, &w.admin)
+                .await
+                .unwrap(),
+        );
+    }
+    if records > 0 {
+        let mut tx = w.db.write_pool().begin().await.unwrap();
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('generic-trial:bulk:%05d',x),CASE WHEN x%10=0 THEN ?4 ELSE json_extract(?3,'$['||((x-1)%?5)||']') END,r.owner_id,r.primary_type,r.kind,printf('generic-trial:bulk:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?2")
+            .bind(records as i64).bind(&w.first).bind(serde_json::to_string(&home_ids).unwrap())
+            .bind(&private).bind(home_ids.len() as i64).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'title',json_quote('Generic trial '||id),created_seq FROM kernel_records WHERE id LIKE 'generic-trial:bulk:%'")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        kernel::ensure_record_metadata(&w.db).await.unwrap();
+    }
+    let dimensions: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM kernel_records),(SELECT count(*) FROM kernel_roots),(SELECT count(*) FROM content_events),(SELECT count(*) FROM kernel_generic_links WHERE active=1),(SELECT count(*) FROM kernel_provider_link_rows)"
+    ).fetch_one(w.db.pool()).await.unwrap();
+    eprintln!(
+        "{}",
+        json!({"generic_visibility_fixture":{
+            "degrees":degrees,"records":dimensions.0,"homes":dimensions.1,"events":dimensions.2,
+            "active_generic_links":dimensions.3,"provider_rows":dimensions.4,
+            "added_providers":providers,"added_bulk_records":records,"added_homes":homes,
+            "endpoint_pool":maximum_degree,"measured_waves":waves,"warmup_waves":2,
+            "debug_assertions":cfg!(debug_assertions),
+            "fixture":"independent anchors share endpoint pool; public outgoing/private incoming; canonical selected records/edges plus optional bulk serving projections; not replay/HQ history",
+            "method":"ordinary renderer A/B with observed/plain arms; no cache clear, priming, explicit prepare or synthetic DDL; plans collected only after timed matrix"
+        }})
+    );
+    let registry = Arc::new(registry());
+    let mut expected = std::collections::BTreeMap::new();
+    for wave in 0..waves + 2 {
+        let mut cases = Vec::new();
+        for (role, credential) in [("owner", "acct:admin"), ("member", "acct:viewer")] {
+            for (degree, id) in &targets {
+                for callers in [1, 4] {
+                    for candidate in [false, true] {
+                        for observed in [true, false] {
+                            cases.push((
+                                role,
+                                credential,
+                                *degree,
+                                id.clone(),
+                                callers,
+                                candidate,
+                                observed,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let positions = cases.len();
+        cases.rotate_left(wave % positions);
+        if wave % 2 == 1 {
+            cases.reverse();
+        }
+        for (role, credential, degree, id, callers, candidate, observed) in cases {
+            let barrier = Arc::new(tokio::sync::Barrier::new(callers));
+            let mut workers = Vec::new();
+            for worker in 0..callers {
+                let db = w.db.clone();
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                let id = id.clone();
+                workers.push(tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(2), barrier.wait()).await.unwrap();
+                    let started = Instant::now();
+                    let invoke = with_generic_visibility_variant(candidate, registry.call_engine(
+                        EngineHandle::KernelV2(db), Caller::authenticated(credential),
+                        "render_record", json!({"id":id})));
+                    let (answer, links, lifecycle, call_us) = if observed {
+                        let ((answer, links), lifecycle) = sql::with_session_lifecycle(
+                            with_link_statement_metadata(with_link_read_diagnostics(
+                                Options { explain:false, before_batch:None }, invoke))).await;
+                        let call_us = started.elapsed().as_micros() as u64;
+                        (answer, json!(links), json!(lifecycle), call_us)
+                    } else {
+                        let answer = invoke.await;
+                        let call_us = started.elapsed().as_micros() as u64;
+                        (answer, Value::Null, Value::Null, call_us)
+                    };
+                    let answer = answer.unwrap();
+                    if observed {
+                        assert_eq!(lifecycle.as_array().unwrap().len(), 5);
+                        for sample in lifecycle.as_array().unwrap() {
+                            assert!(sample["error"].is_null(), "{sample}");
+                            assert_eq!(sample["connection_id"], lifecycle[0]["connection_id"]);
+                            assert_eq!(sample["cache_count_before_probe"], sample["cache_count_after_probe"]);
+                        }
+                        assert_eq!(lifecycle[3]["temp_user_objects"], 0);
+                        assert_eq!(lifecycle[4]["temp_user_objects"], 0);
+                        assert_eq!(lifecycle[4]["reusable"], true);
+                        assert_eq!(links.as_array().unwrap().len(), 1);
+                        let detail = &links[0];
+                        assert_eq!(detail["succeeded"], true);
+                        assert!(detail["plans"].as_array().unwrap().is_empty());
+                        assert!(detail["statement_timeline"].as_array().unwrap().iter()
+                            .all(|s| !s["finished_ns"].is_null()));
+                        let phases = detail["phases"].as_array().unwrap();
+                        let generic = phases.iter().find(|p| p["phase"]=="generic_query").unwrap();
+                        assert_eq!(generic["returned_rows"].as_u64().unwrap(),
+                            if role=="owner" { degree as u64 } else { (degree/2) as u64 });
+                        let metadata = detail["query_metadata"].as_array().unwrap();
+                        assert_eq!(metadata.len(), 3);
+                        for entry in metadata {
+                            assert_eq!(entry["after"]["connection_id"], lifecycle[0]["connection_id"]);
+                            assert_eq!(entry["after"]["matching_statements"].as_array().unwrap().len(), 1);
+                        }
+                    }
+                    let bytes = serde_json::to_vec(&answer).unwrap();
+                    eprintln!("{}",json!({"generic_visibility_sample":{
+                        "wave":wave,"warmup":wave<2,"role":role,"degree":degree,
+                        "callers":callers,"worker":worker,"candidate":candidate,"observed":observed,
+                        "call_us":call_us,"response_bytes":bytes.len(),
+                        "response_sha256":format!("{:x}",sha2::Sha256::digest(&bytes)),
+                        "links":links,"lifecycle":lifecycle
+                    }}));
+                    answer
+                }));
+            }
+            for worker in workers {
+                let answer = worker.await.unwrap();
+                if let Some(prior) = expected.get(&(role, degree)) {
+                    assert_eq!(&answer, prior);
+                } else {
+                    expected.insert((role, degree), answer);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(expected.len(), targets.len() * 2);
+    // Plan collection intentionally follows all latency samples. EXPLAIN can
+    // warm schema/compiler state, so these observations are never timed arms.
+    for (role, credential) in [("owner", "acct:admin"), ("member", "acct:viewer")] {
+        for (degree, id) in &targets {
+            for candidate in [false, true] {
+                let (answer, details) = with_generic_visibility_variant(
+                    candidate,
+                    with_link_read_diagnostics(
+                        Options {
+                            explain: true,
+                            before_batch: None,
+                        },
+                        call_as(&w, credential, "render_record", json!({"id":id})),
+                    ),
+                )
+                .await;
+                assert_eq!(answer.unwrap(), expected[&(role, *degree)]);
+                assert_eq!(details.len(), 1);
+                let detail = serde_json::to_value(&details[0]).unwrap();
+                let plan = detail["plans"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p["phase"] == "generic_query")
+                    .unwrap();
+                assert!(plan["bytecode_ops"].as_u64().unwrap() > 0);
+                if candidate {
+                    let rows = plan["rows"].as_array().unwrap();
+                    assert!(rows.iter().any(|p| p["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("MATERIALIZE candidates")));
+                    assert!(!rows.iter().any(|p| matches!(
+                        p["detail"].as_str().unwrap(),
+                        "MATERIALIZE visible" | "MATERIALIZE endpoints"
+                    )));
+                    assert!(rows.iter().any(|p| p["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("SEARCH r USING INDEX sqlite_autoindex_kernel_records_1")));
+                    assert!(!rows
+                        .iter()
+                        .any(|p| p["detail"].as_str().unwrap().starts_with("SCAN r")));
+                    for endpoint in ["source", "target"] {
+                        assert!(rows.iter().any(|p| {
+                            let text = p["detail"].as_str().unwrap();
+                            text.contains("SEARCH")
+                                && text.contains(&format!("idx_kernel_generic_links_{endpoint}"))
+                        }));
+                    }
+                }
+                eprintln!(
+                    "{}",
+                    json!({"generic_visibility_plan":{
+                        "role":role,"degree":degree,"candidate":candidate,"detail":detail
+                    }})
+                );
+            }
+        }
+    }
+    w.db.close().await;
+}
+
+/// Default-sized correctness check; opt in to the same diagnostic at HQ scale.
+/// Bulk projection/header setup measures serving costs, not replay correctness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_reads_small_read_diagnostics() {
+    fn dimension(name: &str, default: usize, min: usize, max: usize) -> usize {
+        let value = std::env::var(name).map_or(default, |v| {
+            v.parse().expect("numeric diagnostic dimension")
+        });
+        assert!((min..=max).contains(&value), "{name} outside {min}..={max}");
+        value
+    }
+    fn quantiles(mut values: Vec<u64>) -> Value {
+        values.sort_unstable();
+        let n = values.len();
+        json!({"min":values[0],"p50":values[n/2],"p95":values[(n*95).div_ceil(100)-1],"p99":values[(n*99).div_ceil(100)-1],"max":values[n-1]})
+    }
+    use tracing::Instrument;
+    if std::env::var_os("NATIVE_SMALL_READ_PROFILE").is_some() {
+        use tracing_subscriber::prelude::*;
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_test_writer()
+                    .with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                        m.target() == "native_ce::read_staging"
+                    })),
+            )
+            .try_init();
+    }
+    let diagnostic = std::env::var_os("NATIVE_SMALL_READ_DIAGNOSTICS").is_some();
+    let detail = std::env::var("NATIVE_SMALL_READ_DETAIL").unwrap_or_else(|_| "off".into());
+    assert!(matches!(
+        detail.as_str(),
+        "off" | "candidates" | "links" | "both"
+    ));
+    let synchronize_links = std::env::var_os("NATIVE_SMALL_READ_SYNC_LINKS").is_some();
+    let trial_indexes = std::env::var_os("NATIVE_SMALL_READ_INDEX_TRIAL").is_some();
+    assert!(!trial_indexes || matches!(detail.as_str(), "candidates" | "both"));
+    assert!(!synchronize_links || matches!(detail.as_str(), "links" | "both"));
+    assert!(
+        !synchronize_links || !diagnostic || crate::db::governed_sql_pool_size() >= 4,
+        "four-caller synchronization requires four governed slots"
+    );
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    assert_eq!(detail, "off", "detailed probes require v2-kernel-probe");
+    let provider_fixture = std::env::var_os("NATIVE_SMALL_READ_PROVIDERS").is_some();
+    let providers = dimension("NATIVE_SMALL_READ_PROVIDERS", 0, 0, 2000);
+    let provider_slots = dimension(
+        "NATIVE_SMALL_READ_PROVIDER_SLOTS",
+        providers.max(256),
+        providers,
+        2000,
+    );
+    let extra_links = dimension("NATIVE_SMALL_READ_EXTRA_LINKS", 0, 0, 50_000);
+    let records = dimension(
+        "NATIVE_SMALL_READ_RECORDS",
+        if diagnostic { 16_500 } else { 128 },
+        100,
+        25_000,
+    );
+    let edits = dimension(
+        "NATIVE_SMALL_READ_EDITS",
+        if diagnostic { 28 } else { 2 },
+        0,
+        50,
+    );
+    let homes = dimension(
+        "NATIVE_SMALL_READ_HOMES",
+        if diagnostic { 360 } else { 12 },
+        6,
+        600,
+    );
+    let moved = dimension(
+        "NATIVE_SMALL_READ_MOVED_PERCENT",
+        if diagnostic { 100 } else { 50 },
+        0,
+        100,
+    );
+    let move_format = std::env::var("NATIVE_SMALL_READ_MOVE_FORMAT")
+        .unwrap_or_else(|_| if diagnostic { "legacy" } else { "v2" }.into());
+    assert!(matches!(move_format.as_str(), "legacy" | "v2"));
+    let write_pairs = dimension("NATIVE_SMALL_READ_INDEX_WRITE_PAIRS", 0, 0, 100);
+    assert!(write_pairs == 0 || (trial_indexes && move_format == "v2"));
+    let waves = dimension(
+        "NATIVE_SMALL_READ_WAVES",
+        if diagnostic { 5 } else { 1 },
+        1,
+        100,
+    );
+    let w = world().await;
+    let root = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let mut home_ids = Vec::new();
+    for index in 0..homes {
+        let parent = if index % 6 == 0 {
+            &root
+        } else {
+            &home_ids[index - 1]
+        };
+        home_ids.push(
+            kernel::create_home(&w.db, parent, None, &w.admin)
+                .await
+                .unwrap(),
+        );
+    }
+    install_comment_carrier(&w).await;
+    let logical_folder = if move_format == "v2" {
+        Some(
+            call_as(&w, "acct:admin", "create_record", json!({"type":"Collection","kind":"folder","name":"Diagnostic move destination","home_id":root}))
+                .await.unwrap()["id"].as_str().unwrap().to_owned(),
+        )
+    } else {
+        None
+    };
+    let package = crate::v2_standard::v1_compat::package();
+    let definition = &package.definitions[0];
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let message = kernel::MessageState {
+        author: Some(w.admin.clone()),
+        audience: std::collections::BTreeMap::from([
+            (w.admin.clone(), "manage".into()),
+            (w.viewer.clone(), "view".into()),
+        ]),
+        origin: Value::Null,
+        ..Default::default()
+    };
+    kernel::import_record_as(
+        &w.db,
+        &host,
+        "diag:message-template",
+        &root,
+        Some(&w.admin),
+        &kernel::ImportRecordState {
+            definition: Some(kernel::ImportDefinition {
+                pin: crate::meta::definition_artifact::RevisionIdentity {
+                    family: definition.family.clone(),
+                    version: definition.version,
+                    digest: definition.digest.clone(),
+                },
+                primary_type: "V1".into(),
+                kind: crate::v2_standard::v1_compat::KIND.into(),
+                fields: crate::v2_standard::v1_compat::compat_fields(
+                    "Message",
+                    "text",
+                    Some("Diagnostic message template"),
+                    None,
+                    None,
+                ),
+            }),
+            body: Some("message fixture".into()),
+            message: Some(message.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut tx = w.db.write_pool().begin().await.unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('diag:%05d',x),CASE WHEN x%10=0 THEN ?4 ELSE json_extract(?3,'$['||((x-1)%?5)||']') END,r.owner_id,r.primary_type,r.kind,printf('diag:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?2")
+        .bind(records as i64).bind(&w.first).bind(serde_json::to_string(&home_ids).unwrap()).bind(&private).bind(homes as i64).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT r.id,'title',json_quote(CASE WHEN r.id IN ('diag:00002','diag:00003') THEN 'Alpha' ELSE 'Diagnostic '||substr(r.id,6) END),r.created_seq FROM kernel_records r WHERE r.id LIKE 'diag:%' AND r.id!='diag:message-template'")
+        .execute(&mut *tx).await.unwrap();
+    let large_body = "large document paragraph\n".repeat(11_000);
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'body',json_quote(CASE WHEN id='diag:00001' OR CAST(substr(id,6) AS INTEGER)%1000=1 THEN ?1 ELSE ?2 END),created_seq FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template'")
+        .bind(&large_body).bind("small fixture paragraph\n".repeat(50)).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT id,'lifecycle','\"active\"',created_seq FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template' AND CAST(substr(id,6) AS INTEGER)<=min(?1,3600)")
+        .bind(records as i64).execute(&mut *tx).await.unwrap();
+    let messages = (records / 8).min(2000);
+    sqlx::query("UPDATE kernel_records AS r SET primary_type=t.primary_type,kind=t.kind,pin_family=t.pin_family,pin_version=t.pin_version,pin_digest=t.pin_digest,interpreter=t.interpreter FROM kernel_records t WHERE t.id='diag:message-template' AND r.id LIKE 'diag:%' AND r.id!='diag:message-template' AND CAST(substr(r.id,6) AS INTEGER)>?1")
+        .bind((records-messages) as i64).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT r.id,f.name,f.value_json,r.created_seq FROM kernel_records r CROSS JOIN kernel_record_fields f WHERE r.id LIKE 'diag:%' AND r.id!='diag:message-template' AND CAST(substr(r.id,6) AS INTEGER)>?1 AND f.record_id='diag:message-template' AND f.name IN ('v1_type','v1_kind')")
+        .bind((records-messages) as i64).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kernel_messages SELECT id,?2,created_seq FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template' AND CAST(substr(id,6) AS INTEGER)>?1")
+        .bind((records-messages) as i64).bind(serde_json::to_string(&message).unwrap()).execute(&mut *tx).await.unwrap();
+    if edits > 0 {
+        sqlx::query("WITH RECURSIVE edits(k) AS (VALUES(1) UNION ALL SELECT k+1 FROM edits WHERE k<?1) INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'diag-edit:'||r.id||':'||k,r.id,CASE WHEN k%2=0 THEN 'kernel.legacy_recorded.v1' ELSE 'kernel.body_set.v1' END,CASE WHEN k%2=0 THEN '{}' ELSE json_object('body','retained fixture revision') END,CASE WHEN k%3=0 THEN ?3 ELSE ?2 END,'2026-11-08T02:00:00Z',1,'legacy_unknown' FROM edits CROSS JOIN kernel_records r WHERE r.id LIKE 'diag:%' AND r.id!='diag:message-template' ORDER BY k,r.id")
+            .bind(edits as i64).bind(&w.admin).bind(&w.viewer).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO kernel_legacy_sql_events SELECT seq,id,record_id,'record.updated',CASE WHEN actor=?1 THEN 'v1:acct:admin' ELSE 'v1:acct:viewer' END,NULL,NULL,created_at,'content_events' FROM content_events WHERE id LIKE 'diag-edit:%' AND type='kernel.legacy_recorded.v1'; INSERT INTO kernel_legacy_history SELECT seq,'record.updated',json_array(record_id),NULL,0,0,0,2 FROM content_events WHERE id LIKE 'diag-edit:%' AND type='kernel.legacy_recorded.v1'; INSERT INTO kernel_legacy_subjects SELECT record_id,seq FROM content_events WHERE id LIKE 'diag-edit:%' AND type='kernel.legacy_recorded.v1'; INSERT OR REPLACE INTO kernel_legacy_sql_progress VALUES(1,(SELECT coalesce(max(seq),0) FROM content_events WHERE type='kernel.legacy_recorded.v1'),1,1)")
+            .bind(&w.admin).execute(&mut *tx).await.unwrap();
+    }
+    if moved > 0 {
+        if let Some(folder) = &logical_folder {
+            // Preserve physical ACL placement, including private rows, while
+            // exercising independently filed logical destinations. Half the
+            // rows visiting the requested folder subsequently leave it.
+            sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'diag-move:'||id,id,'kernel.record_rehomed.v2',json_object('new_home_id',home_id,'logical_home_id',CASE WHEN CAST(substr(id,6) AS INTEGER)%20 IN (0,2) THEN ?3 ELSE home_id END,'parent_update',NULL),?1,'2026-11-08T03:00:00Z',1,'legacy_unknown' FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template' AND CAST(substr(id,6) AS INTEGER)%100<?2")
+                .bind(&w.admin).bind(moved as i64).bind(folder).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'diag-move-away:'||id,id,'kernel.record_rehomed.v2',json_object('new_home_id',home_id,'logical_home_id',home_id,'parent_update',NULL),?1,'2026-11-08T04:00:00Z',1,'legacy_unknown' FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template' AND CAST(substr(id,6) AS INTEGER)%100<?2 AND CAST(substr(id,6) AS INTEGER)%40 IN (0,2)")
+                .bind(&w.admin).bind(moved as i64).execute(&mut *tx).await.unwrap();
+        } else {
+            // Retain the original serving shape: valid legacy move receipts
+            // may omit the logical destination and use physical placement.
+            sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status) SELECT 'diag-move:'||id,id,'kernel.record_rehomed.v1',json_object('new_home_id',home_id),?1,'2026-11-08T03:00:00Z',1,'legacy_unknown' FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template' AND CAST(substr(id,6) AS INTEGER)%100<?2")
+                .bind(&w.admin).bind(moved as i64).execute(&mut *tx).await.unwrap();
+        }
+    }
+    sqlx::query("INSERT INTO kernel_generic_links(link_id,source_id,target_id,relationship,created_at,active,event_seq,imported) SELECT 'diag-link:'||id,id,printf('diag:%05d',(CAST(substr(id,6) AS INTEGER)%?1)+1),'relates_to',created_at,1,created_seq,1 FROM kernel_records WHERE id LIKE 'diag:%' AND id!='diag:message-template' AND CAST(substr(id,6) AS INTEGER)<=4000")
+        .bind(records as i64).execute(&mut *tx).await.unwrap();
+    if extra_links > 0 {
+        sqlx::query("WITH RECURSIVE extra(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM extra WHERE n<?1) INSERT INTO kernel_generic_links(link_id,source_id,target_id,relationship,created_at,active,event_seq,imported) SELECT 'diag-extra-link:'||n,'diag:00003','diag:00004','diag_extra_'||n,r.created_at,1,r.created_seq,1 FROM extra CROSS JOIN kernel_records r WHERE r.id='diag:00003'")
+            .bind(extra_links as i64).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    kernel::ensure_record_metadata(&w.db).await.unwrap();
+    #[cfg(feature = "v2-kernel-probe")]
+    let provider_anchor = if provider_fixture {
+        Some(small_read_provider_fixture(&w, &root, providers, provider_slots).await)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let provider_anchor: Option<(String, String)> = {
+        assert!(
+            !provider_fixture,
+            "provider fixtures require v2-kernel-probe"
+        );
+        let _ = (providers, provider_slots);
+        None
+    };
+    #[cfg(feature = "v2-kernel-probe")]
+    if trial_indexes {
+        let production_indexes_present: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('idx_kernel_record_names','idx_kernel_record_logical_homes')")
+            .fetch_one(w.db.write_pool()).await.unwrap();
+        let write_fixture = if write_pairs > 0 {
+            let package = crate::v2_standard::document_package();
+            let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+                .await
+                .unwrap();
+            kernel::adopt_package_at(
+                &w.db,
+                &w.admin,
+                KERNEL_ROOT_ID,
+                &package,
+                Some(&installed),
+                &package.declared_reads,
+            )
+            .await
+            .unwrap();
+            Some(call_as(&w, "acct:admin", "create_record", json!({"type":"Document","kind":"note","name":"Diagnostic write probe","home_id":root})).await.unwrap()["id"].as_str().unwrap().to_owned())
+        } else {
+            None
+        };
+        let before = if let Some(id) = &write_fixture {
+            small_read_index_write_probe(
+                &w,
+                id,
+                &root,
+                logical_folder.as_ref().unwrap(),
+                write_pairs,
+            )
+            .await
+        } else {
+            Value::Null
+        };
+        let build = small_read_candidate_index_fixture(&w).await;
+        let after = if let Some(id) = &write_fixture {
+            small_read_index_write_probe(
+                &w,
+                id,
+                &root,
+                logical_folder.as_ref().unwrap(),
+                write_pairs,
+            )
+            .await
+        } else {
+            Value::Null
+        };
+        eprintln!(
+            "{}",
+            json!({"small_read_index_trial_setup":{"indexes":build,"production_indexes_present":production_indexes_present,"canonical_writes_before_disposable_indexes":before,"canonical_writes_after_disposable_indexes":after}})
+        );
+    }
+    let dimensions: (i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM kernel_records),(SELECT count(*) FROM content_events),(SELECT count(*) FROM kernel_roots),(SELECT count(*) FROM kernel_legacy_sql_events),(SELECT count(*) FROM content_events WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')),(SELECT sum(length(CAST(value_json AS BLOB))) FROM kernel_record_fields WHERE name='body')")
+        .fetch_one(w.db.write_pool()).await.unwrap();
+    let move_dimensions: (i64,i64,i64) = sqlx::query_as("SELECT coalesce(sum(type='kernel.record_rehomed.v1'),0),coalesce(sum(type='kernel.record_rehomed.v2'),0),coalesce(sum(json_extract(payload,'$.logical_home_id') IS NOT NULL),0) FROM content_events WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')")
+        .fetch_one(w.db.write_pool()).await.unwrap();
+    let link_dimensions: (i64,i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM kernel_generic_links WHERE active=1),(SELECT count(*) FROM kernel_links),(SELECT count(*) FROM kernel_provider_state WHERE provider_key='relates_to.v1'),(SELECT count(*) FROM kernel_provider_link_rows),(SELECT count(*) FROM kernel_provider_subjects)")
+        .fetch_one(w.db.write_pool()).await.unwrap();
+    eprintln!(
+        "{}",
+        json!({"small_read_fixture":{"records":dimensions.0,"events":dimensions.1,"homes":dimensions.2,"retained_headers":dimensions.3,"moves":dimensions.4,"move_format":move_format,"v1_moves":move_dimensions.0,"v2_moves":move_dimensions.1,"moves_with_logical_home":move_dimensions.2,"encoded_body_bytes":dimensions.5,"added_message_states":messages,"added_lifecycle_fields":records.min(3600),"added_home_depth":6,"generic_links":link_dimensions.0,"legacy_links":link_dimensions.1,"provider_aggregates":link_dimensions.2,"provider_rows":link_dimensions.3,"provider_subjects":link_dimensions.4,"added_unrelated_providers":providers,"provider_record_slots":provider_slots,"added_unrelated_links":extra_links,"trial_indexes":trial_indexes,"detail":detail,"synchronize_links":synchronize_links,"fixture":"bulk serving projections and event headers plus optional canonical providers; not a replay qualification","debug_assertions":cfg!(debug_assertions)}})
+    );
+    let mut names = vec![
+        "Alpha".to_owned(),
+        "Secret".to_owned(),
+        "Alpha".to_owned(),
+        "alpha".to_owned(),
+        "Missing diagnostic name".to_owned(),
+    ];
+    names.extend((1..=95).map(|n| format!("Diagnostic {n:05}")));
+    let mut cases = vec![
+        ("render_small", "render_record", json!({"id":w.first})),
+        ("render_large", "render_record", json!({"id":"diag:00001"})),
+        ("resolve_one", "resolve_many", json!({"names":["Alpha"]})),
+        ("resolve_100", "resolve_many", json!({"names":names})),
+    ];
+    if let Some(folder) = logical_folder {
+        cases.push((
+            "render_moved_children",
+            "render_record",
+            json!({"id":folder}),
+        ));
+    }
+    if let Some((anchor, empty)) = provider_anchor {
+        cases.push(("render_provider", "render_record", json!({"id":anchor})));
+        cases.push(("render_no_links", "render_record", json!({"id":empty})));
+    }
+    let registry = std::sync::Arc::new(registry());
+    let mut expected = std::collections::BTreeMap::new();
+    let mut narrow_failures = 0;
+    for credential in ["acct:admin", "acct:viewer"] {
+        for (case, tool, args) in &cases {
+            for callers in if diagnostic { vec![1, 4] } else { vec![1] } {
+                // Rotate and reverse all three implementations so none always
+                // receives the first warm-cache observation. The old anchor
+                // selector isolates this change from the prior renderer work.
+                let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+                let mut warmup_failures = [0, 0, 0];
+                for wave in 0..=waves {
+                    let mut order = [0usize, 1, 2];
+                    order.rotate_left(wave % 3);
+                    if wave % 2 == 1 {
+                        order.reverse();
+                    }
+                    for mode in order {
+                        let staging = ["full_oracle", "all_moved_candidates", "narrow"][mode];
+                        let barrier = (mode == 2 && synchronize_links && *tool == "render_record")
+                            .then(|| std::sync::Arc::new(tokio::sync::Barrier::new(callers)));
+                        let mut workers = Vec::new();
+                        for worker in 0..callers {
+                            let db = w.db.clone();
+                            let registry = registry.clone();
+                            let args = args.clone();
+                            let tool = *tool;
+                            let barrier = barrier.clone();
+                            let detail = detail.clone();
+                            let span = tracing::info_span!(target:"native_ce::read_staging", "small_read_sample", credential, case, wave, worker, staging);
+                            workers.push(tokio::spawn(
+                                async move {
+                                    let started = std::time::Instant::now();
+                                    let invoke = registry.call_engine(
+                                        EngineHandle::KernelV2(db),
+                                        Caller::authenticated(credential),
+                                        tool,
+                                        args,
+                                    );
+                                    let work = async {
+                                        if mode == 0 {
+                                            record_reads::with_full_small_read_staging(invoke).await
+                                        } else if mode == 1 {
+                                            sql::with_all_moved_candidates(invoke).await
+                                        } else {
+                                            invoke.await
+                                        }
+                                    };
+                                    #[cfg(feature = "v2-kernel-probe")]
+                                    let ((answer, details), stats) =
+                                        sql::measured(small_read_detailed_call(
+                                            mode == 2
+                                                && matches!(detail.as_str(), "candidates" | "both"),
+                                            mode == 2
+                                                && matches!(detail.as_str(), "links" | "both"),
+                                            trial_indexes,
+                                            barrier,
+                                            work,
+                                        ))
+                                        .await;
+                                    #[cfg(not(feature = "v2-kernel-probe"))]
+                                    let ((answer, details), stats) = {
+                                        let _ = (barrier, detail, trial_indexes);
+                                        let (answer, stats) = sql::measured(work).await;
+                                        ((answer, Value::Null), stats)
+                                    };
+                                    let call_us = started.elapsed().as_micros() as u64;
+                                    let started = std::time::Instant::now();
+                                    let bytes = answer
+                                        .as_ref()
+                                        .ok()
+                                        .map(|v| serde_json::to_vec(v).unwrap().len())
+                                        .unwrap_or(0);
+                                    (
+                                        answer,
+                                        stats,
+                                        call_us,
+                                        started.elapsed().as_micros() as u64,
+                                        bytes,
+                                        details,
+                                    )
+                                }
+                                .instrument(span),
+                            ));
+                        }
+                        for worker in workers {
+                            let (answer, stats, call_us, serialize_us, bytes, details) =
+                                worker.await.unwrap();
+                            if !details.is_null() {
+                                eprintln!(
+                                    "{}",
+                                    json!({"small_read_detail":{"caller":credential,"case":case,"callers":callers,"wave":wave,"synchronize_links":synchronize_links,"succeeded":answer.is_ok(),"details":details,"timing":"instrumented probes; separate from latency comparisons"}})
+                                );
+                            }
+                            let failed = answer.is_err();
+                            if mode == 2 && failed {
+                                narrow_failures += 1;
+                            }
+                            if wave == 0 && failed {
+                                warmup_failures[mode] += 1;
+                            }
+                            let timeout = answer.as_ref().err().is_some_and(|e| {
+                                ["interrupted", "timeout", "deadline", "cannot rollback"]
+                                    .iter()
+                                    .any(|s| e.to_string().contains(s))
+                            });
+                            if let Ok(value) = answer {
+                                if let Some(prior) = expected.get(&(credential, *case)) {
+                                    assert_eq!(&value, prior, "{credential} {case}");
+                                } else {
+                                    expected.insert((credential, *case), value);
+                                }
+                            } else if !diagnostic {
+                                panic!("default small-read diagnostic failed: {credential} {case}");
+                            }
+                            if wave > 0 {
+                                samples[mode].push((
+                                    call_us,
+                                    serialize_us,
+                                    bytes,
+                                    failed,
+                                    timeout,
+                                    stats.staged_records,
+                                    stats.home_checks,
+                                    stats.installations,
+                                    stats.staging_us,
+                                    stats.staging_vm_ops,
+                                    stats.pool_wait_us,
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (mode, samples) in samples.into_iter().enumerate() {
+                    let staging = ["full_oracle", "all_moved_candidates", "narrow"][mode];
+                    eprintln!(
+                        "{}",
+                        json!({"small_read_measurement":{"caller":credential,"case":case,"staging":staging,"thermal":"warm; one warmup wave excluded; rotating/reversed implementation order","callers":callers,"samples":samples.len(),"warmup_failures":warmup_failures[mode],"baseline_failures_permitted":diagnostic && mode!=2,"failures":samples.iter().filter(|s|s.3).count(),"timeouts_or_rollback_errors":samples.iter().filter(|s|s.4).count(),"call_us":quantiles(samples.iter().map(|s|s.0).collect()),"serialization_us":quantiles(samples.iter().map(|s|s.1).collect()),"max_response_bytes":samples.iter().map(|s|s.2).max(),"staged_records":quantiles(samples.iter().map(|s|s.5).collect()),"max_home_checks":samples.iter().map(|s|s.6).max(),"max_installations":samples.iter().map(|s|s.7).max(),"staging_us":quantiles(samples.iter().map(|s|s.8).collect()),"staging_vm_ops":quantiles(samples.iter().map(|s|s.9).collect()),"pool_wait_us":quantiles(samples.iter().map(|s|s.10).collect())}})
+                    );
+                }
+            }
+        }
+    }
+    // Keep ordinary-get claim fixtures outside the renderer measurement matrix.
+    seed_claim_directory_diagnostic(&w).await;
+    let get_dimensions: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM kernel_records),(SELECT count(*) FROM content_events)",
+    )
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    eprintln!(
+        "{}",
+        json!({"ordinary_get_fixture":{"records":get_dimensions.0,"events":get_dimensions.1,"directory_rows":101,"serving_projection_fixture":true}})
+    );
+    // Ordinary get_record, not render_record's closed renderer entry point.
+    // One warmup + one measured pair per caller; no concurrency/perf matrix.
+    for credential in ["acct:admin", "acct:viewer"] {
+        let mut default_value: Option<Value> = None;
+        for (case, args) in [
+            ("default", json!({"ids":["diag:00001"]})),
+            (
+                "lean",
+                json!({"ids":["diag:00001"],"include_comments":false,"include_citations":false,"include_suggestions":false,"include_history_summary":false,"children_limit":0,"links_limit":0}),
+            ),
+        ] {
+            for wave in 0..2 {
+                let span = tracing::info_span!(target:"native_ce::read_staging", "ordinary_get_sample", credential, case, wave);
+                let started = std::time::Instant::now();
+                let (answer, stats) =
+                    sql::measured(call_as(&w, credential, "get_record", args.clone()))
+                        .instrument(span)
+                        .await;
+                let elapsed = started.elapsed().as_micros() as u64;
+                let value = answer.unwrap();
+                assert_eq!(value["records"][0]["status"], "found");
+                if wave == 1 {
+                    let mut comparable = value.clone();
+                    for key in ["children", "links_in", "links_out"] {
+                        comparable["records"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(key);
+                    }
+                    if let Some(default_value) = &default_value {
+                        assert_eq!(
+                            &comparable, default_value,
+                            "default/lean counts and core data differ"
+                        );
+                    } else {
+                        default_value = Some(comparable);
+                    }
+                    eprintln!(
+                        "{}",
+                        json!({"ordinary_get_measurement":{"caller":credential,"case":case,"warmup_excluded":true,"call_us":elapsed,"pool_wait_us":stats.pool_wait_us,"staging_us":stats.staging_us,"remaining_call_us":elapsed.saturating_sub(stats.pool_wait_us+stats.staging_us),"staging_vm_ops":stats.staging_vm_ops,"staged_records":stats.staged_records,"home_checks":stats.home_checks,"response_bytes":serde_json::to_vec(&value).unwrap().len(),"directory_rows":101,"failures":0,"retries":0}})
+                    );
+                }
+            }
+        }
+    }
+    w.db.close().await;
+    assert_eq!(
+        narrow_failures, 0,
+        "narrow requests failed; inspect emitted diagnostic measurements"
+    );
+}
+
+#[tokio::test]
+async fn record_reads_temp_write_interrupt_preserves_deadline_error() {
+    let w = world().await;
+    let error = sql::TEST_SNAPSHOT_BUDGET.scope(
+        std::time::Duration::from_millis(5),
+        sql::with_read_session(
+            &w.db,
+            &w.admin,
+            &[("records", "id")],
+            sql::in_snapshot(&w.db, &w.admin, |conn| Box::pin(async move {
+                sqlx::query("CREATE TEMP TABLE _interrupt_probe(n INTEGER)")
+                    .execute(&mut *conn).await?;
+                let error = sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) INSERT INTO temp._interrupt_probe SELECT x FROM n")
+                    .execute(&mut *conn).await.unwrap_err();
+                let mut handle = conn.lock_handle().await?;
+                // SAFETY: the locked SQLite handle is exclusively borrowed and live.
+                assert_ne!(unsafe { libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) }, 0);
+                Err::<(), _>(error.into())
+            })),
+        ),
+    ).await.unwrap_err();
+    assert!(
+        error.to_string().contains("(code: 9) interrupted"),
+        "{error}"
+    );
+    let out = call_as(&w, "acct:admin", "scan", json!({})).await.unwrap();
+    assert_eq!(out["corpus_size"], 3);
+    w.db.close().await;
+}
+
+#[path = "sql_hq_bench.rs"]
+mod sql_hq_bench;
+
+#[tokio::test]
+async fn kernel_v2_composed_body_reads_match_standalone_for_points_and_filters() {
+    let w = world().await;
+    kernel::revise_as(
+        &w.db,
+        &w.admin,
+        &w.hidden,
+        json!({"body":"private body witness"}).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    let queries = [
+        ("SELECT id, body FROM records WHERE id = ?1", Some(w.first.as_str())),
+        ("SELECT id, name, body FROM records WHERE body LIKE ?1 ORDER BY id", Some("%original%")),
+        ("SELECT id, substr(body,1,8) AS excerpt, length(body) AS body_length FROM records ORDER BY id", None),
+        ("SELECT body FROM records WHERE body LIKE ?1 ORDER BY body", Some("%")),
+    ];
+    for actor in [&w.admin, &w.viewer] {
+        for (statement, parameter) in queries {
+            let mut args = json!({"sql":statement});
+            if let Some(value) = parameter {
+                args["parameters"] = json!([{"type":"text","value":value}]);
+            }
+            let expected = sql::query_sql(&w.db, actor, args.clone()).await.unwrap();
+            let actual = sql::with_query_read_session(
+                &w.db,
+                actor,
+                &[statement],
+                sql::query_sql(&w.db, actor, args),
+            )
+            .await
+            .unwrap();
+            assert_eq!(actual["columns"], expected["columns"]);
+            assert_eq!(actual["rows"], expected["rows"], "{statement}");
+            if actor == &w.viewer {
+                assert!(!actual["rows"].to_string().contains("private body witness"));
+            }
+            if statement == queries[0].0 {
+                assert_eq!(actual["rows"][0]["body"], "revised");
+            }
+        }
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_composed_point_body_ignores_unrelated_oversized_body() {
+    let w = world().await;
+    kernel::revise_as(
+        &w.db,
+        &w.admin,
+        &w.second,
+        json!({"body":"x".repeat(crate::query::sql::MAX_SQLITE_VALUE_BYTES as usize + 4096)})
+            .as_object()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let statement =
+        "SELECT id, body FROM records WHERE id = ?1 AND type = 'Document' AND kind = 'note'";
+    for projected in [false, true] {
+        if projected {
+            kernel::sql_record_projection::catch_up(&w.db)
+                .await
+                .unwrap();
+        }
+        for actor in [&w.admin, &w.viewer] {
+            let args = json!({"sql":statement,"parameters":[{"type":"text","value":w.first}]});
+            let expected = sql::query_sql(&w.db, actor, args.clone()).await.unwrap();
+            let actual = sql::with_query_read_session(
+                &w.db,
+                actor,
+                &[statement],
+                sql::query_sql(&w.db, actor, args),
+            )
+            .await
+            .unwrap();
+            assert_eq!(actual["rows"], expected["rows"], "projected={projected}");
+        }
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_prism_bound_event_reads_match_full_staging() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    kernel::hosted_identity::reconcile_hosted_caller(&w.db, |_| async {
+        // SAFETY: complete synthetic membership matching this fixture's bindings.
+        Ok(unsafe {
+            kernel::hosted_identity::VerifiedHostedMembership::from_catalog_unchecked(
+                "acct:admin".into(),
+                std::collections::BTreeMap::from([
+                    ("acct:admin".into(), "admin@example.test".into()),
+                    ("acct:viewer".into(), "viewer@example.test".into()),
+                ]),
+                std::collections::BTreeMap::new(),
+            )
+        })
+    })
+    .await
+    .unwrap();
+    let mut tasks = Vec::new();
+    for parent in [&w.first, &w.hidden] {
+        let home = kernel::read_record_as(&w.db, &w.admin, parent)
+            .await
+            .unwrap()
+            .unwrap()
+            .home_id;
+        let task = call_as(&w,"acct:admin","create_record",json!({"type":"WorkItem","kind":"task","name":"Prism subject","body":"Selected body","home_id":home})).await.unwrap()["id"].as_str().unwrap().to_owned();
+        call_as(&w,"acct:admin","create_record",json!({"type":"Annotation","kind":"comment","body":"Discussion","links":[{"target_id":task,"relationship":"part_of"}]})).await.unwrap();
+        kernel::observe_facet_as(
+            &w.db,
+            &w.admin,
+            &task,
+            &kernel::FacetObservation {
+                key: "prism-proof".into(),
+                value: Some("kept".into()),
+                value_num: None,
+                vocab_ref: None,
+                as_of: chrono::Utc::now().to_rfc3339(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        tasks.push(task);
+    }
+    kernel::add_generic_link_as(&w.db, &w.admin, &tasks[0], &tasks[1], "supersedes", None)
+        .await
+        .unwrap();
+    let needs: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/kernel_v2_prism_reads.json"
+    ))
+    .unwrap();
+    for projected in [false, true] {
+        if projected {
+            kernel::sql_record_projection::catch_up(&w.db)
+                .await
+                .unwrap();
+            kernel::sql_event_projection::catch_up(&w.db).await.unwrap();
+        }
+        for actor in [&w.admin, &w.viewer] {
+            for target in [&tasks[0], &tasks[1]] {
+                for need in needs.as_array().unwrap().iter().filter(|n| {
+                    ["prism.history", "prism.comments", "prism.runs"]
+                        .contains(&n["key"].as_str().unwrap())
+                }) {
+                    let args =
+                        json!({"sql":need["sql"],"parameters":[{"type":"text","value":target}]});
+                    let (expected, full_stats) = sql::measured(sql::with_full_event_staging(
+                        sql::query_sql(&w.db, actor, args.clone()),
+                    ))
+                    .await;
+                    let expected = expected.unwrap();
+                    let (actual, stats) = sql::measured(sql::with_bound_query_read_session(
+                        &w.db,
+                        actor,
+                        std::slice::from_ref(&args),
+                        sql::query_sql(&w.db, actor, args.clone()),
+                    ))
+                    .await;
+                    let actual = actual.unwrap();
+                    assert_eq!(
+                        actual["rows"], expected["rows"],
+                        "{} projected={projected}",
+                        need["key"]
+                    );
+                    assert_eq!(actual["columns"], expected["columns"]);
+                    if !projected {
+                        assert!(
+                            stats.native_event_rows + stats.legacy_event_rows
+                                < full_stats.native_event_rows + full_stats.legacy_event_rows,
+                            "{} did not reduce staged events: {stats:?} vs {full_stats:?}",
+                            need["key"]
+                        );
+                    }
+                    if actor == &w.viewer && target == &tasks[1] {
+                        assert_eq!(actual["row_count"], 0);
+                    }
+                    if actor == &w.admin && need["key"] != "prism.runs" {
+                        assert!(actual["row_count"].as_u64().unwrap() > 0);
+                        if need["key"] == "prism.history" {
+                            assert!(actual["rows"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|r| r["facet_key"] == "prism-proof"
+                                    && r["facet_value"] == "kept"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    w.db.close().await;
+}
+
+/// Explicit disposable-copy diagnostic; never point this at a serving store.
+#[tokio::test]
+#[ignore = "Installed Prism SQL on an explicitly supplied disposable HQ copy (d8550c6)"]
+async fn kernel_v2_prism_disposable_copy_profile() {
+    use crate::realtime::v2::{AppDataNeeds, AppDataRequest};
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                    m.target() == "native_ce::read_staging"
+                })),
+        )
+        .try_init();
+    let path = std::path::PathBuf::from(
+        std::env::var("NATIVE_PRISM_BENCH_COPY").expect("explicit copy required"),
+    )
+    .canonicalize()
+    .unwrap();
+    let target = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .canonicalize()
+        .unwrap();
+    assert!(
+        path.starts_with(&target),
+        "diagnostic copy must be inside this checkout's target directory"
+    );
+    let record = std::env::var("NATIVE_PRISM_BENCH_RECORD").expect("explicit record required");
+    let db = kernel::open_marked_v2_database(path.to_str().unwrap())
+        .await
+        .unwrap();
+    let installs: Vec<(String,String,String,String)> = sqlx::query_as("SELECT p.auth_binding,a.generation,json_extract(a.row_json,'$.version'),json_extract(a.row_json,'$.consented_declaration') FROM kernel_app_installs a JOIN kernel_principals p ON p.principal_id=a.principal WHERE a.package='agent.prism' AND a.status='installed'").fetch_all(db.pool()).await.unwrap();
+    assert_eq!(
+        installs.len(),
+        1,
+        "select an unambiguous installed Prism copy"
+    );
+    let (binding, generation, version, declaration) = &installs[0];
+    let declaration: Value = serde_json::from_str(declaration).unwrap();
+    let app_v2 = declaration["contract"] == "native.app.v2";
+    let caller = Caller::authenticated(binding);
+    let app_caller = caller.clone().with_host_asserted_app(
+        crate::mcp::app_attribution::AppAttribution::new("agent.prism", version, generation)
+            .unwrap(),
+    );
+    let registry = registry();
+    let needs: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/kernel_v2_prism_reads.json"
+    ))
+    .unwrap();
+    eprintln!(
+        "PRISM_COPY_MODE {}",
+        json!({"version":version,"path":if app_v2 {"current_app_query_sql"} else {"declared_live_read"}})
+    );
+    let cache = sql::visible_cache::enable_for_test(&db).await;
+    let mut failures = 0;
+    for warm in [false, true] {
+        if warm {
+            let started = std::time::Instant::now();
+            kernel::sql_record_projection::catch_up(&db).await.unwrap();
+            kernel::sql_event_projection::catch_up(&db).await.unwrap();
+            eprintln!(
+                "PRISM_COPY_FOLD {}",
+                json!({"ms":started.elapsed().as_millis()})
+            );
+        }
+        for need in needs.as_array().unwrap() {
+            let key = (need["key"] != "prism.records").then(|| need["key"].as_str().unwrap());
+            let request = AppDataRequest {
+                package: "agent.prism".into(),
+                expected_install_event_id: generation.clone(),
+                need: key.map(str::to_owned),
+                params: if key.is_some() {
+                    json!({"id":record})
+                } else {
+                    json!({})
+                },
+            };
+            let started = std::time::Instant::now();
+            let (result, stats) = if app_v2 {
+                // Prism 0.2 preserves the seven SQL statements but uses the
+                // shared host's ordinary app-attributed query_sql path. Keep
+                // its current source/install/grant admission intact.
+                let parameters = if key.is_some() {
+                    json!([{"type":"text","value":record}])
+                } else {
+                    json!([])
+                };
+                sql::measured(registry.call_engine(
+                    EngineHandle::KernelV2(db.clone()),
+                    app_caller.clone(),
+                    "query_sql",
+                    json!({"sql":need["sql"],"parameters":parameters}),
+                ))
+                .await
+            } else {
+                let (result, stats) =
+                    sql::measured(super::NativeAppDataNeeds.evaluate(&db, &caller, &request)).await;
+                (result.map(|v| v.result), stats)
+            };
+            failures += usize::from(result.is_err());
+            if let Err(error) = &result {
+                // Refusal/error diagnostics only; returned bodies/rows are
+                // never emitted by this explicit private-copy profile.
+                eprintln!("PRISM_COPY_ERROR {error}");
+            }
+            eprintln!(
+                "PRISM_COPY_READ {}",
+                json!({"need":key.unwrap_or("startup"),"warm":warm,"ms":started.elapsed().as_millis(),"ok":result.is_ok(),"rows":result.as_ref().ok().and_then(|v|v["row_count"].as_u64().or_else(||v["result"]["row_count"].as_u64())),"stats":stats,"visibility_cache":format!("{:?}",cache.stats.lock().unwrap())})
+            );
+        }
+    }
+    sql::visible_cache::disable_for_test(&db);
+    db.close().await;
+    assert_eq!(
+        failures, 0,
+        "inspect numeric copy diagnostics; no production acceptance is implied"
+    );
+}
+
+/// Native design 3a3eabb, proof obligation 1 (pre-implementation): for every
+/// recognised anchor-first extended query_record, every row the CURRENT full
+/// staging path returns lies inside the plan's direct candidate superset.
+/// Adversarial fixture: hidden and private records, moves in and out of
+/// private homes, a deletion, links of several relationships including to a
+/// hidden record, a self-link and a cycle, missing anchor ids and root aliases.
+#[tokio::test]
+async fn extended_query_record_results_lie_within_anchor_candidates() {
+    use std::collections::BTreeSet;
+    let w = world().await;
+    let note = |title: &str| json!({"title": title}).as_object().unwrap().clone();
+    let shared = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let private = kernel::create_home(&w.db, KERNEL_ROOT_ID, Some(&[]), &w.admin)
+        .await
+        .unwrap();
+    let mut made = Vec::new();
+    for (title, home) in [
+        ("Root note", KERNEL_ROOT_ID),
+        ("Shared a", shared.as_str()),
+        ("Shared b", shared.as_str()),
+        ("Private a", private.as_str()),
+        ("Mover in", private.as_str()),
+        ("Mover out", shared.as_str()),
+        ("Doomed", shared.as_str()),
+    ] {
+        made.push(
+            kernel::create_as(&w.db, &w.admin, "fixture.mcp", "note", &note(title), home)
+                .await
+                .unwrap(),
+        );
+    }
+    let [root_note, shared_a, shared_b, private_a, mover_in, mover_out, doomed] =
+        made.try_into().unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, &mover_in, &shared)
+        .await
+        .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, &mover_out, &private)
+        .await
+        .unwrap();
+    let links = [
+        (&shared_a, &shared_b, "relates_to"),
+        (&shared_b, &shared_a, "relates_to"),  // cycle
+        (&shared_a, &shared_a, "relates_to"),  // self-link
+        (&shared_b, &private_a, "relates_to"), // to a hidden endpoint
+        (&private_a, &shared_a, "relates_to"), // from a hidden endpoint
+        (&root_note, &shared_a, "part_of"),
+        (&mover_in, &doomed, "relates_to"),
+        (&w.first, &shared_a, "relates_to"),
+    ];
+    for (source, target, relationship) in links {
+        let _ = call_as(&w, "acct:admin", "manage_links", json!({"action":"add","source_id":source,"target_id":target,"relationship":relationship})).await;
+    }
+    call_as(
+        &w,
+        "acct:admin",
+        "delete_record",
+        json!({"id": doomed, "reason": "anchor oracle fixture"}),
+    )
+    .await
+    .unwrap();
+
+    let mut pipelines = Vec::new();
+    for home in [
+        shared.as_str(),
+        private.as_str(),
+        KERNEL_ROOT_ID,
+        "native:root",
+        "no-such-home",
+    ] {
+        for extra in [
+            json!({}),
+            json!({"types":["Document"]}),
+            json!({"kinds":["note"]}),
+            json!({"include_archived":true}),
+        ] {
+            let mut filter = json!({"step":"filter","home_id":home});
+            filter
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            pipelines.push(json!({"steps":[filter]}));
+        }
+    }
+    let anchor_sets: Vec<Vec<String>> = vec![
+        vec![shared_a.clone()],
+        vec![shared_b.clone()],
+        vec![private_a.clone()],
+        vec![w.hidden.clone()],
+        vec![doomed.clone()],
+        vec!["no-such-record".into()],
+        vec![shared_a.clone(), private_a.clone(), "missing".into()],
+        vec![mover_in.clone()],
+        vec![w.first.clone(), w.second.clone()],
+        vec![root_note.clone()],
+        vec![shared_b.clone(), root_note.clone()],
+    ];
+    for ids in &anchor_sets {
+        for relationship in [None, Some("relates_to"), Some("part_of"), Some("nope")] {
+            for direction in [None, Some("in"), Some("out"), Some("both")] {
+                let mut traverse = json!({"step":"traverse","target":"links"});
+                if let Some(r) = relationship {
+                    traverse["relationship"] = json!(r);
+                }
+                if let Some(d) = direction {
+                    traverse["direction"] = json!(d);
+                }
+                pipelines.push(json!({"steps":[{"step":"filter","ids":ids},traverse]}));
+                pipelines.push(json!({"steps":[{"step":"filter","ids":ids},traverse,{"step":"filter","types":["Document"],"include_archived":true}]}));
+            }
+        }
+    }
+    let mut checked = 0;
+    for steps in pipelines {
+        for order in [
+            "updated_desc",
+            "created_desc",
+            "last_activity_desc",
+            "name_asc",
+        ] {
+            let mut args = steps.clone();
+            args["order"] = json!(order);
+            args["limit"] = json!(500);
+            let plan = super::read_surface::recognize_args(&args)
+                .unwrap_or_else(|| panic!("not recognised: {args}"));
+            let mut conn = w.db.pool().acquire().await.unwrap();
+            let candidates = super::read_surface::direct_candidates_on(&mut conn, &plan)
+                .await
+                .unwrap();
+            drop(conn);
+            for credential in ["acct:admin", "acct:viewer"] {
+                assert_narrowed_identical(&w, credential, &args).await;
+                let Ok(result) = call_as(&w, credential, "query_record", args.clone()).await else {
+                    continue;
+                };
+                let returned: BTreeSet<String> = result["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["id"].as_str().unwrap().to_owned())
+                    .collect();
+                let outside: Vec<_> = returned.difference(&candidates).collect();
+                assert!(
+                    outside.is_empty(),
+                    "{credential} {args}: returned rows outside candidates {outside:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 500, "oracle exercised {checked} calls");
+
+    // Fallback shapes are never recognised.
+    for args in [
+        json!({"steps":[{"step":"filter","ids":[shared_a]},{"step":"traverse","target":"links"},{"step":"traverse","target":"links"}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","home_id":shared,"last_activity_since":"2000-01-01T00:00:00Z"}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","ids":[shared_a]},{"step":"traverse","target":"links"},{"step":"filter","last_activity_since":"2000-01-01T00:00:00Z"}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","ids":[shared_a]},{"step":"traverse","target":"children"}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","types":["Document"]}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","ids":[shared_a],"home_id":shared}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","home_id":shared,"facets":[]}],"order":"name_asc"}),
+        json!({"steps":[{"step":"filter","ids":[shared_a]},{"step":"traverse","target":"links"},{"step":"filter","home_id":shared}],"order":"name_asc"}),
+    ] {
+        assert!(
+            super::read_surface::recognize_args(&args).is_none(),
+            "must fall back: {args}"
+        );
+    }
+}
+
+/// Own-row filter fields (lifecycle, maturity, persistence, name, updated
+/// time) narrow P1 and P2 with byte-identical results to forced full
+/// staging, stay inside the direct candidate superset, and actually select
+/// rows. Includes the workbench rejection log: a record's `part_of`
+/// suggestions filtered to `lifecycle:["rejected"]`.
+#[tokio::test]
+async fn extended_query_record_own_row_filters_narrow_with_full_staging_parity() {
+    use std::collections::BTreeSet;
+    let w = world().await;
+    let v1 = suggestion_v1_fixture(&w).await;
+    let kept = make_suggestion(&w, &v1, None, "keep", "none").await;
+    let rejected = make_suggestion(&w, &v1, None, "drop", "none").await;
+    let out = call_as(
+        &w,
+        "acct:admin",
+        "resolve_suggestions",
+        json!({"action":"reject","suggestion_ids":[rejected],"reason":"rejection log fixture"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["status"], "rejected");
+    let shared = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let note = |title: &str| json!({"title": title}).as_object().unwrap().clone();
+    let mut plans = Vec::new();
+    for title in ["Draft plan", "Occurrent plan", "Other note"] {
+        plans.push(
+            kernel::create_as(
+                &w.db,
+                &w.admin,
+                "fixture.mcp",
+                "note",
+                &note(title),
+                &shared,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    call_as(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({"id":plans[0],"maturity":"draft","reason":"own-row fixture"}),
+    )
+    .await
+    .unwrap();
+    call_as(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({"id":plans[1],"persistence":"occurrent","reason":"own-row fixture"}),
+    )
+    .await
+    .unwrap();
+
+    let rejection_log = json!({"steps":[
+        {"step":"filter","ids":[w.first]},
+        {"step":"traverse","target":"links","relationship":"part_of","direction":"in"},
+        {"step":"filter","kinds":["suggestion"],"lifecycle":["rejected"],"include_archived":true}
+    ],"order":"created_desc","limit":20,"offset":0});
+    let mut cases: Vec<(Value, Option<Vec<String>>)> =
+        vec![(rejection_log, Some(vec![rejected.clone()]))];
+    for (trailing, expect) in [
+        (
+            json!({"kinds":["suggestion"],"lifecycle":["open"]}),
+            Some(vec![kept.clone()]),
+        ),
+        (json!({"kinds":["suggestion"],"name_contains":"sugg"}), None),
+        (
+            json!({"kinds":["suggestion"],"updated_since":"2000-01-01T00:00:00Z"}),
+            None,
+        ),
+        (
+            json!({"kinds":["suggestion"],"updated_since":"2999-01-01T00:00:00Z"}),
+            Some(vec![]),
+        ),
+        (
+            json!({"kinds":["suggestion"],"persistence":"enduring"}),
+            None,
+        ),
+        (json!({"kinds":["suggestion"],"maturity":["draft"]}), None),
+    ] {
+        for direction in ["in", "both"] {
+            let mut filter = json!({"step":"filter"});
+            filter
+                .as_object_mut()
+                .unwrap()
+                .extend(trailing.as_object().unwrap().clone());
+            cases.push((
+                json!({"steps":[
+                    {"step":"filter","ids":[w.first]},
+                    {"step":"traverse","target":"links","relationship":"part_of","direction":direction},
+                    filter
+                ],"order":"created_desc"}),
+                expect.clone(),
+            ));
+        }
+    }
+    for home in [shared.as_str(), KERNEL_ROOT_ID] {
+        let mine = home == shared;
+        for (extra, expect) in [
+            (json!({"maturity":["draft"]}), Some(vec![plans[0].clone()])),
+            (
+                json!({"persistence":"occurrent"}),
+                Some(vec![plans[1].clone()]),
+            ),
+            (
+                json!({"name_contains":"PLAN"}),
+                Some(vec![plans[0].clone(), plans[1].clone()]),
+            ),
+            (json!({"lifecycle":["open"]}), None),
+            (
+                json!({"updated_since":"2000-01-01T00:00:00Z","types":["Document"]}),
+                None,
+            ),
+            (
+                json!({"updated_since":"2999-01-01T00:00:00Z"}),
+                Some(vec![]),
+            ),
+        ] {
+            let mut filter = json!({"step":"filter","home_id":home});
+            filter
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            cases.push((
+                json!({"steps":[filter],"order":"name_asc"}),
+                if mine { expect } else { None },
+            ));
+        }
+    }
+    let mut selected = 0;
+    for (args, expect) in cases {
+        let plan = super::read_surface::recognize_args(&args)
+            .unwrap_or_else(|| panic!("own-row filter not recognised: {args}"));
+        let mut conn = w.db.pool().acquire().await.unwrap();
+        let candidates = super::read_surface::direct_candidates_on(&mut conn, &plan)
+            .await
+            .unwrap();
+        drop(conn);
+        // Narrowing really engaged: fewer records staged than full staging.
+        let (narrowed, full) = staged_narrowed_and_full(&w, "acct:admin", &args).await;
+        assert!(
+            narrowed < full,
+            "{args}: narrowed {narrowed} vs full {full}"
+        );
+        for credential in ["acct:admin", "acct:viewer"] {
+            assert_narrowed_identical(&w, credential, &args).await;
+            let mut full = args.clone();
+            full["limit"] = json!(500);
+            full["offset"] = json!(0);
+            let result = call_as(&w, credential, "query_record", full).await.unwrap();
+            let returned: Vec<String> = result["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect();
+            let outside: Vec<_> = returned
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|id| !candidates.contains(*id))
+                .collect();
+            assert!(
+                outside.is_empty(),
+                "{credential} {args}: outside candidates {outside:?}"
+            );
+            if let (Some(expect), "acct:admin") = (&expect, credential) {
+                let mut want = expect.clone();
+                want.sort();
+                let mut got = returned.clone();
+                got.sort();
+                assert_eq!(
+                    got, want,
+                    "{args}: the filter must select exactly these rows"
+                );
+                selected += usize::from(!want.is_empty());
+            }
+        }
+    }
+    assert!(
+        selected >= 5,
+        "fixtures must make filters select rows: {selected}"
+    );
+}
+
+/// Provider-derived links (LinkScope::All): a provider link is visible only
+/// when every subject of its aggregate is staged. Containment over P2
+/// pipelines on bare records with: a visible pair, a provider whose other
+/// subject is HIDDEN, providers sharing endpoints, and a cycle. Also: a
+/// duplicated provider link id disables narrowing (full fallback).
+#[tokio::test]
+async fn extended_query_record_provider_links_lie_within_anchor_candidates() {
+    use crate::v2_standard::relates_to::Command;
+    use std::collections::BTreeSet;
+    let w = world().await;
+    let package = crate::v2_standard::relates_to::package();
+    let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&installed),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    let shared = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let a = kernel::create_record_as(&w.db, &w.admin, &shared)
+        .await
+        .unwrap();
+    let b = kernel::create_record_as(&w.db, &w.admin, &shared)
+        .await
+        .unwrap();
+    let c = kernel::create_record_as(&w.db, &w.admin, &shared)
+        .await
+        .unwrap();
+    let h = kernel::create_record_as(&w.db, &w.admin, &private)
+        .await
+        .unwrap();
+    for (left, right, key) in [
+        (&a, &b, "p-ab"),
+        (&a, &h, "p-ah-hidden"),
+        (&b, &c, "p-bc"),
+        (&c, &a, "p-ca-cycle"),
+    ] {
+        let request = kernel::prepare_provider_as(
+            &w.db,
+            &w.admin,
+            left,
+            right,
+            key,
+            Command::Assert { sources: vec![] },
+        )
+        .await
+        .unwrap();
+        kernel::commit_provider_as(&w.db, &w.admin, &request)
+            .await
+            .unwrap();
+    }
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    assert!(super::read_surface::narrowing_supported_on(&mut conn)
+        .await
+        .unwrap());
+    drop(conn);
+    let mut checked = 0;
+    let mut nonempty = 0;
+    for ids in [
+        vec![a.clone()],
+        vec![b.clone()],
+        vec![h.clone()],
+        vec![a.clone(), h.clone()],
+        vec![c.clone(), "missing".into()],
+    ] {
+        for relationship in [None, Some("relates_to")] {
+            for direction in [None, Some("in"), Some("out"), Some("both")] {
+                let mut traverse = json!({"step":"traverse","target":"links"});
+                if let Some(r) = relationship {
+                    traverse["relationship"] = json!(r);
+                }
+                if let Some(d) = direction {
+                    traverse["direction"] = json!(d);
+                }
+                for order in ["updated_desc", "name_asc"] {
+                    let args = json!({"steps":[{"step":"filter","ids":ids},traverse],"order":order,"limit":500});
+                    let plan = super::read_surface::recognize_args(&args).expect("recognised");
+                    let mut conn = w.db.pool().acquire().await.unwrap();
+                    let candidates = super::read_surface::direct_candidates_on(&mut conn, &plan)
+                        .await
+                        .unwrap();
+                    drop(conn);
+                    for credential in ["acct:admin", "acct:viewer"] {
+                        assert_narrowed_identical(&w, credential, &args).await;
+                        let Ok(result) =
+                            call_as(&w, credential, "query_record", args.clone()).await
+                        else {
+                            continue;
+                        };
+                        let returned: BTreeSet<String> = result["records"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|r| r["id"].as_str().unwrap().to_owned())
+                            .collect();
+                        if !returned.is_empty() {
+                            nonempty += 1;
+                        }
+                        let outside: Vec<_> = returned.difference(&candidates).collect();
+                        assert!(
+                            outside.is_empty(),
+                            "{credential} {args}: provider rows outside candidates {outside:?}"
+                        );
+                        if credential == "acct:viewer" {
+                            assert!(!returned.contains(&h), "hidden subject leaked: {args}");
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 0 && nonempty > 0,
+        "provider oracle must exercise non-empty results (checked {checked}, nonempty {nonempty})"
+    );
+
+    let (aggregate, link): (String, String) = sqlx::query_as("SELECT aggregate_id,id FROM kernel_provider_link_rows ORDER BY aggregate_id,ordinal LIMIT 1")
+        .fetch_one(w.db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO kernel_provider_link_rows(aggregate_id,ordinal,id,source_id,target_id,note,created_at,created_at_ms,raw_json,if_absent) SELECT aggregate_id||'-dup',ordinal,id,source_id,target_id,note,created_at,created_at_ms,raw_json,if_absent FROM kernel_provider_link_rows WHERE aggregate_id=? AND id=?")
+        .bind(&aggregate).bind(&link).execute(w.db.write_pool()).await.unwrap();
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    assert!(
+        !super::read_surface::narrowing_supported_on(&mut conn)
+            .await
+            .unwrap(),
+        "duplicate provider ids must disable narrowing"
+    );
+    drop(conn);
+    // End to end: the production candidate queries yield their NULL row and
+    // the session falls back to full staging, with identical output.
+    for args in [
+        json!({"steps":[{"step":"filter","ids":[a]},{"step":"traverse","target":"links"}],"order":"name_asc","limit":500}),
+        json!({"steps":[{"step":"filter","home_id":KERNEL_ROOT_ID}],"order":"updated_desc","limit":500}),
+    ] {
+        for credential in ["acct:admin", "acct:viewer"] {
+            assert_narrowed_identical(&w, credential, &args).await;
+            let (narrowed, full) = staged_narrowed_and_full(&w, credential, &args).await;
+            assert_eq!(
+                narrowed, full,
+                "{credential} {args}: duplicate providers must stage in full"
+            );
+        }
+    }
+}
+
+/// Logical-home placement cases P1 must cover (Native 3a3eabb, owed by
+/// review): a mapped physical root whose exposed home record differs from the
+/// root id; a logical (v2) move that beats the home map, and a physical-only
+/// v1 rehome that does not; a legacy
+/// policy-anchor `original_home`; a mapped root the viewer cannot see; and
+/// homes with no record (the physical root id itself, an unknown id).
+/// Containment plus byte-identity for admin and viewer.
+#[tokio::test]
+async fn extended_query_record_logical_home_placements_lie_within_anchor_candidates() {
+    use std::collections::BTreeSet;
+    let w = world().await;
+    let note = |title: &str| json!({"title": title}).as_object().unwrap().clone();
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let shared = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let destination = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let import = |root: String, source: String, entries: Vec<(String, &'static str)>| {
+        let (db, host, admin) = (w.db.clone(), host.clone(), w.admin.clone());
+        async move {
+            let entries: Vec<(&str, &str)> =
+                entries.iter().map(|(s, c)| (s.as_str(), *c)).collect();
+            kernel::hq::import_home_as(
+                &db,
+                &host,
+                &root,
+                &source,
+                KERNEL_ROOT_ID,
+                &admin,
+                Some(&entries),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    // Mapped root: physical root != the record that names it.
+    let mapped = kernel::hq::v1_import_home_id(&w.second);
+    import(
+        mapped.clone(),
+        w.second.clone(),
+        vec![(w.viewer.clone(), "view")],
+    )
+    .await;
+    // Mapped root the viewer cannot see.
+    let mapped_hidden = kernel::hq::v1_import_home_id(&w.hidden);
+    import(mapped_hidden.clone(), w.hidden.clone(), vec![]).await;
+    let mut made = Vec::new();
+    for title in [
+        "Mapped a",
+        "Mapped b",
+        "Mapped then rehomed",
+        "Mapped then moved",
+        "Hidden mapped",
+        "Legacy anchored",
+    ] {
+        made.push(
+            kernel::create_as(
+                &w.db,
+                &w.admin,
+                "fixture.mcp",
+                "note",
+                &note(title),
+                &shared,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let [mapped_a, mapped_b, rehomed, moved, hidden_mapped, legacy] = made.try_into().unwrap();
+    // A physical-only v1 rehome (no logical_home_id) does NOT beat the map;
+    // a logical v2 move does. Both are then placed physically under the map.
+    kernel::rehome_record_as(&w.db, &w.admin, &rehomed, &destination)
+        .await
+        .unwrap();
+    let mut tx = crate::db::begin_write(w.db.write_pool()).await.unwrap();
+    let mut acts = crate::act::ActAllocation::new();
+    kernel::move_record_with_comments_in(&w.db, &mut tx, &mut acts, &w.admin, &moved, &destination)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // Legacy policy anchor: own boundary root, logical parent from provenance.
+    let own_boundary = kernel::hq::v1_import_home_id(&legacy);
+    import(
+        own_boundary.clone(),
+        legacy.clone(),
+        vec![(w.viewer.clone(), "view")],
+    )
+    .await;
+    kernel::hq::import_event_as(
+        &w.db,
+        &host,
+        &legacy,
+        &kernel::hq::LegacyEvent {
+            source: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "v1.snapshot_provenance".into(),
+            payload: json!({"policy_anchor":legacy,"original_home":w.second}),
+            created_at: "2026-10-16T00:00:00Z".into(),
+            actor: None,
+            run_key: None,
+        },
+    )
+    .await
+    .unwrap();
+    for (id, home) in [
+        (&mapped_a, &mapped),
+        (&mapped_b, &mapped),
+        (&rehomed, &mapped),
+        (&moved, &mapped),
+        (&hidden_mapped, &mapped_hidden),
+        (&legacy, &own_boundary),
+    ] {
+        sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+            .bind(home)
+            .bind(id)
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+    }
+    let _ = call_as(&w, "acct:admin", "manage_links", json!({"action":"add","source_id":mapped_a,"target_id":rehomed,"relationship":"relates_to"})).await;
+    let _ = call_as(
+        &w,
+        "acct:admin",
+        "manage_links",
+        json!({"action":"add","source_id":legacy,"target_id":mapped_b,"relationship":"relates_to"}),
+    )
+    .await;
+
+    let mut pipelines = Vec::new();
+    for home in [
+        w.second.as_str(),
+        mapped.as_str(),
+        shared.as_str(),
+        destination.as_str(),
+        w.hidden.as_str(),
+        mapped_hidden.as_str(),
+        legacy.as_str(),
+        own_boundary.as_str(),
+        KERNEL_ROOT_ID,
+        "native:root",
+        "no-such-home",
+    ] {
+        for extra in [
+            json!({}),
+            json!({"kinds":["note"]}),
+            json!({"include_archived":true}),
+        ] {
+            let mut filter = json!({"step":"filter","home_id":home});
+            filter
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            pipelines.push(json!({"steps":[filter]}));
+        }
+    }
+    for ids in [
+        vec![mapped_a.clone()],
+        vec![legacy.clone()],
+        vec![hidden_mapped.clone(), rehomed.clone()],
+        vec![moved.clone()],
+    ] {
+        for direction in [None, Some("in"), Some("out")] {
+            let mut traverse = json!({"step":"traverse","target":"links"});
+            if let Some(d) = direction {
+                traverse["direction"] = json!(d);
+            }
+            pipelines.push(json!({"steps":[{"step":"filter","ids":ids},traverse]}));
+        }
+    }
+    let mut checked = 0;
+    let mut placed = BTreeSet::new();
+    for steps in pipelines {
+        for order in ["updated_desc", "last_activity_desc", "name_asc"] {
+            let mut args = steps.clone();
+            args["order"] = json!(order);
+            args["limit"] = json!(500);
+            let plan = super::read_surface::recognize_args(&args)
+                .unwrap_or_else(|| panic!("not recognised: {args}"));
+            let mut conn = w.db.pool().acquire().await.unwrap();
+            let candidates = super::read_surface::direct_candidates_on(&mut conn, &plan)
+                .await
+                .unwrap();
+            drop(conn);
+            for credential in ["acct:admin", "acct:viewer"] {
+                assert_narrowed_identical(&w, credential, &args).await;
+                let Ok(result) = call_as(&w, credential, "query_record", args.clone()).await else {
+                    continue;
+                };
+                for r in result["records"].as_array().unwrap() {
+                    let id = r["id"].as_str().unwrap().to_owned();
+                    assert!(
+                        candidates.contains(&id),
+                        "{credential} {args}: {id} outside candidates"
+                    );
+                    if let Some(home) = steps["steps"][0]["home_id"].as_str() {
+                        placed.insert((id, home.to_owned()));
+                    }
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 150, "oracle exercised {checked} calls");
+    // Narrowing really engaged on both shapes (not a silent full fallback).
+    for args in [
+        json!({"steps":[{"step":"filter","home_id":w.second}],"order":"updated_desc","limit":500}),
+        json!({"steps":[{"step":"filter","ids":[mapped_a]},{"step":"traverse","target":"links"}],"order":"name_asc","limit":500}),
+    ] {
+        let (narrowed, full) = staged_narrowed_and_full(&w, "acct:admin", &args).await;
+        assert!(
+            narrowed < full,
+            "{args}: narrowed staged {narrowed}, full {full}"
+        );
+    }
+    // The fixture must actually exercise each placement rule.
+    let names = [
+        ("second", &w.second),
+        ("mapped", &mapped),
+        ("shared", &shared),
+        ("destination", &destination),
+        ("hidden", &w.hidden),
+        ("mapped_hidden", &mapped_hidden),
+        ("legacy", &legacy),
+        ("own_boundary", &own_boundary),
+    ];
+    let name = |h: &String| {
+        names
+            .iter()
+            .find(|(_, v)| *v == h)
+            .map(|(n, _)| n.to_string())
+            .unwrap_or(h.clone())
+    };
+    for (label, id, home) in [
+        ("mapped_a", &mapped_a, &w.second),
+        ("mapped_b", &mapped_b, &w.second),
+        ("rehomed (v1, physical only)", &rehomed, &w.second),
+        ("moved (v2, logical)", &moved, &destination),
+        ("legacy", &legacy, &w.second),
+    ] {
+        let seen: Vec<_> = placed
+            .iter()
+            .filter(|(r, _)| r == id)
+            .map(|(_, h)| name(h))
+            .collect();
+        assert!(
+            placed.contains(&(id.clone(), home.clone())),
+            "{label} not placed under {}; seen under {seen:?}",
+            name(home)
+        );
+    }
+    assert!(
+        !placed.contains(&(moved.clone(), w.second.clone())),
+        "a logical move must beat the home map"
+    );
+}
+
+/// Staged-record counts (narrowed default, forced full) for one call, so a
+/// test can prove narrowing really engaged or really fell back; byte parity
+/// alone would also pass if narrowing were silently disabled.
+async fn staged_narrowed_and_full(w: &World, credential: &str, args: &Value) -> (u64, u64) {
+    let (_, narrowed) =
+        super::sql::measured(call_as(w, credential, "query_record", args.clone())).await;
+    let (_, full) = super::read_surface::FORCE_FULL_STAGING
+        .scope(
+            true,
+            super::sql::measured(call_as(w, credential, "query_record", args.clone())),
+        )
+        .await;
+    (narrowed.staged_records, full.staged_records)
+}
+
+/// Byte-identity oracle (Native 3a3eabb): for each limit/offset variant, the
+/// narrowed (default) run returns exactly the same JSON, or exactly
+/// the same error text, as forced full staging.
+async fn assert_narrowed_identical(w: &World, credential: &str, args: &Value) {
+    for (limit, offset) in [(500, 0), (2, 1), (1, 0), (3, 1000)] {
+        let mut variant = args.clone();
+        variant["limit"] = json!(limit);
+        variant["offset"] = json!(offset);
+        let full = super::read_surface::FORCE_FULL_STAGING
+            .scope(
+                true,
+                call_as(w, credential, "query_record", variant.clone()),
+            )
+            .await;
+        let narrowed = call_as(w, credential, "query_record", variant.clone()).await;
+        match (&full, &narrowed) {
+            (Ok(a), Ok(b)) => assert_eq!(
+                serde_json::to_string(a).unwrap(),
+                serde_json::to_string(b).unwrap(),
+                "{credential} {variant}: narrowed output differs"
+            ),
+            (Err(a), Err(b)) => assert_eq!(
+                a.to_string(),
+                b.to_string(),
+                "{credential} {variant}: refusal differs"
+            ),
+            _ => panic!("{credential} {variant}: full {full:?} vs narrowed {narrowed:?}"),
+        }
+    }
+}
+
+/// Opt-in HQ-shaped byte-identity oracle (Native 3a3eabb). Fixtures cannot
+/// reproduce real logical-home mapping (on HQ, ~all records sit under roots
+/// whose exposed home record differs). Run against a scratch COPY:
+///   NATIVE_HQ_COPY=/path/to/hq.db NATIVE_HQ_ACCOUNT=<auth binding> \
+///   RUST_MIN_STACK=67108864 cargo test --lib --features v2-kernel-probe \
+///   extended_query_record_narrowed_matches_full_on_hq_copy -- --ignored --nocapture
+/// Prints shapes, counts and timings only; mismatches report ids, never bodies.
+#[tokio::test]
+#[ignore]
+async fn extended_query_record_narrowed_matches_full_on_hq_copy() {
+    let source = std::env::var("NATIVE_HQ_COPY").expect("NATIVE_HQ_COPY");
+    let account = std::env::var("NATIVE_HQ_ACCOUNT").expect("NATIVE_HQ_ACCOUNT");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hq.db");
+    std::fs::copy(&source, &path).unwrap();
+    let db = kernel::open_v2_database(path.to_str().unwrap())
+        .await
+        .unwrap();
+    let registry = registry();
+    let caller = || Caller::authenticated(&account);
+    // P1 anchors: root and the most populated exposed homes (mapped records).
+    let mut homes: Vec<String> = sqlx::query_scalar(
+        "SELECT h FROM (SELECT coalesce((SELECT json_extract(e.payload,'$.source_record_id') FROM content_events e WHERE e.record_id=r.home_id AND e.type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(e.payload,'$.source_record_id') IS NOT NULL LIMIT 1), r.home_id) AS h, count(*) n FROM kernel_records r GROUP BY 1 ORDER BY n DESC LIMIT 25)",
+    ).fetch_all(db.pool()).await.unwrap();
+    homes.insert(0, "native:root".into());
+    // P2 anchors: the most-linked records plus the caller's person.
+    let mut anchors: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM (SELECT target_id id, count(*) n FROM kernel_generic_links WHERE active=1 GROUP BY 1 UNION ALL SELECT target_id, count(*) FROM kernel_links GROUP BY 1) GROUP BY id ORDER BY sum(n) DESC LIMIT 15",
+    ).fetch_all(db.pool()).await.unwrap();
+    if let Ok(person) = std::env::var("NATIVE_HQ_PERSON") {
+        anchors.insert(0, person);
+    }
+    let mut cases = Vec::new();
+    for home in &homes {
+        for archived in [false, true] {
+            cases.push(json!({"steps":[{"step":"filter","home_id":home,"include_archived":archived}],"order":"last_activity_desc"}));
+        }
+    }
+    for id in &anchors {
+        cases.push(json!({"steps":[{"step":"filter","ids":[id]},{"step":"traverse","target":"links","relationship":"assigned_to","direction":"in"}],"order":"last_activity_desc"}));
+        cases.push(json!({"steps":[{"step":"filter","ids":[id]},{"step":"traverse","target":"links","direction":"both"}],"order":"updated_desc"}));
+        cases.push(json!({"steps":[{"step":"filter","ids":[id]},{"step":"traverse","target":"links","direction":"in"},{"step":"filter","types":["Entity"],"kinds":["person"]}],"order":"name_asc"}));
+    }
+    let (mut compared, mut nonempty, mut refusals) = (0usize, 0usize, 0usize);
+    let (mut full_time, mut narrow_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    for case in &cases {
+        for (limit, offset) in [(60, 0), (24, 0), (5, 3), (10, 100000)] {
+            let mut args = case.clone();
+            args["limit"] = json!(limit);
+            args["offset"] = json!(offset);
+            let started = std::time::Instant::now();
+            let full = super::read_surface::FORCE_FULL_STAGING
+                .scope(
+                    true,
+                    registry.call_engine(
+                        EngineHandle::KernelV2(db.clone()),
+                        caller(),
+                        "query_record",
+                        args.clone(),
+                    ),
+                )
+                .await;
+            full_time += started.elapsed();
+            let started = std::time::Instant::now();
+            let narrowed = registry
+                .call_engine(
+                    EngineHandle::KernelV2(db.clone()),
+                    caller(),
+                    "query_record",
+                    args.clone(),
+                )
+                .await;
+            narrow_time += started.elapsed();
+            match (&full, &narrowed) {
+                (Ok(a), Ok(b)) => {
+                    if a != b {
+                        let ids = |v: &Value| {
+                            v["records"]
+                                .as_array()
+                                .map(|r| {
+                                    r.iter()
+                                        .map(|x| x["id"].as_str().unwrap_or("").to_owned())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        };
+                        panic!(
+                            "HQ mismatch {args}: total {} vs {}, ids {:?} vs {:?}",
+                            a["total"],
+                            b["total"],
+                            ids(a),
+                            ids(b)
+                        );
+                    }
+                    if a["records"].as_array().is_some_and(|r| !r.is_empty()) {
+                        nonempty += 1;
+                    }
+                }
+                (Err(a), Err(b)) => {
+                    assert_eq!(a.to_string(), b.to_string(), "HQ refusal differs {args}");
+                    refusals += 1;
+                }
+                _ => panic!(
+                    "HQ outcome differs {args}: full ok={} narrowed ok={}",
+                    full.is_ok(),
+                    narrowed.is_ok()
+                ),
+            }
+            compared += 1;
+        }
+    }
+    eprintln!("HQ oracle: {compared} comparisons ({nonempty} non-empty, {refusals} identical refusals); full {full_time:?} vs narrowed {narrow_time:?}");
+    assert!(nonempty > 0);
+    db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Visible-set access fence, slice 1 (Native b171a9d). The fence is inert; these
+// tests pin the classification to the gate's real inputs and prove each seam.
+
+/// The 56 event types present on an HQ production copy (10 Nov 2026). Every
+/// one must be explicitly classified, never left to the unknown fallback.
+const HQ_EVENT_TYPES: [&str; 56] = [
+    "kernel.legacy_recorded.v1",
+    "kernel.import_receipt.v1",
+    "kernel.v1_state_imported.v1",
+    "kernel.record_created.v1",
+    "kernel.import_state.v1",
+    "kernel.generic_link_imported.v1",
+    "kernel.provider_outcome.v1",
+    "kernel.import_home_policy.v1",
+    "kernel.import_member_policy.v1",
+    "kernel.mcp_write_receipt_recorded.v1",
+    "kernel.attachment_bound.v1",
+    "kernel.body_set.v1",
+    "kernel.facet_observed.v1",
+    "kernel.app_state_imported.v1",
+    "kernel.import_home.v1",
+    "kernel.generic_link_added.v1",
+    "kernel.record_revised.v2",
+    "kernel.principal_created.v1",
+    "kernel.run_opened.v1",
+    "kernel.artifact_closure_activated.v1",
+    "kernel.run_intent_set.v1",
+    "kernel.artifact_excluded.v1",
+    "kernel.import_record_created.v1",
+    "kernel.record_rehomed.v2",
+    "kernel.comment_anchor_imported.v1",
+    "kernel.run_closed.v1",
+    "kernel.metadata_set.v1",
+    "kernel.home_created.v1",
+    "kernel.saved_tab_changed.v1",
+    "kernel.message_command_committed.v1",
+    "kernel.message_destination_imported.v1",
+    "kernel.message_created.v1",
+    "kernel.archive_changed.v1",
+    "kernel.import_removed.v1",
+    "kernel.instruction_binding_imported.v1",
+    "kernel.canvas_activated.v1",
+    "kernel.package_adopted.v1",
+    "kernel.definition_adopted.v1",
+    "kernel.membership_bundle_defined.v1",
+    "kernel.import_source_head.v1",
+    "kernel.webhook_accepted.v1",
+    "kernel.message_state.v1",
+    "kernel.app_source_published.v1",
+    "kernel.app_install_recorded.v1",
+    "kernel.app_install_adopted.v1",
+    "kernel.workspace_metadata_imported.v1",
+    "kernel.webhook_configured.v1",
+    "kernel.root_created.v1",
+    "kernel.root_admin_bootstrapped.v1",
+    "kernel.import_state_delta.v1",
+    "kernel.import_members_roster.v1",
+    "kernel.import_hosted_accounts.v1",
+    "kernel.hosted_membership.v1",
+    "kernel.host_transform_created.v1",
+    "kernel.host_import_created.v1",
+    "kernel.app_installs_activated.v1",
+];
+
+#[test]
+fn access_fence_classifies_every_hq_event_type_and_refines_by_payload() {
+    use crate::kernel::access_fence::{class_of, classify, AccessClass::*};
+    for event_type in HQ_EVENT_TYPES {
+        assert!(
+            class_of(event_type).is_some(),
+            "unclassified HQ event type {event_type}"
+        );
+    }
+    let none = json!({});
+    // Ordinary content never takes the database-wide fallback.
+    for (event_type, expected) in [
+        ("kernel.body_set.v1", NoEffect),
+        ("kernel.facet_observed.v1", NoEffect),
+        ("kernel.metadata_set.v1", NoEffect),
+        ("kernel.archive_changed.v1", NoEffect),
+        ("kernel.record_created.v1", PatchClosure),
+        ("kernel.record_revised.v2", PatchClosure),
+        ("kernel.record_deleted.v1", PatchClosure),
+        ("kernel.message_created.v1", PatchClosure),
+        ("kernel.home_created.v1", PatchHome),
+        ("kernel.hosted_membership.v1", RecomputePrincipals),
+        ("kernel.home_policy_replaced.v1", RecomputeAll),
+        ("kernel.root_admin_bootstrapped.v1", RecomputeAll),
+        ("kernel.not_a_real_type.v9", RecomputeAll),
+        ("policy.replaced", RecomputeAll),
+    ] {
+        assert_eq!(classify(event_type, &none, false), expected, "{event_type}");
+    }
+    let link = |relationship: &str| json!({"relationship": relationship});
+    assert_eq!(
+        classify("kernel.generic_link_added.v1", &link("part_of"), false),
+        PatchClosure
+    );
+    assert_eq!(
+        classify("kernel.generic_link_added.v1", &link("relates_to"), false),
+        NoEffect
+    );
+    assert_eq!(
+        classify("kernel.generic_link_removed.v1", &none, false),
+        PatchClosure
+    );
+    assert_eq!(
+        classify(
+            "kernel.import_removed.v1",
+            &json!({"kind": "record"}),
+            false
+        ),
+        PatchClosure
+    );
+    assert_eq!(
+        classify("kernel.import_removed.v1", &json!({"kind": "link"}), false),
+        NoEffect
+    );
+    let rehome = json!({"new_home_id": "h", "logical_home_id": "h", "parent_update": null});
+    assert_eq!(
+        classify("kernel.record_rehomed.v2", &rehome, false),
+        PatchClosure
+    );
+    assert_eq!(
+        classify("kernel.record_rehomed.v2", &rehome, true),
+        RecomputeAll
+    );
+    let reparent = json!({"new_home_id": "h", "logical_home_id": "h", "parent_update": {"home_id": "h", "parent_id": "p"}});
+    assert_eq!(
+        classify("kernel.record_rehomed.v2", &reparent, false),
+        RecomputeAll
+    );
+}
+
+/// Main-database (table, column) pairs SQLite reports reading while it
+/// prepares and runs the real gate: `sql_record_visible` (tombstones, derived
+/// bearer, message guard) and `visible_home_anchors_as` (scopes).
+async fn gate_input_columns(w: &World) -> std::collections::BTreeSet<(String, String)> {
+    use std::collections::BTreeSet;
+    use std::ffi::{c_char, c_int, c_void, CStr};
+    use std::sync::Mutex;
+    unsafe extern "C" fn authorize(
+        context: *mut c_void,
+        action: c_int,
+        table: *const c_char,
+        column: *const c_char,
+        database: *const c_char,
+        _trigger: *const c_char,
+    ) -> c_int {
+        if action == libsqlite3_sys::SQLITE_READ && !table.is_null() && !database.is_null() {
+            // SAFETY: SQLite passes NUL-terminated strings valid for this call;
+            // context is the Mutex owned by the enclosing test frame.
+            let (table, database) = unsafe { (CStr::from_ptr(table), CStr::from_ptr(database)) };
+            if database.to_bytes() == b"main" {
+                let column = if column.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(column) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let reads = unsafe { &*context.cast::<Mutex<BTreeSet<(String, String)>>>() };
+                reads
+                    .lock()
+                    .unwrap()
+                    .insert((table.to_string_lossy().into_owned(), column));
+            }
+        }
+        libsqlite3_sys::SQLITE_OK
+    }
+    let reads: Mutex<BTreeSet<(String, String)>> = Mutex::default();
+    let mut conn = w.db.write_pool().acquire().await.unwrap();
+    sqlx::query("CREATE TEMP TABLE _v2_scopes(home_id TEXT, valid INTEGER, policy_view INTEGER, home_view INTEGER)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let raw: *mut libsqlite3_sys::sqlite3 = conn
+        .lock_handle()
+        .await
+        .unwrap()
+        .as_raw_handle()
+        .as_ptr()
+        .cast();
+    // SAFETY: raw is this connection's handle; the context outlives the
+    // authorizer, which is removed below before `reads` is dropped.
+    unsafe {
+        libsqlite3_sys::sqlite3_set_authorizer(
+            raw,
+            Some(authorize),
+            std::ptr::from_ref(&reads).cast_mut().cast(),
+        );
+    }
+    let gate = kernel::sql_record_visible(
+        "r",
+        "?1",
+        "SELECT home_id AS id,policy_view AS view FROM temp._v2_scopes WHERE valid",
+        true,
+    );
+    sqlx::query(&format!(
+        "SELECT r.id FROM main.kernel_records r WHERE {gate}"
+    ))
+    .persistent(false)
+    .bind(&w.viewer)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    kernel::visible_home_anchors_as(&mut conn, &w.viewer)
+        .await
+        .unwrap();
+    unsafe {
+        libsqlite3_sys::sqlite3_set_authorizer(raw, None, std::ptr::null_mut());
+    }
+    sqlx::query("DROP TABLE temp._v2_scopes")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    reads.into_inner().unwrap()
+}
+
+/// A digest of every gate-input column, over all rows except one filter the
+/// gate SQL itself applies: only `part_of` rows of `kernel_generic_links`.
+/// (`kernel_record_fields` is digested in full, which is conservative.)
+/// `content_events` reads are not digested here; admission-read event types
+/// are covered by classification (never NoEffect), not by this digest.
+/// Unchanged digest means the gate's answer cannot have changed.
+async fn gate_input_digest(
+    w: &World,
+    columns: &std::collections::BTreeSet<(String, String)>,
+) -> String {
+    let gate = kernel::sql_record_visible("r", "?1", "SELECT 1 AS id,1 AS view", true);
+    let mut by_table: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (table, column) in columns {
+        if table != "content_events" && !column.is_empty() {
+            by_table.entry(table).or_default().push(column);
+        }
+    }
+    let mut digest = String::new();
+    for (table, columns) in by_table {
+        let filter = match table {
+            "kernel_generic_links" => {
+                assert!(
+                    gate.contains("'part_of'"),
+                    "gate no longer filters part_of links"
+                );
+                " WHERE relationship='part_of'"
+            }
+            _ => "",
+        };
+        let list = columns.join(",");
+        let rows: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT json_array({list}) FROM main.{table}{filter} ORDER BY 1"
+        ))
+        .fetch_all(w.db.pool())
+        .await
+        .unwrap();
+        digest.push_str(&format!("{table}:{}\n", rows.join(";")));
+    }
+    digest
+}
+
+/// The check slice 2 relies on: a transaction whose appended events are all
+/// NoEffect must leave every gate input unchanged.
+fn no_effect_check(
+    classes: &[crate::kernel::access_fence::AccessClass],
+    digest_changed: bool,
+) -> std::result::Result<(), String> {
+    use crate::kernel::access_fence::AccessClass::NoEffect;
+    if !classes.is_empty() && classes.iter().all(|c| *c == NoEffect) && digest_changed {
+        return Err(format!(
+            "events classified NoEffect {classes:?} changed a gate input"
+        ));
+    }
+    Ok(())
+}
+
+async fn appended_classes(
+    w: &World,
+    after: i64,
+) -> Vec<(String, crate::kernel::access_fence::AccessClass)> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT e.type,e.payload,e.record_id FROM content_events e WHERE e.seq>? ORDER BY e.seq",
+    )
+    .bind(after)
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    for (event_type, payload, record) in rows {
+        let is_home: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
+                .bind(&record)
+                .fetch_one(w.db.pool())
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        out.push((
+            event_type.clone(),
+            crate::kernel::access_fence::classify(&event_type, &payload, is_home),
+        ));
+    }
+    out
+}
+
+async fn head_seq(w: &World) -> i64 {
+    sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn access_fence_no_effect_writes_leave_every_gate_input_unchanged() {
+    use crate::kernel::access_fence::AccessClass;
+    let w = world().await;
+    let columns = gate_input_columns(&w).await;
+    let tables: std::collections::BTreeSet<&str> =
+        columns.iter().map(|(t, _)| t.as_str()).collect();
+    for expected in [
+        "kernel_records",
+        "kernel_import_tombstones",
+        "kernel_generic_links",
+        "kernel_messages",
+        "kernel_roots",
+        "kernel_policies",
+        "kernel_policy_entries",
+    ] {
+        assert!(
+            tables.contains(expected),
+            "gate no longer reads {expected}: {tables:?}"
+        );
+    }
+    let note = |title: &str| json!({"title": title}).as_object().unwrap().clone();
+    let record = kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note("Fence subject"),
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    let other = kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note("Fence other"),
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    let get = |id: String| {
+        let w = &w;
+        async move {
+            call_as(w, "acct:admin", "get_record", json!({"id": id}))
+                .await
+                .unwrap()
+        }
+    };
+    let mut ordinary = Vec::new();
+    // Body, facet, metadata, archive and a non-part_of link: ordinary content.
+    let version = get(record.clone()).await["version"].clone();
+    ordinary.push(json!({"tool":"update_record","args":{"id":record,"body_set":"v2","if_unmodified_since":null,"reason":"fence body","expected_version":version}}));
+    for step in [
+        json!({"tool":"update_record","args":{"id":record,"facets":{"fence_score":3},"reason":"fence facet"}}),
+        json!({"tool":"update_record","args":{"id":record,"maturity":"draft","reason":"fence metadata"}}),
+        json!({"tool":"manage_links","args":{"action":"add","source_id":record,"target_id":other,"relationship":"relates_to","reason":"fence link"}}),
+    ] {
+        ordinary.push(step);
+    }
+    let mut exercised = 0;
+    for step in ordinary {
+        let before_seq = head_seq(&w).await;
+        let before = gate_input_digest(&w, &columns).await;
+        let mut args = step["args"].clone();
+        if let Some(map) = args.as_object_mut() {
+            map.retain(|_, v| !v.is_null());
+        }
+        if call_as(
+            &w,
+            "acct:admin",
+            step["tool"].as_str().unwrap(),
+            args.clone(),
+        )
+        .await
+        .is_err()
+        {
+            continue;
+        }
+        let classes = appended_classes(&w, before_seq).await;
+        let after = gate_input_digest(&w, &columns).await;
+        let only: Vec<AccessClass> = classes.iter().map(|(_, c)| *c).collect();
+        assert!(
+            only.iter().all(|c| *c == AccessClass::NoEffect),
+            "{args}: ordinary step appended non-NoEffect events {classes:?}"
+        );
+        no_effect_check(&only, before != after).unwrap_or_else(|e| panic!("{args}: {e}"));
+        exercised += 1;
+    }
+    assert!(exercised >= 3, "only {exercised} ordinary steps exercised");
+
+    // The check bites: a create changes a gate input, so tagging it NoEffect fails.
+    let before_seq = head_seq(&w).await;
+    let before = gate_input_digest(&w, &columns).await;
+    kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note("Fence created"),
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    let after = gate_input_digest(&w, &columns).await;
+    assert_ne!(before, after, "a create must change a gate input");
+    let classes = appended_classes(&w, before_seq).await;
+    assert!(
+        classes.iter().any(|(_, c)| *c == AccessClass::PatchClosure),
+        "{classes:?}"
+    );
+    assert!(
+        no_effect_check(&[AccessClass::NoEffect], before != after).is_err(),
+        "mis-tagged create must fail the check"
+    );
+    assert!(no_effect_check(
+        &classes.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+        before != after
+    )
+    .is_ok());
+}
+
+async fn viewer_sees(w: &World, id: &str) -> usize {
+    call_as(
+        w,
+        "acct:viewer",
+        "query_record",
+        json!({"steps":[{"step":"filter","ids":[id]}]}),
+    )
+    .await
+    .map(|out| out["records"].as_array().map(|r| r.len()).unwrap_or(0))
+    .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn access_fence_policy_grant_removal_is_a_recompute_event() {
+    use crate::kernel::access_fence::AccessClass;
+    let w = world().await;
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let note = json!({"title": "Granted"}).as_object().unwrap().clone();
+    let record = kernel::create_as(&w.db, &w.admin, "fixture.mcp", "note", &note, &home)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_sees(&w, &record).await,
+        1,
+        "viewer must see the record before removal"
+    );
+    let before_seq = head_seq(&w).await;
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[(&w.admin, "manage")])
+        .await
+        .unwrap();
+    let classes = appended_classes(&w, before_seq).await;
+    assert!(
+        classes.iter().any(|(_, c)| *c == AccessClass::RecomputeAll),
+        "a grant removal must append a RecomputeAll event visible to the cursor: {classes:?}"
+    );
+    assert_eq!(
+        viewer_sees(&w, &record).await,
+        0,
+        "grant removal must hide the record"
+    );
+}
+
+#[tokio::test]
+async fn access_fence_generation_and_incarnation_seams() {
+    let w = world().await;
+    // Undeclared handles carry no fence: the ownership invariant is not
+    // established, so a future cache must bypass them.
+    assert_eq!(w.db.access_fence(), None);
+    w.db.declare_exclusive_access_owner();
+    let start =
+        w.db.access_fence()
+            .expect("a declared read-write owner carries a fence");
+    // Clones share the fence; inert reads never move it.
+    assert_eq!(w.db.clone().access_fence(), Some(start));
+    call_as(
+        &w,
+        "acct:admin",
+        "query_record",
+        json!({"steps":[{"step":"filter","types":["Document"]}]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(w.db.access_fence(), Some(start));
+    // A full projection rebuild appends no content event, so it bumps.
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    let rebuilt = w.db.access_fence().unwrap();
+    assert_eq!(rebuilt.incarnation, start.incarnation);
+    assert!(
+        rebuilt.generation > start.generation,
+        "rebuild must bump the generation"
+    );
+    // Preparation may rebuild too.
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    let prepared = w.db.access_fence().unwrap();
+    assert!(prepared.generation > rebuilt.generation);
+    let path = w.db.path().to_owned();
+    // Why ownership must be declared: a rebuild through a SECOND read-write
+    // handle on the same file cannot move this handle's generation, and the
+    // event cursor does not advance either. Only an exclusive owner may fence.
+    let second = kernel::open_v2_database(path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.access_fence(),
+        None,
+        "a second handle is not the declared owner"
+    );
+    let head_before: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::replay_all_projections(&second).await.unwrap();
+    let head_after: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(head_before, head_after, "rebuild appends no content event");
+    assert_eq!(
+        w.db.access_fence(),
+        Some(prepared),
+        "another handle's rebuild is invisible to this fence"
+    );
+    // A fresh open is a new incarnation once declared.
+    second.declare_exclusive_access_owner();
+    assert_ne!(
+        second.access_fence().unwrap().incarnation,
+        start.incarnation
+    );
+    second.close().await;
+    // A standby read-only handle never carries a fence, even if declared: a
+    // refresh, swap or FULL replay through another handle cannot bump it.
+    let standby = crate::db::open_kernel_v2_standby_read_only(path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        standby.open_mode(),
+        crate::db::DatabaseOpenMode::StandbyReadOnly
+    );
+    standby.declare_exclusive_access_owner();
+    assert_eq!(standby.access_fence(), None);
+    standby.close().await;
+}
+
+async fn epoch_table_present(db: &Db) -> bool {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kernel_access_epoch')")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+async fn epoch_of(db: &Db) -> Option<i64> {
+    let mut conn = db.pool().acquire().await.unwrap();
+    crate::kernel::access_fence::read_epoch_on(&mut conn)
+        .await
+        .unwrap()
+}
+
+/// The persisted access epoch is created lazily by serving start only; the
+/// writers bump it inside their own transaction only when it exists; and it
+/// never changes the certified schema, projection inventory or digest.
+#[tokio::test]
+async fn access_epoch_is_lazy_bumped_in_writer_transactions_and_uncertified() {
+    use crate::kernel::access_fence::{bump_epoch_on, ensure_epoch_on};
+    let w = world().await;
+    // Creation, preparation and a rebuild never create the table.
+    assert!(
+        !epoch_table_present(&w.db).await,
+        "creation must not create the epoch"
+    );
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert!(
+        !epoch_table_present(&w.db).await,
+        "prepare/rebuild must not create the epoch"
+    );
+    assert_eq!(
+        epoch_of(&w.db).await,
+        None,
+        "no table means no epoch (do not cache)"
+    );
+    // A bump with the table absent is a no-op.
+    let mut tx = crate::db::begin_write(w.db.write_pool()).await.unwrap();
+    bump_epoch_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(!epoch_table_present(&w.db).await);
+
+    // Certified coordinates and digest before serving creates the epoch.
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    let before = crate::standby::kernel_v2::coordinates(&mut conn)
+        .await
+        .unwrap();
+    let dump_before = crate::kernel::projection_dump::dump_on(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    // Serving start creates and seeds it (writer transaction).
+    let mut tx = crate::db::begin_write(w.db.write_pool()).await.unwrap();
+    ensure_epoch_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let seeded = epoch_of(&w.db).await.expect("seeded");
+    assert!(seeded > 0);
+    let mut tx = crate::db::begin_write(w.db.write_pool()).await.unwrap();
+    ensure_epoch_on(&mut tx).await.unwrap(); // idempotent: never reseeds
+    tx.commit().await.unwrap();
+    assert_eq!(epoch_of(&w.db).await, Some(seeded));
+
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    let after = crate::standby::kernel_v2::coordinates(&mut conn)
+        .await
+        .unwrap();
+    let dump_after = crate::kernel::projection_dump::dump_on(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        after.schema_sha256, before.schema_sha256,
+        "epoch must not enter the certified schema"
+    );
+    assert_eq!(
+        after.projection_tables, before.projection_tables,
+        "epoch must not be a certified projection"
+    );
+    assert!(!after
+        .projection_tables
+        .iter()
+        .any(|t| t == "kernel_access_epoch"));
+    assert_eq!(
+        format!("{dump_after:?}"),
+        format!("{dump_before:?}"),
+        "epoch must not enter the projection digest"
+    );
+
+    // A rebuild bumps it by exactly one, inside its own transaction.
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(epoch_of(&w.db).await, Some(seeded + 1));
+
+    // A rebuild through a SECOND handle on the same file is visible to the
+    // first handle's next snapshot: the epoch lives in the file.
+    let path = w.db.path().to_owned();
+    let second = kernel::open_v2_database(path.to_str().unwrap())
+        .await
+        .unwrap();
+    kernel::replay_all_projections(&second).await.unwrap();
+    second.close().await;
+    assert_eq!(
+        epoch_of(&w.db).await,
+        Some(seeded + 2),
+        "another handle's rebuild must be visible"
+    );
+
+    // An older snapshot keeps its epoch while a rebuild commits elsewhere.
+    let mut reader = w.db.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *reader).await.unwrap();
+    let pinned = crate::kernel::access_fence::read_epoch_on(&mut reader)
+        .await
+        .unwrap();
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(
+        crate::kernel::access_fence::read_epoch_on(&mut reader)
+            .await
+            .unwrap(),
+        pinned,
+        "a snapshot sees one epoch"
+    );
+    sqlx::query("ROLLBACK").execute(&mut *reader).await.unwrap();
+    drop(reader);
+    assert_eq!(epoch_of(&w.db).await, Some(seeded + 3));
+
+    // The v1 policy log does not exist on a v2 database, so it cannot write
+    // gate inputs here; `project_kernel_policy_rows` still bumps the epoch
+    // (defence in depth) should a v2 file ever carry it.
+    let policy_log: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='policy_events')",
+    )
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert!(!policy_log, "v2 databases carry no policy log");
+}
+
+// ---------------------------------------------------------------------------
+// Visible-set cache candidate (Native b171a9d S2-S4; disabled unless a test
+// registers it). Equivalence is against the same call with no cache.
+
+use super::sql::visible_cache as vcache;
+
+async fn ids_as(w: &World, credential: &str) -> Value {
+    let out = call_as(
+        w,
+        credential,
+        "query_sql",
+        json!({"sql":"SELECT id,home_id,type,name FROM records ORDER BY id"}),
+    )
+    .await
+    .unwrap();
+    out["rows"].clone()
+}
+
+/// The same query with this handle's cache temporarily unregistered.
+async fn fresh_as(w: &World, credential: &str) -> Value {
+    vcache::set_bypass_for_test(&w.db, true);
+    let out = ids_as(w, credential).await;
+    vcache::set_bypass_for_test(&w.db, false);
+    out
+}
+
+async fn cached_world() -> World {
+    world().await
+}
+
+async fn settle_refresh(w: &World, before: vcache::Stats) -> vcache::Stats {
+    for _ in 0..200 {
+        let now = vcache::stats(&w.db);
+        if now.refreshes > before.refreshes {
+            return now;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    vcache::stats(&w.db)
+}
+
+#[tokio::test]
+async fn visible_cache_equivalent_isolated_and_reuses_ordinary_writes() {
+    let w = cached_world().await;
+    let admin_fresh = fresh_as(&w, "acct:admin").await;
+    let viewer_fresh = fresh_as(&w, "acct:viewer").await;
+    assert_ne!(
+        admin_fresh, viewer_fresh,
+        "fixture must give the two principals different visibility"
+    );
+    vcache::enable_for_test(&w.db).await;
+    // Miss then hit, for each principal, interleaved: never another's set.
+    for _ in 0..2 {
+        assert_eq!(ids_as(&w, "acct:viewer").await, viewer_fresh);
+        assert_eq!(ids_as(&w, "acct:admin").await, admin_fresh);
+    }
+    let after_warm = vcache::stats(&w.db);
+    assert!(after_warm.hits >= 2, "warm reads must hit: {after_warm:?}");
+
+    // Ordinary writes between cached reads: reuse or patch, never recompute,
+    // never a meta event, always equal to fresh staging.
+    let meta_before: i64 = sqlx::query_scalar("SELECT count(*) FROM meta_events")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let note = |title: &str| json!({"title": title}).as_object().unwrap().clone();
+    let created = kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note("Cache create"),
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    let steps: Vec<Value> = vec![
+        json!({"tool":"update_record","args":{"id":created,"facets":{"cache_score":1},"reason":"cache facet"}}),
+        json!({"tool":"manage_links","args":{"action":"add","source_id":created,"target_id":w.first,"relationship":"relates_to","reason":"cache link"}}),
+        json!({"tool":"manage_links","args":{"action":"add","source_id":created,"target_id":w.first,"relationship":"part_of","reason":"cache part_of"}}),
+    ];
+    let check = |label: String| {
+        let w = &w;
+        async move {
+            let stale_before = vcache::stats(&w.db).stale_serves;
+            for credential in ["acct:viewer", "acct:admin"] {
+                let cached = ids_as(w, credential).await;
+                let fresh = fresh_as(w, credential).await;
+                assert_eq!(
+                    cached, fresh,
+                    "{label}: {credential} cached differs from fresh"
+                );
+            }
+            assert_eq!(
+                vcache::stats(&w.db).stale_serves,
+                stale_before,
+                "{label}: ordinary write must not take the stale path"
+            );
+        }
+    };
+    check("create".into()).await;
+    for step in steps {
+        let _ = call_as(
+            &w,
+            "acct:admin",
+            step["tool"].as_str().unwrap(),
+            step["args"].clone(),
+        )
+        .await;
+        check(format!("{}", step["args"])).await;
+    }
+    let meta_after: i64 = sqlx::query_scalar("SELECT count(*) FROM meta_events")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        meta_before, meta_after,
+        "ordinary writes must not append meta events"
+    );
+    let s = vcache::stats(&w.db);
+    assert!(
+        s.patches >= 1,
+        "a create/part_of must patch in place: {s:?}"
+    );
+    vcache::disable_for_test(&w.db);
+}
+
+#[tokio::test]
+async fn visible_cache_revocation_serves_last_known_then_converges_and_survives_refresh_failure() {
+    let w = cached_world().await;
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let note = json!({"title": "Revocable"}).as_object().unwrap().clone();
+    let record = kernel::create_as(&w.db, &w.admin, "fixture.mcp", "note", &note, &home)
+        .await
+        .unwrap();
+    let has = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == json!(record))
+    };
+    vcache::enable_for_test(&w.db).await;
+    assert!(has(&ids_as(&w, "acct:viewer").await));
+    assert!(has(&ids_as(&w, "acct:viewer").await), "warm");
+
+    // Prolonged refresh failure: the known result is retained, never refused.
+    vcache::set_fail_refresh(&w.db, true);
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[(&w.admin, "manage")])
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        assert!(
+            has(&ids_as(&w, "acct:viewer").await),
+            "last-known set retained while refresh fails"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let s = vcache::stats(&w.db);
+    assert!(s.stale_serves >= 5, "{s:?}");
+    // Failure never degrades into another principal's set.
+    let admin_fresh = fresh_as(&w, "acct:admin").await;
+    vcache::enable_for_test(&w.db).await;
+    assert_eq!(
+        ids_as(&w, "acct:admin").await,
+        admin_fresh,
+        "a different principal never inherits the stale set"
+    );
+
+    // Recovery: the next stale read retries; once it succeeds the revoked
+    // record is absent and the result equals fresh staging.
+    vcache::set_fail_refresh(&w.db, false);
+    let before = vcache::stats(&w.db);
+    let _ = ids_as(&w, "acct:viewer").await;
+    settle_refresh(&w, before).await;
+    let converged = ids_as(&w, "acct:viewer").await;
+    assert!(
+        !has(&converged),
+        "after a successful refresh the revoked record is absent"
+    );
+    let viewer_fresh = fresh_as(&w, "acct:viewer").await;
+    assert_eq!(converged, viewer_fresh);
+}
+
+#[tokio::test]
+async fn visible_cache_rebuild_epoch_older_snapshot_and_concurrent_readers() {
+    let w = cached_world().await;
+    vcache::enable_for_test(&w.db).await;
+    let viewer_fresh = fresh_as(&w, "acct:viewer").await;
+    vcache::enable_for_test(&w.db).await;
+    assert_eq!(ids_as(&w, "acct:viewer").await, viewer_fresh);
+
+    // An older snapshot never uses an entry published ahead of it.
+    let mut pinned = w.db.governed_pool().acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *pinned).await.unwrap();
+    let _: i64 = sqlx::query_scalar("SELECT count(*) FROM main.content_events")
+        .fetch_one(&mut *pinned)
+        .await
+        .unwrap();
+    let note = json!({"title": "After pin"}).as_object().unwrap().clone();
+    kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note,
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    let _ = ids_as(&w, "acct:viewer").await; // publishes an entry stamped after the pin
+    assert_eq!(
+        vcache::plan_kind_for_test(&mut pinned, &w.db, &w.viewer).await,
+        "miss_no_publish"
+    );
+    sqlx::query("ROLLBACK").execute(&mut *pinned).await.unwrap();
+    drop(pinned);
+
+    // A rebuild changes the persisted epoch: last-known is served, a refresh
+    // converges, and the result equals fresh staging.
+    let before = vcache::stats(&w.db);
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    let _ = ids_as(&w, "acct:viewer").await;
+    assert!(
+        vcache::stats(&w.db).stale_serves > before.stale_serves,
+        "epoch change takes the refresh path"
+    );
+    settle_refresh(&w, before).await;
+    let viewer_fresh = fresh_as(&w, "acct:viewer").await;
+    vcache::enable_for_test(&w.db).await;
+    assert_eq!(ids_as(&w, "acct:viewer").await, viewer_fresh);
+
+    // Concurrent readers after an access change: all succeed, and once the
+    // single-flight refresh lands the result is fresh.
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    let before = vcache::stats(&w.db);
+    let reads = (0..8).map(|_| ids_as(&w, "acct:viewer"));
+    let results = futures::future::join_all(reads).await;
+    assert_eq!(results.len(), 8);
+    let after = settle_refresh(&w, before).await;
+    assert!(
+        after.refreshes - before.refreshes <= 2,
+        "refresh is single-flight: {before:?} -> {after:?}"
+    );
+    let viewer_fresh = fresh_as(&w, "acct:viewer").await;
+    vcache::enable_for_test(&w.db).await;
+    assert_eq!(ids_as(&w, "acct:viewer").await, viewer_fresh);
+    vcache::disable_for_test(&w.db);
+}
+
+/// Periodic re-verify (Native 788c170): a change the delta cannot see (a
+/// projection edited with no event, standing in for any classification gap)
+/// converges after one re-verify, and no read waits for it.
+#[tokio::test]
+async fn visible_cache_reverify_converges_on_an_unclassified_change_without_blocking() {
+    let w = world().await;
+    let private = kernel::create_home(&w.db, KERNEL_ROOT_ID, Some(&[]), &w.admin)
+        .await
+        .unwrap();
+    let note = json!({"title": "Will move silently"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let record = kernel::create_as(&w.db, &w.admin, "fixture.mcp", "note", &note, &private)
+        .await
+        .unwrap();
+    let has = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == json!(record))
+    };
+    vcache::enable_for_test(&w.db).await;
+    assert!(!has(&ids_as(&w, "acct:viewer").await));
+    assert!(!has(&ids_as(&w, "acct:viewer").await), "warm hit");
+    // Silent projection change into the viewer's view: no event, so the cursor
+    // sees nothing and the cached set lags (a stand-in for any classification gap).
+    let shared = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&shared)
+        .bind(&record)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(
+        has(&fresh_as(&w, "acct:viewer").await),
+        "fresh staging sees the move"
+    );
+    assert!(
+        !has(&ids_as(&w, "acct:viewer").await),
+        "before re-verify the cached set lags"
+    );
+    let before = vcache::stats(&w.db);
+    vcache::age_entries_for_test(&w.db);
+    let started = std::time::Instant::now();
+    let _ = ids_as(&w, "acct:viewer").await; // due: served at once, re-verify starts
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the due read is not blocked"
+    );
+    let after = settle_refresh(&w, before).await;
+    assert!(
+        after.reverifies > before.reverifies,
+        "{before:?} -> {after:?}"
+    );
+    let converged = ids_as(&w, "acct:viewer").await;
+    assert!(
+        has(&converged),
+        "after one re-verify the change is reflected"
+    );
+    assert_eq!(converged, fresh_as(&w, "acct:viewer").await);
+}
+
+/// The approved periodic background re-verify (788c170): a real timer, owned
+/// by the serving registration, converges a change the delta cannot see with
+/// no read at all, even while the entry is continuously patched by ordinary
+/// writes (age is measured from the last full verification only).
+#[tokio::test]
+async fn visible_cache_timer_reverifies_busy_entries_and_converges_without_reads() {
+    let w = world().await;
+    let private = kernel::create_home(&w.db, KERNEL_ROOT_ID, Some(&[]), &w.admin)
+        .await
+        .unwrap();
+    let shared = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    let note = |t: &str| json!({"title": t}).as_object().unwrap().clone();
+    let record = kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note("Silent"),
+        &private,
+    )
+    .await
+    .unwrap();
+    let has = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == json!(record))
+    };
+    let cache =
+        vcache::enable_with_interval_for_test(&w.db, std::time::Duration::from_millis(120)).await;
+    assert!(!has(&ids_as(&w, "acct:viewer").await));
+
+    // Busy entry: ordinary creates patch it continuously; the timer still
+    // performs full refreshes because patches never reset the verified age.
+    // Keep patching until two refreshes land rather than for a fixed count:
+    // a loaded runner can starve the 120 ms timer for a while, and that says
+    // nothing about whether patches reset the age. The deadline bounds a
+    // genuine regression (patches suppressing refreshes) to a clear failure.
+    let start = cache.stats.lock().unwrap().timer_refreshes;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut i = 0;
+    while cache.stats.lock().unwrap().timer_refreshes - start < 2
+        && std::time::Instant::now() < deadline
+    {
+        kernel::create_as(
+            &w.db,
+            &w.admin,
+            "fixture.mcp",
+            "note",
+            &note(&format!("Busy {i}")),
+            &shared,
+        )
+        .await
+        .unwrap();
+        i += 1;
+        let _ = ids_as(&w, "acct:viewer").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let busy = cache.stats.lock().unwrap().timer_refreshes - start;
+    assert!(
+        busy >= 2,
+        "a continuously patched entry is still fully re-verified each period: {busy}"
+    );
+
+    // Planted gap: a silent projection move into the viewer's view. No reads
+    // at all until well after a timer period; the next read is converged.
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&shared)
+        .bind(&record)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let before = *cache.stats.lock().unwrap();
+    // Wait for the timer itself (bounded) rather than a fixed 500 ms, which a
+    // loaded runner can overrun; still no reads in the meantime.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    while cache.stats.lock().unwrap().timer_refreshes <= before.timer_refreshes
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let after = *cache.stats.lock().unwrap();
+    assert!(
+        after.timer_refreshes > before.timer_refreshes,
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(after.reverifies, before.reverifies, "no read triggered it");
+    let converged = ids_as(&w, "acct:viewer").await;
+    assert!(
+        has(&converged),
+        "the timer converged the planted gap with no read"
+    );
+    assert_eq!(converged, fresh_as(&w, "acct:viewer").await);
+    vcache::disable_for_test(&w.db);
+}
+
+/// The aggregate stats line measures real reads: a miss stages through the
+/// gate, a repeat read stages from cached ids, an ordinary write is read as a
+/// delta and patched, and a failed background refresh is counted. Lines are
+/// emitted only by the timer, at most once per window, carry no caller data,
+/// and stop when serving stops.
+#[tokio::test]
+async fn visible_cache_stats_line_counts_real_reads_and_stops_with_serving() {
+    let w = world().await;
+    let home = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.viewer, "view")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    // A 10 s re-verify interval: the timer ticks every ~5 s (and so emits),
+    // but never refreshes an entry during the counted reads below, even on
+    // a slow debug run.
+    let cache =
+        vcache::enable_with_interval_for_test(&w.db, std::time::Duration::from_secs(10)).await;
+    let window = std::time::Duration::from_millis(400);
+    vcache::set_stats_window_for_test(&w.db, window);
+    let started = std::time::Instant::now();
+    let fresh = fresh_as(&w, "acct:viewer").await;
+    let base = *cache.stats.lock().unwrap();
+
+    assert_eq!(ids_as(&w, "acct:viewer").await, fresh);
+    let first = *cache.stats.lock().unwrap();
+    assert_eq!(first.plans - base.plans, 1);
+    assert_eq!(first.misses - base.misses, 1, "{first:?}");
+    assert_eq!(
+        first.gate_stages - base.gate_stages,
+        1,
+        "a miss stages through the gate"
+    );
+    assert_eq!(first.cached_stages, base.cached_stages);
+
+    assert_eq!(ids_as(&w, "acct:viewer").await, fresh);
+    let second = *cache.stats.lock().unwrap();
+    assert_eq!(second.hits - first.hits, 1, "{second:?}");
+    assert_eq!(
+        second.cached_stages - first.cached_stages,
+        1,
+        "a hit stages cached ids"
+    );
+    assert_eq!(second.gate_stages, first.gate_stages);
+
+    let note = json!({"title": "Stats create"})
+        .as_object()
+        .unwrap()
+        .clone();
+    kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note,
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ids_as(&w, "acct:viewer").await,
+        fresh_as(&w, "acct:viewer").await
+    );
+    let third = *cache.stats.lock().unwrap();
+    assert!(
+        third.delta_rows > second.delta_rows,
+        "the write is read as a delta: {third:?}"
+    );
+    assert_eq!(
+        third.patches - second.patches,
+        1,
+        "an ordinary create patches: {third:?}"
+    );
+    assert!(third.closure_ids > second.closure_ids);
+    assert!(third.plan_us >= second.plan_us && third.cached_stage_us >= second.cached_stage_us);
+
+    // An access change serves the last-known set and starts a background
+    // refresh; a failing refresh is counted, and the entry is retained.
+    vcache::set_fail_refresh(&w.db, true);
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[(&w.admin, "manage")])
+        .await
+        .unwrap();
+    let _ = ids_as(&w, "acct:viewer").await;
+    assert!(cache.stats.lock().unwrap().stale_serves > third.stale_serves);
+    for _ in 0..200 {
+        if cache.stats.lock().unwrap().refresh_failures > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(cache.stats.lock().unwrap().refresh_failures > 0);
+    vcache::set_fail_refresh(&w.db, false);
+    let mut counted = false;
+    for _ in 0..300 {
+        if cache
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| !l.contains(" refresh_failures=0 "))
+        {
+            counted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(counted, "a timer line reports the failed refresh");
+
+    // Once-per-window is pinned by the unit test; here every line comes from
+    // a timer tick (~interval/2 apart), so lines never outnumber ticks.
+    let lines = cache.emitted.lock().unwrap().clone();
+    assert!(
+        !lines.is_empty(),
+        "the timer emits once a window has elapsed"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        lines.len() as u128 <= elapsed.as_millis() / 4_750 + 1,
+        "at most one line per timer tick: {} lines in {elapsed:?}",
+        lines.len()
+    );
+    let sum = |field: &str| -> u64 {
+        lines
+            .iter()
+            .map(|l| {
+                l.split(' ')
+                    .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
+                    .unwrap_or_else(|| panic!("{field} missing in {l}"))
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .sum()
+    };
+    assert!(sum("plans") >= 3, "{lines:?}");
+    assert!(sum("misses") >= 1 && sum("patches") >= 1 && sum("hits") >= 1);
+    assert!(sum("gate_stages") >= 1 && sum("cached_stages") >= 2);
+    assert!(sum("refresh_failures") >= 1, "{lines:?}");
+    let path = w.db.path().to_string_lossy().into_owned();
+    for line in &lines {
+        assert!(line.starts_with("visible-cache window_s="), "{line}");
+        for secret in [
+            w.viewer.as_str(),
+            w.admin.as_str(),
+            "acct:viewer",
+            path.as_str(),
+        ] {
+            assert!(
+                !secret.is_empty() && !line.contains(secret),
+                "caller data in {line}"
+            );
+        }
+        assert!(
+            !line.contains("SELECT") && !line.contains("Stats create"),
+            "{line}"
+        );
+    }
+
+    // Lifecycle-bound: no line after serving stops, whatever the activity.
+    // Reads bypass a disabled cache, so record activity directly on the
+    // retained cache: a timer still running would report it at its next tick.
+    vcache::disable_for_test(&w.db);
+    for _ in 0..100 {
+        if cache.stats.lock().unwrap().timer_exits == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        cache.stats.lock().unwrap().timer_exits,
+        1,
+        "the timer exits when serving stops"
+    );
+    let stopped = cache.emitted.lock().unwrap().len();
+    cache.stats.lock().unwrap().plans += 1;
+    // Longer than a timer tick (~5 s) and the stats window: a live timer
+    // would have emitted a line for this activity.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    assert_eq!(
+        cache.emitted.lock().unwrap().len(),
+        stopped,
+        "emission ends with the timer"
+    );
+}
+
+/// Lifecycle: stop_serving cancels the timer, drops the registration's Db
+/// clone (no self-owned cycle), and no refresh runs afterwards.
+#[tokio::test]
+async fn visible_cache_stop_serving_cancels_timer_and_releases_the_handle() {
+    let w = world().await;
+    let cache =
+        vcache::enable_with_interval_for_test(&w.db, std::time::Duration::from_millis(40)).await;
+    let _ = ids_as(&w, "acct:viewer").await;
+    let weak = vcache::registration_weak_for_test(&w.db);
+    assert!(weak.upgrade().is_some());
+    vcache::disable_for_test(&w.db); // stop_serving
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        weak.upgrade().is_none(),
+        "registration (and its Db clone) is released: no cycle"
+    );
+    let stopped = *cache.stats.lock().unwrap();
+    assert_eq!(stopped.timer_exits, 1, "the timer task exited: {stopped:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        cache.stats.lock().unwrap().timer_refreshes,
+        stopped.timer_refreshes,
+        "no refresh after stop"
+    );
+    // Closing a handle that is still registered stops it too.
+    vcache::enable_with_interval_for_test(&w.db, std::time::Duration::from_millis(40)).await;
+    let weak = vcache::registration_weak_for_test(&w.db);
+    w.db.close().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        weak.upgrade().is_none(),
+        "close stops a still-registered cache"
+    );
+}
+
+/// Cancellation safety: aborting a refresh between BEGIN and its gate query
+/// must never return a pooled connection with an open transaction.
+#[tokio::test]
+async fn visible_cache_aborted_refresh_leaves_no_open_transaction_in_the_pool() {
+    let w = world().await;
+    vcache::enable_for_test(&w.db).await;
+    let entered = vcache::park_refresh_for_test(&w.db);
+    let (db, viewer) = (w.db.clone(), w.viewer.clone());
+    let task = tokio::spawn(async move { vcache::refresh_for_test(&db, &viewer).await });
+    entered.notified().await;
+    task.abort();
+    let _ = task.await;
+    let pool = w.db.governed_pool();
+    let max = pool.options().get_max_connections() as usize;
+    let mut held = Vec::new();
+    for _ in 0..max {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN")
+            .execute(&mut *conn)
+            .await
+            .expect("no transaction left open by an aborted refresh");
+        sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
+        held.push(conn);
+    }
+    drop(held);
+    vcache::disable_for_test(&w.db);
+}
+
+/// Serving start must never write (a serving open is often triggered by a
+/// read); the persisted epoch is created by the first ordinary write.
+#[tokio::test]
+async fn visible_cache_serving_start_never_writes_and_first_write_creates_the_epoch() {
+    let w = world().await;
+    let path = w.db.path().to_owned();
+    let wal = format!("{}-wal", path.display());
+    let main_before = std::fs::read(&path).unwrap();
+    let wal_before = std::fs::read(&wal).ok();
+    vcache::start_serving_for_test(&w.db).await;
+    let _ = ids_as(&w, "acct:viewer").await; // a read through the cache
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        main_before,
+        "serving start + read changed the main file"
+    );
+    assert_eq!(
+        std::fs::read(&wal).ok(),
+        wal_before,
+        "serving start + read changed the WAL"
+    );
+    assert!(
+        !epoch_table_present(&w.db).await,
+        "no epoch before any write"
+    );
+    let note = json!({"title": "First write"}).as_object().unwrap().clone();
+    kernel::create_as(
+        &w.db,
+        &w.admin,
+        "fixture.mcp",
+        "note",
+        &note,
+        KERNEL_ROOT_ID,
+    )
+    .await
+    .unwrap();
+    assert!(
+        epoch_table_present(&w.db).await,
+        "the first ordinary write creates the epoch"
+    );
+    let _ = ids_as(&w, "acct:viewer").await; // a miss publishes now that the epoch exists
+    let before = vcache::stats(&w.db);
+    let _ = ids_as(&w, "acct:viewer").await;
+    assert!(
+        vcache::stats(&w.db).hits > before.hits,
+        "the cache engages once the epoch exists"
+    );
+    vcache::disable_for_test(&w.db);
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+async fn page_snapshot_section(world: &World, token: &str, section: &str) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let page = call(
+            world,
+            "get_workspace_snapshot",
+            json!({
+                "action": "page",
+                "snapshot_token": token,
+                "section": section,
+                "limit": 100,
+                "after_id": after
+            }),
+        )
+        .await
+        .unwrap();
+        rows.extend(page["rows"].as_array().cloned().unwrap());
+        if !page["has_more"].as_bool().unwrap() {
+            break;
+        }
+        after = page["after_id"].clone();
+    }
+    rows
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn snapshot_currency_matches_sql_with_hidden_successor_source() {
+    let w = world().await;
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.hidden, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    let hidden_sql = call(
+        &w,
+        "query_sql",
+        json!({
+            "sql": "SELECT is_current, updated_at_ms, archived FROM records WHERE id=?1",
+            "parameters": [{"type":"text","value": w.first}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hidden_sql["rows"][0]["is_current"], json!(1));
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let token = opened["snapshot_token"].as_str().unwrap();
+    let records = page_snapshot_section(&w, token, "records").await;
+    let row = records.iter().find(|row| row["id"] == w.first).unwrap();
+    assert_eq!(row["is_current"], hidden_sql["rows"][0]["is_current"]);
+    assert_eq!(row["updated_at_ms"], hidden_sql["rows"][0]["updated_at_ms"]);
+    assert_eq!(row["archived"], hidden_sql["rows"][0]["archived"]);
+    let links = page_snapshot_section(&w, token, "links").await;
+    assert!(
+        links.iter().all(|row| row["source_id"] != w.hidden),
+        "a hidden successor source is not a visible link"
+    );
+
+    kernel::add_generic_link_as(&w.db, &w.admin, &w.second, &w.first, "supersedes", None)
+        .await
+        .unwrap();
+    let visible_sql = call(
+        &w,
+        "query_sql",
+        json!({
+            "sql": "SELECT is_current, updated_at_ms, archived FROM records WHERE id=?1",
+            "parameters": [{"type":"text","value": w.first}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(visible_sql["rows"][0]["is_current"].is_null());
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let token = opened["snapshot_token"].as_str().unwrap();
+    let records = page_snapshot_section(&w, token, "records").await;
+    let row = records.iter().find(|row| row["id"] == w.first).unwrap();
+    assert_eq!(row["is_current"], visible_sql["rows"][0]["is_current"]);
+    assert_eq!(
+        row["updated_at_ms"],
+        visible_sql["rows"][0]["updated_at_ms"]
+    );
+    assert_eq!(row["archived"], visible_sql["rows"][0]["archived"]);
+    let links = page_snapshot_section(&w, token, "links").await;
+    assert!(links.iter().any(|row| {
+        row["source_id"] == w.second
+            && row["target_id"] == w.first
+            && row["relationship"] == "supersedes"
+    }));
+    assert!(links.iter().all(|row| row["source_id"] != w.hidden));
+
+    let revision = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .expect("visible record exists")
+        .revision;
+    kernel::set_archived_as(&w.db, &w.admin, &w.first, true, revision)
+        .await
+        .unwrap();
+    let archived_sql = call(
+        &w,
+        "query_sql",
+        json!({
+            "sql": "SELECT is_current, updated_at_ms, archived FROM records WHERE id=?1",
+            "parameters": [{"type":"text","value": w.first}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(archived_sql["rows"][0]["archived"], json!(1));
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let records =
+        page_snapshot_section(&w, opened["snapshot_token"].as_str().unwrap(), "records").await;
+    let row = records.iter().find(|row| row["id"] == w.first).unwrap();
+    assert_eq!(row["archived"], archived_sql["rows"][0]["archived"]);
+    assert_eq!(row["is_current"], archived_sql["rows"][0]["is_current"]);
+    assert_eq!(
+        row["updated_at_ms"],
+        archived_sql["rows"][0]["updated_at_ms"]
+    );
+    w.db.close().await;
+}
+
+#[path = "demand_tests.rs"]
+mod demand_tests;
+#[path = "record_projection_tests.rs"]
+mod record_projection_tests;

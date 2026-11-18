@@ -3,6 +3,7 @@
 use super::*;
 use crate::mcp::app_attribution::AppAttribution;
 use crate::mcp::Caller;
+use std::sync::{Arc, Mutex};
 
 /// Subscription callers are freshly admitted credentials, without the
 /// transport-only cookie/catalogue fields. Resolve their account, consent
@@ -65,20 +66,81 @@ pub(crate) async fn admit_account_app_as(
     Ok(admitted)
 }
 
-/// Each bounded read/mutation calls this on its own actual connection.
-/// Reusing the existing provenance scope also preserves nested/cancelled-call
-/// isolation; no second ambient authority or cached executable bit is added.
-#[cfg(feature = "v2-kernel-probe")]
+/// A fresh cache belongs to one pinned read scope, never to a request's
+/// database/event-head key. Separate transactions can have identical heads.
+#[derive(Default)]
+pub(crate) struct ReadAdmissions {
+    entries: Mutex<Vec<(ReadAdmissionKey, Arc<AppSourceAdmission>)>>,
+}
+#[derive(PartialEq, Eq)]
+struct ReadAdmissionKey {
+    connection: usize,
+    principal: String,
+    account: String,
+    claim: AppAttribution,
+}
+tokio::task_local! {
+    static READ_ADMISSIONS: Option<(usize, Arc<ReadAdmissions>)>;
+}
+
+pub(crate) async fn scope_read_admissions<F: std::future::Future>(
+    connection: usize,
+    admissions: Arc<ReadAdmissions>,
+    work: F,
+) -> F::Output {
+    READ_ADMISSIONS
+        .scope(Some((connection, admissions)), work)
+        .await
+}
+pub(crate) async fn without_read_admissions<F: std::future::Future>(work: F) -> F::Output {
+    READ_ADMISSIONS.scope(None, work).await
+}
+
+/// Each bounded read/mutation calls this on its actual connection. Only a
+/// pinned read scope reuses successful admission; mutation admission stays live.
 pub(crate) async fn admit_dispatched_on(
     conn: &mut SqliteConnection,
     principal: &str,
-) -> Result<Option<AppSourceAdmission>> {
+) -> Result<Option<Arc<AppSourceAdmission>>> {
     let Some((account, claim)) = crate::provenance::current_app_claim() else {
         return Ok(None);
     };
+    let connection = crate::kernel::read_cache::connection_id(conn);
+    let cache = READ_ADMISSIONS
+        .try_with(|scope| match scope {
+            Some((expected, _)) if *expected != connection => {
+                Err(Error::engine("pinned app admission connection mismatch"))
+            }
+            Some((_, entries)) => Ok(Some(entries.clone())),
+            None => Ok(None),
+        })
+        .ok()
+        .transpose()?
+        .flatten();
+    let key = ReadAdmissionKey {
+        connection,
+        principal: principal.into(),
+        account,
+        claim: claim.as_ref().clone(),
+    };
+    if let Some(cache) = &cache {
+        if let Some((_, admitted)) = cache
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(entry, _)| entry == &key)
+        {
+            return Ok(Some(admitted.clone()));
+        }
+    }
     let admitted = admit_app_on(conn, principal, &claim).await?;
-    if admitted.account != account || admitted.principal != principal {
+    if admitted.account != key.account || admitted.principal != principal {
         return Err(Error::engine("native app dispatch principal changed"));
+    }
+    let admitted = Arc::new(admitted);
+    if let Some(cache) = cache {
+        cache.entries.lock().unwrap().push((key, admitted.clone()));
     }
     Ok(Some(admitted))
 }

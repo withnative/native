@@ -6,7 +6,7 @@ export { validatePackage, loadPackage, packageFindings, versionFindings, digestF
 export { APP_CONTRACT_V2, isAppV2Declaration, parseDeclaration, parseFacetSetBound, parseCommentCreateBound, parseCommentCreateBounds, parseMessageReactBound, parseMessageReactBounds, parseTitleSetBound, parseTitleSetBounds, splitNeeds, FACET_SET_EFFECT, COMMENT_CREATE_EFFECT, COMMENT_CREATE_MAX_BODY_BYTES, COMMENT_CREATE_POSITIONS, MESSAGE_REACT_EFFECT, MESSAGE_REACT_EMOJIS, TITLE_SET_EFFECT } from "./declaration.mjs";
 // Dormant BodySet shape/digest only; no engine/host Save capability asserted.
 export { parseBodySetBound, parseBodySetBounds, BODY_SET_EFFECT, BODY_SET_MAX_BODY_BYTES } from "./declaration.mjs";
-export { lintSql, NOT_MIRRORED } from "./sql-lint.mjs";
+export { lintSql, lintSqlLimitOrder, NOT_MIRRORED } from "./sql-lint.mjs";
 export { validateHtml, STRICT_DEFAULT } from "./html.mjs";
 export { completenessFindings, completenessAnalysis, LINT_BUDGET, PACKAGE_LINT_BUDGET } from "./completeness-lint.mjs";
 export { compareHosted, ADVISORY_VALIDATOR_VERSION } from "./hosted.mjs";

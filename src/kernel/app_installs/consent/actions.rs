@@ -87,6 +87,52 @@ struct Recorded {
     outputs: Vec<Output>,
 }
 
+// Decode-only 95 envelope. Canonical 94 serialization continues using Recorded.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recorded95 {
+    format: u32,
+    admitted_event_id: String,
+    outputs: Vec<Output>,
+    #[serde(default, deserialize_with = "ordinal95")]
+    caller_write_ordinal: Option<i64>,
+}
+
+fn ordinal95<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> std::result::Result<Option<i64>, D::Error> {
+    // Missing is allowed by default; a present null is not a producer shape.
+    <i64 as Deserialize>::deserialize(decoder).map(Some)
+}
+
+async fn decode_recorded(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    admitted: Option<&crate::standby::kernel_v2_delta::ProjectionShape>,
+) -> Result<Recorded> {
+    let Some(payload) = event.payload.as_deref() else {
+        return event_payload(event);
+    };
+    let value: serde_json::Value = serde_json::from_str(payload)?;
+    if value.get("caller_write_ordinal").is_none() {
+        return event_payload(event);
+    }
+    let observation_envelope = match admitted {
+        Some(shape) => shape.observation_envelope(),
+        None => crate::standby::shapes::on(conn).await?.observation_envelope,
+    };
+    if !observation_envelope {
+        return Err(invalid("app action ordinal is not in this receiver shape"));
+    }
+    let p: Recorded95 = serde_json::from_value(value)?;
+    let _preserved_in_event = p.caller_write_ordinal;
+    Ok(Recorded {
+        format: p.format,
+        admitted_event_id: p.admitted_event_id,
+        outputs: p.outputs,
+    })
+}
+
 #[derive(sqlx::FromRow)]
 struct StartWitness {
     local_seq: i64,
@@ -106,10 +152,152 @@ pub(crate) struct PendingAppAction {
     facts: Started,
 }
 
+// These witnesses certify comparisons only. The fixed Update driver retains
+// the actual W0 Open loan, local start/digest/args and SAME mutable act memo.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) enum RoutedActionBinding<'p> {
+    App(RoutedAppBinding<'p>),
+    NonApp(RoutedNonAppBinding),
+}
+#[cfg(feature = "v2-kernel-probe")]
+struct RoutedScope {
+    credential: String,
+    principal: String,
+    target: String,
+    request_digest: String,
+    app: Option<crate::mcp::app_attribution::AppAttribution>,
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) struct RoutedAppBinding<'p> {
+    scope: RoutedScope,
+    pending: &'p PendingAppAction,
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) struct RoutedNonAppBinding {
+    scope: RoutedScope,
+}
+#[cfg(feature = "v2-kernel-probe")]
+impl RoutedActionBinding<'_> {
+    pub(crate) fn require_update_scope(
+        &self,
+        caller: &crate::mcp::registry::Caller,
+        actor: &str,
+        target: &str,
+        acts: &crate::act::ActAllocation,
+    ) -> Result<()> {
+        let scope = match self {
+            Self::App(binding) => {
+                if binding.pending.facts.request_digest != binding.scope.request_digest
+                    || binding.pending.event.act.is_none()
+                    || binding.pending.event.act != acts.get()
+                {
+                    return Err(invalid("routed app action act changed"));
+                }
+                &binding.scope
+            }
+            // None at bind-time is NOT memo identity. Intervening metadata can
+            // allocate the original memo; fixed-driver continuity is essential.
+            Self::NonApp(binding) => &binding.scope,
+        };
+        if scope.credential != caller.credential()
+            || scope.principal != actor
+            || scope.target != target
+            || scope.app.as_ref() != caller.host_asserted_app()
+        {
+            return Err(invalid("routed update scope changed"));
+        }
+        Ok(())
+    }
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn bind_update_action_on<'p>(
+    conn: &mut SqliteConnection,
+    pending: Option<&'p PendingAppAction>,
+    caller: &crate::mcp::registry::Caller,
+    actor: &str,
+    original_args: &Value,
+    original_request_digest: &str,
+    acts: &crate::act::ActAllocation,
+) -> Result<RoutedActionBinding<'p>> {
+    let principal = crate::mcp::kernel_v2::principal_on(conn, caller).await?;
+    if principal != actor {
+        return Err(invalid("routed update principal changed"));
+    }
+    let target = original_args
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid("routed update target missing"))?;
+    let scope = RoutedScope {
+        credential: caller.credential().to_owned(),
+        principal,
+        target: target.to_owned(),
+        request_digest: original_request_digest.to_owned(),
+        app: caller.host_asserted_app().cloned(),
+    };
+    let ambient = crate::provenance::current_app_claim();
+    let admitted = crate::kernel::app_installs::admit_dispatched_on(conn, actor).await?;
+    let Some(claim) = caller.host_asserted_app() else {
+        if pending.is_some() || ambient.is_some() || admitted.is_some() {
+            return Err(invalid("routed non-app absence disagreement"));
+        }
+        return Ok(RoutedActionBinding::NonApp(RoutedNonAppBinding { scope }));
+    };
+    if !ambient
+        .as_ref()
+        .is_some_and(|(_, app)| app.as_ref() == claim)
+    {
+        return Err(invalid("routed app dispatch disagreement"));
+    }
+    let admitted = admitted.ok_or_else(|| invalid("routed app admission missing"))?;
+    let pending = pending.ok_or_else(|| invalid("routed app start missing"))?;
+    let f = &pending.facts;
+    if pending.event.actor.as_deref() != Some(actor)
+        || pending.event.act.is_none()
+        || pending.event.act != acts.get()
+        || pending.event.record_id != aggregate(actor, &claim.package)
+        || pending.event.event_type != ACTION_STARTED
+        || f.operation != "update_record"
+        || f.request_digest != original_request_digest
+        || admitted.principal != actor
+        || f.account != admitted.account
+        || f.package != admitted.package
+        || f.version != admitted.version
+        || f.generation != admitted.generation
+        || f.package != claim.package
+        || f.version != claim.version
+        || f.generation != claim.install_event_id
+        || f.install_event_seq != admitted.install_event_seq
+        || f.revocation_epoch != admitted.revocation_epoch
+        || f.frozen_source_seq != admitted.frozen_source_seq
+        || f.pin != admitted.pin
+    {
+        return Err(invalid("routed app start/source identity changed"));
+    }
+    let row: StartWitness = sqlx::query_as("SELECT seq AS local_seq,id,record_id,type AS event_type,payload,actor,act FROM main.content_events WHERE id=?")
+        .bind(&pending.event.id).fetch_optional(&mut *conn).await?
+        .ok_or_else(|| invalid("routed app start row missing"))?;
+    if row.local_seq != pending.event.local_seq
+        || row.id != pending.event.id
+        || row.record_id != pending.event.record_id
+        || row.event_type != pending.event.event_type
+        || row.actor != pending.event.actor
+        || row.act != pending.event.act
+        || Some(row.payload.as_str()) != pending.event.payload.as_deref()
+        || serde_json::from_str::<Value>(&row.payload)? != serde_json::to_value(f)?
+    {
+        return Err(invalid("routed app start row changed"));
+    }
+    Ok(RoutedActionBinding::App(RoutedAppBinding {
+        scope,
+        pending,
+    }))
+}
+
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn start_app_action_in(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     actor: &str,
     operation: &str,
     request_digest: String,
@@ -123,7 +311,7 @@ pub(crate) async fn start_app_action_in(
         db,
         tx,
         actor,
-        admitted,
+        std::sync::Arc::unwrap_or_clone(admitted),
         operation,
         request_digest,
         reason,
@@ -136,7 +324,7 @@ pub(crate) async fn start_app_action_in(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_declared_app_action_in(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     actor: &str,
     admitted: AppSourceAdmission,
     operation: &str,
@@ -152,6 +340,7 @@ pub(crate) async fn start_declared_app_action_in(
         "attach_text"
             | "create_record"
             | "update_record"
+            | "merge_body"
             | "manage_links"
             | "archive_record"
             | "manage_canvas"
@@ -177,7 +366,7 @@ pub(crate) async fn start_declared_app_action_in(
         reason,
     };
     facts.validate()?;
-    let event = append_in(
+    let event = crate::store::append_on(
         db,
         tx,
         AppendSpec {
@@ -206,7 +395,7 @@ async fn outputs_between(
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn finish_app_action_in(
     db: &Db,
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     actor: &str,
     pending: Option<Box<PendingAppAction>>,
     acts: &mut crate::act::ActAllocation,
@@ -218,7 +407,7 @@ pub(crate) async fn finish_app_action_in(
         return Err(invalid("app action transaction identity changed"));
     }
     let outputs = outputs_between(tx, pending.event.local_seq, pending.event.act, i64::MAX).await?;
-    let event = append_in(
+    let event = crate::store::append_on(
         db,
         tx,
         AppendSpec {
@@ -296,8 +485,9 @@ pub(in crate::kernel::app_installs) async fn project_started(
 pub(in crate::kernel::app_installs) async fn project_recorded(
     conn: &mut SqliteConnection,
     event: &EventRow,
+    admitted: Option<&crate::standby::kernel_v2_delta::ProjectionShape>,
 ) -> Result<()> {
-    let p: Recorded = event_payload(event)?;
+    let p = decode_recorded(conn, event, admitted).await?;
     if p.format != 1 {
         return Err(invalid("invalid recorded app action"));
     }
@@ -352,7 +542,30 @@ pub(in crate::kernel::app_installs) async fn ensure_schema(
     let events =
         crate::conformance::rebuild::read_events_of_types(conn, &[ACTION_RECORDED]).await?;
     for event in events {
-        project_recorded(conn, &event).await?;
+        project_recorded(conn, &event, None).await?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[test]
+fn receiver95_recorded_decoder_is_closed_and_rejects_null_ordinal() {
+    let old = serde_json::json!({"format":1,"admitted_event_id":"event","outputs":[]});
+    let before =
+        serde_json::to_vec(&serde_json::from_value::<Recorded>(old.clone()).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(serde_json::from_slice::<Recorded>(&before).unwrap()).unwrap(),
+        old
+    );
+    let mut new = old.clone();
+    new["caller_write_ordinal"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<Recorded>(new.clone()).is_err());
+    assert!(serde_json::from_value::<Recorded95>(new.clone()).is_ok());
+    new["caller_write_ordinal"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<Recorded95>(new.clone()).is_err());
+    new["caller_write_ordinal"] = serde_json::json!("1");
+    assert!(serde_json::from_value::<Recorded95>(new.clone()).is_err());
+    new["caller_write_ordinal"] = serde_json::json!(1);
+    new["future_semantics"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<Recorded95>(new).is_err());
 }

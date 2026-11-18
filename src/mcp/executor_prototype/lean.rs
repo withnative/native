@@ -203,6 +203,7 @@ fn narrowed_clause(narrowed: &BTreeMap<String, Vec<String>>) -> String {
 pub(super) fn call_executor_descriptor(
     callable: &OperationsByExecutor,
     direct: &OperationsByExecutor,
+    direct_only: bool,
 ) -> Value {
     let targets = callable
         .keys()
@@ -220,7 +221,7 @@ pub(super) fn call_executor_descriptor(
     let description = format!(
         "Call any contracted operation that is not advertised directly, through the same contract, authorization, validation and plan gating as a direct executor call. {reach} List them with sql_read query_sql: {LEAN_CATALOG_QUERY}; describe_operation {{executor, operation}} returns any contract. Example: {{executor:'records_read', operation:'get_history', arguments:{{record_id:reference}}}}. Plan-required operations: prepare with {{executor, operation, arguments}}, then execute only with the returned {{executor, operation, plan_id, target, effect_summary}}."
     );
-    json!({
+    let mut descriptor = json!({
         "name": CALL_EXECUTOR,
         "title": "Call executor",
         "description": description,
@@ -275,7 +276,19 @@ pub(super) fn call_executor_descriptor(
             "idempotentHint": false,
             "openWorldHint": false
         }
-    })
+    });
+    if direct_only {
+        descriptor["description"] = json!(format!("Call any contracted operation that is not advertised directly, through the same source authorization, validation and concurrency checks. {reach} List them with sql_read query_sql: {LEAN_CATALOG_QUERY}; describe_operation {{executor, operation}} returns any contract. Each call executes the selected operation once with {{executor, operation, arguments}}."));
+        let schema = &mut descriptor["inputSchema"];
+        schema.as_object_mut().unwrap().remove("oneOf");
+        let properties = schema["properties"].as_object_mut().unwrap();
+        for field in ["plan_id", "target", "effect_summary"] {
+            properties.remove(field);
+        }
+        properties.get_mut("format").unwrap()["description"] = json!("Response representation. Availability follows the target operation. Keep this field outside nested arguments.");
+        schema["required"] = json!(["executor", "operation", "arguments"]);
+    }
+    descriptor
 }
 
 /// Lean fields merged into bootstrap's `tool_exposure` summary. The text
@@ -284,6 +297,7 @@ pub(super) fn exposure_summary(
     callable: &OperationsByExecutor,
     direct: &OperationsByExecutor,
     advertised_tools: &[Value],
+    direct_only: bool,
 ) -> Value {
     let (hidden, narrowed) = hidden_executors(callable, direct);
     let advertised = advertised_tools
@@ -303,7 +317,11 @@ pub(super) fn exposure_summary(
                 {"executor": "records_read", "operation": "search", "arguments": {"query": "<words>"}},
                 {"executor": "coordination_read", "operation": "get_run_activity", "arguments": {}}
             ],
-            "guidance": "Open a known reference with get_record; choose, filter, count or follow links with sql_read query_sql; use records_read search for free text, and reach any other operation through call_executor with {executor, operation, arguments}. It runs the same contract, authorization, validation and plan gating as a direct call."
+            "guidance": if direct_only {
+                "Open a known reference with get_record; choose, filter, count or follow links with sql_read query_sql; use records_read search for free text, and reach any other operation through call_executor with {executor, operation, arguments}. Each call executes directly with the same source authorization, validation and concurrency checks."
+            } else {
+                "Open a known reference with get_record; choose, filter, count or follow links with sql_read query_sql; use records_read search for free text, and reach any other operation through call_executor with {executor, operation, arguments}. It runs the same contract, authorization, validation and plan gating as a direct call."
+            }
         }
     })
 }

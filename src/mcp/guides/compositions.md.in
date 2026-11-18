@@ -4,9 +4,19 @@ This guide contains only non-obvious focused-profile recipes whose limitations m
 
 When the person asks to build an **app**, use installed apps: read
 `guidance_read.read_guide` topic `app-builder-1.0.0` first. It covers the supplied
-Preact kit (`app-kit-core-1.1.0`), `artifacts_read.manage_alpha_tabs.prepare_install`,
+Preact kit (`app-kit-core-1.7.0`), `artifacts_read.manage_alpha_tabs.prepare_install`,
 and the person's Preview/Adopt boundary. Use the artifact recipe below for
 dashboards, boards and views inside Native.
+
+Before a consequential executor call, inspect the advertised operation with
+`describe_operation` and follow `prototype.plan_required`. Kernel v2 executes
+supported mutations with one operation-and-arguments call, retaining source
+authorization, validation and concurrency guards. A legacy engine may advertise
+`plan_required:true`; only then prepare, review the returned target and effect,
+and execute that returned plan. An operation absent from the current catalogue
+is unavailable through this route. In particular, module-grant mutations and
+guest links require separate v2 support; the recipes below do not establish
+that support.
 
 ## Author a live artifact from scratch
 
@@ -165,17 +175,21 @@ contract when needed.
    Use the returned artifact-source subject's event identity and source digest
    in the next step; do not invent them or copy a module-release subject.
 
-4. Prepare `access_admin`, operation `manage_artifact_module_grants.grant`:
+4. Check that `access_admin`, operation
+   `manage_artifact_module_grants.grant`, is advertised, then inspect its
+   `describe_operation` contract. This module-grant mutation is currently
+   unavailable on kernel v2. When available, use these operation arguments:
 
    ```json
    {"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"items"}}
    ```
 
-   Preparation does not grant anything. Review the returned target and effect
-   within the person's authorization, then execute with the same operation,
-   `plan_id`, `target` and `effect_summary` returned by preparation, without
-   nested arguments. A manifest declares `scope.port`; this root-source grant
-   uses `scope.artifact_port`. Grants authorize the declared runtime request;
+   If `prototype.plan_required` is false, submit those arguments in one
+   direct call. If true, preparation does not grant anything: review the
+   returned target and effect within the person's authorization, then execute
+   with the same operation and the returned `plan_id`, `target` and
+   `effect_summary`, without nested arguments. A manifest declares `scope.port`;
+   this root-source grant uses `scope.artifact_port`. Grants authorize the declared runtime request;
    they do not confer visibility of otherwise unreadable records. Adding
    `RecordCard` or `RecordTable` also requires the declared and granted
    `navigation.record.user_gesture` capability with an empty scope.
@@ -520,9 +534,11 @@ document as its complete `body`. Bind both ports with
 {"artifact_id":"<artifact ID>","port_name":"edges","collection_id":"<governed edge-query Collection ID>"}
 ```
 
-Read the current artifact-source identity as in step 3, then prepare and execute
-one exact-source grant per port as in step 4, changing only
-`scope.artifact_port` between `nodes` and `edges`:
+Read the current artifact-source identity as in step 3. If the module-grant
+mutation is advertised, submit one exact-source grant per port as in step 4,
+following its `prototype.plan_required` contract and changing only
+`scope.artifact_port` between `nodes` and `edges`. This grant route is currently
+unavailable on kernel v2:
 
 ```json
 {"artifact_id":"<artifact ID>","subject_kind":"artifact_source","subject_record_id":"<artifact ID>","subject_event_id":"<source event ID>","source_sha256":"<source digest>","capability":"input.read","scope":{"artifact_port":"nodes"}}
@@ -682,6 +698,6 @@ Use a bulk operation only when it supplies semantics beyond scheduling the same 
 
 - `records_read.resolve_many` resolves a bounded, ordered list of exact names and reports unique, absent, and ambiguous outcomes without exposing hidden candidates. Use it for deterministic deduplication; use `search` for exploratory lexical recall.
 - `records_write.create_many` creates a bounded graph. Batch-local `ref` values can be used by `parent_ref`, link `target_ref`, and `[[ref]]` body mentions. The server validates the whole dependency graph before writing, then returns positional receipts; one failed record prevents its dependants but not independent branches.
-- `access_admin.manage_record_policy.set_many` converges each `(record, subject)` pair on an exact capability or on absence. It is one plan-required, all-or-nothing effect: prepare it first, review the complete target/effect summary, and execute only that returned plan.
+- `access_admin.manage_record_policy.set_many` converges each `(record, subject)` pair on an exact capability or on absence in one all-or-nothing effect. On kernel v2, submit its `items`, `reason` and applicable concurrency guards in one direct call. Check `describe_operation.prototype.plan_required`: on a legacy engine advertising `true`, prepare first, review the complete target/effect summary, and execute only that returned plan.
 
 For independent ordinary calls with no shared lookup, graph, or convergence semantics, pipeline the singular operations instead. A generic heterogeneous batch does not reduce response payload and does not provide cross-operation atomicity. Prefer compact response/receipt modes when payload size is the actual cost.

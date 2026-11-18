@@ -118,9 +118,42 @@ impl StandbyAdmissionCheck {
     }
 }
 
+/// Canonical control-event reference; never a domain apply claim.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeFenceReference {
+    pub canonical_event_id: String,
+    pub origin_database_id: String,
+    pub genesis_event_id: String,
+    pub local_seq: i64,
+    pub act: i64,
+    pub causal_envelope: crate::events::CausalEnvelopeV1,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginalConflictKind {
+    KeyFenced,
+    RecordIdRetired,
+}
+/// Structured refusal. This is NOT authority to clean up a node original.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalConflict {
+    pub schema: String,
+    pub kind: OriginalConflictKind,
+    pub record_id: Option<String>,
+    pub fence_id: String,
+    pub native_fence: NativeFenceReference,
+    pub namespace_sha256: String,
+    pub fenced_original_binding_sha256: String,
+    pub requested_original_binding_sha256: Option<String>,
+}
+
 /// Engine error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("original is durably fenced; reconcile its immutable settlement")]
+    OriginalConflict(Box<OriginalConflict>),
     /// Preserve the internal source and its historical Display surface, with
     /// a separate static admission stage for payload-free refresh diagnostics.
     #[error("{source}")]

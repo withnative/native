@@ -532,31 +532,34 @@ impl MemberCopyGate {
         let Ok(result) = &mut outcome.outcome else {
             return;
         };
+        if let Err(error) = self.decorate_value(tool, arguments, &mut result.structured) {
+            outcome.outcome = Err(error);
+        }
+    }
+    /// Shared member presentation policy; this grants no binding/read authority.
+    pub(crate) fn decorate_value(
+        &self,
+        tool: &str,
+        arguments: &Value,
+        result: &mut Value,
+    ) -> Result<()> {
         if tool == "query_record" {
-            self.rebind_query_record_basis(arguments, &mut result.structured);
+            self.rebind_query_record_basis(arguments, result);
             // A stale continuation becomes the same typed refusal online
             // returns; it carries no counter and no record identity.
-            if result
-                .structured
-                .get("page_basis_mismatch")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
+            if result.get("page_basis_mismatch").and_then(Value::as_bool) == Some(true) {
                 result
-                    .structured
                     .as_object_mut()
                     .expect("response is an object")
                     .remove("page_basis_mismatch");
-                outcome.outcome = Err(Error::engine(
-                    "query_record: record page basis changed under current authorization or schema; restart from offset 0",
-                ));
-                return;
+                return Err(Error::engine("query_record: record page basis changed under current authorization or schema; restart from offset 0"));
             }
         }
-        scrub_member_response(tool, &mut result.structured);
-        if let Some(object) = result.structured.as_object_mut() {
+        scrub_member_response(tool, result);
+        if let Some(object) = result.as_object_mut() {
             object.insert("standby_context".into(), self.context_value());
         }
+        Ok(())
     }
 
     /// Bind the member `query_record` page basis to the admitted generation
@@ -753,6 +756,7 @@ mod tests {
             StandbyConsumerIdentity, StandbyConsumerPlatform, STANDBY_CONSUMER_CONTRACT,
         };
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -6099,6 +6103,8 @@ mod tests {
             "SELECT * FROM facet_times ORDER BY record_id, key",
             "SELECT * FROM facet_keys ORDER BY scope_id, type, kind, key",
             "SELECT * FROM bindings ORDER BY record_id, system, identifier",
+            "SELECT person_id, display_name FROM viewer",
+            "SELECT count(*) AS n FROM viewer",
             "SELECT * FROM vocabularies ORDER BY id",
             "SELECT * FROM vocabulary_values ORDER BY vocabulary_id, value",
             "SELECT * FROM schema_config ORDER BY id",

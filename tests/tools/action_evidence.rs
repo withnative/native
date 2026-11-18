@@ -131,12 +131,14 @@ fn the_carve_out_is_one_named_set_the_evaluator_surfaces_belong_to() {
     for tool in ["get_record", "query_record", "get_history", "read_guide"] {
         assert!(!is_action_evidence_surface(tool), "{tool} is attention");
     }
-    assert_eq!(surfaces.len(), 29, "the action-evidence set changed size");
+    assert_eq!(surfaces.len(), 31, "the action-evidence set changed size");
 }
 
 #[test]
 fn every_action_evidence_surface_is_a_live_registered_tool() {
-    let registry = registry();
+    let mut registry = registry();
+    assert!(registry.get("manage_publication").is_none());
+    native_ce::mcp::tools::register_publication_management_tool(&mut registry).unwrap();
     let registered = registry
         .specs()
         .map(|spec| spec.name.clone())

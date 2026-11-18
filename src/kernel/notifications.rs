@@ -251,7 +251,48 @@ pub(crate) const REALTIME_AUTHORITY_INDEX: &str = r#"CREATE INDEX idx_kernel_rea
  'kernel.import_hosted_accounts.v1','kernel.import_member_policy.v1',
  'kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1',
  'kernel.import_state.v1','kernel.import_state_delta.v1','kernel.import_removed.v1',
+ 'kernel.record_deleted.v1','kernel.record_rebound.v1','kernel.record_type_corrected.v1',
+ 'kernel.record_rehomed.v1','kernel.record_rehomed.v2',
+ 'kernel.generic_link_removed.v1','kernel.generic_link_removal_imported.v1')
+ OR (type='kernel.home_created.v1' AND json_type(payload,'$.entries')='array')
+ OR (type IN ('kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1') AND json_extract(payload,'$.binding.system')='native-principal')
+ OR (type='kernel.identity_bindings_reconciled.v1')
+ OR (type IN ('kernel.record_revised.v1','kernel.record_revised.v2') AND
+   (json_type(payload,'$.fields.v1_type') IS NOT NULL OR json_type(payload,'$.fields.v1_kind') IS NOT NULL))
+ OR (type IN ('kernel.generic_link_added.v1','kernel.generic_link_imported.v1','kernel.link_added.v1','kernel.link_removed.v1')
+   AND json_extract(payload,'$.relationship')='part_of')
+)"#;
+
+// Exact historical optional accelerator from 5c2aadeaf60d299f82bd8b9f0adba86c967c42dc.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) const REALTIME_AUTHORITY_INDEX_V1: &str = r#"CREATE INDEX idx_kernel_realtime_authority ON content_events(type,seq) WHERE (
+ type IN ('kernel.root_admin_bootstrapped.v1',
+ 'kernel.home_created_for.v1','kernel.home_policy_replaced.v1',
+ 'kernel.hosted_membership.v1','kernel.hosted_offboarding.v1',
+ 'kernel.import_hosted_accounts.v1','kernel.import_member_policy.v1',
+ 'kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1',
+ 'kernel.import_state.v1','kernel.import_state_delta.v1','kernel.import_removed.v1',
  'kernel.record_deleted.v1','kernel.record_rebound.v1',
+ 'kernel.record_rehomed.v1','kernel.record_rehomed.v2',
+ 'kernel.generic_link_removed.v1','kernel.generic_link_removal_imported.v1')
+ OR (type='kernel.home_created.v1' AND json_type(payload,'$.entries')='array')
+ OR (type='kernel.identity_binding_added.v1' AND json_extract(payload,'$.binding.system')='native-principal')
+ OR (type IN ('kernel.record_revised.v1','kernel.record_revised.v2') AND
+   (json_type(payload,'$.fields.v1_type') IS NOT NULL OR json_type(payload,'$.fields.v1_kind') IS NOT NULL))
+ OR (type IN ('kernel.generic_link_added.v1','kernel.generic_link_imported.v1','kernel.link_added.v1','kernel.link_removed.v1')
+   AND json_extract(payload,'$.relationship')='part_of')
+)"#;
+
+// Exact historical optional accelerator from 5b9525c33.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) const REALTIME_AUTHORITY_INDEX_V2: &str = r#"CREATE INDEX idx_kernel_realtime_authority ON content_events(type,seq) WHERE (
+ type IN ('kernel.root_admin_bootstrapped.v1',
+ 'kernel.home_created_for.v1','kernel.home_policy_replaced.v1',
+ 'kernel.hosted_membership.v1','kernel.hosted_offboarding.v1',
+ 'kernel.import_hosted_accounts.v1','kernel.import_member_policy.v1',
+ 'kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1',
+ 'kernel.import_state.v1','kernel.import_state_delta.v1','kernel.import_removed.v1',
+ 'kernel.record_deleted.v1','kernel.record_rebound.v1','kernel.record_type_corrected.v1',
  'kernel.record_rehomed.v1','kernel.record_rehomed.v2',
  'kernel.generic_link_removed.v1','kernel.generic_link_removal_imported.v1')
  OR (type='kernel.home_created.v1' AND json_type(payload,'$.entries')='array')
@@ -660,10 +701,11 @@ const REALTIME_AUTHORITY_EVENT: &str = r#"(
  'kernel.import_hosted_accounts.v1','kernel.import_member_policy.v1',
  'kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1',
  'kernel.import_state.v1','kernel.import_state_delta.v1','kernel.import_removed.v1',
- 'kernel.record_deleted.v1','kernel.record_rebound.v1',
+ 'kernel.record_deleted.v1','kernel.record_rebound.v1','kernel.record_type_corrected.v1',
  'kernel.record_rehomed.v1','kernel.record_rehomed.v2')
  OR (e.type='kernel.home_created.v1' AND json_type(e.payload,'$.entries')='array')
- OR (e.type='kernel.identity_binding_added.v1' AND json_extract(e.payload,'$.binding.system')='native-principal')
+ OR (e.type IN ('kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1') AND json_extract(e.payload,'$.binding.system')='native-principal')
+ OR (e.type='kernel.identity_bindings_reconciled.v1' AND EXISTS (SELECT 1 FROM json_each(e.payload,'$.bindings') binding WHERE json_extract(binding.value,'$.system')='native-principal'))
  OR (e.type IN ('kernel.record_revised.v1','kernel.record_revised.v2') AND EXISTS (
    SELECT 1 FROM json_each(e.payload,'$.fields') f WHERE f.key IN ('v1_type','v1_kind')))
  OR (e.type IN ('kernel.generic_link_added.v1','kernel.generic_link_imported.v1','kernel.link_added.v1','kernel.link_removed.v1')

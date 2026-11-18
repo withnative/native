@@ -860,6 +860,7 @@ async fn caller_bound_member_copy_and_read_only_standby_preserve_mapping() {
                 hosted_route_database_id: "route-config".into(),
                 ordinal: 1,
                 consumer: crate::standby_snapshot::StandbyConsumerIdentity {
+                    kernel_v2_reader: Default::default(),
                     contract: crate::standby_snapshot::STANDBY_CONSUMER_CONTRACT.into(),
                     version: 1,
                     platform: crate::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,

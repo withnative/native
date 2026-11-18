@@ -851,8 +851,11 @@ async fn persona_policy_tool_correction_and_owner_facet_are_refused() {
     let r = registry();
     let error = r.call(db.clone(),Caller::authenticated("alice"),"manage_record_policy",json!({"action":"grant","record_id":p,"subject":{"kind":"person","person_record_id":BOB},"capability":"view","reason":"sharing forbidden"})).await.unwrap_err().to_string();
     assert!(error.contains("owner-locked"), "{error}");
-    let error = super::super::lifecycle::prepare_correct_record_type(&db,&Caller::authenticated("alice"),json!({"record_id":p,"target_type":"Document","target_kind":"note","reason":"correction forbidden"})).await.unwrap_err().to_string();
-    assert!(error.contains("owner-locked"), "{error}");
+    #[cfg(feature = "mcp-executor-prototype")]
+    {
+        let error = super::super::lifecycle::prepare_correct_record_type(&db,&Caller::authenticated("alice"),json!({"record_id":p,"target_type":"Document","target_kind":"note","reason":"correction forbidden"})).await.unwrap_err().to_string();
+        assert!(error.contains("owner-locked"), "{error}");
+    }
     let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
         .fetch_one(db.pool())
         .await

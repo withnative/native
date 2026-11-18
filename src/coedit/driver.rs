@@ -557,21 +557,18 @@ pub(crate) async fn authorize_supported(
     let row = sqlx::query("SELECT type,kind,body,deleted_at,EXISTS(SELECT 1 FROM facet_values WHERE record_id=records.id AND key='runtime') AS runtime_present FROM records WHERE id=?")
         .bind(record).fetch_one(&mut **tx).await?;
     let kind = row.try_get::<Option<String>, _>("kind")?;
-    let (artifact, instruction) = if let Some(kind) = kind {
-        let resolved = crate::meta::kind::resolve_on(tx, "Document", &kind).await?;
-        (
-            kind == "artifact"
-                || crate::generated::kinds::CoreKind::DocumentArtifact.matches(&resolved),
-            kind == "instruction" || resolved.canonical_kind.as_deref() == Some("instruction"),
-        )
-    } else {
-        (false, false)
-    };
-    if row.try_get::<String, _>("type")? != "Document"
+    let record_type: String = row.try_get("type")?;
+    // This inactive custody driver still owns only the retained Document
+    // lane. Share body safety policy without widening its storage authority.
+    if record_type != "Document"
         || row.try_get::<Option<String>, _>("deleted_at")?.is_some()
-        || row.try_get::<bool, _>("runtime_present")?
-        || artifact
-        || instruction
+        || !super::eligibility::markdown_body_supported(
+            tx,
+            &record_type,
+            kind.as_deref(),
+            row.try_get("runtime_present")?,
+        )
+        .await?
     {
         return Err(Error::engine(
             "session requires a live non-artifact, non-instruction Document without runtime",

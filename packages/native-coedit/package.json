@@ -4,7 +4,7 @@
   "private": true,
   "description": "Transport-agnostic live co-editing client for session.body.v1 (Yjs doc, single root Y.Text `body`).",
   "license": "AGPL-3.0-only",
-  "repository": "withnative/native-ce",
+  "repository": "withnative/native",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

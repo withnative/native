@@ -260,6 +260,7 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     // Excluded: everything ExcludedOperational in standby_classification
     // (section 3.2 "Excluded: everything ExcludedOperational" row).
     ("provenance_local_attestation_authority", Excluded),
+    ("provenance_local_command_cancellations", Excluded),
     ("webhook_deliveries", Excluded),
     ("relationship_local_admissions", Excluded),
     ("relationship_federation_quarantine", Excluded),
@@ -1057,6 +1058,7 @@ mod tests {
         "record_body_json_nodes",
         "awareness_event_evidence",
         "provenance_local_attestation_authority",
+        "provenance_local_command_cancellations",
         "webhook_deliveries",
         "relationship_local_admissions",
         "relationship_federation_quarantine",

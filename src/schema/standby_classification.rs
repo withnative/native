@@ -64,6 +64,7 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     // Same-database authenticated standby copies preserve issuance authority,
     // like FULL snapshots. This is deliberately NOT portable interchange.
     ("provenance_local_attestation_authority", Companion),
+    ("provenance_local_command_cancellations", Companion),
     ("provenance_action_events", Companion),
     ("provenance_action_outputs", Companion),
     // Host-asserted app attribution (v83), keyed by the attestation it

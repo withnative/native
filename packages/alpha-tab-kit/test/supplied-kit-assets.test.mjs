@@ -4,23 +4,39 @@ import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readKitAssets, validateManifest, validateCatalog, sha256 } from '../src/fake-host/kit-assets.mjs';
+import { readKitAssets, validateManifest, validateCatalog, sha256, DEFAULT_KIT_DELIVERY } from '../src/fake-host/kit-assets.mjs';
+import { recordObservationProtocol } from '../../native-launcher/src/recordObservationLaunch.mjs';
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const canonical = resolve(root, 'crates/artifact-html/kit-releases');
 const packaged = resolve(root, 'packages/alpha-tab-kit/supplied-kit');
 const encode = value => JSON.stringify(value, null, 2) + '\n';
 test('package is an exact mirror of the reviewed canonical releases', async () => {
   const source = await readKitAssets(canonical), mirror = await readKitAssets();
-  assert.deepEqual(mirror, source); assert.equal(source.releases.length, 2); assert.equal(source.releases[0].manifest.version, '1.0.0');
+  assert.deepEqual(mirror, source); assert.equal(source.releases[0].manifest.version, '1.0.0');
   assert.deepEqual(Object.keys(source.catalog).sort(), ['releases', 'schema']);
-  for (const name of ['catalog.json', '1.0.0/core.js', '1.0.0/core.d.ts', '1.0.0/manifest.json', '1.1.0/core.js', '1.1.0/core.d.ts', '1.1.0/manifest.json']) assert.deepEqual(await readFile(resolve(canonical, name)), await readFile(resolve(packaged, name)));
+  const versions = source.releases.map(release => release.manifest.version);
+  const files = ['catalog.json', ...versions.flatMap(version =>
+    ['core.js', 'core.d.ts', 'manifest.json'].map(file => `${version}/${file}`))];
+  for (const name of files) assert.deepEqual(await readFile(resolve(canonical, name)), await readFile(resolve(packaged, name)));
   const pkg = JSON.parse(await readFile(resolve(root, 'packages/alpha-tab-kit/package.json')));
   assert.equal(pkg.version, '0.1.0'); assert.ok(pkg.files.includes('supplied-kit/'));
-  assert.equal(pkg.exports['./supplied-kit/1.0.0/types'], './supplied-kit/1.0.0/core.d.ts');
+  for (const version of versions) {
+    assert.equal(pkg.exports[`./supplied-kit/${version}/types`], `./supplied-kit/${version}/core.d.ts`);
+    assert.equal(pkg.exports[`./supplied-kit/${version}/manifest.json`], `./supplied-kit/${version}/manifest.json`);
+  }
+});
+// The source-backed default must retain the record channel when a new immutable
+// kit ships. Admission stays an explicit launcher decision, never a semver range.
+test('source-backed default kit is admitted to the launcher record-observation protocol', async () => {
+  const identity = JSON.parse(await readFile(resolve(root, 'web/apps/src/kit/supplied/core-release.json'), 'utf8'));
+  const { release } = DEFAULT_KIT_DELIVERY.resolve(identity.major);
+  assert.equal(release.version, identity.version, 'fake-host default must match the source-backed kit');
+  assert.ok(recordObservationProtocol(release) > 0,
+    `kit ${release.version} needs reviewed launcher record-observation admission before becoming the default`);
 });
 test('closed manifests and catalogs reject identity, paths, bounds and extra fields', async () => {
   const { catalog, releases } = await readKitAssets(canonical), manifest = releases[0].manifest;
-  for (const patch of [{ extra: true }, { version: '1.00.0' }, { version: '../1.0.0' }, { major: 2 }, { factory: 'other' }, { bridge: 'other' }, { layer: 'ui' }, { js: { ...manifest.js, file: '../core.js' } }, { types: { ...manifest.types, bytes: 32769 } }, { js: { ...manifest.js, sha256: 'A'.repeat(64) } }]) assert.throws(() => validateManifest({ ...manifest, ...patch }));
+  for (const patch of [{ extra: true }, { version: '1.00.0' }, { version: '../1.0.0' }, { major: 2 }, { factory: 'other' }, { bridge: 'other' }, { layer: 'ui' }, { js: { ...manifest.js, file: '../core.js' } }, { types: { ...manifest.types, bytes: 65537 } }, { js: { ...manifest.js, bytes: 155649 } }, { js: { ...manifest.js, sha256: 'A'.repeat(64) } }]) assert.throws(() => validateManifest({ ...manifest, ...patch }));
   for (const changed of [{ ...catalog, active: '1.0.0' }, { ...catalog, releases: [catalog.releases[0], catalog.releases[0]] }, { ...catalog, releases: [{ ...catalog.releases[0], manifest: '../manifest.json' }] }, { ...catalog, releases: [{ ...catalog.releases[0], major: 2 }] }]) assert.throws(() => validateCatalog(changed));
 });
 // TEST ONLY catalogs: fixtures are intentionally unrelated to production release admission.

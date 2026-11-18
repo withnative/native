@@ -1,7 +1,8 @@
 //! Coalesced device checks after serving publication. Never a readiness gate.
 use super::*;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CURRENT_RECHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -29,9 +30,11 @@ impl Drop for RefreshVerificationRetry<'_> {
             return;
         }
         if let Ok(pointer) = self.store.read_pointer() {
+            // "Is the current copy already verified?": a trusted-at-rest
+            // stamp counts, or every refresh would reschedule a sweep.
             if self
                 .store
-                .cached_verification(&pointer.generation_id, self.observed)
+                .cached_verification_trusting(&pointer.generation_id, self.observed)
                 .is_none()
                 && self.store.current_recheck_due()
             {
@@ -61,6 +64,17 @@ impl GenerationStore {
             Arc::new(tokio::sync::Notify::new()),
         );
         *self.verification_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    /// Hold the next consumer rebind, once it has the checkpoint lease.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn pause_next_rebind(&self) -> VerificationPause {
+        let pause = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.rebind_pause.lock().unwrap() = Some(pause.clone());
         pause
     }
 
@@ -171,8 +185,11 @@ impl GenerationStore {
                 .collect::<Vec<_>>();
             (pointer, candidates, warnings, excess)
         };
+        // A TrustedAtRest stamp counts here: re-running the trust check every
+        // sweep would digest content_event_heads for nothing. Retention and
+        // deletion decisions below keep the strict observation on purpose.
         if self
-            .cached_verification(&pointer.generation_id, observed)
+            .cached_verification_trusting(&pointer.generation_id, observed)
             .is_none()
         {
             self.recheck_unknown_current(&pointer, observed).await?;
@@ -185,11 +202,40 @@ impl GenerationStore {
         candidates.sort_by(compare_generation_newest_first);
         // Holding the two priors' leases protects the known-good floor from
         // another retention process while later deletion checks run.
-        let mut keep: Vec<(InstalledGeneration, verification_status::StatusStamp, File)> =
-            Vec::new();
+        //
+        // Routine sweeps stay cheap (fast by default, 22d0148): a prior
+        // already device-verified by this process and unchanged since (the
+        // stamp covers its files' size, mtime, inode, head and receipt) is
+        // not re-copied and re-checked, and a prior that failed with these
+        // same inputs is not retried until they change or its backoff
+        // expires. The heavy fresh check is spent where it protects
+        // something: on a copy about to be deleted, and, just before that
+        // deletion, on the floor that deletion relies on. Nothing is ever
+        // deleted on a cached observation alone, and a failing copy is kept.
+        let consumer = serde_jcs::to_vec(observed)?;
+        // An unreadable generation listing must never read as "no
+        // generations": the in-memory table keeps its old forget-on-error
+        // behaviour, but disk pruning only runs on a successful listing, so
+        // a failed listing can never delete live verdicts.
+        match self.generation_ids() {
+            Ok(live_ids) => {
+                self.retention_backoff.retain_ids(&live_ids);
+                self.prune_persisted_backoffs(&live_ids);
+            }
+            Err(_) => self.retention_backoff.retain_ids(&[]),
+        }
+        // (generation, stamp when last checked, lease, checked afresh this sweep)
+        let mut keep: Vec<(
+            InstalledGeneration,
+            verification_status::StatusStamp,
+            File,
+            bool,
+        )> = Vec::new();
         for candidate in candidates {
             check_verification_cancellation()?;
-            if self.pinned_v1_generation()?.as_deref() == Some(&candidate.id) {
+            if self.pinned_v1_generation()?.as_deref() == Some(&candidate.id)
+                || self.shape_pin_contains(&candidate.id)?
+            {
                 continue;
             }
             let lease = {
@@ -199,25 +245,34 @@ impl GenerationStore {
                 }
                 self.acquire_serving_lease(&candidate.id)?
             };
-            // With excess copies, establish the two-prior floor with fresh
-            // device checks before deleting anything. Metadata observations
-            // cannot protect a good older copy behind a silently damaged prior.
-            if !excess && self.cached_verification(&candidate.id, observed) == Some(true) {
+            let cached = self.cached_verification(&candidate.id, observed);
+            if cached == Some(true) && (!excess || keep.len() < 2) {
                 keep.push((
                     candidate.clone(),
                     self.status_stamp(&candidate.id, observed)?,
                     lease,
+                    false,
                 ));
                 continue;
             }
+            // Same inputs, same failure: not re-copied until its backoff
+            // (10 minutes doubling to 6 hours, in memory and across
+            // processes) expires or the copy changes.
+            if let Ok(stamp) = self.status_stamp(&candidate.id, observed) {
+                if self.persisted_backoff_holds(&candidate.id, &consumer, &stamp) {
+                    continue;
+                }
+            }
             let before = self.status_stamp(&candidate.id, observed).ok();
-            if self
-                .verify_generation_for_startup(&candidate.id, observed)
+            if let Err(error) = self
+                .verify_generation_for_startup(&candidate.id, observed, "retention")
                 .await
-                .is_err()
             {
+                self.settle_prior_failure(&candidate.id, &consumer, before, &error);
                 continue;
             }
+            self.retention_backoff.clear(&candidate.id, &consumer);
+            self.clear_persisted_backoff(&candidate.id);
             // The verifier may create a consumer receipt. Its own observation
             // must have survived all byte/head changes before we use it.
             if self.cached_verification(&candidate.id, observed) != Some(true) {
@@ -228,14 +283,34 @@ impl GenerationStore {
             if !self.verification_inputs_unchanged(before, &after) {
                 continue;
             }
-            if keep.len() < 2 {
-                keep.push((candidate, after, lease));
-                continue;
-            }
-            if !excess {
+            if keep.len() < 2 || !excess {
+                keep.push((candidate, after, lease, true));
                 continue;
             }
             drop(lease);
+            // Deleting relies on the floor being good: give any floor copy
+            // that was only observed, not checked, its fresh check first.
+            for floor in keep.iter_mut() {
+                if floor.3 {
+                    continue;
+                }
+                let id = floor.0.id.clone();
+                let before = self.status_stamp(&id, observed).ok();
+                if self
+                    .verify_generation_for_startup(&id, observed, "retention")
+                    .await
+                    .is_err()
+                    || self.cached_verification(&id, observed) != Some(true)
+                {
+                    return Ok(warnings);
+                }
+                let after = self.status_stamp(&id, observed)?;
+                if !self.verification_inputs_unchanged(before, &after) {
+                    return Ok(warnings);
+                }
+                floor.1 = after;
+                floor.3 = true;
+            }
             let _lock = acquire_promotion_lock(self.root.join("promotion.lock")).await?;
             if !self.pointer_still_selects(&pointer)? {
                 return Ok(warnings);
@@ -243,7 +318,7 @@ impl GenerationStore {
             // A live verified current (including one advanced by our refresher)
             // and two unchanged good priors are required before any deletion.
             if self.cached_verification(&pointer.generation_id, observed) != Some(true)
-                || keep.iter().any(|(generation, stamp, _)| {
+                || keep.iter().any(|(generation, stamp, _, _)| {
                     self.status_stamp(&generation.id, observed).ok().as_ref() != Some(stamp)
                 })
                 || self.status_stamp(&candidate.id, observed)? != after
@@ -264,6 +339,37 @@ impl GenerationStore {
             }
         }
         Ok(warnings)
+    }
+
+    /// Only a definite verdict starts the repeat-failure backoff. An
+    /// infrastructure error (I/O, a lock, cancellation) says nothing about the
+    /// copy: it is logged as such and retried at the next sweep.
+    pub(super) fn settle_prior_failure(
+        &self,
+        id: &str,
+        consumer: &[u8],
+        before: Option<verification_status::StatusStamp>,
+        error: &Error,
+    ) {
+        if audit_infrastructure_error(error) {
+            if check_verification_cancellation().is_ok() {
+                tracing::warn!(target: "native_ce::standby::verification", generation_id = %id,
+                    "standby retained generation check could not complete; retrying next sweep");
+            }
+            return;
+        }
+        if let Some(stamp) = before {
+            if self.retention_backoff.record_failure(id, consumer, stamp) {
+                let (check, refusal) = retention_failure_diagnostic(error);
+                tracing::warn!(target: "native_ce::standby::verification", generation_id = %id,
+                    check, refusal = %refusal,
+                    "standby retained generation fails verification; keeping it and backing off");
+            }
+            // Durably keep the same backoff shape across processes. This only
+            // changes retry timing: the keep/delete rules below still never
+            // serve or delete on a cached (or persisted) verdict alone.
+            self.persist_backoff(id, consumer);
+        }
     }
 
     fn current_recheck_due(&self) -> bool {
@@ -307,7 +413,7 @@ impl GenerationStore {
             let _lock = acquire_promotion_lock(self.root.join("promotion.lock")).await?;
             if !self.pointer_still_selects(pointer)?
                 || self
-                    .cached_verification(&pointer.generation_id, observed)
+                    .cached_verification_trusting(&pointer.generation_id, observed)
                     .is_some()
             {
                 return Ok(());
@@ -328,10 +434,18 @@ impl GenerationStore {
             }
             state.last_current_recheck = Some(Instant::now());
         }
-        // Cooperating delta writers cannot race this check. Keep the stamp
-        // guard too: other input changes still leave an unknown observation.
+        // Trust by what was checked as it was applied: a qualifying copy
+        // skips the whole-file pass and records TrustedAtRest provenance.
+        // Anything short of trust runs exactly the full pass, which owns the
+        // verdict and the S0 count under the maintenance_recheck reason (not
+        // startup_recheck, which is reserved for the post-startup recheck).
+        // Cooperating delta writers cannot race this check.
         let _ = self
-            .verify_generation_for_startup(&pointer.generation_id, observed)
+            .verify_generation_trusting_at_rest(
+                &pointer.generation_id,
+                observed,
+                "maintenance_recheck",
+            )
             .await;
         Ok(())
     }
@@ -340,6 +454,201 @@ impl GenerationStore {
         let current = self.read_pointer()?;
         Ok(current.generation_id == selected.generation_id
             && current.snapshot_sha256 == selected.snapshot_sha256)
+    }
+}
+
+/// Which admission check refused a retained copy, and its refusal text, for
+/// the retained-generation WARN. Errors without check attribution (plain
+/// engine refusals from identity/shape gates) report as `unclassified` with
+/// the full refusal text.
+fn retention_failure_diagnostic(error: &Error) -> (&'static str, String) {
+    match error {
+        Error::StandbyAdmission { check, source } => (check.token(), source.to_string()),
+        _ => ("unclassified", error.to_string()),
+    }
+}
+
+/// Durable repeat-failure backoff for retained copies, kept beside the heads
+/// as `heads/<generation id>.retention-backoff.json`. It records the same
+/// 10 minute doubling to 6 hour shape as the in-memory backoff, keyed by a
+/// fingerprint of the exact inputs the failure was recorded against, so a
+/// changed copy is never covered by a stale verdict. A corrupt or unreadable
+/// sidecar is treated as no verdict, never fatal.
+const PERSISTED_BACKOFF_VERSION: u32 = 1;
+const PERSISTED_BACKOFF_SUFFIX: &str = ".retention-backoff.json";
+/// Slack for wall-clock granularity when bounding a restored retry time: a
+/// retry farther ahead than the cap plus this reads as corruption.
+const BACKOFF_VALIDATION_SLACK_MS: u64 = 60_000;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRetentionBackoff {
+    version: u32,
+    generation_id: String,
+    consumer_hex: String,
+    stamp_fingerprint: String,
+    failures: u32,
+    retry_at_ms: u64,
+}
+
+impl GenerationStore {
+    fn retention_backoff_path(&self, id: &str) -> PathBuf {
+        self.root
+            .join("heads")
+            .join(format!("{id}{PERSISTED_BACKOFF_SUFFIX}"))
+    }
+
+    /// Stable fingerprint of the inputs a failure verdict was recorded
+    /// against (bytes, head, receipt, pointer). Any change to the copy
+    /// changes the fingerprint, so the copy is retried at once.
+    fn backoff_fingerprint(stamp: &verification_status::StatusStamp) -> String {
+        hex::encode(Sha256::digest(format!("{stamp:?}")))
+    }
+
+    /// Cross-process repeat-failure backoff: in memory first, then the
+    /// sidecar. Restoring a sidecar hit into memory keeps later sweeps of
+    /// this process cheap; restoring an expired one keeps only its failure
+    /// count, so the next definite failure keeps doubling.
+    fn persisted_backoff_holds(
+        &self,
+        id: &str,
+        consumer: &[u8],
+        stamp: &verification_status::StatusStamp,
+    ) -> bool {
+        if self.retention_backoff.holds(id, consumer, stamp) {
+            return true;
+        }
+        let bytes = match fs::read(self.retention_backoff_path(id)) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        let persisted: PersistedRetentionBackoff = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        if persisted.version != PERSISTED_BACKOFF_VERSION
+            || persisted.generation_id != id
+            || persisted.consumer_hex != hex::encode(consumer)
+            || persisted.stamp_fingerprint != Self::backoff_fingerprint(stamp)
+        {
+            return false;
+        }
+        // Reject implausible values: no doubling schedule the cap expresses
+        // can produce them, so they read as corruption, never as a verdict.
+        if persisted.failures == 0 || persisted.failures > verification_flight::BACKOFF_MAX_FAILURES
+        {
+            return false;
+        }
+        let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => elapsed.as_millis() as u64,
+            Err(_) => return false,
+        };
+        if persisted.retry_at_ms.saturating_sub(now_ms)
+            > verification_flight::BACKOFF_CAP.as_millis() as u64 + BACKOFF_VALIDATION_SLACK_MS
+        {
+            return false;
+        }
+        if persisted.retry_at_ms <= now_ms {
+            self.retention_backoff.restore(
+                id,
+                consumer,
+                stamp.clone(),
+                persisted.failures,
+                Instant::now(),
+            );
+            return false;
+        }
+        self.retention_backoff.restore(
+            id,
+            consumer,
+            stamp.clone(),
+            persisted.failures,
+            Instant::now() + Duration::from_millis(persisted.retry_at_ms - now_ms),
+        );
+        true
+    }
+
+    /// Durably keep the backoff just recorded (or re-recorded) for this copy.
+    /// Best effort: write failures are ignored, and a partial write reads
+    /// back as no verdict. Called only for definite verdicts, never for
+    /// infrastructure errors.
+    fn persist_backoff(&self, id: &str, consumer: &[u8]) {
+        let Some((stamp, failures, retry_at)) = self.retention_backoff.entry(id, consumer) else {
+            return;
+        };
+        let Some(now_ms) = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_millis() as u64)
+        else {
+            return;
+        };
+        let retry_at_ms = now_ms.saturating_add(
+            retry_at
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        let verdict = PersistedRetentionBackoff {
+            version: PERSISTED_BACKOFF_VERSION,
+            generation_id: id.into(),
+            consumer_hex: hex::encode(consumer),
+            stamp_fingerprint: Self::backoff_fingerprint(&stamp),
+            failures,
+            retry_at_ms,
+        };
+        let Ok(bytes) = serde_json::to_vec(&verdict) else {
+            return;
+        };
+        // Atomic publish: a crash between truncate and write must never leave
+        // a torn sidecar behind. The temp name is unique per write and never
+        // matches the sidecar suffix, so readers and pruning never pick it
+        // up, and a leftover temp file is harmless.
+        let target = self.retention_backoff_path(id);
+        let temp = self
+            .root
+            .join("heads")
+            .join(format!(".retention-backoff-{}.tmp", uuid::Uuid::new_v4()));
+        if fs::write(&temp, bytes).is_ok() {
+            let _ = fs::rename(&temp, &target);
+        }
+    }
+
+    fn clear_persisted_backoff(&self, id: &str) {
+        let _ = fs::remove_file(self.retention_backoff_path(id));
+    }
+
+    /// Drop sidecars for generations that no longer exist. Best effort, and
+    /// conservative: only an exact `<64-hex-id>.retention-backoff.json` name
+    /// with a valid id is a candidate, and a candidate is removed only on
+    /// positive proof of absence — the generation directory must read as
+    /// absent with an explicit not-found, and a fresh listing must succeed
+    /// and still miss the id. Any inspection error keeps the file. A
+    /// leftover race only costs an extra verification on a later sweep (and
+    /// a failing copy re-persists on its next definite failure); verdicts
+    /// never gate serving or deletion.
+    fn prune_persisted_backoffs(&self, ids: &[String]) {
+        let Ok(entries) = fs::read_dir(self.root.join("heads")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(PERSISTED_BACKOFF_SUFFIX) else {
+                continue;
+            };
+            if !is_generation_id(id) || ids.iter().any(|known| known == id) {
+                continue;
+            }
+            match fs::symlink_metadata(self.root.join("generations").join(id)) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+            match self.generation_ids() {
+                Ok(fresh) if !fresh.iter().any(|known| known == id) => {}
+                _ => continue,
+            }
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 

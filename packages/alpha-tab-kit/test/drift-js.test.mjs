@@ -131,3 +131,8 @@ test("a copied standalone package imports its public icon and install API", asyn
     assert.equal(typeof copied.planInstall, "function");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("the standalone fake-host app state store equals the launcher source", () => {
+  const source = new URL("packages/native-launcher/src/appState.mjs", repo);
+  if (existsSync(source)) assert.equal(readFileSync(new URL("src/fake-host/app-state.mjs", kit), "utf8"), readFileSync(source, "utf8"));
+});

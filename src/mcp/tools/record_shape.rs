@@ -34,6 +34,54 @@ async fn preview_record_shape(db: Db, caller: Caller, arguments: Value) -> Resul
     }
 }
 
+/// Member-only entry over the admitted immutable generation. Preview has no
+/// record selector: identity/owner/archive facts cannot become new preview
+/// authority or invented catalogue classifications.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_preview_record_shape(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(crate::Error::copy_unavailable());
+    }
+    if caller
+        .member_schema_incomplete_for()
+        .iter()
+        .any(|scope| scope == "global")
+    {
+        return Err(crate::Error::unavailable_offline(
+            "preview_record_shape",
+            "schema_incomplete",
+        ));
+    }
+    let mut executor =
+        crate::portable_sql::BorrowedSqliteStatementExecutor::new(session.transaction());
+    let mut response = crate::domain_transaction::execute_preview_record_shape(
+        &mut executor,
+        caller,
+        arguments,
+        true,
+    )
+    .await?;
+    // This identity row is on the same file/connection verified before and
+    // after the read. Never substitute a canonical event head for member data.
+    let generation: String = sqlx::query_scalar(
+        "SELECT generation_id FROM main.kernel_member_identity WHERE singleton=1",
+    )
+    .fetch_one(&mut **session.transaction())
+    .await?;
+    response["advisory_basis"]["schema_state_revision"] =
+        json!(format!("native-member:{generation}"));
+    if serde_json::to_vec(&response)?.len() > 65_536 {
+        return Err(crate::Error::engine(
+            "preview_record_shape: response exceeds 65536 bytes",
+        ));
+    }
+    Ok(response)
+}
+
 pub fn register_record_shape_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::PreviewRecordShape,

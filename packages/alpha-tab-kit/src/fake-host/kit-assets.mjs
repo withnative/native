@@ -43,7 +43,7 @@ export function validateManifest(manifest) {
   versionMajor(manifest.version, manifest.major);
   if (manifest.schema !== 'native.app-kit.release.v1' || manifest.layer !== 'core'
     || manifest.factory !== 'native.app-kit.core.factory.v1' || manifest.bridge !== 'native.html.bridge.v1') fail('invalid release contract');
-  for (const [key, file, cap] of [['js', 'core.js', 65536], ['types', 'core.d.ts', 32768]]) {
+  for (const [key, file, cap] of [['js', 'core.js', 155648], ['types', 'core.d.ts', 65536]]) {
     const asset = manifest[key];
     closed(asset, ['file', 'bytes', 'sha256']);
     if (asset.file !== file || !Number.isSafeInteger(asset.bytes) || asset.bytes < 1 || asset.bytes > cap) fail('invalid asset path/bounds');
@@ -79,7 +79,7 @@ export function assertKitDelivery(delivery) {
 }
 
 /** Closed, bounded explicit selection. Resolve once per prepared document. */
-export function createKitDelivery(inventory, selector = {schema: 'native.app-kit.selector.v1', selections: [{major: 1, version: '1.1.0'}]}) {
+export function createKitDelivery(inventory, selector = {schema: 'native.app-kit.selector.v1', selections: [{major: 1, version: '1.7.14'}]}) {
   const catalog = validateCatalog(inventory.catalog);
   if (inventory.releases.length !== catalog.releases.length) fail('inventory cardinality drift');
   const admitted = new Map();

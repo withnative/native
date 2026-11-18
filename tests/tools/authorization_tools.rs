@@ -3186,7 +3186,11 @@ async fn diagnostics_scan_facets_and_work_context_use_only_visible_related_rows(
 
 #[test]
 fn every_registered_tool_kind_has_an_authorization_disposition() {
-    assert_eq!(ToolKind::ALL.len(), 92);
+    assert_eq!(ToolKind::ALL.len(), 96);
+    assert_eq!(
+        ToolKind::ManageSavedTabs.authorization(),
+        AuthorizationDisposition::Specialized
+    );
     let mut registry = ToolRegistry::new();
     register_builtin_tools(&mut registry).unwrap();
     register_surface_tools(&mut registry).unwrap();
@@ -3203,6 +3207,7 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
         vec![
             ToolKind::StandbyStatus,
             ToolKind::OutboxStatus,
+            ToolKind::ManagePublication,
             ToolKind::ExportSnapshot,
             ToolKind::ManageMemberships,
             ToolKind::WorkspaceRead,
@@ -3269,6 +3274,7 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
         ToolKind::RenderArtifact,
         ToolKind::VerifyArtifact,
         ToolKind::OpenCollection,
+        ToolKind::ReadAppBundle,
     ] {
         assert_eq!(kind.authorization(), AuthorizationDisposition::Specialized);
     }
@@ -3942,7 +3948,7 @@ async fn workspace_snapshot_resume_reconciles_manifest_without_disclosure() {
     let manifest = || {
         json!({
             "version": 1,
-            "profile": "workspace-snapshot-resume/v1",
+            "profile": "workspace-snapshot-resume/v2",
             "records": [[&common, &zeros], [&alice_only, &zeros]],
             "facets": [],
             "links": [],

@@ -70,6 +70,30 @@ fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> Strin
         }
         return tests;
     }
+    if relative == Path::new("src/mcp/tools/record_hook.rs") {
+        // Visibility fixtures seed one anchor per inserted record so the
+        // records view can see them. The four copies of this exact statement
+        // stay inside the single cfg(test) module; a runtime policy write, or
+        // any other statement, still fails the guard.
+        let (runtime, tests) = normalized_source
+            .split_once("#[cfg(test)] mod tests")
+            .expect("record_hook policy seeds remain in the test module");
+        assert_eq!(
+            normalized_source.matches("#[cfg(test)] mod tests").count(),
+            1,
+            "record_hook admits one test module"
+        );
+        let mut tests = tests.to_owned();
+        let fixture =
+            normalized("sqlx::query(\"INSERT INTO record_policies(record_id) VALUES(?)\")");
+        assert_eq!(
+            tests.matches(&fixture).count(),
+            4,
+            "record_hook visibility fixtures must retain exactly these four test-only policy seeds"
+        );
+        tests = tests.replace(&fixture, "");
+        return format!("{runtime} {tests}");
+    }
     if relative != Path::new("src/turso_local.rs") {
         return normalized_source;
     }
@@ -186,6 +210,13 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
         // Probe-only imported-app visibility fixture: one hidden-child anchor
         // and one owner entry in the independent temporary v1 source snapshot.
         ("src/v1_import/tests/app_state.rs", 2),
+        // Folder-scope fixtures: two account-only source anchors and their
+        // owner entries, plus the access-loss fixture's folder-host and
+        // content anchors with their entries (one record_policies and one
+        // policy_entries insert). All are seeded only into the independent
+        // temporary v1 source snapshot before import; never the v2 target.
+        // Its runtime revocation goes through kernel::replace_home_policy.
+        ("src/v1_import/tests/app_state/app_scope.rs", 4),
         // Caller-context tests seed only their independent temporary v1 source:
         // one record_policies insert and two policy_entries inserts. The
         // cfg(test) ancestor and single child declaration are verified below.

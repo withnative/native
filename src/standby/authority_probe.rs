@@ -414,6 +414,7 @@ impl AuthorityActHeadCoordinates<'_> {
 /// read-only pool is a different snapshot from the writer, so a probe is
 /// always a point-in-time observation rather than a partial in-transaction
 /// read.
+#[cfg(test)]
 pub(crate) async fn read_authority_act_head(db: &crate::Db) -> Result<AuthorityActHeadV1> {
     let mut tx = db.pool().begin().await?;
     let outcome = read_authority_act_head_on(&mut tx).await;

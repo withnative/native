@@ -242,6 +242,8 @@ export function validateHtml(source, { strict = STRICT_DEFAULT, package: isPacka
   // An installed app package bundle (the record carries the package facet)
   // gets the package limit; every other document keeps the ordinary one.
   const bodyMax = isPackage ? L.package_body_max_bytes : L.body_max_bytes;
+  const assetMax = isPackage ? L.package_data_asset_max_bytes : L.data_asset_max_bytes;
+  const assetTotalMax = isPackage ? L.package_data_assets_total_max_bytes : L.data_assets_total_max_bytes;
   if (bytes > bodyMax) {
     error("body-size", 1557, `HTML source is ${bytes} bytes; the UTF-8 body limit is ${bodyMax}${isPackage ? " (package bundle)" : ""}`, null, "html_source_too_large");
     return findings;
@@ -363,9 +365,9 @@ export function validateHtml(source, { strict = STRICT_DEFAULT, package: isPacka
   for (const asset of assets) {
     const decoded = decodeDataUrl(asset);
     if (decoded.error) { error("data-url", 1503, decoded.error, null, "html_asset_invalid"); continue; }
-    if (decoded.bytes > L.data_asset_max_bytes) error("data-asset-size", 1544, "decoded data asset exceeds per-asset limit", null, "html_asset_too_large");
+    if (decoded.bytes > assetMax) error("data-asset-size", 1544, "decoded data asset exceeds per-asset limit", null, "html_asset_too_large");
     assetTotal += decoded.bytes;
   }
-  if (assetTotal > L.data_assets_total_max_bytes) error("data-asset-total", 1714, "decoded data assets exceed aggregate limit", null, "html_asset_too_large");
+  if (assetTotal > assetTotalMax) error("data-asset-total", 1714, "decoded data assets exceed aggregate limit", null, "html_asset_too_large");
   return findings;
 }

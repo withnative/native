@@ -1,5 +1,6 @@
 //! Per-process memo of the immutable half of the `live_read` gate chain
-//! (task `9be4011`).
+//! (task `9be4011`), shared with the launch verdict that `list` reports
+//! (task `5635fe9`).
 //!
 //! Every tab read re-runs the whole gate on its own snapshot: install row and
 //! CAS, install gates, target and View, runtime facet, then the source and
@@ -27,6 +28,7 @@
 //! edited in place, as several tests do, misses and runs the full chain.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
@@ -67,9 +69,12 @@ pub(super) struct VerifiedInstall {
     declaration: Value,
     /// SHA-256 of the source body, as `alpha_tab_bundle_digest` gives it.
     pub(super) bundle_sha256: String,
-    /// `None` when the declaration's SQL needs do not parse: a read that
-    /// asks for them re-parses and refuses exactly as before.
-    sql_needs: Option<Vec<SqlNeed>>,
+    /// Parsed on first use, since `list` verifies installs and never reads
+    /// their needs. `None` when the declaration's SQL needs do not parse: a
+    /// read that asks for them re-parses and refuses exactly as before.
+    sql_needs: OnceLock<Option<Vec<SqlNeed>>>,
+    /// Lookups this entry has answered, for tests.
+    hits: AtomicU64,
 }
 
 impl VerifiedInstall {
@@ -83,7 +88,8 @@ impl VerifiedInstall {
             declaration_digest: row.declaration_digest.clone(),
             declaration: row.consented_declaration.clone(),
             bundle_sha256,
-            sql_needs: sql_needs_in(&row.consented_declaration).ok(),
+            sql_needs: OnceLock::new(),
+            hits: AtomicU64::new(0),
         }
     }
 
@@ -105,7 +111,10 @@ impl VerifiedInstall {
 
     /// The declaration's SQL needs, as `sql_needs_in` returns them.
     pub(super) fn sql_needs(&self) -> Result<Vec<SqlNeed>> {
-        match &self.sql_needs {
+        let parsed = self
+            .sql_needs
+            .get_or_init(|| sql_needs_in(&self.declaration).ok());
+        match parsed {
             Some(needs) => Ok(needs.clone()),
             None => sql_needs_in(&self.declaration),
         }
@@ -136,6 +145,7 @@ impl Cache {
             return None;
         }
         *used = tick;
+        verified.hits.fetch_add(1, Ordering::Relaxed);
         Some(Arc::clone(verified))
     }
 
@@ -157,6 +167,12 @@ impl Cache {
 
     fn holds(&self, key: &Key) -> bool {
         self.entries.contains_key(key)
+    }
+
+    fn hits(&self, key: &Key) -> u64 {
+        self.entries
+            .get(key)
+            .map_or(0, |(verified, _)| verified.hits.load(Ordering::Relaxed))
     }
 }
 
@@ -223,6 +239,18 @@ pub fn holds(db: &crate::db::Db, account_id: &str, package: &str, install_event_
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .holds(&key)
+}
+
+/// How many lookups the entry for the install event has answered, `0` when
+/// there is none. Public only so integration tests can show a `list` was
+/// served from the cache rather than re-verified.
+#[doc(hidden)]
+pub fn hits(db: &crate::db::Db, account_id: &str, package: &str, install_event_id: &str) -> u64 {
+    let key = Key::new(db.handle_id(), account_id, package, install_event_id);
+    cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hits(&key)
 }
 
 #[cfg(test)]

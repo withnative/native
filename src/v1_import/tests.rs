@@ -2,6 +2,9 @@ use super::*;
 use serde_json::Value;
 use sqlx::Executor;
 
+#[path = "tests/target_retirement.rs"]
+mod target_retirement;
+
 #[cfg(feature = "v2-kernel-probe")]
 #[tokio::test]
 async fn imported_relation_removal_needs_only_source_edit_and_keeps_provenance() {
@@ -55,12 +58,25 @@ async fn imported_member_move_preserves_record_local_policy_by_refusing_unsafe_r
         .await
         .unwrap();
     let policy:Vec<(String,String,String)>=sqlx::query_as("SELECT subject_id,capability,effect FROM kernel_policy_entries WHERE root_id=? ORDER BY subject_id,capability,effect").bind(&home).fetch_all(db.pool()).await.unwrap();
+    // Use a distinct public destination so this remains a real move while
+    // preserving the task's private record-local authorization boundary.
+    let destination = ordinary_kernel_call(
+        &db,
+        "account-a",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Move destination","home_id":"native:root"}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let before = k::dump_all_kernel_tables(&db).await.unwrap();
     assert!(ordinary_kernel_call(
         &db,
         "account-b",
         "update_record",
-        json!({"id":"task","home_id":"native:root"})
+        json!({"id":"task","home_id":destination})
     )
     .await
     .is_err());
@@ -69,7 +85,7 @@ async fn imported_member_move_preserves_record_local_policy_by_refusing_unsafe_r
         &db,
         "account-a",
         "update_record",
-        json!({"id":"task","home_id":"native:root"}),
+        json!({"id":"task","home_id":destination}),
     )
     .await
     .unwrap();
@@ -85,7 +101,7 @@ async fn imported_member_move_preserves_record_local_policy_by_refusing_unsafe_r
         let get = ordinary_kernel_call(&db, "account-a", "get_record", json!({"ids":[id]}))
             .await
             .unwrap();
-        assert_eq!(get["records"][0]["home_id"], "native:root");
+        assert_eq!(get["records"][0]["home_id"], destination);
         let hidden = ordinary_kernel_call(&db, "account-b", "get_record", json!({"ids":[id]}))
             .await
             .unwrap();
@@ -102,7 +118,7 @@ async fn imported_member_move_preserves_record_local_policy_by_refusing_unsafe_r
                 .iter()
                 .find(|hit| hit["id"] == id.as_str());
             if account == "account-a" {
-                assert_eq!(hit.unwrap()["home_id"], "native:root");
+                assert_eq!(hit.unwrap()["home_id"], destination);
             } else {
                 assert!(hit.is_none());
             }
@@ -116,7 +132,7 @@ async fn imported_member_move_preserves_record_local_policy_by_refusing_unsafe_r
     )
     .await
     .unwrap();
-    assert_eq!(sql["rows"][0]["home_id"], "native:root");
+    assert_eq!(sql["rows"][0]["home_id"], destination);
     let before = k::dump_all_kernel_tables(&db).await.unwrap();
     k::replay_all_projections(&db).await.unwrap();
     assert_eq!(before, k::dump_all_kernel_tables(&db).await.unwrap());
@@ -1861,6 +1877,7 @@ async fn imported_runtime_packages_support_ordinary_claims_and_resume() {
         vec![
             standard::claims_v1::FAMILY,
             "native.relationship.relates_to",
+            standard::saved_tabs::FAMILY,
             standard::DOCUMENT_FAMILY,
             standard::v1_compat::FAMILY,
         ]
@@ -2030,9 +2047,11 @@ async fn imported_editor_provenance_is_visible_legacy_metadata_with_actor_redact
     );
     for (tool, value) in [("get_record", &read), ("get_history", &history)] {
         let text = crate::mcp::render::render(tool, value).unwrap();
-        assert!(text.contains("Imported v1 provenance (snapshot)"));
-        assert!(text.contains("last editor: v1:last-editor"));
-        assert!(text.contains("last edited at: 2026-02-01T00:00:00Z"));
+        assert!(text.contains("Imported from v1: created "), "{text}");
+        assert!(
+            text.contains("last edited 2026-02-01T00:00:00Z by v1:last-editor"),
+            "{text}"
+        );
     }
     ordinary_kernel_call(
         &db,
@@ -3210,14 +3229,22 @@ async fn imported_w1_registry_home_and_metadata_match_sql_without_hidden_folder_
             KERNEL_ROOT_ID.to_owned(),
         ),
     ] {
+        // The public Root selector is exercised by a folder, which may still
+        // be filed there. Other rows retain ordinary document coordinate checks.
+        let (record_type, kind) = if home == V1_ROOT {
+            ("Collection", "folder")
+        } else {
+            ("Document", "note")
+        };
         let created = ordinary_kernel_call(
             &db,
             account,
             "create_record",
-            json!({"type":"Document","kind":"note","home_id":home}),
+            json!({"type":record_type,"kind":kind,"home_id":home}),
         )
         .await
         .unwrap();
+        assert!(created.get("redirected_home").is_none());
         assert_eq!(
             k::read_record_as(
                 &db,
@@ -5465,17 +5492,29 @@ async fn imported_onboarding_completed_state_is_read_only_private_and_retry_stab
         let boot = ordinary_kernel_call(&db, account, "bootstrap", json!({}))
             .await
             .unwrap();
-        let p = &boot["pending_obligations"];
-        assert_eq!(p["status"], "read_only");
-        assert_eq!(p["delivery_enabled"], false);
-        assert_eq!(p["pending"].as_array().unwrap().len(), 0);
-        assert_eq!(p["states"].as_array().unwrap().len(), 1);
-        if account == "account-b" {
-            assert_eq!(p["progress"].as_array().unwrap().len(), 0);
-            assert_eq!(p["programmes"].as_array().unwrap().len(), 0);
-            assert!(!p.to_string().contains("secret"));
-        }
+        assert!(boot.get("pending_obligations").is_none());
+        assert_eq!(boot["bootstrap_readiness"]["status"], "complete");
+        assert!(!boot.to_string().contains("value_delivered"));
+        assert!(!boot.to_string().contains("practical_workflow"));
     }
+    // Removing onboarding from entry does not discard its imported state.
+    // Inspect the retained import through the host-only state API, not bootstrap.
+    let mut conn = db.write_pool().acquire().await.unwrap();
+    let states = k::v1_state::rows_on(&mut conn, "member_obligations")
+        .await
+        .unwrap();
+    let mut retained: Vec<_> = states
+        .iter()
+        .map(|state| state["state"].as_str().unwrap())
+        .collect();
+    retained.sort();
+    assert_eq!(retained, vec!["completed", "declined"]);
+    let progress = k::v1_state::rows_on(&mut conn, "member_obligation_progress")
+        .await
+        .unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0]["artifact_id"], "secret");
+    drop(conn);
     let events = k::history_as(&db, &r.principals["account-b"], KERNEL_ROOT_ID)
         .await
         .unwrap();
@@ -5790,6 +5829,9 @@ async fn imported_collection_schema_uses_immediate_logical_home_for_reads_and_wr
         .await
         .unwrap();
     source.execute("INSERT INTO schema_config VALUES('scoped','user',NULL,'{\"shapes\":{\"WorkItem:task\":{\"facets\":{\"lifecycle\":{\"axis\":{\"key\":\"scoped_status\",\"label\":\"Scoped status\"},\"vocab_ref\":\"custom\",\"required\":true}}}}}','folder',NULL,'2026-01-02T00:00:00Z'); UPDATE records SET lifecycle='preserved' WHERE id='task'").await.unwrap();
+    // Retired and engine-reserved tokens in the scoped vocabulary: neither is
+    // a usable lifecycle value, so the refusal must recommend neither.
+    source.execute("INSERT INTO vocabulary_values VALUES('custom-retired','custom','retired',NULL,'retired',2,'open','{}',NULL),('custom-archived','custom','archived',NULL,'active',3,'open','{}',NULL)").await.unwrap();
     // Reuse the fixture's exclusive per-record policy: its kernel home is
     // the task itself, but lifecycle schema still belongs to its collection.
     source.execute("UPDATE records SET type='WorkItem',kind='task',home_id='folder',lifecycle='preserved' WHERE id='private'").await.unwrap();
@@ -5806,14 +5848,30 @@ async fn imported_collection_schema_uses_immediate_logical_home_for_reads_and_wr
     let sql=ordinary_kernel_call(&db,"account-a","query_sql",json!({"sql":"SELECT axis_key,canonical FROM record_lifecycle_interpretations WHERE record_id='task'"})).await.unwrap();
     assert_eq!(sql["rows"][0]["axis_key"], "scoped_status");
     assert_eq!(sql["rows"][0]["canonical"], "preserved");
-    assert!(ordinary_kernel_call(
+    // The refusal names the scoped axis, the governing vocabulary, and the
+    // exact usable alternatives — and recommends neither the retired token
+    // nor the engine-reserved `archived` literal.
+    let refusal = ordinary_kernel_call(
         &db,
         "account-a",
         "update_record",
-        json!({"id":"task","lifecycle":"open"})
+        json!({"id":"task","lifecycle":"open"}),
     )
     .await
-    .is_err());
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refusal.contains("lifecycle is unknown, inactive"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("scoped_status"), "{refusal}");
+    assert!(refusal.contains("'custom'"), "{refusal}");
+    assert!(
+        refusal.contains("usable lifecycle values of 'custom': preserved"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("retired"), "{refusal}");
+    assert!(!refusal.contains("archived"), "{refusal}");
     assert!(ordinary_kernel_call(&db,"account-a","create_record",json!({"type":"WorkItem","kind":"task","name":"scoped invalid","home_id":"folder","lifecycle":"open"})).await.is_err());
     assert!(ordinary_kernel_call(&db,"account-a","create_record",json!({"type":"WorkItem","kind":"task","name":"scoped valid","home_id":"folder","lifecycle":"preserved"})).await.is_ok());
     let private = ordinary_kernel_call(&db, "account-a", "get_record", json!({"ids":["private"]}))
@@ -7606,7 +7664,9 @@ async fn imported_native_delete_retains_derivation_guards_and_requires_known_evi
     let mut source = SqliteConnection::connect(f.source.to_str().unwrap())
         .await
         .unwrap();
-    source.execute("CREATE TABLE derivation_target_heads(target_kind TEXT,target_record_id TEXT,target_slot TEXT,active_binding_id TEXT); CREATE TABLE derivation_artifact_role_assignments(assignment_id TEXT,target_kind TEXT,target_record_id TEXT,target_slot TEXT); CREATE TABLE derivation_artifact_role_heads(active_assignment_id TEXT); INSERT INTO derivation_target_heads VALUES('record','task','body','active-body'); INSERT INTO derivation_artifact_role_assignments VALUES('active-role','record','epic','body'); INSERT INTO derivation_artifact_role_heads VALUES('active-role')").await.unwrap();
+    // Real heads retain their target identity even after the active assignment
+    // is cleared; both deletion and historical type-correction capture read it.
+    source.execute("CREATE TABLE derivation_target_heads(target_kind TEXT,target_record_id TEXT,target_slot TEXT,active_binding_id TEXT); CREATE TABLE derivation_artifact_role_assignments(assignment_id TEXT,target_kind TEXT,target_record_id TEXT,target_slot TEXT); CREATE TABLE derivation_artifact_role_heads(target_kind TEXT,target_record_id TEXT,target_slot TEXT,active_assignment_id TEXT); INSERT INTO derivation_target_heads VALUES('record','task','body','active-body'); INSERT INTO derivation_artifact_role_assignments VALUES('active-role','record','epic','body'); INSERT INTO derivation_artifact_role_heads VALUES('record','epic','body','active-role')").await.unwrap();
     let imported = run(f.options(&["task", "epic"], true)).await.unwrap();
     assert!(imported.refusals.is_empty());
     let db = f.db().await;
@@ -7731,3 +7791,39 @@ mod record_classes_sql;
 mod sql_fixture;
 
 mod member_context;
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) async fn native_peer_adopted_app_fixture(
+) -> std::sync::Arc<super::NativePeerAdoptedAppFixture> {
+    app_state::native_peer_adopted_app_fixture().await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) async fn native_peer_two_adopted_apps_fixture(
+) -> std::sync::Arc<super::NativePeerTwoAdoptedAppsFixture> {
+    app_state::native_peer_two_adopted_apps_fixture().await
+}
+
+#[tokio::test]
+async fn v1_webhook_state_refuses_subset_import_before_creating_target() {
+    let f = Fixture::new().await;
+    let mut source = SqliteConnection::connect(f.source.to_str().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO content_events(id,record_id,type,payload,actor,created_at) VALUES('intake-config','native:webhook:fixture','webhook.configured.v1','{}','account-a','2026-11-06T00:00:00Z')")
+        .execute(&mut source).await.unwrap();
+    source.close().await.unwrap();
+    let options = f.options(&["task"], false);
+    assert!(!options.history);
+    let report = run(options).await.unwrap();
+    assert!(
+        report.refusals.iter().any(|i| i.id == "webhook_intake"),
+        "{}",
+        serde_json::to_string(&report.refusals).unwrap()
+    );
+    assert!(!f.target.exists());
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/personal_db.rs"]
+mod personal_db;

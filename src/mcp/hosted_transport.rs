@@ -272,6 +272,12 @@ fn require_federated_read(name: &str) -> Result<()> {
     }
 }
 
+/// Proposal-only early allocation refusal. Hosted adapters call this before
+/// error decoration can resolve a run context; unrelated tools are unchanged.
+pub fn validate_proposal_run(name: &str, arguments: &Value) -> Result<()> {
+    super::proposal_run::check(name, arguments)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

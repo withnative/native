@@ -6,17 +6,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "v2-kernel-probe")]
 mod admission;
+pub mod catalog;
 mod consent;
 pub(crate) mod declarations;
+pub(crate) mod materialized;
+pub(crate) mod shelf;
+pub(crate) mod sources;
 use declarations::activation_supported;
 mod management;
 mod preview;
+pub(crate) mod scope;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use admission::{
     admit_account_app_as, admit_data_as, admit_dispatched_on, dispatched_identity,
+    scope_read_admissions, without_read_admissions, ReadAdmissions,
 };
-#[cfg(feature = "v2-kernel-probe")]
-pub(crate) use consent::install_for_user_as;
 pub(crate) use consent::ACTIONS_DDL;
 pub(crate) use consent::OUTCOMES_DDL;
 #[cfg(feature = "v2-kernel-probe")]
@@ -25,11 +29,19 @@ pub(crate) use consent::{
     prepare_source_as, preview_as, AdoptRequest, AppSourceAdmission,
 };
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) use consent::{finish_app_action_in, start_app_action_in, start_declared_app_action_in};
+pub(crate) use consent::{
+    bind_update_action_on, finish_app_action_in, start_app_action_in, start_declared_app_action_in,
+    RoutedActionBinding,
+};
 pub use consent::{install_as, InstallOutcome, InstallRequest};
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use consent::{install_for_user_as, install_from_shelf_as};
 pub(crate) use management::ManagementOutcome;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use management::{inspect_as, list_as};
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use scope::set_scope_as;
+pub(crate) use scope::AppScope;
 
 const RETAINED_SOURCE_UNVERIFIED: &str = "retained_source_unverified_on_v2";
 
@@ -153,6 +165,30 @@ async fn require_activated_on(conn: &mut SqliteConnection) -> Result<()> {
     }
     Ok(())
 }
+/// Gate for the shelf and member-consent paths. Activation verifies the
+/// frozen v1 app capsules an import carried, before anything runs. A database
+/// whose import carried no app custody has nothing to verify (activating it
+/// would take an empty capsule set), so it may use catalogue apps without the
+/// operator step. Any imported app custody keeps the gate closed until the
+/// operator activates it.
+async fn require_apps_open_on(conn: &mut SqliteConnection) -> Result<()> {
+    let table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='kernel_app_state')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let frozen: bool = if table {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.kernel_app_state)")
+            .fetch_one(&mut *conn)
+            .await?
+    } else {
+        false
+    };
+    if frozen {
+        return require_activated_on(conn).await;
+    }
+    Ok(())
+}
 fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key]
         .as_str()
@@ -242,6 +278,7 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
             REMOVED,
             consent::RECORDED,
             consent::ADOPTED,
+            scope::SCOPE_SET,
             hosted_identity::offboarding::EVENT,
         ],
     )
@@ -254,6 +291,9 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
                     project_source(conn, &install, event.local_seq).await?;
                 }
             }
+            if !sources && event.event_type == consent::RECORDED {
+                consent::recover_source(conn, event).await?;
+            }
             if !outcomes && event.event_type == consent::RECORDED {
                 consent::recover_outcome(conn, event).await?;
             }
@@ -263,10 +303,14 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
             if !outcomes && event.event_type == REMOVED {
                 recover_removal_outcome(conn, event).await?;
             }
+            // Scope folds are idempotent `json_set` onto the install row,
+            // which this partial-recovery branch preserves; replaying one
+            // here would needlessly re-validate membership at each event.
+            // The full rebuild below folds them in seq order.
             continue;
         }
         match event.event_type.as_str() {
-            ACTIVATED | REMOVED | consent::RECORDED | consent::ADOPTED => {
+            ACTIVATED | REMOVED | consent::RECORDED | consent::ADOPTED | scope::SCOPE_SET => {
                 project(conn, event).await?
             }
             hosted_identity::offboarding::EVENT => revoke_offboarded(conn, event).await?,
@@ -781,6 +825,14 @@ async fn verify_install_row(
 }
 
 pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    project_on_registered_copy(conn, event, None).await
+}
+
+pub(crate) async fn project_on_registered_copy(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    admitted: Option<&crate::standby::kernel_v2_delta::ProjectionShape>,
+) -> Result<()> {
     let logged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE seq=? AND id=? AND record_id=? AND type=? AND payload IS ? AND actor IS ? AND act IS ?)")
         .bind(event.local_seq).bind(&event.id).bind(&event.record_id).bind(&event.event_type).bind(&event.payload).bind(&event.actor).bind(event.act).fetch_one(&mut *conn).await?;
     if !logged {
@@ -789,9 +841,10 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
     app_state::refuse_entity_collision(conn, &event.record_id).await?;
     match event.event_type.as_str() {
         consent::ACTION_STARTED => consent::project_action_started(conn, event).await?,
-        consent::ACTION_RECORDED => consent::project_action_recorded(conn, event).await?,
+        consent::ACTION_RECORDED => consent::project_action_recorded(conn, event, admitted).await?,
         consent::RECORDED => consent::project_recorded(conn, event).await?,
         consent::ADOPTED => consent::project_adopted(conn, event).await?,
+        scope::SCOPE_SET => scope::project_scope_set(conn, event).await?,
         ACTIVATED => {
             hq::require_import(conn, event.actor.as_deref().unwrap_or_default()).await?;
             let p: Activation = event_payload(event)?;
@@ -1141,7 +1194,7 @@ async fn frozen_sources_on(
     if !hosted_identity::account_admitted_before(conn, principal, i64::MAX).await? {
         return Err(Error::engine("database membership not found"));
     }
-    require_activated_on(conn).await?;
+    require_apps_open_on(conn).await?;
     let pins: Vec<String> = sqlx::query_scalar(
         "SELECT pin_json FROM kernel_app_package_sources ORDER BY package,version,digest,artifact_id,source_revision,declaration_digest",
     )
@@ -1166,7 +1219,7 @@ async fn frozen_sources_on(
     for raw in pins {
         let pin: Value = serde_json::from_str(&raw)?;
         let artifact = string(&pin, "artifact_id")?;
-        if let Some(record) = read_record_on(conn, principal, artifact).await? {
+        if let Some(record) = read_record_metadata_on(conn, principal, artifact).await? {
             if is_artifact_on(conn, &record).await? {
                 let runtime: Option<String> = sqlx::query_scalar(
                     "SELECT value FROM kernel_facets WHERE record_id=? AND key='runtime'",
@@ -1184,7 +1237,10 @@ async fn frozen_sources_on(
     Ok(visible)
 }
 
-async fn is_artifact_on(conn: &mut SqliteConnection, record: &KernelRecordView) -> Result<bool> {
+pub(crate) async fn is_artifact_on(
+    conn: &mut SqliteConnection,
+    record: &KernelRecordView,
+) -> Result<bool> {
     if record.archived {
         return Ok(false);
     }
@@ -1222,4 +1278,18 @@ mod frozen_messaging_tests {
             assert!(legacy_supported(format, "agent.whiteboard", "0.2.0"));
         }
     }
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+tokio::task_local! { static SOURCE_ADMISSIONS: std::cell::Cell<usize>; }
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn with_source_admission_count<F: std::future::Future>(
+    work: F,
+) -> (F::Output, usize) {
+    SOURCE_ADMISSIONS
+        .scope(std::cell::Cell::new(0), async {
+            let result = work.await;
+            (result, SOURCE_ADMISSIONS.with(|count| count.get()))
+        })
+        .await
 }

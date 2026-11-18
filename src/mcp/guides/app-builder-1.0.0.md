@@ -2,7 +2,15 @@
 
 # Build an app with only Native MCP — builder 1.0.0
 
-Read `app-kit-core-1.1.0` for the API reference. You need no shell, npm,
+For the approved Native apps (Docs, Linear, Miro, Notion and Slack), use
+`artifacts_read.manage_alpha_tabs.install_link` with the app's package instead
+of copying its source into a record. Give the person the returned `install_url`:
+they sign in and choose Add on the app's access screen. This read-only handoff
+does not install or adopt anything itself. A null URL means no public origin
+is configured; use the deployment-relative `install_path` without inventing a
+host. The instructions below are for building a new app.
+
+Read `app-kit-core-1.7.0` for the API reference. You need no shell, npm,
 compiler, imports or filesystem. Copy one complete HTML block below as the
 artifact's text body; adapt names, CSS and bounded queries in that small source.
 The host supplies core major 1, including Preact and `html = htm.bind(h)`.
@@ -11,8 +19,14 @@ The host supplies core major 1, including Preact and `html = htm.bind(h)`.
 
 Use v1 for a read-only declared snapshot: local filtering only covers delivered
 rows. Use v2 for an app that writes or tracks state: `{ "contract":"native.app.v2", "needs":[],
-"effects":[] }`. V2 acts as the adopted person and has broader read/write access;
-the kit policy grants no permissions. Explain this choice before adoption.
+"effects":[] }`. V2 acts as the adopted person by default. On the installation
+screen the person can choose Everything or limit the app to selected folders,
+and change that later in Access. A folder grant includes subfolders and applies
+to reads and writes; narrowed apps cannot use messages or launch agents yet.
+The app cannot widen its own grant, and the kit policy grants no permissions.
+Explain the access choice before adoption.
+To read or browse records without writing SQL, see "Read and browse records
+without SQL (v2)" below; it needs v2 and its wider access.
 
 Find folders with `sql_read.query_sql`: `SELECT id, name FROM records WHERE
  type = 'Collection' AND kind = 'folder' AND deleted_at IS NULL ORDER BY name,
@@ -31,12 +45,26 @@ anything. Hosts without v2 subscriptions or calls show an unsupported state.
 
 Use `describe_operation` for each actual executor/operation pair:
 `records_write.create_record`, `artifacts_read.manage_alpha_tabs.prepare_install`,
-`artifacts_write.manage_alpha_tabs.install`, `artifacts_write.manage_alpha_tabs.update`,
-and `artifacts_read.manage_alpha_tabs.inspect`. Create a `type:'Document',
-kind:'artifact'` record with `body` equal to the complete HTML,
-`facets:{runtime:'native.html.v1'}`, a sensible `home_id`, name and reason.
+`artifacts_write.manage_alpha_tabs.install`, and
+`artifacts_read.manage_alpha_tabs.inspect`. Follow the prepared `next_call` for
+updates too. Create a `type:'Document', kind:'artifact'` record with `body` equal
+to the complete HTML,
+`facets:{runtime:'native.html.v1',app_package:'true'}`, a sensible `home_id`, name
+and reason. Include the package marker even for a small app: it allows up to
+2 MiB of HTML, with embedded images/fonts up to 512 KiB each and 1 MiB total
+(decoded bytes). The supplied kit does not count toward this allowance.
+For an existing app source missing the marker, add it with
+`records_write.update_record` before saving a larger body or preparing install.
 Read it back for its current `body_digest` or exact body-writing source revision.
 Keep the declaration separately; it is not the inert kit policy in the HTML.
+
+On v2, first publish the new owned source with `records_write.update_record`:
+use `body_set` containing the same complete HTML and `if_body_digest` from the
+read. This guarded first publication attests the source even if its bytes are
+unchanged. Read the resulting source revision before preparation. Only an
+eligible member who owns a never-installed artifact can first-publish it;
+reserved catalogue package names and previously removed sources are refused.
+Publication does not install or adopt the app.
 
 If `describe_operation` does not list
 `artifacts_read.manage_alpha_tabs.prepare_install`, stop and tell the person
@@ -66,7 +94,7 @@ detail (event_id guard, adoption, launch binding).
 Both reads need hosted Native: they are not served from offline or member copies.
 Tell the person its package/name and to open it in Apps, **Preview**, then
 **Adopt**. MCP cannot fabricate the first browser gesture. Verify live folder
-reads and create after adoption; only `.confirmed` means saved.
+reads and create after adoption. `.confirmed` means hosted acceptance; immediate page feedback alone is not a durable save.
 
 ## Later edits
 
@@ -74,8 +102,12 @@ Read current source and inspect the current install. Use `records_write.update_r
 with its current write guard, or create a replacement Artifact, preserving the
 old source for restoration. Prepare the new version with the current source
 pin, then follow the guarded update `next_call`. Preserve name/icon/skin and
-request; do not infer a new declaration from CSS changes. `adoption:'carried'`
-means unchanged access can carry existing consent; otherwise ask for Preview/Adopt.
+request; do not infer a new declaration from CSS changes. An update result with
+`adoption_basis:'carried'` reuses verified consent for the unchanged canonical
+permission declaration. This approves new code under existing permissions; it does
+not claim that the new source was previewed. Changed declarations (including
+narrowing) or ineligible predecessors require fresh Preview/Adopt. Inspect the
+accepted update result rather than treating preparation as consent.
 A stale source or install-event refusal means read/prepare again, not overwrite.
 Restore previous HTML through the same guarded flow with a new version.
 Host-compatible kit minor/patch changes are independent of source edits.
@@ -117,7 +149,7 @@ Install declaration:
 <script type="module">
 const kit = window.native?.kit;
 const root = document.getElementById('app');
-if (!kit?.preact) root.textContent = 'Open in Native with core kit 1.1.0.';
+if (!kit?.preact) root.textContent = 'Open in Native with core kit 1.1.1.';
 else {
   const { html, render, useState, useFeed, Loading, Empty, ErrorState, RecordLink } = kit.preact;
   function App() {
@@ -142,7 +174,72 @@ else {
 </script></body></html>
 ```
 
-## App with live reads and confirmed creates (v2)
+## Optimistic note creation with standard record hooks (v2)
+
+Core kit 1.7.13 adds two ordinary write methods to the existing hooks:
+
+```js
+const notes = useRecordList({ folder }, { type: 'Document', kind: 'note' });
+notes.create({ name: 'Meeting notes', body: 'Our next steps…' });
+
+const note = useRecord(id);
+note.update({ name: 'New title' }); // Metadata only; use the body editor for body edits.
+```
+
+The runtime captures a frozen request before returning. All matching views in
+this page share the change immediately; synchronization, retry keys, receipt
+matching and reconciliation are handled for you. Keep composing the next note.
+Do not await hosted acceptance to clear a successfully captured form. A capture
+failure posts a supplied notice and throws before the form is reset. Programming
+errors (unknown fields, invalid binding or oversized body) throw synchronously.
+
+`create` exists only on a folder with an explicit supported `type`; `kind` is
+optional. `type` and legacy `types` are mutually exclusive. Kind filters are
+strict (1–64 UTF-16 units), apply before paging, and are invalid on an `ids`
+source. During mixed-node compatibility, kind-filtered typed reads use the existing
+qualified page-local answer first, then hosted on a miss to avoid older nodes;
+they never silently return other kinds. If no qualified local answer exists, a
+fresh offline/local-mode read can remain unavailable until hosted returns; kept
+rows remain readable. The older node/copy path needs a qualified capability floor.
+Body input is bounded to 262,142 Unicode
+code points, with embedded NUL refused, matching the reader's counting unit.
+
+Reads still expose `data`, `freshness`, `notice` and recovery actions. A list's
+`pending` is a source-filtered view of legacy `creating`: frozen create actions with stable `key`,
+`request`, status and retry/discard actions. Before the host supplies a final
+record ID, a create is an action, never a provisional row. `data` and `rows`
+already compose eligible edits and confirmed creates. Save outcome is separate
+from read-refresh health; do not add invalidation or refresh-after-write loops.
+
+Supplied components are optional. The example below renders its own list and
+uses `EditStatus` only for status wording/actions. Custom visuals can use the
+same public state directly. The runtime also mounts a quiet Changes entry for
+recovery after a component unmounts or the person changes folders. Its captured
+text remains available without overwriting a newer draft. Dismiss clears saved
+history only after every open view has caught up, so cleanup cannot restore an
+older value. If protected history fills the bounded page capacity, capture shows
+a notice and keeps the next draft intact until those views catch up.
+
+The page owns captured changes for its lifetime. A supporting host may also
+keep requests on this device and resend them in the background; a request
+checkpoint is recovery custody, not domain admission. Only a qualified node
+receipt permits “Saved on this device”; this API does not enable that provider.
+“Saved” and existing `.confirmed` mean hosted acceptance. Body/coedit journals
+keep their own path.
+
+The sandbox blocks native form submission, so do not rely on `onSubmit`.
+The example handles the button click and Enter in the title field directly,
+checks the form before capturing, and returns focus for the next draft.
+On an account or workspace boundary it removes the form and requires a reload;
+unsubmitted private text must not carry into a new scope.
+
+The returned handle is optional: `change.settled` reports accepted, refused or
+stopped; create handles also offer `change.record` (available, none or unknown).
+These describe the observed attempt. A definitive refusal means none for that
+attempt; retry can create a new attempt under the same recovery action key.
+Stopping observation means unknown, never proof that nothing was created.
+There is no deadline while an outcome remains uncertain. `handle.key` matches
+its managed pending action's key, and is never a record ID.
 
 Install declaration:
 
@@ -154,95 +251,41 @@ Install declaration:
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Meeting notes</title>
 <script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
-<style>body{font:16px system-ui;margin:2rem;color:#243047;max-width:65rem}input,textarea,select,button{font:inherit;padding:.5rem}label{display:block;margin:.8rem 0}textarea{width:95%;min-height:8rem}.columns{display:grid;grid-template-columns:1fr 2fr;gap:2rem}li{margin:.6rem 0}.kit-error{color:#9c2630}.kit-record-link{cursor:pointer}pre{white-space:pre-wrap}button:disabled{opacity:.6}@media(max-width:650px){.columns{display:block}}</style>
+<style>body{font:16px system-ui;margin:2rem;max-width:65rem}input,textarea,button{font:inherit;padding:.5rem}label{display:block;margin:.8rem 0}textarea{width:95%;min-height:8rem}li{margin:.6rem 0}</style>
 </head><body><main id="app">Opening Native…</main>
 <script type="module">
-const FOLDERS = [{ id: 'native:unfiled', name: 'Unfiled' }, { id: 'native:root', name: 'Workspace root' }]; // Replace with real folder ids/names.
 const kit = window.native?.kit;
 const root = document.getElementById('app');
-if (!kit?.preact) root.textContent = 'Open in Native with core kit 1.1.0.';
+if (!kit?.preact?.useRecordList) root.textContent = 'Open with Native core kit 1.7.13 or later.';
 else {
-  const { html, render, useState, useRef, useQueryFeed, Loading, Empty, ErrorState, RecordLink, Markdown } = kit.preact;
-  // SQL query rows arrive as objects keyed by column name: use row.id, never row[0].
-  function NoteView({ id, folder }) {
-    const feed = useQueryFeed({
-      sql: "SELECT id, substr(name, 1, 160) AS name, substr(body, 1, 120000) AS body FROM records WHERE id = ?1 AND home_id = ?2 AND type = 'Document' AND kind = 'note' AND deleted_at IS NULL AND archived = 0 ORDER BY id ASC LIMIT 1",
-      params: [{ type: 'text', value: id }, { type: 'text', value: folder }]
-    });
-    const result = feed.status === 'ready' ? feed.result : feed.last;
-    const note = result?.rows[0];
-    return html`<article>
-      ${feed.status === 'loading' && html`<${Loading} what="selected note" />`}
-      ${feed.status === 'unsupported' && html`<p role="alert">${feed.message}</p>`}
-      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} onRetry=${feed.retry} />`}
-      ${feed.status === 'error' && note && html`<p>Last good body; may be out of date.</p>`}
-      ${note ? html`<h2>${note.name}</h2><p>Body preview, up to 120,000 characters.</p><${RecordLink} id=${note.id}>Open record<//><${Markdown} source=${note.body || ''} />`
-        : result && html`<${Empty}>Note unavailable in this folder.<//>`}
-    </article>`;
-  }
+  const { html, render, useState, useEffect, useRecordList, Loading, FeedNotice, EditStatus, RecordLink } = kit.preact;
+  const folder = 'native:unfiled'; // Replace with the actual chosen folder ID.
   function App() {
-    const [folder, setFolder] = useState(FOLDERS[0].id);
-    const [filter, setFilter] = useState('');
-    const [selected, setSelected] = useState(null);
-    const [title, setTitle] = useState('');
-    const [body, setBody] = useState('');
-    const [save, setSave] = useState({ status: 'idle' });
-    const attempt = useRef(null);
-    const feed = useQueryFeed({
-      sql: "SELECT id, substr(name, 1, 160) AS name, substr(body, 1, 160) AS excerpt FROM records WHERE home_id = ?1 AND type = 'Document' AND kind = 'note' AND deleted_at IS NULL AND archived = 0 ORDER BY updated_at_ms DESC, id ASC LIMIT 50",
-      params: [{ type: 'text', value: folder }]
-    });
-    const result = feed.status === 'ready' ? feed.result : feed.last;
-    const rows = result?.rows || [];
-    const visible = rows.filter(row => (row.name || '').toLowerCase().includes(filter.toLowerCase()));
-    const locked = save.status === 'pending' || save.status === 'uncertain';
-    async function create() {
-      if (save.status === 'pending') return;
-      setSave({ status: 'pending' });
-      try {
-        // Key generation can fail before dispatch; report it as not dispatched.
-        if (!attempt.current) {
-          let key;
-          try { key = crypto.randomUUID(); }
-          catch { throw { code: 'tool_not_dispatched', message: 'Secure random key unavailable. Open this app in a secure Native host.' }; }
-          attempt.current = {
-            type: 'Document', kind: 'note', name: title.trim(), body, home_id: folder,
-            reason: 'Create meeting note from inbox', idempotency_key: key
-          };
-        }
-        await window.native.call('create_record', attempt.current).confirmed;
-        attempt.current = null;
-        setTitle(''); setBody(''); setSave({ status: 'saved' }); feed.retry();
-      } catch (error) {
-        // A refused retry cannot settle the earlier uncertain dispatch.
-        const notWritten = error?.applied !== true && (error?.status === 'refused' || ['tool_not_dispatched', 'effect_not_dispatched'].includes(error?.code));
-        const uncertain = save.status === 'uncertain' || !notWritten;
-        if (!uncertain) attempt.current = null;
-        setSave({ status: uncertain ? 'uncertain' : 'error', error });
-      }
+    const notes = useRecordList({ folder }, { type: 'Document', kind: 'note' });
+    const [blocked, setBlocked] = useState(false);
+    useEffect(() => { if (notes.error?.code === 'scope_changed') setBlocked(true); }, [notes.error?.code]);
+    if (blocked || notes.error?.code === 'scope_changed') return html`<p role="alert">Your workspace changed. Reload to continue.</p>`;
+    if (!notes.create) return html`<p>Open with Native core kit 1.7.13 or later.</p>`;
+    function create(form) {
+      if (!form.reportValidity()) return;
+      notes.create({ name: form.elements.title.value, body: form.elements.body.value });
+      form.reset(); // Runs only after this page has captured the unchanged request.
+      form.elements.title.focus();
     }
     return html`<section><h1>Meeting notes</h1>
-      <label>Folder <select id="folder" value=${folder} disabled=${locked} onChange=${e => { setFolder(e.currentTarget.value); setSelected(null); setSave({ status: 'idle' }); }}>${FOLDERS.map(f => html`<option value=${f.id}>${f.name}</option>`)}</select></label>
-      <p>Newest 50 notes. Filter covers delivered titles; list excerpts are capped at 160 characters.</p>
-      <label>Filter <input id="filter" value=${filter} onInput=${e => setFilter(e.currentTarget.value)} /></label>
-      ${feed.status === 'loading' && html`<${Loading} what="notes" />`}
-      ${feed.status === 'unsupported' && html`<p role="alert">${feed.message}</p>`}
-      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} onRetry=${feed.retry} />`}
-      ${feed.status === 'error' && result && html`<p>Last good rows; may be out of date.</p>`}
-      ${result?.truncated && html`<p>More notes exist than delivered.</p>`}
-      <div class="columns"><nav aria-label="Notes">${visible.length ? html`<ul>${visible.map(row => html`<li key=${row.id}><button onClick=${() => setSelected(row.id)}>${row.name || row.id}</button><p>${(row.excerpt || '').slice(0, 160)}</p></li>`)}</ul>` : result && html`<${Empty}>No matching notes.<//>`}</nav>
-        ${selected ? html`<${NoteView} key=${folder + ':' + selected} id=${selected} folder=${folder} />` : html`<article><p>Select a note to read its preview.</p></article>`}</div>
-      <h2>New note</h2>
-      <div>
-        <label>Title <input id="title" required value=${title} disabled=${locked} onInput=${e => { setTitle(e.currentTarget.value); setSave({ status: 'idle' }); }} /></label>
-        <label>Notes <textarea id="body" value=${body} disabled=${locked} onInput=${e => { setBody(e.currentTarget.value); setSave({ status: 'idle' }); }} /></label>
-        <button id="create" type="button" onClick=${create} disabled=${locked || !title.trim() || typeof window.native.call !== 'function'}>Create note</button>
-      </div>
-      ${typeof window.native.call !== 'function' && html`<p role="alert">This host does not offer app-v2 writes.</p>`}
-      ${save.status === 'pending' && html`<p role="status">Saving… waiting for confirmation.</p>`}
-      ${save.status === 'saved' && html`<p role="status">Saved.</p>`}
-      ${save.status === 'uncertain' && html`<p>Outcome uncertain. Keep this app open and retry the same note; fields are locked to preserve its key and payload.</p>`}
-      ${save.error && html`<${ErrorState} error=${save.error} onRetry=${create} />`}
+      <${FeedNotice} feed=${notes} />
+      ${notes.data === undefined && html`<${Loading} what="notes" />`}
+      <ul>${(notes.data || []).map(row => html`<li key=${row.id}><${RecordLink} id=${row.id}>${row.name}<//></li>`)}</ul>
+      ${notes.more && !notes.capped && html`<button onClick=${notes.loadMore}>More notes</button>`}
+      <section aria-label="Note actions">${notes.pending.map(change => html`<article key=${change.key}>
+        <strong>${change.request.name}</strong><${EditStatus} edit=${change} />
+        ${change.createdId && html`<${RecordLink} id=${change.createdId}>Open<//>`}
+      </article>`)}</section>
+      <form onKeyDown=${event => {
+        if (event.key === 'Enter' && event.target.name === 'title' && !event.isComposing) { event.preventDefault(); create(event.currentTarget); }
+      }}><label>Title <input name="title" required /></label>
+        <label>Notes <textarea name="body" /></label><button type="button" onClick=${event => create(event.currentTarget.form)}>Create note</button>
+      </form>
     </section>`;
   }
   try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
@@ -251,3 +294,197 @@ else {
 }
 </script></body></html>
 ```
+
+## Read and browse records without SQL (v2)
+
+**Choose access first.** `useRecord` and `useRecordList` (core kit 1.7.0) need v2.
+V2 runs as the adopted person, within any folder grant they chose at installation:
+a read-only interface is not a read-only grant, and these helpers do not narrow
+what the app can reach. A v1 declared read (the "Read-only recent
+records" starter above): it reads only the SQL declared at install. Pick v1 when a
+fixed list is enough, and say which you chose and why before adoption. Hosts
+without v2 subscriptions report `unsupported`.
+
+Use the helpers when the app is a record reader or a collection browser. They drop
+the plumbing a hand-written query needs: the deleted/archived/type filters, a
+bounded body read with its length, the check that a row belongs to the id asked
+for, bounded lists and load-more, and the notice and retry. `useRecord(id)` returns
+`status` (`idle | loading | ready | missing | unsupported | error`), `record`, `body`,
+`bodyLength`, `bodyTruncated`, `cached`, `retry`, `notice`. `missing` means the read
+succeeded and no row came back (deleted, archived, out of scope or no access); show
+"unavailable", the app need not tell these apart. `useRecordList({ folder })` or
+`useRecordList({ ids })` returns `rows`, `missing` (for ids), `more`, `loadMore`,
+`retry`, `notice`; a folder is newest first, an id set keeps its order, and a list
+never shows more than 200 rows. The app still owns selection, layout and wording.
+Full reference: `app-kit-core-1.7.0`. The v2 starter with creates above keeps
+hand-written SQL on purpose: it needs `kind = 'note'`, excerpts and a folder check,
+which the helpers do not cover, and raw `useQueryFeed` stays available for that.
+
+Install declaration:
+
+```json
+{"contract":"native.app.v2","needs":[],"effects":[]}
+```
+
+Type a folder id (try `native:root`) or paste record ids, one per line:
+
+```html
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Record reader</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem;color:#243047;max-width:65rem}input,textarea,button{font:inherit;padding:.5rem}label{display:block;margin:.8rem 0}textarea{width:95%;min-height:4rem}.columns{display:grid;grid-template-columns:1fr 2fr;gap:2rem}li{margin:.5rem 0}.kit-error{color:#9c2630}.kit-record-link{cursor:pointer}@media(max-width:650px){.columns{display:block}}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact?.useRecordList) root.textContent = 'Open in Native with core kit 1.7.0.';
+else {
+  const { html, render, useState, useRecord, useRecordList, Loading, Empty, ErrorState, FeedNotice, RecordLink, Markdown } = kit.preact;
+  const nf = n => n.toLocaleString('en-US');
+  // One record by id. `record` is only ever the requested id's; while another id loads it is null.
+  function Reader({ id, onPrevious, onNext }) {
+    const r = useRecord(id); // body is read up to 120,000 characters
+    return html`<article>
+      <p><button type="button" id="previous" disabled=${!onPrevious} onClick=${onPrevious}>Previous</button> <button type="button" id="next" disabled=${!onNext} onClick=${onNext}>Next</button></p>
+      ${r.status === 'loading' && html`<${Loading} what="record" />`}
+      ${r.status === 'unsupported' && html`<p role="alert">This host does not offer app-v2 query subscriptions.</p>`}
+      ${r.status === 'error' && html`<${ErrorState} error=${r.error} onRetry=${r.retry} />`}
+      ${r.status === 'missing' && html`<${Empty}>This record is unavailable.<//>`}
+      <${FeedNotice} feed=${r} />
+      ${r.record && html`<h2>${r.record.name || r.record.id}</h2>
+        <p><${RecordLink} id=${r.record.id}>Open record<//>${r.cached && ' · Showing a saved copy; checking for updates.'}</p>
+        ${r.bodyTruncated && html`<p role="status">Showing the first ${nf(r.body.length)} of ${nf(r.bodyLength)} characters.</p>`}
+        <${Markdown} source=${r.body || ''} />`}
+    </article>`;
+  }
+  function App() {
+    const [mode, setMode] = useState('folder');
+    const [draft, setDraft] = useState('native:root'); // Any folder id; try native:unfiled too.
+    const [folder, setFolder] = useState('native:root');
+    const [text, setText] = useState('');
+    const [ids, setIds] = useState([]);
+    const [selected, setSelected] = useState(null);
+    // A folder's children, newest first, or the ids you list in order. Never more than 200 rows.
+    const list = useRecordList(mode === 'folder' ? { folder } : { ids }, { limit: 20 });
+    const rows = list.rows, at = rows.findIndex(row => row.id === selected);
+    const go = step => () => { const row = rows[at + step]; if (row) setSelected(row.id); };
+    const start = next => { setMode(next); setSelected(null); };
+    return html`<section><h1>Record reader</h1>
+      <p><button type="button" id="mode-folder" disabled=${mode === 'folder'} onClick=${() => start('folder')}>Folder</button> <button type="button" id="mode-ids" disabled=${mode === 'ids'} onClick=${() => start('ids')}>Id list</button></p>
+      ${mode === 'folder'
+        ? html`<label>Folder id <input id="folder" value=${draft} onInput=${e => setDraft(e.currentTarget.value)} /></label><button type="button" id="open" onClick=${() => { setFolder(draft.trim()); setSelected(null); }}>Open</button>`
+        : html`<label>Record ids, one per line <textarea id="ids" value=${text} onInput=${e => setText(e.currentTarget.value)} /></label><button type="button" id="open" onClick=${() => { setIds(text.split('\n').map(id => id.trim()).filter(Boolean)); setSelected(null); }}>Open</button>`}
+      <div class="columns"><nav aria-label="Records">
+        ${list.status === 'loading' && html`<${Loading} what="records" />`}
+        ${list.status === 'unsupported' && html`<p role="alert">This host does not offer app-v2 query subscriptions.</p>`}
+        ${list.status === 'error' && html`<${ErrorState} error=${list.error} onRetry=${list.retry} />`}
+        <${FeedNotice} feed=${list} />
+        ${list.status === 'ready' && !rows.length && !list.missing.length && html`<${Empty}>No records here.<//>`}
+        <ul>${rows.map(row => html`<li key=${row.id}><button type="button" onClick=${() => setSelected(row.id)}>${row.name || row.id}</button> — ${row.type}</li>`)}</ul>
+        ${list.missing.length > 0 && html`<p>${list.missing.length} listed record${list.missing.length > 1 ? 's are' : ' is'} unavailable to this account: ${list.missing.join(', ')}</p>`}
+        ${list.omitted > 0 && html`<p>${list.omitted} more ids past the 200 limit were not read.</p>`}
+        ${list.more && !list.capped && html`<button type="button" id="more" disabled=${list.refreshing} onClick=${list.loadMore}>${list.refreshing ? 'Loading…' : 'Load more'}</button>`}
+        ${list.capped && html`<p>Showing the first 200.</p>`}
+      </nav>
+      ${selected ? html`<${Reader} id=${selected} onPrevious=${at > 0 ? go(-1) : undefined} onNext=${at >= 0 && at < rows.length - 1 ? go(1) : undefined} />` : html`<article><p>Select a record to read it.</p></article>`}</div>
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>
+```
+
+## Optional reusable record queries (v2)
+
+For a reusable read, keep the query as data in the app's own script. The
+app-side `native.query.v1` descriptor uses today's record hooks. Copy these
+adapters into a single-file HTML app when sharing a query is useful:
+
+```js
+const createTypes = ['Document', 'Collection', 'Resolution', 'WorkItem', 'Outcome'];
+
+function useQueryList(ui, query) {
+  const { from, types, kinds, order, limit } = query;
+  if ('folder' in from) {
+    const typeOptions = types.length === 1 && createTypes.includes(types[0])
+      ? { type: types[0] } : { types };
+    return ui.useRecordList({ folder: from.folder }, {
+      ...typeOptions, kind: kinds?.[0], order, limit,
+    });
+  }
+  return ui.useRecordList({ ids: from.ids }, { types, limit });
+}
+
+function useQueryRecord(ui, query) {
+  return ui.useRecord(query.from.id, { types: query.types, body: query.select?.body ?? false });
+}
+
+// Inside your component, after kit initialization:
+const notes = useQueryList(kit.preact, {
+  v: 'native.query.v1', from: { folder }, types: ['Document'],
+  kinds: ['note'], order: 'name', limit: 20,
+});
+const opened = useQueryRecord(kit.preact, {
+  v: 'native.query.v1', from: { id }, types: ['Document'],
+  limit: 1, select: { body: 20_000 },
+});
+```
+
+Use these snippets with descriptors you author in the app. A list can use
+`from: { folder }` or `from: { ids: [id1, id2] }`. Id lists keep caller order
+and support `types` and `limit`. Folder lists also support one kind in
+`kinds` and `order: 'updated'` or `'name'`. One-record reads use `from: { id }`
+and `limit: 1`. Omit `select` for metadata only, or set `select.body` to the
+number of body characters to read. Use `select: { body: 120_000 }` for the
+same body prefix as a bare `useRecord(id)` call. The result's `body` is
+separate from its `record` metadata. Use a null folder or id while waiting for
+a selection.
+
+The adapters return the hook result directly, so use the same notices,
+paging and pending-action UI as in the examples above. One explicit supported
+type on a folder also binds `create`. Use the hooks directly for simple reads.
+Use `useQueryFeed({ sql })` for advanced reads such as reports or activity.
+TypeScript apps in the Native source tree can import `kit/recordQuery` for typed
+rows and the optional `records.in(folder)`, `records.ids(ids)` and
+`records.one(id)` builder.
+
+## Optional: derive a kind contract while scaffolding
+
+Do this only if the app interprets workspace-specific facet values. The
+contract captures current expectations for one type and kind. Save it in
+the app source, or inline it in the app's script. The read-only derivation
+needs the builder's workspace access during scaffolding.
+
+1. Count the caller-visible, current, non-archived records for the type and
+   kind. Use `query_sql` with the type and kind bound as `?1` and `?2`.
+2. Inspect the facet coverage and governing vocabularies for that same set.
+   For example, the following SQLite read gives one row per observed key.
+
+   ```sql
+   SELECT f.key, count(DISTINCT f.record_id) AS present,
+          count(*) AS entries, count(f.value_num) AS numeric_entries,
+          count(f.vocab_ref) AS governed_entries,
+          count(DISTINCT f.vocab_ref) AS vocabularies,
+          min(f.vocab_ref) AS vocab_ref
+   FROM facet_values f JOIN records r ON r.id = f.record_id
+   WHERE r.type = ?1 AND r.kind = ?2 AND r.is_current = 1 AND r.archived = 0
+   GROUP BY f.key ORDER BY f.key
+   ```
+
+3. For a key whose values all reference the same resolved vocabulary, use
+   `manage_vocabularies.list_values` for that vocabulary. Follow aliases to
+   their canonical values, save the active canonical values in `values` and
+   the deprecated canonical values in `deprecated`. Describe the key as
+   `{ t: 'oneOf', basis: 'governed', values, deprecated }`. For frequent
+   ungoverned or mixed keys, use `{ t: 'text', basis: 'observed' }`. If the
+   author opts into numeric inference, wholly ungoverned keys with numeric
+   evidence for every entry can use `{ t: 'number', basis: 'observed' }`.
+4. Save `{ type, kind, facets, provenance }` with the workspace identity,
+   source act (or null if unavailable), number of records sampled and ISO
+   derivation date in `provenance`. All facet keys are optional. The contract
+   creates no schema or grants. If the app reads facet values through an
+   existing declared read, check the specific value it uses. Keep missing
+   values and unknown values distinguishable, accept and flag deprecated
+   values, and keep the original row available.

@@ -5,19 +5,19 @@ use crate::identity::hosted::{
 };
 use crate::mcp::kernel_v2::tests::registry;
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
-    source: Db,
-    db: Db,
-    target: std::path::PathBuf,
-    owner: String,
-    member: String,
-    owner_principal: String,
-    member_principal: String,
-    folder: String,
-    private: String,
-    shared: String,
-    comment: String,
+    pub(super) source: Db,
+    pub(super) db: Db,
+    pub(super) target: std::path::PathBuf,
+    pub(super) owner: String,
+    pub(super) member: String,
+    pub(super) owner_principal: String,
+    pub(super) member_principal: String,
+    pub(super) folder: String,
+    pub(super) private: String,
+    pub(super) shared: String,
+    pub(super) comment: String,
 }
 async fn v1(db: &Db, account: &str, tool: &str, args: Value) -> Result<Value> {
     registry()
@@ -34,7 +34,7 @@ async fn v2(f: &Fixture, account: &str, tool: &str, args: Value) -> Result<Value
         )
         .await
 }
-async fn fixture(one_member: bool) -> Fixture {
+pub(super) async fn fixture(one_member: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("source.db");
     let target = dir.path().join("target.db");
@@ -223,7 +223,7 @@ async fn kernel_v2_policy_members_are_not_a_one_account_privacy_proof() {
 }
 
 #[tokio::test]
-async fn kernel_v2_policy_list_refuses_non_managers_and_mutations_without_disclosure() {
+async fn kernel_v2_policy_refuses_non_managers_without_disclosure_and_allows_owner_grants() {
     let f = fixture(false).await;
     let before = kernel::dump_all_kernel_tables(&f.db).await.unwrap();
     for id in [f.private.as_str(), f.shared.as_str(), "missing"] {
@@ -239,15 +239,27 @@ async fn kernel_v2_policy_list_refuses_non_managers_and_mutations_without_disclo
             error.to_string(),
             Error::engine("manage_record_policy: record does not exist").to_string()
         );
+        let error = v2(
+            &f,
+            &f.member,
+            "manage_record_policy",
+            json!({"action":"grant","record_id":id,"subject":{"kind":"members"},"capability":"view","reason":"Unauthorized grant"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            Error::engine("manage_record_policy: record does not exist").to_string()
+        );
     }
-    assert!(v2(&f,&f.owner,"manage_record_policy",json!({"action":"grant","record_id":f.private,"subject":{"kind":"members"},"capability":"view","reason":"unsupported mutation"})).await.is_err());
+    assert_eq!(before, kernel::dump_all_kernel_tables(&f.db).await.unwrap());
     let r = registry();
     assert!(r.has_engine_operation(
         "manage_record_policy",
         EngineKind::KernelV2,
         Some(("action", "list"))
     ));
-    assert!(!r.has_engine_operation(
+    assert!(r.has_engine_operation(
         "manage_record_policy",
         EngineKind::KernelV2,
         Some(("action", "grant"))
@@ -257,7 +269,40 @@ async fn kernel_v2_policy_list_refuses_non_managers_and_mutations_without_disclo
         EngineKind::Sqlite,
         Some(("action", "grant"))
     ));
-    assert_eq!(before, kernel::dump_all_kernel_tables(&f.db).await.unwrap());
+    // This importer fixture has frozen source membership, without hosted
+    // roster activation. Grant its canonical account explicitly; live member
+    // baseline expansion has a separate activated-roster proof.
+    let grant = json!({"action":"grant","record_id":f.private,"subject":{"kind":"account","account_id":f.member},"capability":"view","reason":"Allow this account to read this record"});
+    let result = v2(&f, &f.owner, "manage_record_policy", grant.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(
+        kernel::kernel_effective_capability(&f.db, &f.member_principal, &f.private)
+            .await
+            .unwrap(),
+        crate::authorization::Capability::View
+    );
+    assert_eq!(
+        kernel::kernel_effective_capability(&f.db, &f.member_principal, &f.shared)
+            .await
+            .unwrap(),
+        crate::authorization::Capability::Edit
+    );
+    assert_eq!(
+        kernel::kernel_effective_capability(&f.db, &f.owner_principal, &f.private)
+            .await
+            .unwrap(),
+        crate::authorization::Capability::Manage
+    );
+    let after = kernel::dump_all_kernel_tables(&f.db).await.unwrap();
+    assert_eq!(
+        v2(&f, &f.owner, "manage_record_policy", grant)
+            .await
+            .unwrap()["changed"],
+        false
+    );
+    assert_eq!(after, kernel::dump_all_kernel_tables(&f.db).await.unwrap());
     f.source.close().await;
     f.db.close().await;
 }
@@ -684,7 +729,6 @@ async fn kernel_v2_batch_refuses_invalid_and_unqualified_forms_without_partial_w
         json!([{"op":"archive","id":"short-id"}]),
         json!([{"op":"archive","id":f.private,"archived":"true"}]),
         json!([{"op":"update","id":f.private,"body":"unsupported"}]),
-        json!([{"op":"add_link","source_id":f.private,"target_id":f.shared,"relationship":"relates_to"}]),
         json!(vec![archive.clone(); 26]),
     ] {
         assert!(v2(
@@ -700,7 +744,7 @@ async fn kernel_v2_batch_refuses_invalid_and_unqualified_forms_without_partial_w
     for patch in [
         json!({"reason":" "}),
         json!({"idempotency_key":" "}),
-        json!({"sources":[]}),
+        json!({"sources":null}),
         json!({"unknown":true}),
     ] {
         let mut args = json!({"reason":"invalid metadata","items":[guard,archive]});
@@ -1102,3 +1146,89 @@ async fn kernel_v2_browser_bootstrap_roots_match_visible_structure_and_v1_folder
     f.source.close().await;
     f.db.close().await;
 }
+
+#[tokio::test]
+async fn kernel_v2_bootstrap_roots_match_imported_moved_and_archived_children() {
+    let f = Box::pin(fixture(false)).await;
+    // Root filing now admits Collections. Import public/private folders so
+    // this still proves independent policy homes survive a move to root.
+    let mut folders = Vec::new();
+    for (name, private) in [
+        ("Shared preview folder", false),
+        ("Private preview folder", true),
+    ] {
+        let mut args = json!({"type":"Collection","kind":"folder","name":name,"home_id":f.folder,"reason":"root preview parity"});
+        if private {
+            args["access_policy"] = json!("account_only");
+        }
+        let created = v1(&f.source, &f.owner, "create_record", args)
+            .await
+            .unwrap();
+        folders.push(created["id"].as_str().unwrap().to_owned());
+    }
+    let report = crate::v1_import::run(crate::v1_import::Options {
+        source: f._dir.path().join("source.db"),
+        target: f.target.clone(),
+        seeds: vec![],
+        all: true,
+        history: true,
+        resume: true,
+        members_file: Some(f._dir.path().join("members.txt")),
+    })
+    .await
+    .unwrap();
+    assert!(
+        report.refusals.is_empty(),
+        "{}",
+        serde_json::to_string(&report.refusals).unwrap()
+    );
+    assert!(report.review.is_empty());
+    let shared = &folders[0];
+    for id in &folders {
+        v2(
+            &f,
+            &f.owner,
+            "update_record",
+            json!({"id":id,"home_id":"native:root","reason":"root preview parity"}),
+        )
+        .await
+        .unwrap();
+    }
+    for archived in [false, true] {
+        if archived {
+            let revision = kernel::read_record_as(&f.db, &f.owner_principal, shared)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision;
+            kernel::set_archived_as(&f.db, &f.owner_principal, shared, true, revision)
+                .await
+                .unwrap();
+        }
+        let mut counts = Vec::new();
+        for (account, actor) in [
+            (&f.owner, &f.owner_principal),
+            (&f.member, &f.member_principal),
+        ] {
+            let actual = Box::pin(super::read_surface::bootstrap_roots(&f.db, actor))
+                .await
+                .unwrap();
+            let expected = v2(
+                &f,
+                account,
+                "get_structure",
+                json!({"root_id":"native:root","max_depth":0,"max_children_per_node":0}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(actual, expected["nodes"]);
+            counts.push(actual[0]["child_count"].as_i64().unwrap());
+        }
+        assert_eq!(counts[0], counts[1] + 1, "private child remains hidden");
+    }
+    f.source.close().await;
+    f.db.close().await;
+}
+
+#[path = "saved_tabs_tests.rs"]
+mod saved_tabs_tests;

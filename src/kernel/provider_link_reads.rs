@@ -8,13 +8,58 @@ use serde_json::json;
 use sqlx::SqliteConnection;
 
 const VERSION: i64 = 1;
+// Shared verbatim by the production reader and opt-in plan diagnostics.
+pub(crate) const COVERAGE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM kernel_provider_state p LEFT JOIN kernel_provider_link_heads h INDEXED BY idx_kernel_provider_link_coverage ON h.aggregate_id=p.id WHERE p.provider_key='relates_to.v1' AND (h.aggregate_id IS NULL OR h.head<>p.head)) OR EXISTS(SELECT 1 FROM kernel_provider_link_heads h WHERE NOT EXISTS(SELECT 1 FROM kernel_provider_state p INDEXED BY idx_kernel_provider_state_heads WHERE p.provider_key='relates_to.v1' AND p.id=h.aggregate_id) OR h.row_count<>(SELECT count(*) FROM kernel_provider_link_rows r WHERE r.aggregate_id=h.aggregate_id)) OR EXISTS(SELECT 1 FROM kernel_provider_link_rows r WHERE NOT EXISTS(SELECT 1 FROM kernel_provider_link_heads h WHERE h.aggregate_id=r.aggregate_id))";
 const READ_INDEXES: &[(&str,&str)] = &[
     ("idx_kernel_provider_state_heads","CREATE INDEX IF NOT EXISTS idx_kernel_provider_state_heads ON kernel_provider_state(provider_key,id,head)"),
     ("idx_kernel_provider_link_coverage","CREATE INDEX IF NOT EXISTS idx_kernel_provider_link_coverage ON kernel_provider_link_heads(aggregate_id,head,row_count)"),
     ("idx_kernel_event_birth","CREATE INDEX IF NOT EXISTS idx_kernel_event_birth ON content_events(seq,created_at)"),
     ("idx_kernel_read_type","CREATE INDEX IF NOT EXISTS idx_kernel_read_type ON kernel_record_fields(record_id,value_json) WHERE name='v1_type'"),
     ("idx_kernel_read_kind","CREATE INDEX IF NOT EXISTS idx_kernel_read_kind ON kernel_record_fields(record_id,value_json) WHERE name='v1_kind'"),
+    // P2 endpoint seeks stay with their table: kernel_provider_link_rows is
+    // provisioned in ensure_schema_on after the V2_KERNEL_TABLES loop, so
+    // these entries must not move into that loop (fresh-create ordering is
+    // table-before-index).
+    ("idx_kernel_provider_link_rows_source",LINK_ROWS_SOURCE_INDEX),
+    ("idx_kernel_provider_link_rows_target",LINK_ROWS_TARGET_INDEX),
 ];
+
+/// Endpoint seeks for the P2 link-candidate superset (LINK_CANDIDATES): both
+/// directions of every provider row touching an anchor, plus the touched
+/// aggregate lookup. Covering both endpoint columns keeps the union branches
+/// off the table; the touched aggregate id is fetched from the few matching
+/// rows. The global duplicate-id guard keeps its own identity-index scan.
+pub(crate) const LINK_ROWS_SOURCE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_kernel_provider_link_rows_source ON kernel_provider_link_rows(source_id,target_id)";
+pub(crate) const LINK_ROWS_TARGET_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_kernel_provider_link_rows_target ON kernel_provider_link_rows(target_id,source_id)";
+
+/// Reject same-name indexes with different keys or predicates. SQLite retains
+/// the canonical CREATE statement without IF NOT EXISTS.
+pub(crate) async fn require_endpoint_indexes_on(conn: &mut SqliteConnection) -> Result<()> {
+    for (name, ddl) in [
+        (
+            "idx_kernel_provider_link_rows_source",
+            LINK_ROWS_SOURCE_INDEX,
+        ),
+        (
+            "idx_kernel_provider_link_rows_target",
+            LINK_ROWS_TARGET_INDEX,
+        ),
+    ] {
+        let actual: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+        )
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
+        if actual.as_deref() != Some(ddl.replacen(" IF NOT EXISTS", "", 1).as_str()) {
+            return Err(Error::engine(format!(
+                "v2 endpoint index preparation found an unexpected definition for {name}"
+            )));
+        }
+    }
+    Ok(())
+}
 const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS kernel_provider_link_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS kernel_provider_link_heads (aggregate_id TEXT PRIMARY KEY,head INTEGER NOT NULL,pins_json TEXT NOT NULL,left_id TEXT NOT NULL,right_id TEXT NOT NULL,active INTEGER NOT NULL,row_count INTEGER NOT NULL)",
@@ -126,30 +171,31 @@ pub(crate) async fn prepare_on(conn: &mut SqliteConnection) -> Result<()> {
 /// Check coverage, not merely MAX(head): a missing older aggregate or a partly
 /// written row set must refuse too. No stored-state JSON is decoded on reads.
 pub(crate) async fn require_ready_on(conn: &mut SqliteConnection) -> Result<()> {
-    for (name, _) in READ_INDEXES {
-        let ready: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?)",
-        )
-        .bind(name)
-        .fetch_one(&mut *conn)
-        .await?;
-        if !ready {
-            return Err(Error::engine("v2 provider-link read projection is not ready; run explicit v2 import/preparation before serving"));
-        }
-    }
-    let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE (type='table' AND name IN ('kernel_provider_link_meta','kernel_provider_link_heads','kernel_provider_link_rows')) OR (type='index' AND name='idx_kernel_provider_link_identity')").fetch_one(&mut *conn).await?;
-    if objects != 4 {
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    super::generic_links::diagnostics::phase("readiness_schema");
+    // Check only schema metadata first: referencing a missing projection table
+    // or INDEXED BY index in this query would change the readiness refusal.
+    let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE (type='table' AND name IN ('kernel_provider_link_meta','kernel_provider_link_heads','kernel_provider_link_rows')) OR (type='index' AND name IN ('idx_kernel_provider_link_identity','idx_kernel_provider_state_heads','idx_kernel_provider_link_coverage','idx_kernel_event_birth','idx_kernel_read_type','idx_kernel_read_kind'))")
+        .fetch_one(&mut *conn).await?;
+    if objects != 9 {
         return Err(Error::engine("v2 provider-link read projection is not ready; run explicit v2 import/preparation before serving"));
     }
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    super::generic_links::diagnostics::phase("readiness_version");
     let version: Option<i64> =
         sqlx::query_scalar("SELECT version FROM kernel_provider_link_meta WHERE singleton=1")
             .fetch_optional(&mut *conn)
             .await?;
-    let stale: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_provider_state p LEFT JOIN kernel_provider_link_heads h INDEXED BY idx_kernel_provider_link_coverage ON h.aggregate_id=p.id WHERE p.provider_key='relates_to.v1' AND (h.aggregate_id IS NULL OR h.head<>p.head)) OR EXISTS(SELECT 1 FROM kernel_provider_link_heads h WHERE NOT EXISTS(SELECT 1 FROM kernel_provider_state p INDEXED BY idx_kernel_provider_state_heads WHERE p.provider_key='relates_to.v1' AND p.id=h.aggregate_id) OR h.row_count<>(SELECT count(*) FROM kernel_provider_link_rows r WHERE r.aggregate_id=h.aggregate_id)) OR EXISTS(SELECT 1 FROM kernel_provider_link_rows r WHERE NOT EXISTS(SELECT 1 FROM kernel_provider_link_heads h WHERE h.aggregate_id=r.aggregate_id))")
-        .fetch_one(&mut *conn).await?;
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    super::generic_links::diagnostics::phase("readiness_coverage");
+    let stale: bool = sqlx::query_scalar(COVERAGE_SQL)
+        .fetch_one(&mut *conn)
+        .await?;
     if version != Some(VERSION) || stale {
         return Err(Error::engine("v2 provider-link read projection is not ready; run explicit v2 import/preparation before serving"));
     }
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    super::generic_links::diagnostics::phase("readiness_pins");
     let pins: Vec<String> =
         sqlx::query_scalar("SELECT DISTINCT pins_json FROM kernel_provider_link_heads")
             .fetch_all(&mut *conn)

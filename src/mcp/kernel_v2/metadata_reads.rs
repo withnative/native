@@ -1,7 +1,7 @@
-//! Read the sealed imported schema/vocabularies through kernel authorization.
+//! Read the schema/vocabulary catalogue through kernel authorization.
 use super::*;
 use crate::query::cascade;
-const GUARANTEE:&str="Imported schema declarations are read-only discoverability metadata. This response does not certify stored values or grant permission for a future write.";
+pub(crate) const GUARANTEE:&str="Schema declarations describe the current discoverability cascade. This response does not certify stored values or grant permission for a future write.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +47,10 @@ pub(super) async fn facet_values(
     actor: &str,
     id: &str,
 ) -> Result<Vec<(String, String, Option<String>, i64)>> {
+    // One transaction plus admission per member on this path; the envelope
+    // regression tallies these to compare against the page-scoped fetch.
+    #[cfg(test)]
+    read_surface::envelope_diagnostics::note_facet_transaction();
     let mut tx = db.pool().begin().await?;
     kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     kernel::kernel_require(&mut tx, actor, id, crate::authorization::Capability::View).await?;

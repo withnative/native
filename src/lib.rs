@@ -73,8 +73,12 @@ pub mod backup;
 pub mod blob;
 pub mod body_blocks;
 pub(crate) mod body_blocks_projection;
+pub mod body_merge_flag;
+pub(crate) mod client_compatibility;
+pub mod dispatch_stack;
 #[cfg(unix)]
 pub mod node;
+pub mod node_credential;
 pub(crate) mod persona;
 // Request-bound PRIMARY SQLite service; body authority requires a genuine adopted source.
 #[doc(hidden)]
@@ -118,6 +122,9 @@ mod dependency_rule_tests;
 mod dependency_tests;
 #[cfg(test)]
 mod dependency_transition_tests;
+/// Internal speculative-execution fork seam (hosted maintenance outbox; local node next).
+#[doc(hidden)]
+pub mod fork;
 pub mod freshness;
 pub mod generated;
 pub mod holding;
@@ -155,6 +162,7 @@ pub mod migrations;
 pub(crate) mod named_views;
 #[cfg(all(feature = "dev-tools", feature = "v2-kernel-probe"))]
 pub use named_views::export as named_view_export;
+pub(crate) mod async_diagnostics;
 /// Shared local-CLI serving paths for the `mcp-stdio` and `native` binaries.
 pub mod native_cli;
 pub(crate) mod need_metrics;
@@ -188,6 +196,7 @@ pub mod replica_generation;
 #[doc(hidden)]
 pub mod request_work;
 pub(crate) mod write_contention;
+pub(crate) mod write_diagnostics;
 pub(crate) use native_record_type_correction_kernel as record_type_correction;
 #[cfg(test)]
 mod bare_kernel_probe;
@@ -258,9 +267,9 @@ pub use db::{
     SUPPORTED_ENGINE_SCHEMA_BASELINE,
 };
 pub use error::{
-    DeploymentReadOnlyOperation, Error, ReplayApplied, ReplayBound, Result,
-    REPLAY_BOUND_EXCEEDED_CODE, REPLAY_BOUND_EXCEEDED_PARTIAL_RECOVERY,
-    REPLAY_BOUND_EXCEEDED_RECOVERY,
+    DeploymentReadOnlyOperation, Error, NativeFenceReference, OriginalConflict,
+    OriginalConflictKind, ReplayApplied, ReplayBound, Result, REPLAY_BOUND_EXCEEDED_CODE,
+    REPLAY_BOUND_EXCEEDED_PARTIAL_RECOVERY, REPLAY_BOUND_EXCEEDED_RECOVERY,
 };
 pub use instructions::{
     MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES, MAX_BOOTSTRAP_INSTRUCTION_ENTRIES,
@@ -272,3 +281,8 @@ pub mod v1_import;
 
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub mod definition_shape;
+
+#[doc(hidden)]
+pub mod webhook_contract;
+
+pub mod record_id;

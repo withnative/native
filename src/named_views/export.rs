@@ -18,6 +18,10 @@ pub struct Request {
     pub kind: Option<String>,
     pub home: String,
     pub selection: Selection,
+    /// Closed selector: omitted or `facet-1` keeps the default; `facet-global-1`
+    /// is explicit. Never auto-switched.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -43,7 +47,16 @@ pub async fn export_file(path: &Path, request: Request) -> Result<Vec<u8>> {
                 Selection::Keys { keys } => crate::query::generated_facets::Selection::Keys(keys),
                 Selection::All => crate::query::generated_facets::Selection::All,
             };
-            let candidate = facet_resolver::prepare(
+            let profile = match request.profile.as_deref() {
+                None | Some("facet-1") => facet_resolver::Profile::Facet1,
+                Some("facet-global-1") => facet_resolver::Profile::Global1,
+                Some(other) => {
+                    return Err(Error::engine(format!(
+                        "view_profile_unsupported: unknown profile {other}"
+                    )))
+                }
+            };
+            let candidate = facet_resolver::prepare_profile(
                 &db,
                 &request.actor,
                 &workspace,
@@ -54,6 +67,7 @@ pub async fn export_file(path: &Path, request: Request) -> Result<Vec<u8>> {
                     home: request.home,
                     selection,
                 },
+                profile.compiler(),
                 deadline,
             )
             .await?;

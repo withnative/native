@@ -17,8 +17,9 @@ use native_ce::Db;
 use serde_json::{json, Value};
 
 use crate::alpha_tabs::{
-    adopt_fixture_artifact, adopted_with_declaration, adopted_with_declaration_as, call_as,
-    configure_preview_launch, install_with_declaration, v2_declaration, ALICE, ARTIFACT_A, BEA,
+    adopt_fixture_artifact, adopted_package_with_declaration_as, adopted_with_declaration,
+    adopted_with_declaration_as, call_as, configure_preview_launch, install_with_declaration,
+    v2_declaration, ALICE, ARTIFACT_A, BEA,
 };
 
 /// The package I3's `adopted_with_declaration` installs for Alice.
@@ -535,4 +536,238 @@ async fn adopted_v1_store_app_can_query_records_as_its_user() {
         "reads do not create write attributions"
     );
     db.close().await;
+}
+
+// Snapshot effects and immutable command evidence around a rejected retry.
+async fn keyed_context_snapshot(db: &Db) -> Vec<String> {
+    let pool = crate::common::fixture_write_pool(db).await;
+    let mut result = Vec::new();
+    for query in [
+        "SELECT json_group_array(json_array(id,seq,record_id,type,payload,act)) FROM (SELECT * FROM content_events ORDER BY seq)",
+        "SELECT json_group_array(json_array(id,seq,type,payload,act)) FROM (SELECT * FROM relationship_events ORDER BY seq)",
+        "SELECT json_group_array(json_array(id,principal,operation,action_digest,intent_digest,command_identity_digest,output_event_set_digest)) FROM (SELECT * FROM provenance_action_attestations ORDER BY id)",
+        "SELECT json_group_array(json_array(attestation_id,issuer_origin_database_id,principal,operation,command_identity_digest)) FROM (SELECT * FROM provenance_local_attestation_authority ORDER BY attestation_id)",
+        "SELECT json_group_array(json_array(action_attestation_id,package,version,install_event_id,assertion)) FROM (SELECT * FROM provenance_action_app_attributions ORDER BY action_attestation_id)",
+        "SELECT json_group_array(json_array(event_id,parent_event_id)) FROM (SELECT * FROM content_event_causal_frontier ORDER BY event_id,parent_event_id)",
+        "SELECT json_group_array(json_array(next_act)) FROM act_state",
+        "SELECT json_group_array(event_id) FROM (SELECT event_id FROM content_event_heads ORDER BY event_id)",
+        "SELECT json_group_array(json_array(id,name,body,updated_at)) FROM (SELECT * FROM records ORDER BY id)",
+    ] {
+        result.push(sqlx::query_scalar(query).fetch_one(&pool).await.unwrap());
+    }
+    result
+}
+
+async fn assert_keyed_context_isolation(operation: &str) {
+    let (db, registry) = fixture().await;
+    let install = adopted_v2(&registry, &db).await;
+    let other =
+        adopted_package_with_declaration_as(&registry, &db, ALICE, "agent.other", v2_declaration())
+            .await;
+    let contexts = [
+        native_ce::provenance::CommandAppContext::host_app(&app(&install)).unwrap(),
+        native_ce::provenance::CommandAppContext::host_app(
+            &AppAttribution::new("agent.other", "0.1.0", &other).unwrap(),
+        )
+        .unwrap(),
+        native_ce::provenance::CommandAppContext::no_app(),
+    ];
+    let callers = [
+        Caller::authenticated(ALICE).with_host_asserted_app(app(&install)),
+        Caller::authenticated(ALICE)
+            .with_host_asserted_app(AppAttribution::new("agent.other", "0.1.0", other).unwrap()),
+        Caller::authenticated(ALICE),
+    ];
+    for (index, owner) in callers.iter().enumerate() {
+        let id = uuid::Uuid::new_v4().to_string();
+        if operation == "update_record" {
+            call_as(&registry, &db, Caller::authenticated(ALICE), "create_record",
+                json!({"id":id,"type":"Document","kind":"note","name":"append target","body":"original","reason":"fixture"})).await.unwrap();
+        }
+        let args = if operation == "create_record" {
+            json!({"id":id,"type":"Document","kind":"note","name":"keyed context","body":"saved JSON","reason":"context proof","idempotency_key":format!("context-{operation}-{index}"),"response_mode":"summary"})
+        } else {
+            json!({"id":id,"body_append":" acknowledged append","reason":"context proof","idempotency_key":format!("context-{operation}-{index}"),"response_mode":"summary"})
+        };
+        let first = call_as(&registry, &db, owner.clone(), operation, args.clone())
+            .await
+            .unwrap();
+        let origin = native_ce::identity::database_id(&db).await.unwrap();
+        let proof = native_ce::provenance::reconcile_deferred_command_with_context(
+            &db,
+            &origin,
+            ALICE,
+            operation,
+            &args,
+            None,
+            &contexts[index],
+        )
+        .await
+        .unwrap()
+        .expect("matching local commit");
+        assert!(first["action_attestation_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(proof)));
+        let saved = keyed_context_snapshot(&db).await;
+        let matching = call_as(&registry, &db, owner.clone(), operation, args.clone())
+            .await
+            .unwrap();
+        assert_eq!(matching, first, "same exact context retains its receipt");
+        assert_eq!(keyed_context_snapshot(&db).await, saved);
+        for (candidate, caller) in callers.iter().enumerate() {
+            if candidate == index {
+                continue;
+            }
+            let refused = native_ce::provenance::reconcile_deferred_command_with_context(
+                &db,
+                &origin,
+                ALICE,
+                operation,
+                &args,
+                None,
+                &contexts[candidate],
+            )
+            .await
+            .unwrap_err();
+            assert!(refused.is_idempotency_conflict());
+            let result = call_as(&registry, &db, caller.clone(), operation, args.clone()).await;
+            assert!(result.as_ref().is_err_and(|e| e.is_idempotency_conflict()), "wrong app/no-app must refuse before effects, {operation} {index}->{candidate}: {result:?}");
+            assert_eq!(
+                keyed_context_snapshot(&db).await,
+                saved,
+                "no events, acts, frontiers, records or receipt metadata change"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyed_create_refuses_other_app_and_no_app_without_effects() {
+    assert_keyed_context_isolation("create_record").await;
+}
+#[tokio::test]
+async fn keyed_append_refuses_other_app_and_no_app_without_effects() {
+    assert_keyed_context_isolation("update_record").await;
+}
+
+#[tokio::test]
+async fn keyed_app_authorization_precedes_key_disclosure() {
+    use native_ce::authorization::Capability;
+    let (db, registry) = fixture().await;
+    let install = adopted_v2(&registry, &db).await;
+    let home = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"restricted","reason":"Restricted home fixture."}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    crate::alpha_tabs::grant(&db, &home, ALICE, Capability::Edit).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let create = json!({"id":id,"type":"Document","kind":"note","name":"private","body":"private payload","home_id":home,"reason":"fixture","idempotency_key":"private-create"});
+    let app = Caller::authenticated(ALICE).with_host_asserted_app(app(&install));
+    call_as(&registry, &db, app.clone(), "create_record", create.clone())
+        .await
+        .unwrap();
+    // Record-local owners retain Manage independently of policy (authorization.rs).
+    // Use another owner's target so this test revokes an actual removable grant.
+    let append_id = call_as(&registry, &db, Caller::local(), "create_record",
+        json!({"type":"Document","kind":"note","name":"granted append target","body":"private payload","home_id":home,"reason":"Separately owned revocation fixture."})).await.unwrap()["id"].as_str().unwrap().to_owned();
+    crate::alpha_tabs::grant(&db, &append_id, ALICE, Capability::Edit).await;
+    let append = json!({"id":append_id,"body_append":" one","reason":"fixture","idempotency_key":"private-append"});
+    call_as(&registry, &db, app.clone(), "update_record", append.clone())
+        .await
+        .unwrap();
+    crate::alpha_tabs::revoke_all(&db, &home).await;
+    crate::alpha_tabs::revoke_all(&db, &append_id).await;
+    for target in [&home, &append_id] {
+        for account in [ALICE, BEA] {
+            assert!(
+                !native_ce::authorization::effective_capability(
+                    &db,
+                    native_ce::authorization::Principal::bound(account, false),
+                    target
+                )
+                .await
+                .unwrap()
+                .allows(Capability::Edit),
+                "fixture must actually revoke the account's authority before probing its keys"
+            );
+        }
+    }
+    for (operation, args) in [("create_record", create), ("update_record", append)] {
+        for caller in [
+            app.clone(),
+            Caller::authenticated(ALICE),
+            Caller::authenticated(BEA),
+        ] {
+            let saved = keyed_context_snapshot(&db).await;
+            let old = call_as(&registry, &db, caller.clone(), operation, args.clone())
+                .await
+                .unwrap_err()
+                .to_string();
+            let mut fresh = args.clone();
+            fresh["idempotency_key"] = json!("never-used");
+            let new = call_as(&registry, &db, caller, operation, fresh)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                old, new,
+                "unauthorized reused key is indistinguishable from an unknown key"
+            );
+            assert!(!old.contains("private payload"));
+            assert_eq!(keyed_context_snapshot(&db).await, saved);
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyed_attribution_context_refuses_in_its_transaction_before_outputs() {
+    use sha2::{Digest, Sha256};
+    let (db, registry) = fixture().await;
+    let install = adopted_v2(&registry, &db).await;
+    let note = call_as(&registry, &db, Caller::authenticated(ALICE), "create_record", json!({"type":"Document","kind":"note","name":"statement","body":"exact statement","reason":"fixture"})).await.unwrap();
+    let event: String = sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id=? AND type='record.created'",
+    )
+    .bind(note["id"].as_str().unwrap())
+    .fetch_one(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    let args = json!({"idempotency_key":"attributed-assessment","bearer_id":note["id"],"target":{"source_event_id":event,"source_body_sha256":hex::encode(Sha256::digest(b"exact statement")),"scope":"whole_revision","selectors":[]},"subject":{"kind":"self_person"},"relation":"expresses_view","polarity":"affirmed","transformation":"summary","confidence":"likely","rationale":"A considered view."});
+    let caller = Caller::authenticated(ALICE).with_host_asserted_app(app(&install));
+    let first = call_as(
+        &registry,
+        &db,
+        caller.clone(),
+        "create_attribution",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    let before = keyed_context_snapshot(&db).await;
+    assert_eq!(
+        call_as(&registry, &db, caller, "create_attribution", args.clone())
+            .await
+            .unwrap(),
+        first
+    );
+    assert!(call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "create_attribution",
+        args
+    )
+    .await
+    .unwrap_err()
+    .is_idempotency_conflict());
+    assert_eq!(keyed_context_snapshot(&db).await, before);
 }

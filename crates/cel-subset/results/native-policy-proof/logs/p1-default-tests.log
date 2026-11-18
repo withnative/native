@@ -1,4 +1,4 @@
-   Compiling cel-subset v0.14.5 (/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/engine-pr1b-policy-proof/crates/cel-subset)
+   Compiling cel-subset v0.14.5 (/fixtures/checkout/crates/cel-subset)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 9.05s
      Running unittests src/lib.rs (target/debug/deps/cel-d9f182ebdd29b587)
 

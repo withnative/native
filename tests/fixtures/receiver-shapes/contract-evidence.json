@@ -1,0 +1,40 @@
+{
+  "94": {
+    "source_revision": "03b1bbb3f4204591b69e0e80a2d14788bf0535ef",
+    "constructor": "NodeOperationContracts::hosted_kernel_v2",
+    "artifact_sha256": "700c1c235b7877a79666f5889a4c8bfd4b3db92db2f7d644119f9f6dcf5467c0",
+    "contracts": {
+      "update_record": {
+        "public_contract_digest": "4eb0ca37e1d1caa6d8981b65f4f7ed5f26ab6f929c9de0d2304d57635798cc3a",
+        "descriptor_jcs_sha256": "e10eafe3a3be15b62a46a3ed11a543c0df3d81d6c60d7dee149c1ffc67ee2b62"
+      },
+      "manage_links.add": {
+        "public_contract_digest": "fc94ae7c32c84e0a8409fb06b9814ac6f55962835d56b9893f313cfcd758321c",
+        "descriptor_jcs_sha256": "7fba13e92d73559f6371a68b803d43db04e638d44ab22ca5ae2605d25e7b90fd"
+      },
+      "attach_text": {
+        "public_contract_digest": "79ce3a68310b0be1ba073206f5fa5b07625d8b3809a38f7746616c39a4c5d106",
+        "descriptor_jcs_sha256": "44ecc8a1607dfa0c4549790df90fa99d748af34b525b830ff49df98d0314818a"
+      }
+    }
+  },
+  "95": {
+    "source_revision": "79570567dc19b5fd1b91191d302a7a573265073f",
+    "constructor": "NodeOperationContracts::hosted_kernel_v2",
+    "artifact_sha256": "44c4becd3424db48c30a0388e9229a40783ecddada67a180398477954a7a6cab",
+    "contracts": {
+      "update_record": {
+        "public_contract_digest": "c25709f1f76520556c3c74be6bb720d237e841640f8d5c44faec6948ce59e8d2",
+        "descriptor_jcs_sha256": "851ad5b5301d9c51da3783c87955beaf4562d56d1649891d3f3a58e11866e7bf"
+      },
+      "manage_links.add": {
+        "public_contract_digest": "a64f977e9337df198d1e0aee9e725c8101c51412c41d3ecc074162f777153e72",
+        "descriptor_jcs_sha256": "54aec3ddb380c501eeec00c2c4a698c658adae961a6234c10ab8fe8a16304072"
+      },
+      "attach_text": {
+        "public_contract_digest": "cbf744ddff73116508a055c4a37f51e39ea4045f9318d6eb057a69d0f56b4731",
+        "descriptor_jcs_sha256": "58a664a34905abbc0d86606fee7d38f109695804b45319d3d4100fa61854475f"
+      }
+    }
+  }
+}

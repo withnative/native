@@ -247,6 +247,17 @@ impl DeploymentMutationBarrier {
         }))
     }
 
+    /// STOP requires an EXISTING database guard. Pure ownership check: never
+    /// upgrades a fleet lease or opens/acquires a database fence after BEGIN.
+    #[cfg(feature = "mcp-executor-prototype")]
+    pub(crate) fn owns_scoped_persistence(&self, lease: &DeploymentPersistenceLease) -> bool {
+        self.0.databases.is_some()
+            && Arc::ptr_eq(&self.0, &lease._lease._gate)
+            && self
+                .database_id()
+                .is_some_and(|id| lease.database.as_ref().is_some_and(|(held, _)| held == &id))
+    }
+
     /// Reuse authority already admitted by this exact process barrier.
     ///
     /// This is the nested-dispatch seam for an executor operation whose

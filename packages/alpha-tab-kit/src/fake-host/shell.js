@@ -1,3 +1,5 @@
+import { bodyDraftJournal } from "/__kit/body-drafts.mjs";
+import { createAppStateStore, handleAppStateMessage } from "./app-state.mjs";
 // The fake host's parent page: a browser-side mirror of the alpha shell's
 // live-frame holder (experiments/demo-shell/public/views/pending.js,
 // `liveFrame`, `handleRead` and `dispatchRead`). Served as a module by
@@ -59,6 +61,12 @@
 import { declaredReadRefusal } from "/__kit/rules.mjs";
 
 const config = window.__ALPHA_TAB_HOST_CONFIG__;
+const draftAdmission = config.bodyDraft && config.mode !== 'sample' ? await bodyDraftJournal.admit('fake-account').catch(() => ({ account: 'fake-account', generation: [] })) : null;
+const draftStore = draftAdmission ? bodyDraftJournal.connect({ admission: draftAdmission, database: 'fake-db', package: config.descriptor?.package ?? 'app.docs', authorize: async () => true }) : null;
+const appStateStore = config.appState && config.mode !== 'sample' ? createAppStateStore({
+  storage: localStorage, scope: { account: 'fake-account', database: 'fake-database', package: config.title.split(' ')[0] },
+  appName: config.title, bodyDigest: 'fake-body',
+}) : null;
 const limits = config.limits;
 const version = limits.bridge.version;
 const events = [];
@@ -71,6 +79,10 @@ const log = (type, detail = {}) => {
 };
 
 let port = null;
+let draftUsed = false, draftRisk = false;
+window.addEventListener('beforeunload', event => {
+  if (draftUsed && draftRisk) { event.preventDefault(); event.returnValue = ''; }
+});
 // Reads accepted but not yet dispatched, oldest first, and the tool calls
 // dispatched and not yet settled. A queued ticket is `{ id, port, requestId,
 // need, params, settled }`; a dispatched call is a group `{ tickets, port,
@@ -407,6 +419,81 @@ async function handleCall(message, receivingPort) {
 // from 1 and strictly increasing.
 const queryInFlight = new Set();
 const subscriptionsOpen = new Map();
+const subscriptionCap = limits?.bridge?.pending_subscription_cap ?? 32;
+let subscriptionPeak = 0;
+let subscriptionsOpened = 0;
+let subscriptionsUnsubscribed = 0;
+let subscriptionsTerminalClosed = 0;
+const subscriptionRefusals = [];
+let observedSubscriptionRefusalCount = 0;
+let observedSubscriptionLimitRefusals = 0;
+function noteSubscriptionRefusal(refusal) {
+  observedSubscriptionRefusalCount += 1;
+  if (refusal.code === "subscription_limit") observedSubscriptionLimitRefusals += 1;
+  subscriptionRefusals.push(refusal);
+  if (subscriptionRefusals.length > 32) subscriptionRefusals.shift();
+}
+
+function subscriptionQueryKey(query) {
+  try {
+    if (query && typeof query === "object" && !Array.isArray(query) && Array.isArray(query.steps)) {
+      return JSON.stringify(["steps", query.steps, query.order ?? null, query.limit ?? null, query.offset ?? null]);
+    }
+    if (query && typeof query === "object" && !Array.isArray(query) && typeof query.sql === "string") {
+      return JSON.stringify(["sql", query.sql, Array.isArray(query.parameters) ? query.parameters : []]);
+    }
+    return "malformed";
+  } catch {
+    return "malformed";
+  }
+}
+
+function buildSubscriptionDiagnostics() {
+  const byKey = new Map();
+  const active = [];
+  for (const sub of subscriptionsOpen.values()) {
+    active.push({ id: sub.id, key: sub.key, query: sub.query, delivery: sub.delivery });
+    const group = byKey.get(sub.key) ?? { key: sub.key, query: sub.query, subscriptionIds: [] };
+    group.subscriptionIds.push(sub.id);
+    byKey.set(sub.key, group);
+  }
+  const duplicateQueries = [...byKey.values()]
+    .filter((group) => group.subscriptionIds.length > 1)
+    .map((group) => ({
+      key: group.key,
+      query: group.query,
+      count: group.subscriptionIds.length,
+      subscriptionIds: group.subscriptionIds,
+    }));
+  const observedLimitRefusals = observedSubscriptionLimitRefusals;
+  let hint = null;
+  if (observedLimitRefusals > 0 || subscriptionsOpen.size >= subscriptionCap) {
+    hint = `Frame reached the ${subscriptionCap}-subscription cap (counted per subscribe call before host query deduplication). Unmount offscreen readers or pass null/empty id when inactive, share one active reader per record, and keep pickers/menus lazy.`;
+  } else if (duplicateQueries.length > 0) {
+    hint = `Multiple open subscriptions issue identical queries (${duplicateQueries.length} duplicate query group(s)); each mounted hook consumes a per-frame slot before host readHub deduplication.`;
+  }
+  return {
+    budget: subscriptionCap,
+    countingRule: "per_frame_before_dedup",
+    refusalReporting: "host_gate_exact_plus_throttled_bridge_diagnostic_1_per_250ms_max_16",
+    activeCount: subscriptionsOpen.size,
+    peakOpen: subscriptionPeak,
+    opened: subscriptionsOpened,
+    unsubscribed: subscriptionsUnsubscribed,
+    terminalClosed: subscriptionsTerminalClosed,
+    openIds: [...subscriptionsOpen.keys()],
+    active,
+    duplicateQueries,
+    observedLimitRefusals,
+    limitRefusals: observedLimitRefusals,
+    observedRefusalCount: observedSubscriptionRefusalCount,
+    refusalHistoryLimit: 32,
+    refusalHistoryTruncated: observedSubscriptionRefusalCount > 32,
+    observedRefusals: subscriptionRefusals.slice(),
+    refusals: subscriptionRefusals.slice(),
+    hint,
+  };
+}
 
 // `{sql, parameters}`, or a structured query (R4): `query_record`'s own `{steps, order?, limit?, offset?}`.
 const validQuery = (query) => !!query && typeof query === "object" && !Array.isArray(query)
@@ -466,11 +553,13 @@ function postSubscription(subscription, body) {
 function deliverSubscription(subscription, answer, options = {}) {
   if (answer.status === "ok") {
     subscription.delivery = options.delivery ?? subscription.delivery + 1;
-    postSubscription(subscription, { type: "subscription-result", delivery: subscription.delivery, result: answer.result, cached: options.cached === true });
+    postSubscription(subscription, { type: "subscription-result", delivery: subscription.delivery, result: answer.result, cached: options.cached === true, behind: options.behind === true });
     return;
   }
   const terminal = answer.terminal === true || answer.status === "refused";
-  if (postSubscription(subscription, { type: "subscription-error", code: answer.code, message: answer.message, terminal }) && terminal) subscriptionsOpen.delete(subscription.id);
+  if (postSubscription(subscription, { type: "subscription-error", code: answer.code, message: answer.message, terminal }) && terminal) {
+    if (subscriptionsOpen.delete(subscription.id)) subscriptionsTerminalClosed += 1;
+  }
 }
 
 async function handleSubscribe(message, receivingPort) {
@@ -478,17 +567,22 @@ async function handleSubscribe(message, receivingPort) {
   const { subscription_id: id, query } = message;
   log("subscribe", { subscription_id: id, query });
   if (!boundedId(id) || !validQuery(query) || subscriptionsOpen.has(id)) {
+    noteSubscriptionRefusal({ code: "malformed", subscription_id: id ?? null, activeCount: subscriptionsOpen.size, budget: subscriptionCap });
     try { receivingPort.postMessage({ type: "subscription-error", version, subscription_id: id, code: "malformed", message: "subscribe needs a fresh id and either a sql string with a parameters array or a steps array", terminal: true }); } catch { /* closed */ }
     return;
   }
-  const subscription = { id, query, port: receivingPort, delivery: 0 };
+  const subscription = { id, query, key: subscriptionQueryKey(query), port: receivingPort, delivery: 0 };
   subscriptionsOpen.set(id, subscription);
+  subscriptionsOpened += 1;
+  if (subscriptionsOpen.size > subscriptionPeak) subscriptionPeak = subscriptionsOpen.size;
   deliverSubscription(subscription, await askQuery(query));
 }
 
 function handleUnsubscribe(message) {
-  if (subscriptionsOpen.delete(message.subscription_id)) log("unsubscribe", { subscription_id: message.subscription_id });
-  else log("unsubscribe-ignored", { subscription_id: message.subscription_id });
+  if (subscriptionsOpen.delete(message.subscription_id)) {
+    subscriptionsUnsubscribed += 1;
+    log("unsubscribe", { subscription_id: message.subscription_id });
+  } else log("unsubscribe-ignored", { subscription_id: message.subscription_id });
 }
 
 // App contract v2 `session-open` (app.session.v2). Each accepted open gets its
@@ -674,6 +768,40 @@ function onPortMessage(event, receivingPort) {
     case "agents-ask":
       handleAgentsAsk(message, receivingPort);
       break;
+    case "unsaved":
+      if (message.unsaved_version === 'surface.unsaved.v1') draftRisk = message.state !== null;
+      break;
+    case "body-draft":
+      draftUsed = true;
+      if (draftStore) {
+        const receivingPort = port;
+        void draftStore.handle(message).then(answer => {
+          if (port === receivingPort) receivingPort.postMessage({ version, type: 'body-draft-result', request_id: message.request_id, ...answer });
+        });
+      }
+      break;
+    case "app-state":
+      if (appStateStore) {
+        const receivingPort = port;
+        void handleAppStateMessage(appStateStore, message).then(answer => {
+          receivingPort.postMessage({ version, type: 'app-state-result', request_id: message.request_id, ...answer });
+        });
+      }
+      break;
+    case "tab-title": {
+      if (!config.tabTitles || config.mode === "sample") break;
+      const keys = Object.keys(message).sort().join(',');
+      let title = message.title;
+      const valid = keys === ['version','type','request_id','tab_title_version','title'].sort().join(',')
+        && boundedId(message.request_id) && message.tab_title_version === 'app.tab-title.v1'
+        && (title === null || (typeof title === 'string' && title.length > 0 && [...title].length <= 256
+          && !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/u.test(title.replace(/[\u{10000}-\u{10ffff}]/gu, ''))
+          && title === title.replace(/\s+/gu, ' ').trim()))
+        && new TextEncoder().encode(JSON.stringify(message)).length <= 2048;
+      log('tab-title', { title, accepted: valid });
+      if (boundedId(message.request_id)) receivingPort.postMessage({ version, type: 'tab-title-result', request_id: message.request_id, status: 'ok', accepted: valid });
+      break;
+    }
     case "presentation":
       handlePresentation(message, receivingPort);
       break;
@@ -718,6 +846,14 @@ function onPortMessage(event, receivingPort) {
       log(message.type, { input_digest: message.input_digest, reason: message.reason });
       break;
     case "diagnostic":
+      if (message.code === "html_subscribe_refused") {
+        noteSubscriptionRefusal({
+          code: String(message.detail?.reason ?? "refused"),
+          subscription_id: null,
+          activeCount: subscriptionsOpen.size,
+          budget: subscriptionCap,
+        });
+      }
       log("diagnostic", { code: message.code, detail: message.detail });
       break;
     default:
@@ -735,6 +871,13 @@ window.addEventListener("message", (event) => {
     drainCalls("tab_reloaded");
     drainQueries("tab_reloaded");
     dropSubscriptions();
+    subscriptionPeak = 0;
+    subscriptionsOpened = 0;
+    subscriptionsUnsubscribed = 0;
+    subscriptionsTerminalClosed = 0;
+    subscriptionRefusals.length = 0;
+    observedSubscriptionRefusalCount = 0;
+    observedSubscriptionLimitRefusals = 0;
     closeSessionPorts();
     drainAgents();
     if (readInFlight.size > 0) {
@@ -748,6 +891,7 @@ window.addEventListener("message", (event) => {
   }
   const channel = new MessageChannel();
   port = channel.port1;
+  draftUsed = false; draftRisk = false;
   const receivingPort = port;
   port.onmessage = (event) => onPortMessage(event, receivingPort);
   port.onmessageerror = () => {
@@ -759,8 +903,9 @@ window.addEventListener("message", (event) => {
   const init = { type: "native-html-init", version, input: config.init.input };
   if (config.init.input_digest) init.input_digest = config.init.input_digest;
   if (config.init.needs?.length) init.needs = config.init.needs;
-  const features = [...(config.writes ? ["intent-arm-confirm.v1"] : []), ...(config.calls ? ["app.call.v2"] : []), ...(config.sessions ? ["app.session.v2"] : []), ...(config.queries && config.mode !== "sample" ? ["app.subscribe.v2"] : []), ...(config.agents && config.mode !== "sample" ? ["app.agents.v2"] : []), ...(config.presentation && config.mode !== "sample" ? ["app.presentation.v1"] : [])];
+  const features = [...(draftStore ? ["surface.unsaved.v1"] : []),...(config.tabTitles && config.mode !== "sample" ? ["app.tab-title.v1"] : []),...(draftStore ? ["app.body-draft.v1"] : []),...(appStateStore ? ["app.state.v1"] : []), ...(config.writes ? ["intent-arm-confirm.v1"] : []), ...(config.calls ? ["app.call.v2"] : []), ...(config.sessions ? ["app.session.v2"] : []), ...(config.queries && config.mode !== "sample" ? ["app.subscribe.v2"] : []), ...(config.agents && config.mode !== "sample" ? ["app.agents.v2"] : []), ...(config.presentation && config.mode !== "sample" ? ["app.presentation.v1"] : []), ...(config.viewer !== undefined && config.mode !== "sample" ? ["app.viewer.v1"] : [])];
   if (features.length) init.host_features = features;
+  if (config.viewer !== undefined) init.viewer = config.viewer;
   if (config.holdViewState && heldViewState) init.view_state = heldViewState;
   log("init", { mode: config.mode, needs: init.needs ?? [] });
   iframe.contentWindow.postMessage(init, "*", [channel.port2]);
@@ -781,6 +926,12 @@ window.__alphaTabHost = Object.freeze({
     if (failed || !port || typeof record_id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(record_id)) throw Error("Invalid reveal target or closed tab");
     port.postMessage({ type: "reveal", version, record_id });
     log("reveal-sent", { record_id });
+  },
+  // Test-only: push a viewer update on the main port, as the host would when the value changes.
+  pushViewer(viewer) {
+    if (failed || !port) throw Error("Invalid viewer update or closed tab");
+    port.postMessage({ type: "viewer", version, viewer });
+    log("viewer-sent", {});
   },
   async pushInput() {
     const response = await fetch("/__host/snapshot", { method: "POST" });
@@ -805,9 +956,11 @@ window.__alphaTabHost = Object.freeze({
   },
   // Test-only: the open subscription ids, in subscribe order.
   subscriptions: () => [...subscriptionsOpen.keys()],
+  // Test/developer-only: active subscription count, budget, duplicate queries and refusals.
+  subscriptionDiagnostics: () => buildSubscriptionDiagnostics(),
   // Test-only: push a delivery on one open subscription. With no `result` the host re-runs its
   // handler (so a handler that changes its answer pushes the change); `options.delivery` forces
-  // the number (to replay a stale one) and `options.cached` sets the flag.
+  // the number (to replay a stale one) and `options.cached` / `options.behind` set the flags.
   async pushSubscription(id, result, options = {}) {
     const subscription = subscriptionsOpen.get(id);
     if (!subscription) throw Error(`no open subscription ${id}`);
@@ -818,7 +971,7 @@ window.__alphaTabHost = Object.freeze({
     const subscription = subscriptionsOpen.get(id);
     if (!subscription) throw Error(`no open subscription ${id}`);
     postSubscription(subscription, { type: "subscription-error", code, message, terminal });
-    if (terminal) subscriptionsOpen.delete(id);
+    if (terminal && subscriptionsOpen.delete(id)) subscriptionsTerminalClosed += 1;
   },
   // Test-only: push an AskStatus as the shell relay would. It reaches the frame only when the
   // current frame's ask was answered with `status.ask_id`; returns whether it was posted.

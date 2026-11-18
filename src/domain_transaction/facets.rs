@@ -26,7 +26,7 @@ const DEFAULT_OBSERVATION_LIMIT: i64 = 200;
 const MAX_OBSERVATION_LIMIT: i64 = 1_000;
 const MAX_RESOLVED_VALUES: i64 = 10_000;
 const MAX_VOCABULARY_SUGGESTIONS: i64 = 10_000;
-const SHAPE_GUARANTEE: &str = "Supported record-writing tools enforce global declared type, values, and governing vocabulary membership absolutely for every outgoing open-facet value, using the resulting kind and the same write-transaction snapshot; global required is enforced post-batch and comparatively (new missing facets are refused, unchanged legacy gaps remain editable); multi is rejected at schema authoring. Collection-scoped declarations are discoverability metadata: resolve_facets on the bearing record may display them, but filing home never contributes schema to a child's product facet context and writers do not enforce them in V1. These checks are forward-only, are not re-run during replay, do not retroactively certify stored values, and can be bypassed through store::append* or direct trusted-filesystem mutation of the ejectable SQLite file; Db::pool() is physically read-only. This response is not a standing data-invariant certificate. V1 rejects declared type on string-carried spine facets.";
+pub(crate) const SHAPE_GUARANTEE: &str = "Supported record-writing tools enforce global declared type, values, and governing vocabulary membership absolutely for every outgoing open-facet value, using the resulting kind and the same write-transaction snapshot; global required is enforced post-batch and comparatively (new missing facets are refused, unchanged legacy gaps remain editable); multi is rejected at schema authoring. Collection-scoped declarations are discoverability metadata: resolve_facets on the bearing record may display them, but filing home never contributes schema to a child's product facet context and writers do not enforce them in V1. These checks are forward-only, are not re-run during replay, do not retroactively certify stored values, and can be bypassed through store::append* or direct trusted-filesystem mutation of the ejectable SQLite file; Db::pool() is physically read-only. This response is not a standing data-invariant certificate. V1 rejects declared type on string-carried spine facets.";
 
 /// Physical publication seam for one already governed observation event.
 /// The shared fold owns admission and payload meaning; adapters own event
@@ -1473,7 +1473,7 @@ pub(crate) async fn execute_resolve_facets<E: DomainStatementExecutor>(
     }
 }
 
-async fn vocabulary_and_active_values<E: DomainStatementExecutor>(
+pub(crate) async fn vocabulary_and_active_values<E: DomainStatementExecutor>(
     executor: &mut E,
     designator: &str,
 ) -> Result<(Value, Vec<Value>)> {

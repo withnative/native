@@ -18,6 +18,9 @@ struct CachedVerification {
 enum VerificationVerdict {
     DeviceChecked,
     VerifiedAndAdvanced,
+    /// An advanced copy accepted by its at-rest audit record, not by a
+    /// whole-file pass. Never counts where a full verification is required.
+    TrustedAtRest,
     Invalid,
 }
 
@@ -86,6 +89,10 @@ impl GenerationStore {
             self.root.join("current.json"),
             directory.join("snapshot.db-journal"),
             self.rebind_path(id, observed),
+            // A kernel-v2 copy advanced in place changes in its WAL, not in
+            // `snapshot.db`, until a checkpoint. `-shm` is deliberately not
+            // stamped: readers rewrite it constantly and it holds no data.
+            directory.join("snapshot.db-wal"),
         ]
         .iter()
         .enumerate()
@@ -97,6 +104,14 @@ impl GenerationStore {
             }
         })
         .collect::<Result<Vec<_>>>()?;
+        // A missing WAL and an empty one hold the same database: opening a
+        // WAL-mode copy (even read-only) creates a 0-byte `-wal` when none
+        // exists, so stamping the distinction would invalidate every first
+        // observation of a healthy copy. Like `-shm`, an empty WAL holds no
+        // data and is not stamped.
+        if files[5].as_ref().is_some_and(|stamp| stamp.len == 0) {
+            files[5] = None;
+        }
         let pointer = if self
             .read_pointer()
             .ok()
@@ -142,6 +157,19 @@ impl GenerationStore {
         before: Option<StatusStamp>,
         passed: bool,
     ) {
+        self.remember_verification_at(id, observed, before, passed, false);
+    }
+
+    /// [`Self::remember_verification`], recording that a pass was only trusted
+    /// at rest (no whole-file pass ran) when `trusted` is set.
+    pub(super) fn remember_verification_at(
+        &self,
+        id: &str,
+        observed: &ObservedInstalledConsumerIdentity,
+        before: Option<StatusStamp>,
+        passed: bool,
+        trusted: bool,
+    ) {
         let Ok(after) = self.status_stamp(id, observed) else {
             return;
         };
@@ -152,7 +180,7 @@ impl GenerationStore {
         if before != after {
             return;
         }
-        self.cache_verification(id, observed, after, passed);
+        self.cache_verification(id, observed, after, passed, trusted);
     }
 
     pub(super) fn cache_completed_verification(
@@ -173,7 +201,16 @@ impl GenerationStore {
             {
                 return;
             }
-            self.cache_verification(id, observed, stamp, passed);
+            self.cache_verification(id, observed, stamp, passed, false);
+            // Admission just ran this process's own device verification on
+            // the bytes it published. Remember that, so a connected handoff
+            // of this generation can take the cheap route (see
+            // `activate_accepted_fast`). In memory only.
+            if passed {
+                if let Ok(consumer) = serde_jcs::to_vec(observed) {
+                    self.fresh_builds.note(id, consumer);
+                }
+            }
         }
     }
 
@@ -183,6 +220,7 @@ impl GenerationStore {
         observed: &ObservedInstalledConsumerIdentity,
         stamp: StatusStamp,
         passed: bool,
+        trusted: bool,
     ) {
         let Ok(consumer) = serde_jcs::to_vec(observed) else {
             return;
@@ -190,6 +228,8 @@ impl GenerationStore {
         if let Ok(mut entries) = self.verification_status.0.lock() {
             let verdict = if !passed {
                 VerificationVerdict::Invalid
+            } else if trusted {
+                VerificationVerdict::TrustedAtRest
             } else if stamp
                 .head
                 .as_ref()
@@ -232,7 +272,9 @@ impl GenerationStore {
         id: &str,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Option<VerifiedRefreshBase> {
-        if self.cached_verification(id, observed) != Some(true) {
+        // A refresh carries a trusted verdict forward as trusted: the apply
+        // checked the prior state against the last receipt either way.
+        if self.cached_verification_trusting(id, observed) != Some(true) {
             return None;
         }
         let key = (id.into(), serde_jcs::to_vec(observed).ok()?);
@@ -274,7 +316,8 @@ impl GenerationStore {
             || (advanced && !head.advanced_in_place())
             || base.stamp.pointer != after.pointer
             || after.pointer.is_none()
-            || base.stamp.files[1..] != after.files[1..]
+            // The WAL (index 5) legitimately changes with the delta itself.
+            || base.stamp.files[1..5] != after.files[1..5]
             || after.files[3].is_some()
         {
             return;
@@ -300,7 +343,9 @@ impl GenerationStore {
                 (id.into(), consumer),
                 CachedVerification {
                     stamp: after,
-                    verdict: if advanced {
+                    verdict: if advanced && base.verdict == VerificationVerdict::TrustedAtRest {
+                        VerificationVerdict::TrustedAtRest
+                    } else if advanced {
                         VerificationVerdict::VerifiedAndAdvanced
                     } else {
                         base.verdict
@@ -319,6 +364,7 @@ impl GenerationStore {
             serde_jcs::to_vec(observed),
             self.verification_status.0.lock(),
         ) {
+            self.fresh_builds.forget(id, &key);
             entries.remove(&(id.into(), key));
         }
     }
@@ -331,6 +377,30 @@ impl GenerationStore {
         id: &str,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Option<bool> {
+        match self.cached_verdict(id, observed)? {
+            VerificationVerdict::Invalid => Some(false),
+            // Not a whole-file proof: whoever requires one (retention, the
+            // maintenance recheck) sees it as not yet verified.
+            VerificationVerdict::TrustedAtRest => None,
+            _ => Some(true),
+        }
+    }
+
+    /// [`Self::cached_verification`] for a caller content with an at-rest
+    /// trusted pass too (status, a trusting flight, the refresh base).
+    pub(super) fn cached_verification_trusting(
+        &self,
+        id: &str,
+        observed: &ObservedInstalledConsumerIdentity,
+    ) -> Option<bool> {
+        Some(self.cached_verdict(id, observed)? != VerificationVerdict::Invalid)
+    }
+
+    fn cached_verdict(
+        &self,
+        id: &str,
+        observed: &ObservedInstalledConsumerIdentity,
+    ) -> Option<VerificationVerdict> {
         let stamp = self.status_stamp(id, observed).ok()?;
         let consumer = serde_jcs::to_vec(observed).ok()?;
         let key = (id.into(), consumer);
@@ -344,6 +414,6 @@ impl GenerationStore {
             entries.remove(&key);
             return None;
         }
-        Some(entry.verdict != VerificationVerdict::Invalid)
+        Some(entry.verdict)
     }
 }

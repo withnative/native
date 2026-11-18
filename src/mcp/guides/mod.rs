@@ -21,6 +21,7 @@ use super::ToolKind;
 pub enum GuideSource {
     HandwrittenTemplate,
     ProductModel,
+    EngineOrientation,
     FrozenSqliteDdl,
     CompleteToolRegistry,
     SuppliedKitRelease,
@@ -35,7 +36,17 @@ pub struct GuideSpec {
 }
 
 /// The canonical ordered topic table for the shipped guide corpus.
-pub const GUIDE_SPECS: [GuideSpec; 28] = [
+pub const GUIDE_SPECS: [GuideSpec; 37] = [
+    GuideSpec {
+        topic: "bootstrap-reference",
+        markdown: include_str!("bootstrap-reference.md"),
+        source: GuideSource::EngineOrientation,
+    },
+    GuideSpec {
+        topic: "rendered-artifacts",
+        markdown: include_str!("rendered-artifacts.md"),
+        source: GuideSource::HandwrittenTemplate,
+    },
     GuideSpec {
         topic: "app-builder-1.0.0",
         markdown: include_str!("app-builder-1.0.0.md"),
@@ -176,6 +187,41 @@ pub const GUIDE_SPECS: [GuideSpec; 28] = [
         markdown: include_str!("app-kit-core-1.1.0.md"),
         source: GuideSource::SuppliedKitRelease,
     },
+    GuideSpec {
+        topic: "app-kit-core-1.1.1",
+        markdown: include_str!("app-kit-core-1.1.1.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.2.0",
+        markdown: include_str!("app-kit-core-1.2.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.3.0",
+        markdown: include_str!("app-kit-core-1.3.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.4.0",
+        markdown: include_str!("app-kit-core-1.4.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.5.0",
+        markdown: include_str!("app-kit-core-1.5.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.6.0",
+        markdown: include_str!("app-kit-core-1.6.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.7.0",
+        markdown: include_str!("app-kit-core-1.7.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
 ];
 
 #[derive(Deserialize)]
@@ -189,6 +235,10 @@ fn valid_topics() -> Vec<&'static str> {
 }
 
 async fn read_guide(_db: Db, _caller: Caller, arguments: Value) -> Result<Value> {
+    read_guide_value(arguments)
+}
+
+pub(crate) fn read_guide_value(arguments: Value) -> Result<Value> {
     let args: ReadGuideArgs = serde_json::from_value(arguments)
         .map_err(|error| Error::engine(format!("read_guide: invalid arguments: {error}")))?;
     let Some(guide) = GUIDE_SPECS.iter().find(|guide| guide.topic == args.topic) else {
@@ -245,6 +295,8 @@ mod tests {
         assert_eq!(
             valid_topics(),
             vec![
+                "bootstrap-reference",
+                "rendered-artifacts",
                 "app-builder-1.0.0",
                 "about",
                 "entering-a-live-shared-world",
@@ -273,6 +325,13 @@ mod tests {
                 "capabilities",
                 "app-kit-core-1.0.0",
                 "app-kit-core-1.1.0",
+                "app-kit-core-1.1.1",
+                "app-kit-core-1.2.0",
+                "app-kit-core-1.3.0",
+                "app-kit-core-1.4.0",
+                "app-kit-core-1.5.0",
+                "app-kit-core-1.6.0",
+                "app-kit-core-1.7.0",
             ]
         );
         let searching = GUIDE_SPECS
@@ -370,6 +429,13 @@ mod tests {
             "app-builder-1.0.0",
             "app-kit-core-1.0.0",
             "app-kit-core-1.1.0",
+            "app-kit-core-1.1.1",
+            "app-kit-core-1.2.0",
+            "app-kit-core-1.3.0",
+            "app-kit-core-1.4.0",
+            "app-kit-core-1.5.0",
+            "app-kit-core-1.6.0",
+            "app-kit-core-1.7.0",
             "interpretive-claims",
             "sql-schema",
             "capabilities",
@@ -393,7 +459,7 @@ mod tests {
             .find(|guide| guide.topic == "app-builder-1.0.0")
             .unwrap();
         for prerequisite in [
-            "app-kit-core-1.1.0",
+            "app-kit-core-1.7.0",
             "artifacts_read.manage_alpha_tabs.prepare_install",
             "Preview",
             "Adopt",
@@ -514,6 +580,41 @@ mod tests {
                 "app-kit-core-1.1.0",
                 include_str!("../../../crates/artifact-html/kit-releases/1.1.0/manifest.json"),
                 include_str!("../../../crates/artifact-html/kit-releases/1.1.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.1.1",
+                include_str!("../../../crates/artifact-html/kit-releases/1.1.1/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.1.1/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.2.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.2.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.2.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.3.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.3.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.3.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.4.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.4.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.4.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.5.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.5.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.5.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.6.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.6.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.6.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.7.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.7.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.7.0/core.d.ts"),
             ),
         ] {
             let guide = GUIDE_SPECS

@@ -77,6 +77,14 @@ pub async fn insert(
     );
     let actor = actor(db, caller).await?;
     let mut tx = begin_write(db.write_pool()).await?;
+    kernel::mcp_write_receipts::fences::refuse_key_on(
+        &mut tx,
+        &actor,
+        "insert_record_image",
+        &metadata.idempotency_key,
+    )
+    .await
+    .map_err(RecordImageError::from)?;
     kernel::app_installs::admit_dispatched_on(&mut tx, &actor).await?;
     require(&mut tx, &actor, bearer, Capability::Edit).await?;
     let parent = read_record_on(&mut tx, &actor, bearer)
@@ -211,13 +219,19 @@ pub async fn insert(
     )
     .await?;
     kernel::app_installs::finish_app_action_in(db, &mut tx, &actor, pending, &mut acts).await?;
-    sqlx::query("INSERT INTO kernel_mcp_write_receipts VALUES(?,'insert_record_image',?,?,?)")
-        .bind(&actor)
-        .bind(&id)
-        .bind(json!({"record_id":bearer,"request_digest":request}).to_string())
-        .bind(receipt.to_string())
-        .execute(&mut *tx)
-        .await?;
+    kernel::mcp_write_receipts::record_on(
+        db,
+        &mut tx,
+        &mut acts,
+        kernel::mcp_write_receipts::Outcome {
+            principal: &actor,
+            operation: "insert_record_image",
+            key: &id,
+            request: &json!({"record_id":bearer,"request_digest":request}).to_string(),
+            receipt: &receipt.to_string(),
+        },
+    )
+    .await?;
     let mut result = v1::replay_from_receipt(&receipt, &request).ok_or_else(|| {
         RecordImageError::Internal(Error::engine("invalid committed image receipt"))
     })?;

@@ -875,7 +875,9 @@ pub(crate) async fn run_pipeline<E: DomainStatementExecutor>(
         let mut row = record.row.clone();
         row.hydrate_lifecycle(&snapshot.lifecycle_interpreter);
         let mut value = serde_json::to_value(&row)?;
-        value["body"] = json!(selected_body(executor, &id).await?);
+        if !opts.metadata_only {
+            value["body"] = json!(selected_body(executor, &id).await?);
+        }
         value["custody_boundary"] = json!(views_history::custody_boundary(
             &snapshot.rows.records,
             record
@@ -905,6 +907,9 @@ pub(crate) async fn run_pipeline<E: DomainStatementExecutor>(
         "has_more":opts.offset + returned < total,
         "offset":opts.offset,
     });
+    if opts.metadata_only {
+        crate::mcp::tools::querying::project_record_metadata(&mut payload);
+    }
     add_messages(&mut payload, messages, opts.facet_order.as_ref());
     Ok(payload)
 }

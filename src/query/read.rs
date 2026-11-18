@@ -1604,7 +1604,217 @@ pub(crate) async fn resolves_comment(
     Ok(crate::generated::kinds::CoreKind::AnnotationComment.matches(&resolution))
 }
 
+async fn resolves_comment_on(
+    connection: &mut sqlx::SqliteConnection,
+    record_type: &str,
+    kind: Option<&str>,
+) -> Result<bool> {
+    let Some(kind) = kind else { return Ok(false) };
+    let resolution = crate::meta::kind::resolve_on(connection, record_type, kind).await?;
+    Ok(crate::generated::kinds::CoreKind::AnnotationComment.matches(&resolution))
+}
+
+/// Existing member comment integrity fold on one borrowed immutable snapshot.
+pub(crate) async fn valid_member_comment_on(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<bool> {
+    valid_member_comment_with_identity(connection, id, MemberCommentIdentity::Catalogue).await
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) async fn valid_native_member_comment_on(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<bool> {
+    valid_member_comment_with_identity(connection, id, MemberCommentIdentity::NativeWitness).await
+}
+#[derive(Clone, Copy)]
+enum MemberCommentIdentity {
+    Catalogue,
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeWitness,
+}
+impl MemberCommentIdentity {
+    async fn matches(
+        self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+        typ: &str,
+        kind: Option<&str>,
+    ) -> Result<bool> {
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let _ = id;
+        match self {
+            Self::Catalogue => resolves_comment_on(connection, typ, kind).await,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeWitness => native_member_comment_identity_on(connection, id).await,
+        }
+    }
+}
+/// This selected boolean witnesses the source kernel's actual compat-pin and
+/// typed-field identity on the capture transaction. It is not CoreKind data.
+#[cfg(feature = "v2-kernel-probe")]
+pub(super) async fn native_member_comment_identity_on(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<bool> {
+    let witness: Option<bool> = sqlx::query_scalar(
+        "SELECT native_comment FROM main.member_record_metadata WHERE record_id=?",
+    )
+    .bind(id)
+    .fetch_optional(connection)
+    .await?;
+    witness.ok_or_else(crate::Error::copy_unavailable)
+}
+async fn valid_member_comment_with_identity(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+    identity: MemberCommentIdentity,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT type, kind, body, lifecycle, summary, deleted_at
+           FROM records WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(row) = row else { return Ok(false) };
+    if row.try_get::<Option<String>, _>("deleted_at")?.is_some() {
+        return Ok(false);
+    }
+    let record_type: String = row.try_get("type")?;
+    let kind: Option<String> = row.try_get("kind")?;
+    if !identity
+        .matches(connection, id, &record_type, kind.as_deref())
+        .await?
+    {
+        return Ok(false);
+    }
+    let bearers: Vec<String> = sqlx::query_scalar(
+        "SELECT target_id FROM links
+          WHERE source_id = ? AND relationship = 'part_of' ORDER BY target_id",
+    )
+    .bind(id)
+    .fetch_all(&mut *connection)
+    .await?;
+    if bearers.len() != 1 {
+        return Ok(false);
+    }
+    let bearer = sqlx::query("SELECT type, kind, deleted_at FROM records WHERE id = ?")
+        .bind(&bearers[0])
+        .fetch_optional(&mut *connection)
+        .await?;
+    let Some(bearer) = bearer else {
+        return Ok(false);
+    };
+    if bearer.try_get::<Option<String>, _>("deleted_at")?.is_some() {
+        return Ok(false);
+    }
+    let bearer_type: String = bearer.try_get("type")?;
+    let bearer_kind: Option<String> = bearer.try_get("kind")?;
+    let is_reply = identity
+        .matches(
+            connection,
+            &bearers[0],
+            &bearer_type,
+            bearer_kind.as_deref(),
+        )
+        .await?;
+    let own_target = sqlx::query(
+        "SELECT target_record_id, source_slot FROM annotation_targets WHERE annotation_id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let Some(target) = own_target {
+        if is_reply
+            || target.try_get::<String, _>("target_record_id")? != bearers[0].as_str()
+            || target.try_get::<String, _>("source_slot")? != "body"
+        {
+            return Ok(false);
+        }
+    }
+    if is_reply {
+        // A reply may bear only on a valid root, never another reply.
+        let root = sqlx::query(
+            "SELECT root.type, root.kind, root.body, root.lifecycle, root.summary,
+                    root.deleted_at, COUNT(root_part.target_id) AS bearer_count,
+                    MIN(root_part.target_id) AS root_bearer_id
+               FROM records root
+               LEFT JOIN links root_part
+                 ON root_part.source_id = root.id AND root_part.relationship = 'part_of'
+              WHERE root.id = ?
+              GROUP BY root.id",
+        )
+        .bind(&bearers[0])
+        .fetch_optional(&mut *connection)
+        .await?;
+        let Some(root) = root else { return Ok(false) };
+        if root.try_get::<Option<String>, _>("deleted_at")?.is_some()
+            || root.try_get::<i64, _>("bearer_count")? != 1
+            || !valid_comment_fields(
+                false,
+                root.try_get::<Option<String>, _>("body")?.as_deref(),
+                root.try_get::<Option<String>, _>("lifecycle")?.as_deref(),
+                root.try_get::<Option<String>, _>("summary")?.as_deref(),
+            )
+        {
+            return Ok(false);
+        }
+        let root_bearer_id: String = root.try_get("root_bearer_id")?;
+        let root_target = sqlx::query(
+            "SELECT target_record_id, source_slot FROM annotation_targets WHERE annotation_id = ?",
+        )
+        .bind(&bearers[0])
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(target) = root_target {
+            if target.try_get::<String, _>("target_record_id")? != root_bearer_id.as_str()
+                || target.try_get::<String, _>("source_slot")? != "body"
+            {
+                return Ok(false);
+            }
+        }
+        let root_bearer = sqlx::query("SELECT type, kind, deleted_at FROM records WHERE id = ?")
+            .bind(&root_bearer_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+        let Some(root_bearer) = root_bearer else {
+            return Ok(false);
+        };
+        if root_bearer
+            .try_get::<Option<String>, _>("deleted_at")?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let target_type: String = root_bearer.try_get("type")?;
+        let target_kind: Option<String> = root_bearer.try_get("kind")?;
+        if identity
+            .matches(
+                connection,
+                &root_bearer_id,
+                &target_type,
+                target_kind.as_deref(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(valid_comment_fields(
+        is_reply,
+        row.try_get::<Option<String>, _>("body")?.as_deref(),
+        row.try_get::<Option<String>, _>("lifecycle")?.as_deref(),
+        row.try_get::<Option<String>, _>("summary")?.as_deref(),
+    ))
+}
+
 pub(crate) async fn valid_comment_with_lens(lens: &ReadLens<'_>, id: &str) -> Result<bool> {
+    if lens.is_member() {
+        let mut connection = lens.projection().snapshot_pool().acquire().await?;
+        return valid_member_comment_on(&mut connection, id).await;
+    }
     let db = lens.projection().snapshot_pool();
     let row = sqlx::query(
         "SELECT type, kind, body, lifecycle, summary, deleted_at
@@ -2459,11 +2669,161 @@ pub(crate) async fn ordinary_record_read_eligible_live_in(
     valid_comment_live_in(tx, id, &row).await
 }
 
+/// The native profile has actual typed identity witnesses, not legacy catalogue
+/// identity. Its logical type/kind comes from the same reserved-pin mapping as
+/// native online reads; comments use the source-selected native witness and
+/// the existing member integrity fold. Missing metadata/errors never fall back
+/// to the legacy resolver or become eligible rows.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn ordinary_record_read_eligible_native_member_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> Result<bool> {
+    let Some(head) = sqlx::query("SELECT type,kind,deleted_at FROM records WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if head.try_get::<Option<String>, _>("deleted_at")?.is_some() {
+        return Ok(false);
+    }
+    let record_type: String = head.try_get("type")?;
+    let kind: Option<String> = head.try_get("kind")?;
+    if record_type == "Annotation"
+        && kind.as_deref() == Some(crate::mcp::kernel_v2::NATIVE_ATTRIBUTION_KIND)
+    {
+        return Ok(false);
+    }
+    if native_member_comment_identity_on(tx, id).await? {
+        return valid_native_member_comment_on(tx, id).await;
+    }
+    Ok(true)
+}
+
 /// Pool-scoped wrapper for ordinary record admission. The transaction keeps
 /// the governed identity and comment-integrity reads on one SQLite snapshot.
 pub(crate) async fn ordinary_record_read_eligible(db: &Db, id: &str) -> Result<bool> {
     let mut tx = db.write_pool().begin().await?;
     ordinary_record_read_eligible_live_in(&mut tx, id).await
+}
+
+// Private source choice. Only the sealed-session entry below can select
+// NativeMember; canonical callers retain their principal/legacy-local checks.
+#[derive(Clone, Copy)]
+enum RecordReadMode<'a> {
+    Canonical(Option<crate::authorization::Principal<'a>>),
+    #[cfg(feature = "v2-kernel-probe")]
+    NativeMember,
+}
+impl<'a> RecordReadMode<'a> {
+    fn native_member(self) -> bool {
+        match self {
+            Self::Canonical(_) => false,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember => true,
+        }
+    }
+    fn principal(self) -> Option<crate::authorization::Principal<'a>> {
+        match self {
+            Self::Canonical(principal) => principal,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::NativeMember => None,
+        }
+    }
+    // Native's public archive state is a held records column. v1 retains its
+    // engine-reserved facet carrier and binding; do not synthesize facet IDs,
+    // observation timestamps or history for the native adapter.
+    fn archived_sql(self) -> &'static str {
+        if self.native_member() {
+            "r.archived"
+        } else {
+            "EXISTS (SELECT 1 FROM facet_values av WHERE av.record_id = r.id AND av.key = ?)"
+        }
+    }
+    async fn identity_tokens(
+        self,
+        tx: &mut Transaction<'_, Sqlite>,
+        family: crate::generated::kinds::CoreKind,
+    ) -> Result<Vec<String>> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.native_member() {
+            if matches!(
+                family,
+                crate::generated::kinds::CoreKind::AnnotationSuggestion
+                    | crate::generated::kinds::CoreKind::AnnotationCitation
+            ) {
+                // The native Get surface has its own explicit fresh/imported
+                // catalogue rule. Reuse that exact fold, not the query_record
+                // opt-in rule or fabricated legacy KindResolution facts.
+                let vocabularies: Vec<String> = sqlx::query_scalar(
+                    "SELECT json_object('id',id,'name',name) FROM vocabularies ORDER BY rowid",
+                )
+                .fetch_all(&mut **tx)
+                .await?;
+                let values: Vec<String> = sqlx::query_scalar("SELECT json_object('id',id,'vocabulary_id',vocabulary_id,'value',value,'status',status,'alias_of',alias_of) FROM vocabulary_values ORDER BY rowid").fetch_all(&mut **tx).await?;
+                let vocabularies = vocabularies
+                    .iter()
+                    .map(|row| serde_json::from_str(row))
+                    .collect::<std::result::Result<Vec<Value>, _>>()?;
+                let values = values
+                    .iter()
+                    .map(|row| serde_json::from_str(row))
+                    .collect::<std::result::Result<Vec<Value>, _>>()?;
+                let kinds =
+                    crate::mcp::kernel_v2::native_artifact_kind_tokens(&vocabularies, &values);
+                return Ok(kinds[usize::from(
+                    family == crate::generated::kinds::CoreKind::AnnotationCitation,
+                )]
+                .clone());
+            }
+            return Ok(crate::mcp::kernel_v2::NATIVE_QUERY_OPT_IN_FAMILIES
+                .into_iter()
+                .filter(|token| *token == family.token())
+                .map(str::to_owned)
+                .collect());
+        }
+        crate::meta::kind::active_identity_tokens_on(tx, family.record_type(), family.value_id())
+            .await
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn get_records_native_member(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    ids: &[String],
+    opts: EnrichOptions,
+) -> Result<Vec<BatchGetItem>> {
+    opts.validate()?;
+    let tx = session.transaction();
+    let schema_rows = super::cascade::schema_config_rows_on(tx).await?;
+    let interpreter =
+        super::lifecycle::LifecycleInterpreter::load_from_connection(tx, schema_rows.clone())
+            .await?;
+    let mut shared = LiveBatchContext {
+        schema_rows: Some(schema_rows),
+        interpreter: Some(interpreter),
+    };
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+        let mut used_indexed_head = false;
+        let record = get_record_in(
+            tx,
+            id,
+            opts,
+            RecordReadMode::NativeMember,
+            &mut shared,
+            None,
+            &mut used_indexed_head,
+        )
+        .await?;
+        items.push(match record {
+            Some(record) => BatchGetItem::Found(Box::new(record)),
+            None => BatchGetItem::NotFound { id: id.clone() },
+        });
+    }
+    Ok(items)
 }
 
 async fn get_record_live_in(
@@ -2475,7 +2835,33 @@ async fn get_record_live_in(
     indexed_head: Option<&crate::workspace_index::RecordHead>,
     used_indexed_head: &mut bool,
 ) -> Result<Option<EnrichedRecord>> {
-    if let Some(principal) = principal {
+    get_record_in(
+        tx,
+        id,
+        opts,
+        RecordReadMode::Canonical(principal),
+        shared,
+        indexed_head,
+        used_indexed_head,
+    )
+    .await
+}
+
+async fn get_record_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    opts: EnrichOptions,
+    mode: RecordReadMode<'_>,
+    shared: &mut LiveBatchContext,
+    indexed_head: Option<&crate::workspace_index::RecordHead>,
+    used_indexed_head: &mut bool,
+) -> Result<Option<EnrichedRecord>> {
+    let native_member = mode.native_member();
+    let principal = mode.principal();
+    if native_member {
+        // Presence in the admitted closed profile is the member visibility
+        // decision. No canonical principal-less authorization path is used.
+    } else if let Some(principal) = principal {
         let visible = crate::authorization::effective_capability_on(tx, principal, id)
             .await
             .is_ok_and(|capability| capability.allows(crate::authorization::Capability::View));
@@ -2512,26 +2898,43 @@ async fn get_record_live_in(
         };
         (record_from_row(&row)?, Some(row))
     };
-    super::hydrate_communication_origin_on(tx, &mut record).await?;
-    super::hydrate_federation_provenance_on(tx, &mut record).await?;
-    let bears_shape = sqlx::query_scalar(
+    if !native_member {
+        super::hydrate_communication_origin_on(tx, &mut record).await?;
+        super::hydrate_federation_provenance_on(tx, &mut record).await?;
+    }
+    let mut bears_shape = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM schema_config WHERE applies_to_collection_id = ?)",
     )
     .bind(id)
     .fetch_one(&mut **tx)
     .await?;
-    let kind_governance = match record.kind.as_deref() {
+    let kind_governance = match record.kind.as_deref().filter(|_| !native_member) {
         Some(kind) => Some(crate::meta::kind::resolve_on(tx, &record.record_type, kind).await?),
         None => None,
     };
     let is_comment = kind_governance.as_ref().is_some_and(|resolution| {
         crate::generated::kinds::CoreKind::AnnotationComment.matches(resolution)
     });
+    #[cfg(feature = "v2-kernel-probe")]
+    let is_comment = if native_member {
+        native_member_comment_identity_on(tx, id).await?
+    } else {
+        is_comment
+    };
     if is_comment {
         // Core comment kinds are Annotation records. A custom metadata alias
         // reaching the same kind on another type still needs the same
         // integrity rule; fetch the full row on that rare path.
-        let valid = if let Some(row) = row.as_ref() {
+        let valid = if native_member {
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                valid_native_member_comment_on(tx, id).await?
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            {
+                unreachable!("native member mode is feature-gated")
+            }
+        } else if let Some(row) = row.as_ref() {
             valid_comment_live_in(tx, id, row).await?
         } else {
             let sql = format!("SELECT {RECORD_COLUMNS} FROM records WHERE id = ?");
@@ -2545,12 +2948,14 @@ async fn get_record_live_in(
         }
     }
 
-    let facet_rows = sqlx::query(
+    let facet_rows = sqlx::query(if native_member {
+        "SELECT fv.key,fv.value,fv.vocab_ref,NULL AS version FROM facet_values fv WHERE fv.record_id=? ORDER BY fv.key"
+    } else {
         "SELECT fv.key, fv.value, fv.vocab_ref,
                 (SELECT MAX(fo.event_seq) FROM facet_observations fo
                   WHERE fo.record_id = fv.record_id AND fo.key = fv.key) AS version
-           FROM facet_values fv WHERE fv.record_id = ? ORDER BY fv.key",
-    )
+           FROM facet_values fv WHERE fv.record_id = ? ORDER BY fv.key"
+    })
     .bind(id)
     .fetch_all(&mut **tx)
     .await?;
@@ -2641,23 +3046,34 @@ async fn get_record_live_in(
         tx,
         id,
         crate::generated::kinds::CoreKind::AnnotationSuggestion,
-        principal,
+        mode,
     )
     .await?;
     let citation_candidates = artifact_summaries_live_in(
         tx,
         id,
         crate::generated::kinds::CoreKind::AnnotationCitation,
-        principal,
+        mode,
     )
     .await?;
     let comment_candidates =
-        comment_summaries_live_in_with(tx, id, principal, lifecycle_interpreter).await?;
+        comment_summaries_live_in_with(tx, id, mode, lifecycle_interpreter).await?;
     let suggestion_count = suggestion_candidates.len() as i64;
     let citation_count = citation_candidates.len() as i64;
     let comment_count = comment_candidates.len() as i64;
 
-    let not_hidden = super::not_hidden_predicate("r");
+    let not_hidden = if native_member {
+        #[cfg(feature = "v2-kernel-probe")]
+        {
+            crate::mcp::kernel_v2::native_query_hidden_predicate("r", &[])
+        }
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        {
+            unreachable!("native member mode is feature-gated")
+        }
+    } else {
+        super::not_hidden_predicate("r")
+    };
     let child_count_sql = format!(
         "SELECT COUNT(*) FROM records r
           WHERE r.home_id = ? AND r.deleted_at IS NULL AND {not_hidden}"
@@ -2666,16 +3082,18 @@ async fn get_record_live_in(
         .bind(id)
         .fetch_one(&mut **tx)
         .await?;
+    let archived_sql = mode.archived_sql();
     let children_sql = format!(
-        "SELECT r.id, r.type, r.kind, r.name,
-                EXISTS (SELECT 1 FROM facet_values av
-                         WHERE av.record_id = r.id AND av.key = ?) AS archived
+        "SELECT r.id, r.type, r.kind, r.name, {archived_sql} AS archived
            FROM records r
           WHERE r.home_id = ? AND r.deleted_at IS NULL AND {not_hidden}
           ORDER BY r.name, r.id LIMIT ? OFFSET ?"
     );
-    let children = sqlx::query(&children_sql)
-        .bind(ARCHIVED_FACET_KEY)
+    let mut children_query = sqlx::query(&children_sql);
+    if !native_member {
+        children_query = children_query.bind(ARCHIVED_FACET_KEY);
+    }
+    let children = children_query
         .bind(id)
         .bind(opts.children_limit)
         .bind(opts.children_offset)
@@ -2714,10 +3132,10 @@ async fn get_record_live_in(
             .take(opts.comments_limit as usize)
             .collect::<Vec<_>>()
     });
-    if let Some(comments) = comments.as_mut() {
+    if let Some(comments) = comments.as_mut().filter(|_| !native_member) {
         hydrate_comment_targets_live_in(tx, comments).await?;
     }
-    let target = if record.record_type == "Annotation" {
+    let target = if record.record_type == "Annotation" && !native_member {
         let target_owner = if is_comment {
             comment_context_owner_live_in(tx, id).await?
         } else {
@@ -2728,13 +3146,23 @@ async fn get_record_live_in(
         None
     };
     let ancestors = tree::ancestors_on(tx, id).await?;
+    let mut custody_boundary = false;
+    let mut containment_path_visible = true;
+    if native_member {
+        (custody_boundary, bears_shape, archived, containment_path_visible) = sqlx::query_as(
+            "SELECT m.custody_boundary,m.bears_shape,r.archived,m.containment_path_visible FROM main.member_record_metadata m JOIN records r ON r.id=m.record_id WHERE m.record_id=?",
+        )
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    }
 
     *used_indexed_head |= using_indexed_head;
     Ok(Some(EnrichedRecord {
         record,
         archived,
-        custody_boundary: false,
-        containment_path_visible: true,
+        custody_boundary,
+        containment_path_visible,
         bears_shape,
         kind_governance,
         facets,
@@ -2775,21 +3203,19 @@ async fn artifact_summaries_live_in(
     tx: &mut Transaction<'_, Sqlite>,
     bearer_id: &str,
     family: crate::generated::kinds::CoreKind,
-    principal: Option<crate::authorization::Principal<'_>>,
+    mode: RecordReadMode<'_>,
 ) -> Result<Vec<ChildSummary>> {
-    let tokens =
-        crate::meta::kind::active_identity_tokens_on(tx, family.record_type(), family.value_id())
-            .await?;
+    let principal = mode.principal();
+    let tokens = mode.identity_tokens(tx, family).await?;
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
     let placeholders = std::iter::repeat_n("?", tokens.len())
         .collect::<Vec<_>>()
         .join(",");
+    let archived_sql = mode.archived_sql();
     let sql = format!(
-        "SELECT r.id, r.type, r.kind, r.name,
-                EXISTS (SELECT 1 FROM facet_values av
-                         WHERE av.record_id = r.id AND av.key = ?) AS archived
+        "SELECT r.id, r.type, r.kind, r.name, {archived_sql} AS archived
            FROM records r
           WHERE r.deleted_at IS NULL AND r.type = ? AND r.kind IN ({placeholders})
             AND EXISTS (SELECT 1 FROM links bearer
@@ -2798,9 +3224,11 @@ async fn artifact_summaries_live_in(
                            AND bearer.target_id = ?)
           ORDER BY r.created_at, r.id"
     );
-    let mut query = sqlx::query(&sql)
-        .bind(ARCHIVED_FACET_KEY)
-        .bind(family.record_type());
+    let mut query = sqlx::query(&sql);
+    if !mode.native_member() {
+        query = query.bind(ARCHIVED_FACET_KEY);
+    }
+    query = query.bind(family.record_type());
     for token in tokens {
         query = query.bind(token);
     }
@@ -2859,33 +3287,41 @@ pub(crate) async fn valid_comment_live_in(
 async fn comment_summaries_live_in_with(
     tx: &mut Transaction<'_, Sqlite>,
     bearer_id: &str,
-    principal: Option<crate::authorization::Principal<'_>>,
+    mode: RecordReadMode<'_>,
     interpreter: &super::lifecycle::LifecycleInterpreter,
 ) -> Result<Vec<CommentSummary>> {
-    let tokens = crate::meta::kind::active_identity_tokens_on(
-        tx,
-        "Annotation",
-        crate::generated::kinds::CoreKind::AnnotationComment.value_id(),
-    )
-    .await?;
+    let tokens = mode
+        .identity_tokens(tx, crate::generated::kinds::CoreKind::AnnotationComment)
+        .await?;
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
-    comment_summaries_live_in_with_tokens(tx, bearer_id, principal, interpreter, tokens).await
+    comment_summaries_live_in_with_tokens(tx, bearer_id, mode, interpreter, tokens).await
 }
 
 async fn comment_summaries_live_in_with_tokens(
     tx: &mut Transaction<'_, Sqlite>,
     bearer_id: &str,
-    principal: Option<crate::authorization::Principal<'_>>,
+    mode: RecordReadMode<'_>,
     interpreter: &super::lifecycle::LifecycleInterpreter,
     tokens: Vec<String>,
 ) -> Result<Vec<CommentSummary>> {
+    let principal = mode.principal();
+    #[cfg(feature = "v2-kernel-probe")]
+    let native_replies = if mode.native_member() {
+        Some(native_member_comment_identity_on(tx, bearer_id).await?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let native_replies: Option<bool> = None;
     let bearer = sqlx::query("SELECT type, kind FROM records WHERE id = ?")
         .bind(bearer_id)
         .fetch_optional(&mut **tx)
         .await?;
-    let replies = if let Some(bearer) = bearer {
+    let replies = if let Some(replies) = native_replies {
+        replies
+    } else if let Some(bearer) = bearer {
         let record_type: String = bearer.try_get("type")?;
         let kind: Option<String> = bearer.try_get("kind")?;
         crate::comments::is_governed_comment_on(tx, &record_type, kind.as_deref()).await?
@@ -2900,11 +3336,10 @@ async fn comment_summaries_live_in_with_tokens(
     } else {
         "r.created_at DESC, r.id DESC"
     };
+    let archived_sql = mode.archived_sql();
     let sql = format!(
         "SELECT r.id, r.type, r.kind, r.name, r.body, r.home_id, r.lifecycle, r.summary,
-                r.owner_id, r.created_at, r.updated_at,
-                EXISTS (SELECT 1 FROM facet_values av
-                         WHERE av.record_id = r.id AND av.key = ?) AS archived
+                r.owner_id, r.created_at, r.updated_at, {archived_sql} AS archived
            FROM records r
           WHERE r.deleted_at IS NULL AND r.type = 'Annotation'
             AND r.kind IN ({placeholders})
@@ -2914,7 +3349,10 @@ async fn comment_summaries_live_in_with_tokens(
                            AND bearer.target_id = ?)
           ORDER BY {order}"
     );
-    let mut query = sqlx::query(&sql).bind(ARCHIVED_FACET_KEY);
+    let mut query = sqlx::query(&sql);
+    if !mode.native_member() {
+        query = query.bind(ARCHIVED_FACET_KEY);
+    }
     for token in tokens {
         query = query.bind(token);
     }
@@ -2922,7 +3360,19 @@ async fn comment_summaries_live_in_with_tokens(
     let mut summaries = Vec::with_capacity(rows.len());
     for row in rows {
         let id: String = row.try_get("id")?;
-        if !valid_comment_live_in(tx, &id, &row).await? {
+        let valid = if mode.native_member() {
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                valid_native_member_comment_on(tx, &id).await?
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            {
+                unreachable!("native member mode is feature-gated")
+            }
+        } else {
+            valid_comment_live_in(tx, &id, &row).await?
+        };
+        if !valid {
             continue;
         }
         let mut summary = comment_summary_from_row(&row)?;

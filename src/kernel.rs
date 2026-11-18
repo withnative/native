@@ -16,6 +16,10 @@
 //! V1 `record_policies` remains tied to `records(id)` by frozen DDL. The
 //! records-coupled nearest-anchor refresh is not used in this mode.
 
+pub(crate) mod access_fence;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod body_evidence;
+
 use crate::authorization::Capability;
 use crate::db::{apply_schema, begin_write, open_database, Db};
 use crate::error::Error;
@@ -55,17 +59,50 @@ pub(crate) mod facet_time_reads;
 pub(crate) mod historical;
 pub mod hosted_identity;
 pub(crate) mod legacy_history;
+pub(crate) mod mcp_write_receipts;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod original_settlement;
+pub(crate) mod projection_capture;
 pub mod projection_dump;
+pub(crate) mod projection_set;
 pub(crate) mod provider_link_reads;
+pub mod publications;
 pub(crate) mod read_cache;
-/// Hosted MCP's optional durable retry ledger. It is adapter state, not a
-/// replayed projection, but its exact shape is admitted by v2 generations.
+pub(crate) mod saved_tabs;
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub(crate) mod schema_catalogue;
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub(crate) mod schema_configuration;
+pub(crate) mod sql_event_projection;
+pub(crate) mod sql_record_projection;
+pub(crate) mod stored_visibility;
+pub mod webhooks;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod working_undo;
+pub(crate) mod working_undo_schema;
+/// Hosted MCP's durable retry ledger, rebuilt from private canonical outcome
+/// events. Older files may lack it until explicit preparation or a keyed write.
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub(crate) const MCP_WRITE_RECEIPTS_DDL: &str = "CREATE TABLE IF NOT EXISTS kernel_mcp_write_receipts (principal_id TEXT NOT NULL, operation TEXT NOT NULL, operation_key TEXT NOT NULL, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, PRIMARY KEY(principal_id,operation,operation_key))";
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) const MCP_TYPED_WRITE_RECEIPTS_DDL: &str = "CREATE TABLE IF NOT EXISTS kernel_mcp_write_receipts (principal_id TEXT NOT NULL, operation TEXT NOT NULL, operation_key TEXT NOT NULL, request_json TEXT NOT NULL, receipt_json TEXT, outcome_kind TEXT NOT NULL CHECK(outcome_kind IN ('accepted','unapplied_terminal')), terminal_json TEXT, retired_record_id TEXT, PRIMARY KEY(principal_id,operation,operation_key), CHECK((outcome_kind='accepted' AND receipt_json IS NOT NULL AND terminal_json IS NULL AND retired_record_id IS NULL) OR (outcome_kind='unapplied_terminal' AND receipt_json IS NULL AND terminal_json IS NOT NULL)))";
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod policy_mutations;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod policy_read;
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub(crate) mod type_correction;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use legacy_history::visible as legacy_history_visible;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod census_parity_tests;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod demand_root_aliases;
+/// Live demand-scoped home visibility for finite point reads (S1).
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod demand_visibility;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod demand_visibility_tests;
 pub(crate) mod run_ledger;
 pub(crate) mod slots;
 pub mod v1_state;
@@ -77,6 +114,9 @@ mod slots_batch_tests;
 // The evaluator and gate have no non-test caller until the operations land.
 #[cfg(test)]
 mod home_admission_tests;
+/// Message guard depth (task 11ef0d8b): deep non-message chains.
+#[cfg(test)]
+mod message_guard_depth_tests;
 #[allow(dead_code)]
 pub(crate) mod slots_eval;
 #[cfg(test)]
@@ -139,7 +179,9 @@ pub(crate) mod hq;
 #[cfg(feature = "v2-kernel-probe")]
 pub mod imported_content;
 pub(crate) mod record_metadata;
-pub use record_metadata::{ensure_record_metadata, set_record_metadata_as, RecordMetadata};
+pub use record_metadata::{
+    ensure_record_metadata, prepare_record_lookup_indexes, set_record_metadata_as, RecordMetadata,
+};
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 // Default tests need index/projector plumbing; query entry points are exercised
 // by the probe lane. Keep dead-code linting strict when that lane is enabled.
@@ -169,9 +211,14 @@ mod links_v2_tests;
 pub(crate) use links_v2::{
     admit_link_event, check_link4_projection_authority, project_link4_added, refuse_legacy_defn4,
 };
+// Standby generation coordinates (test/probe only) normalize the endpoint
+// accelerators out of the schema hash. Gate the re-export the same way so a
+// production build never carries an unused import.
 pub use links_v2::{
     describe_record_links_as, link4_as, prepare_link4_as, Link4Receipt, Link4Request,
 };
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) use links_v2::{LINK4_SOURCE_INDEX, LINK4_TARGET_INDEX};
 
 /// Discover the closed W1 provider port independently of a package-specific client.
 pub fn provider_port_contract() -> serde_json::Value {
@@ -406,6 +453,7 @@ pub async fn apply_kernel_schema(db: &Db) -> Result<()> {
         facet_time_reads::ensure_schema_on(&mut tx).await?;
     }
     ensure_named_view_index_on(&mut tx).await?;
+    publications::ensure_schema_on(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -422,6 +470,9 @@ fn event_payload<T: serde::de::DeserializeOwned>(event: &EventRow) -> Result<T> 
 /// Admission checks the selected artifact before append; replay does not
 /// consult mutable adoption state.
 fn is_record_replacement(event: &EventRow) -> bool {
+    if event.event_type == type_correction::EVENT {
+        return true;
+    }
     (cfg!(test) && event.event_type == "kernel.record_rebound.v1")
         || event.event_type == "kernel.import_state_delta.v1"
 }
@@ -430,6 +481,7 @@ pub(crate) async fn project_kernel_record_created(
     conn: &mut SqliteConnection,
     event: &EventRow,
 ) -> Result<()> {
+    mcp_write_receipts::fences::refuse_retired_on(conn, &event.record_id, Some(event)).await?;
     let p: KernelRecordPayload = event_payload(event)?;
     // Legacy named identities (for example native:workspace-agent-instructions)
     // are admitted exclusively by the sealed host import event. Ordinary record
@@ -1126,14 +1178,18 @@ async fn create_kernel_record(
 /// uses, so ordering can never silently differ between tests.
 pub async fn replay_all_projections(db: &Db) -> Result<()> {
     messaging::migrate_command_receipts(db).await?;
+    mcp_write_receipts::prepare(db).await?;
     let mut tx = begin_write(db.write_pool()).await?;
     crate::mcp::tools::hcp_v2::kernel::ensure_schema(&mut tx).await?;
     blobs::ensure_schema(&mut tx).await?;
     v1_state::ensure_schema(&mut tx).await?;
     identity_bindings::ensure_schema(&mut tx).await?;
     account_config::ensure_schema(&mut tx).await?;
+    webhooks::prepare_on(&mut tx).await?;
+    saved_tabs::ensure_schema(&mut tx).await?;
     hq::ensure_tombstones(&mut tx).await?;
     app_state::ensure_schema(&mut tx).await?;
+    publications::ensure_schema_on(&mut tx).await?;
     app_installs::ensure_schema(&mut tx).await?;
     canvas_v2::ensure_schema(&mut tx).await?;
     artifact_closures::ensure_schema(&mut tx).await?;
@@ -1141,15 +1197,48 @@ pub async fn replay_all_projections(db: &Db) -> Result<()> {
     provider_link_reads::ensure_schema_on(&mut tx).await?;
     facet_time_reads::ensure_schema_on(&mut tx).await?;
     ensure_named_view_index_on(&mut tx).await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    db.demand_root_aliases.invalidate();
     replay_all_projections_on(&mut tx).await?;
+    tx.commit().await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        db.demand_root_aliases.invalidate();
+        demand_root_aliases::Check::start(db);
+    }
+    // Every projection was rebuilt without appending content events.
+    db.bump_access_generation();
+    Ok(())
+}
+
+/// Install the stored-visibility marking objects on a kernel v2 database, as
+/// a marked primary would carry them. **Qualification support only** (the C6
+/// old-binary checks, plan 5b21bd7): no production path calls this, and
+/// production creation stays off until its enablement step.
+#[doc(hidden)]
+pub async fn install_stored_visibility_marking_for_qualification(db: &Db) -> Result<()> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    stored_visibility::install_on(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// FULL/repair replay on the caller's transaction. Standby deltas use the tail fold below.
 pub(crate) async fn replay_all_projections_on(conn: &mut SqliteConnection) -> Result<()> {
+    mcp_write_receipts::ensure_schema(conn).await?;
+    // Only sealed full rebuild may bypass the terminal row DELETE guard.
+    mcp_write_receipts::fences::suspend_delete_guard_on(conn).await?;
+    // Every projection is wiped and replayed without appending content
+    // events: advance the persisted access epoch in this same transaction.
+    access_fence::bump_epoch_on(conn).await?;
+    // Stored visibility marking (73ad275 §2.3): every input row is about to
+    // be deleted and refolded, so suspend marking and reset it at the end.
+    let marking = stored_visibility::suspend_for_replay_on(conn).await?;
+    sql_event_projection::reset_on(conn, 0).await?;
+    sql_record_projection::reset_on(conn).await?;
     let meta = read_kernel_meta_after(conn, i64::MIN).await?;
     for table in [
+        "kernel_mcp_write_receipts",
         "kernel_canvas_source_events",
         "canvas_batches",
         "canvas_objects",
@@ -1160,6 +1249,8 @@ pub(crate) async fn replay_all_projections_on(conn: &mut SqliteConnection) -> Re
         "kernel_app_installs",
         "kernel_artifact_closures",
         "kernel_app_consent_revocations",
+        "kernel_publication_receipts",
+        "kernel_publications",
         "kernel_app_state",
         "kernel_hcp_resolutions",
         "kernel_hcp_disclosures",
@@ -1169,6 +1260,8 @@ pub(crate) async fn replay_all_projections_on(conn: &mut SqliteConnection) -> Re
         "kernel_slots",
         "kernel_instruction_bindings",
         "kernel_identity_bindings",
+        "kernel_saved_tab_operations",
+        "kernel_saved_tabs",
         "kernel_account_configs",
         "kernel_v1_state",
         "kernel_runs",
@@ -1231,6 +1324,7 @@ pub(crate) async fn replay_all_projections_on(conn: &mut SqliteConnection) -> Re
     ensure_named_view_index_on(conn).await?;
     crate::projector::meta::replay_meta(&mut *conn, &meta).await?;
     let mut checker = crate::named_views::ReplayChecker::default();
+    let mut decoder_shape = None;
     let mut after = i64::MIN;
     loop {
         let page = crate::conformance::rebuild::read_event_page_after_seq(conn, after, 128).await?;
@@ -1238,11 +1332,13 @@ pub(crate) async fn replay_all_projections_on(conn: &mut SqliteConnection) -> Re
             break;
         };
         after = last.local_seq;
-        replay_kernel_content_on(conn, &page, &mut checker).await?;
+        replay_kernel_content_on(conn, &page, &mut checker, &mut decoder_shape).await?;
     }
     // S7a: rebuild the probe search index from the replayed projections.
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     search_v2::rebuild_search_index(&mut *conn).await?;
+    mcp_write_receipts::fences::install_guards_on(conn).await?;
+    stored_visibility::finish_replay_on(conn, marking).await?;
     Ok(())
 }
 
@@ -1252,6 +1348,25 @@ pub(crate) async fn replay_projection_tail_on(
     conn: &mut SqliteConnection,
     content_after: i64,
     meta_after: i64,
+) -> Result<()> {
+    replay_projection_tail_with_shape_on(conn, content_after, meta_after, None).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn replay_projection_tail_on_registered_copy(
+    conn: &mut SqliteConnection,
+    content_after: i64,
+    meta_after: i64,
+    admitted: crate::standby::kernel_v2_delta::ProjectionShape,
+) -> Result<()> {
+    replay_projection_tail_with_shape_on(conn, content_after, meta_after, Some(admitted)).await
+}
+
+async fn replay_projection_tail_with_shape_on(
+    conn: &mut SqliteConnection,
+    content_after: i64,
+    meta_after: i64,
+    mut decoder_shape: Option<crate::standby::kernel_v2_delta::ProjectionShape>,
 ) -> Result<()> {
     let meta = read_kernel_meta_after(conn, meta_after).await?;
     crate::projector::meta::replay_meta(conn, &meta).await?;
@@ -1264,7 +1379,7 @@ pub(crate) async fn replay_projection_tail_on(
     } else {
         crate::named_views::ReplayChecker::default()
     };
-    replay_kernel_content_on(conn, &content, &mut checker).await?;
+    replay_kernel_content_on(conn, &content, &mut checker, &mut decoder_shape).await?;
     // Live folds maintain FTS per affected record; also cover retained-outcome
     // routes and legacy events with the same record's final projected state.
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -1310,6 +1425,7 @@ async fn replay_kernel_content_on(
     conn: &mut SqliteConnection,
     content: &[EventRow],
     checker: &mut crate::named_views::ReplayChecker,
+    decoder_shape: &mut Option<crate::standby::kernel_v2_delta::ProjectionShape>,
 ) -> Result<()> {
     for event in content {
         checker.apply(event)?;
@@ -1340,6 +1456,27 @@ async fn replay_kernel_content_on(
                 | "kernel.message_destination_set.v1"
         ) {
             messaging::replay(&mut *conn, event).await?;
+        } else if event.event_type == "kernel.app_action_recorded.v1"
+            && event
+                .payload
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()?
+                .is_some_and(|value| value.get("caller_write_ordinal").is_some())
+        {
+            if decoder_shape.is_none() {
+                // Full/native replays qualify once, lazily, on this same
+                // pinned connection. A private W tail already carries the
+                // existing fold's checked native-coordinate witness.
+                *decoder_shape =
+                    Some(crate::standby::kernel_v2_delta::ProjectionShape::observe_on(conn).await?);
+            }
+            crate::projector::project_on_registered_copy(
+                conn,
+                event,
+                decoder_shape.as_ref().expect("qualified above"),
+            )
+            .await?;
         } else {
             crate::projector::project(&mut *conn, event).await?;
         }
@@ -1491,6 +1628,8 @@ pub struct KernelTableDump {
         String,
     )>,
 
+    pub saved_tabs: Vec<(String, String, String, String, String, i64, String)>,
+    pub saved_tab_operations: Vec<(String, String, String, String, i64)>,
     pub account_configs: Vec<(String, String, String, Option<String>, bool, bool, i64)>,
     pub v1_state: Vec<(
         String,
@@ -1633,6 +1772,8 @@ pub async fn dump_all_kernel_tables(db: &Db) -> Result<KernelTableDump> {
         import_tombstones:sqlx::query_as("SELECT record_id,deleted_at,event_seq FROM kernel_import_tombstones ORDER BY record_id").fetch_all(pool).await?,
         lifecycle: sqlx::query_as("SELECT record_id,archived FROM kernel_lifecycle ORDER BY record_id").fetch_all(pool).await?,
         comment_anchors: sqlx::query_as("SELECT annotation_id,target_record_id,source_slot,selectors,body_revision,body_revision_source,body_sha256,purpose,created_at,actor,event_seq FROM kernel_comment_anchors ORDER BY annotation_id").fetch_all(pool).await?,
+        saved_tabs: sqlx::query_as("SELECT principal_id,record_id,creation_key,create_digest,definition,event_seq,home_id FROM kernel_saved_tabs ORDER BY principal_id,record_id").fetch_all(pool).await?,
+        saved_tab_operations: sqlx::query_as("SELECT principal_id,operation_id,record_id,request_digest,event_seq FROM kernel_saved_tab_operations ORDER BY principal_id,operation_id").fetch_all(pool).await?,
         account_configs: sqlx::query_as("SELECT principal_id,kind,record_id,source_origin,source_deleted,source_missing,event_seq FROM kernel_account_configs ORDER BY principal_id,kind").fetch_all(pool).await?,
         v1_state: sqlx::query_as("SELECT section,source_id,origin,payload,account_principal,record_id,observed_at,event_seq FROM kernel_v1_state ORDER BY section,source_id").fetch_all(pool).await?,
         runs: sqlx::query_as("SELECT id,owner_principal,run_principal,opened_seq,head,closed FROM kernel_runs ORDER BY id").fetch_all(db.pool()).await?,
@@ -1770,6 +1911,9 @@ pub(crate) async fn project_kernel_policy_rows(
         ));
     }
     let payload = crate::policy::replaced_payload(event)?;
+    // The policy log writes kernel_policies/entries outside content events:
+    // advance the persisted access epoch in the same transaction.
+    access_fence::bump_epoch_on(conn).await?;
     sqlx::query("INSERT OR IGNORE INTO kernel_policies (root_id, created_at) VALUES (?, ?)")
         .bind(&event.record_id)
         .bind(&event.created_at)
@@ -1827,6 +1971,8 @@ pub async fn create_kernel_database(url: &str) -> Result<Db> {
     )
     .await?;
     db.commit_content(tx).await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    demand_root_aliases::Check::start(&db);
     Ok(db)
 }
 
@@ -1870,6 +2016,9 @@ const EXPECTED_V2_RULE_INSTALLATION_STATEMENTS: usize = 2;
 /// and principals; records/links/policies land now so the constructor stays
 /// stable while later increments add their events and folds.
 const V2_KERNEL_TABLES: &[&str] = &[
+    publications::DDL,
+    publications::RECEIPTS,
+    publications::INDEX,
     app_state::DDL,
     artifact_closures::DDL,
     app_installs::SOURCES_DDL,
@@ -1887,6 +2036,14 @@ const V2_KERNEL_TABLES: &[&str] = &[
     identity_bindings::DDL,
     identity_bindings::CANONICAL_INDEX,
     v1_state::DDL,
+    saved_tabs::DDL,
+    saved_tabs::OPS_DDL,
+    saved_tabs::ACTIVE_INDEX,
+    saved_tabs::CREATE_INDEX,
+    saved_tabs::OP_INDEX,
+    webhooks::INDEX,
+    webhooks::KEYS,
+    webhooks::CONFIG_KEY,
     account_config::DDL,
     account_config::BINDING_INDEX,
     v1_state::RUN_INDEX,
@@ -1902,6 +2059,7 @@ const V2_KERNEL_TABLES: &[&str] = &[
     record_metadata::DDL,
     record_metadata::CLOCK_INDEX,
     record_metadata::REHOME_INDEX,
+    record_metadata::LOGICAL_HOME_LOOKUP_INDEX,
     record_metadata::HISTORICAL_HOME_INDEX,
     record_metadata::HISTORICAL_TARGET_INDEX,
     blobs::BYTES_DDL,
@@ -1940,6 +2098,7 @@ const V2_KERNEL_TABLES: &[&str] = &[
     KERNEL_POLICY_ENTRIES_DDL,
     KERNEL_RECORDS_DDL,
     KERNEL_RECORD_FIELDS_DDL,
+    record_metadata::NAME_LOOKUP_INDEX,
     record_metadata::FILING_TYPE_INDEX,
     record_metadata::MESSAGE_TYPE_INDEX,
     KERNEL_LINKS_DDL,
@@ -1951,6 +2110,8 @@ const V2_KERNEL_TABLES: &[&str] = &[
     commit_port::RECEIPT_DDL,
     commit_port::SUBJECT_DDL,
     generic_links::PROVIDER_AGGREGATE_INDEX,
+    links_v2::LINK4_SOURCE_INDEX,
+    links_v2::LINK4_TARGET_INDEX,
     "CREATE INDEX idx_kernel_link4_edges_created_seq ON kernel_link4_edges(created_seq)",
     KERNEL_ADOPTIONS_DDL,
     KERNEL_PACKAGE_SELECTIONS_DDL,
@@ -2090,6 +2251,8 @@ pub async fn prepare_v2_database(db: &Db) -> Result<()> {
     v1_state::ensure_schema(&mut tx).await?;
     identity_bindings::ensure_schema(&mut tx).await?;
     account_config::ensure_schema(&mut tx).await?;
+    webhooks::prepare_on(&mut tx).await?;
+    saved_tabs::ensure_schema(&mut tx).await?;
     app_state::ensure_schema(&mut tx).await?;
     artifact_closures::ensure_schema(&mut tx).await?;
     notifications::prepare_preferences_on(&mut tx).await?;
@@ -2104,7 +2267,11 @@ pub async fn prepare_v2_database(db: &Db) -> Result<()> {
     legacy_history::ensure_schema(&mut tx).await?;
     facet_time_reads::prepare_on(&mut tx).await?;
     ensure_named_view_index_on(&mut tx).await?;
+    publications::prepare_on(&mut tx).await?;
     tx.commit().await?;
+    // Preparation may rebuild projections (publication preparation replays).
+    db.bump_access_generation();
+    mcp_write_receipts::prepare(db).await?;
     ensure_record_metadata(db).await?;
     ensure_search_index(db).await?;
     ensure_link_read_indexes(db).await?;
@@ -2126,6 +2293,46 @@ pub async fn verify_v2_ready(db: &Db) -> Result<()> {
 }
 
 pub(crate) async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Result<()> {
+    verify_v2_readiness_on(connection, true).await
+}
+
+/// Release equality only, never serving or generation admission. The release
+/// observer separately requires the frozen pre-webhook source-v1 inventory,
+/// with all three indexes absent, in this same read transaction. Every other readiness
+/// check remains mandatory. Existing indexes, including partial preparation,
+/// must use the ordinary strict readiness path or refuse the release shape.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn verify_v2_release_before_webhook_preparation_on(
+    connection: &mut SqliteConnection,
+    _qualified: &crate::standby::kernel_v2::QualifiedPreWebhookSourceV1,
+    phase: &mut crate::standby::ReleaseHeadObservationPhase,
+) -> Result<()> {
+    use crate::standby::ReleaseHeadObservationPhase as Phase;
+    use webhooks::PreparationSourceFailure as Failure;
+    if let Err(failure) = webhooks::require_preparation_source_on(connection).await {
+        return Err(match failure {
+            Failure::Shape(error) => {
+                *phase = Phase::V2Schema;
+                error
+            }
+            Failure::KeysUnreadable(error) => {
+                *phase = Phase::V2WebhookKeysUnreadable;
+                error
+            }
+            Failure::KeysConflict => {
+                *phase = Phase::V2WebhookKeysConflict;
+                Error::engine("v2 release pre-preparation has conflicting webhook index keys")
+            }
+        });
+    }
+    *phase = Phase::V2Readiness;
+    verify_v2_readiness_on(connection, false).await
+}
+
+async fn verify_v2_readiness_on(
+    connection: &mut SqliteConnection,
+    require_webhook_indexes: bool,
+) -> Result<()> {
     let required = [
         ("table", "kernel_provider_link_meta"),
         ("table", "kernel_provider_link_heads"),
@@ -2147,8 +2354,19 @@ pub(crate) async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Res
         ("table", "kernel_legacy_subjects"),
         ("table", "kernel_v1_state"),
         ("table", "kernel_identity_bindings"),
+        ("table", "kernel_saved_tabs"),
+        ("table", "kernel_saved_tab_operations"),
+        ("index", "idx_kernel_saved_tab_active"),
+        ("index", "idx_kernel_saved_tab_creation"),
+        ("index", "idx_kernel_saved_tab_operation"),
         ("table", "kernel_account_configs"),
         ("index", "idx_kernel_account_config_binding"),
+        ("index", "idx_kernel_webhook_events"),
+        ("index", "idx_kernel_webhook_accepted_key"),
+        ("index", "idx_kernel_webhook_configuration"),
+        ("table", "kernel_publications"),
+        ("table", "kernel_publication_receipts"),
+        ("index", "idx_kernel_publications_record"),
         ("table", "kernel_app_state"),
         ("table", "canvas_objects"),
         ("table", "canvas_batches"),
@@ -2184,6 +2402,8 @@ pub(crate) async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Res
         ("index", "idx_kernel_hosted_event_lookup"),
         ("index", "idx_kernel_record_event_clock"),
         ("index", "idx_kernel_record_moves"),
+        ("index", "idx_kernel_record_names"),
+        ("index", "idx_kernel_record_logical_homes"),
         ("index", "idx_kernel_record_filing_types"),
         ("index", "idx_kernel_record_message_types"),
         ("index", "idx_kernel_v1_state_record"),
@@ -2191,6 +2411,14 @@ pub(crate) async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Res
         ("index", "idx_kernel_historical_target"),
     ];
     for (kind, name) in required {
+        if !require_webhook_indexes
+            && kind == "index"
+            && webhooks::PREPARATION_INDEXES
+                .iter()
+                .any(|(index, _)| *index == name)
+        {
+            continue;
+        }
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=? AND name=?)",
         )
@@ -2202,6 +2430,7 @@ pub(crate) async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Res
             return Err(Error::engine(format!("v2 database is not ready: missing {name}; run explicit v2 import/preparation before serving")));
         }
     }
+    record_metadata::require_lookup_indexes_on(connection).await?;
     let gap_free: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_table_info('kernel_legacy_sql_progress') WHERE name='gap_free')")
         .fetch_one(&mut *connection).await?;
     if !gap_free {
@@ -2219,6 +2448,10 @@ pub(crate) async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Res
     .await?;
     if pending {
         return Err(Error::engine("v2 database is not ready: legacy provenance headers need backfill; run explicit v2 import/preparation before serving"));
+    }
+    publications::require_ready_on(connection).await?;
+    if require_webhook_indexes {
+        webhooks::require_ready_on(connection).await?;
     }
     legacy_history::require_sql_frontier_on(connection).await?;
     provider_link_reads::require_ready_on(connection).await?;
@@ -2261,7 +2494,8 @@ pub async fn verify_marked_v2_file_read_only(path: &std::path::Path) -> Result<(
 }
 
 /// Open an existing v2 file. Legacy unmarked files are stamped after readiness
-/// verification; no open-time schema creation or projection rebuild is allowed.
+/// verification; canonical projections are never rebuilt during serving open.
+/// Opening alone never creates or maintains the disposable SQL event cache.
 pub async fn open_v2_database(path: &str) -> Result<Db> {
     open_v2_database_inner(path, true).await
 }
@@ -2341,6 +2575,8 @@ async fn open_v2_database_inner(path: &str, allow_legacy: bool) -> Result<Db> {
         db.close().await;
         return Err(error);
     }
+    #[cfg(feature = "v2-kernel-probe")]
+    demand_root_aliases::Check::start(&db);
     Ok(db)
 }
 
@@ -2417,8 +2653,19 @@ pub async fn create_v2_database(
         payload: serde_json::json!({"kind":"agent","display_label":"V1 host importer","auth_binding":HOST_IMPORT_BINDING}),
         actor: Some(KERNEL_GENESIS_ACTOR.into()),
     }, &mut acts).await?;
+    // Slice 2a: seeded owner/member/guest bundle definitions, written by the
+    // host importer as ordinary kernel events. Event-sourced reads need no
+    // schema change, so generation coordinates are unaffected.
+    let host_import_id: String =
+        sqlx::query_scalar("SELECT principal_id FROM kernel_principals WHERE auth_binding=?")
+            .bind(HOST_IMPORT_BINDING)
+            .fetch_one(&mut *tx)
+            .await?;
+    hosted_identity::bundles::seed_bundles_in(&db, &mut tx, &host_import_id, &mut acts).await?;
     tx.commit().await?;
     prepare_v2_database(&db).await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    demand_root_aliases::Check::start(&db);
     Ok((db, admin_id))
 }
 
@@ -2487,7 +2734,10 @@ pub async fn resolve_principal_by_binding(
         "SELECT principal_id, kind, display_label FROM kernel_principals WHERE auth_binding = ?",
     )
     .bind(auth_binding)
-    .fetch_optional(db.write_pool())
+    // Committed state only (no caller transaction is visible through `&Db`
+    // either way), so the read pool serves it without taking a writer slot.
+    // Every authenticated v2 call resolves its principal here, at least twice.
+    .fetch_optional(db.pool())
     .await?;
     Ok(row)
 }
@@ -2534,7 +2784,7 @@ struct KernelHomeCreatedPayload {
     parent_id: String,
     /// Owner principal: the creator for an ordinary home, or the existing
     /// folder owner for a child-home binding. Never an auth binding.
-    owner_id: String,
+    owner_id: Option<String>,
     /// `Some` (possibly empty) installs an own policy anchor on the home;
     /// `None` leaves the home anchorless so it inherits its nearest ancestor.
     entries: Option<Vec<KernelHomeEntryPayload>>,
@@ -2561,16 +2811,32 @@ pub(crate) async fn project_kernel_home_created(
     if !parent_exists {
         return Err(Error::engine("invalid kernel home parent"));
     }
-    if p.owner_id.trim().is_empty() {
-        return Err(Error::engine("invalid kernel home owner"));
-    }
-    let owner_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_principals WHERE principal_id = ?)")
-            .bind(&p.owner_id)
-            .fetch_one(&mut *conn)
-            .await?;
-    if !owner_exists {
-        return Err(Error::engine("invalid kernel home owner"));
+    if let Some(owner) = &p.owner_id {
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kernel_principals WHERE principal_id=?)",
+        )
+        .bind(owner)
+        .fetch_one(&mut *conn)
+        .await?;
+        if owner.trim().is_empty() || !valid {
+            return Err(Error::engine("invalid kernel home owner"));
+        }
+    } else {
+        // An ownerless record must not acquire a new owner floor merely by
+        // receiving a policy boundary. Ordinary unbound homes still require
+        // their existing creator/owner identity.
+        let Some(source) = &p.source_record_id else {
+            return Err(Error::engine("invalid ownerless kernel home"));
+        };
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id=? AND owner_id IS NULL)",
+        )
+        .bind(source)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !valid {
+            return Err(Error::engine("invalid ownerless kernel home binding"));
+        }
     }
     if let Some(entries) = &p.entries {
         for entry in entries {
@@ -2623,35 +2889,93 @@ pub(crate) async fn admit_home_event(conn: &mut SqliteConnection, event: &EventR
     #[cfg(feature = "v2-kernel-probe")]
     named_views::admit(conn, event).await?;
     account_config::admit(conn, event).await?;
+    schema_catalogue::admit(conn, event).await?;
+    schema_configuration::admit(conn, event).await?;
+    webhooks::admit(conn, event).await?;
+    saved_tabs::admit(conn, event).await?;
     blobs::admit(conn, event).await?;
     generic_links::admit(conn, event).await?;
     identity_bindings::admit(conn, event).await?;
     comments_v2::admit(conn, event).await?;
+    type_correction::admit(conn, event).await?;
     match event.event_type.as_str() {
+        KERNEL_POLICY_REPLACED_EVENT => {
+            let p: KernelPolicyReplacedPayload = event_payload(event)?;
+            if let Some(metadata) = p.record_policy {
+                #[cfg(feature = "v2-kernel-probe")]
+                let admitted = policy_mutations::admitted(
+                    event.actor.as_deref().unwrap_or_default(),
+                    &metadata.target,
+                );
+                #[cfg(not(feature = "v2-kernel-probe"))]
+                let admitted = false;
+                if !admitted {
+                    kernel_require(
+                        conn,
+                        event.actor.as_deref().unwrap_or_default(),
+                        &metadata.target,
+                        Capability::Manage,
+                    )
+                    .await?;
+                }
+                if metadata.target != KERNEL_ROOT_ID {
+                    let home: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)",
+                    )
+                    .bind(&metadata.target)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    if !home
+                        && (is_message_record(conn, &metadata.target).await?
+                            || comments_v2::derived_terminal_on(conn, &metadata.target)
+                                .await?
+                                .as_deref()
+                                != Some(metadata.target.as_str()))
+                    {
+                        return Err(Error::engine(
+                            "policy mutations require an ordinary terminal bearer",
+                        ));
+                    }
+                }
+                // Workspace owner recovery is admitted by the verified
+                // product Caller, not by an event-payload role assertion.
+                // Unflagged low-level home replacement keeps its old guard.
+            }
+            Ok(())
+        }
         KERNEL_HOME_CREATED_EVENT => {
             let p: KernelHomeCreatedPayload = event_payload(event)?;
             if let Some(folder) = &p.source_record_id {
-                let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records r JOIN kernel_record_fields t ON t.record_id=r.id AND t.name='v1_type' AND t.value_json='\"Collection\"' JOIN kernel_record_fields k ON k.record_id=r.id AND k.name='v1_kind' AND k.value_json='\"folder\"' WHERE r.id=? AND r.home_id=? AND r.owner_id=? AND NOT EXISTS(SELECT 1 FROM kernel_lifecycle life WHERE life.record_id=r.id AND life.archived=1) AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id))")
+                let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records r JOIN kernel_record_fields t ON t.record_id=r.id AND t.name='v1_type' AND t.value_json='\"Collection\"' JOIN kernel_record_fields k ON k.record_id=r.id AND k.name='v1_kind' AND k.value_json='\"folder\"' WHERE r.id=? AND r.home_id=? AND r.owner_id IS ? AND NOT EXISTS(SELECT 1 FROM kernel_lifecycle life WHERE life.record_id=r.id AND life.archived=1) AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id))")
                     .bind(folder).bind(&p.parent_id).bind(&p.owner_id).fetch_one(&mut *conn).await?;
                 // Ordinary account-only creation uses the same record/home
                 // binding as imported self-policy records. It can only install
                 // the existing record owner's sole Manage grant, never confer
                 // authority on another principal or detach derived authority.
+                let ordinary: bool = sqlx::query_scalar(&format!(
+                    "SELECT EXISTS(SELECT 1 FROM kernel_records r WHERE r.id=? AND r.home_id=? AND r.owner_id IS ? AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id) AND NOT ({}))",
+                    sql_is_derived_artifact("r")
+                )).bind(folder).bind(&p.parent_id).bind(&p.owner_id).fetch_one(&mut *conn).await?;
                 let private = if let Some(entries) = &p.entries {
-                    let ordinary: bool = sqlx::query_scalar(&format!(
-                        "SELECT EXISTS(SELECT 1 FROM kernel_records r WHERE r.id=? AND r.home_id=? AND r.owner_id=? AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id) AND NOT ({}))",
-                        sql_is_derived_artifact("r")
-                    )).bind(folder).bind(&p.parent_id).bind(&p.owner_id).fetch_one(&mut *conn).await?;
                     ordinary
-                        && event.actor.as_deref() == Some(p.owner_id.as_str())
+                        && event.actor.as_deref() == p.owner_id.as_deref()
                         && entries.len() == 1
-                        && entries[0].subject_id == p.owner_id
+                        && p.owner_id.as_deref() == Some(entries[0].subject_id.as_str())
                         && entries[0].capability == "manage"
                 } else {
                     false
                 };
+                let policy_boundary = ordinary
+                    && p.entries.is_none()
+                    && kernel_effective_capability_on(
+                        conn,
+                        event.actor.as_deref().unwrap_or_default(),
+                        folder,
+                    )
+                    .await?
+                    .allows(Capability::Manage);
                 if event.record_id != v1_import_home_id(folder)
-                    || !(private || (valid && p.entries.is_none()))
+                    || !(private || policy_boundary || (valid && p.entries.is_none()))
                 {
                     return Err(Error::engine("invalid record home binding"));
                 }
@@ -2673,7 +2997,7 @@ pub(crate) async fn admit_home_event(conn: &mut SqliteConnection, event: &EventR
                     },
                 )
                 .await?;
-            } else if event.actor.as_deref() != Some(p.owner_id.as_str()) {
+            } else if p.owner_id.is_none() || event.actor.as_deref() != p.owner_id.as_deref() {
                 return Err(Error::engine(
                     "a home can be created for another owner only through the sealed home_created_for route",
                 ));
@@ -2730,15 +3054,192 @@ const MAX_HOME_DEPTH: usize = 100;
 /// indistinguishable, and no id or title of the target leaks.
 pub(crate) const HIDDEN_OR_MISSING: &str = "kernel target missing or hidden";
 
+/// A scoped app reaching directly for a record its person can see but did
+/// not share with the app. Unlike hidden targets this is safe to name: the
+/// app already knows its own grant, and the person set it.
+pub(crate) const OUTSIDE_APP_SCOPE: &str = "not shared with this app [outside_app_scope]";
+
+/// Whether `target_id` (a record or a home) sits inside a folder grant,
+/// judged by logical folder: the walk is target, its logical folder
+/// (`v1_state::lifecycle_bearer_on`, which rebuilds a private record's
+/// folder from rehome events), that folder's logical folder, and so on.
+/// A home target enters through its own bearer, so a folder's child home
+/// counts as the folder. Derived records judge by their terminal bearer,
+/// matching capability. Fail-closed: unknown nodes end the walk.
+#[inline(never)]
+pub(crate) fn app_scope_allows_target_on<'a>(
+    conn: &'a mut SqliteConnection,
+    target_id: &'a str,
+    scope: &'a app_installs::AppScope,
+) -> futures::future::BoxFuture<'a, Result<bool>> {
+    Box::pin(app_scope_allows_target_inner(conn, target_id, scope))
+}
+
+async fn app_scope_allows_target_inner(
+    conn: &mut SqliteConnection,
+    target_id: &str,
+    scope: &app_installs::AppScope,
+) -> Result<bool> {
+    let Some(folders) = scope.folders() else {
+        return Ok(true);
+    };
+    // Messages follow audience rules, not folders: a scoped app never
+    // reaches one, nor anything deriving authority from one (the
+    // derived-terminal resolution below lands on the Message itself).
+    if messaging::is_message_record(conn, target_id).await? {
+        return Ok(false);
+    }
+    let is_home: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
+            .bind(target_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let mut node = if is_home {
+        v1_state::lifecycle_bearer_on(conn, target_id, None).await?
+    } else if comments_v2::is_derived_on(conn, target_id).await? {
+        let Some(terminal) = comments_v2::derived_terminal_on(conn, target_id).await? else {
+            return Ok(false);
+        };
+        if messaging::is_message_record(conn, &terminal).await? {
+            return Ok(false);
+        }
+        terminal
+    } else {
+        target_id.to_owned()
+    };
+    for _ in 0..=MAX_HOME_DEPTH {
+        if folders.iter().any(|folder| folder == &node) {
+            return Ok(true);
+        }
+        let record_home: Option<String> =
+            sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id = ?")
+                .bind(&node)
+                .fetch_optional(&mut *conn)
+                .await?;
+        let next = if let Some(home) = record_home {
+            v1_state::lifecycle_bearer_on(conn, &home, Some(&node)).await?
+        } else {
+            let parent: Option<String> =
+                sqlx::query_scalar("SELECT parent_id FROM kernel_roots WHERE root_id = ?")
+                    .bind(&node)
+                    .fetch_optional(&mut *conn)
+                    .await?
+                    .flatten();
+            match parent {
+                Some(parent) => v1_state::lifecycle_bearer_on(conn, &parent, None).await?,
+                None => return Ok(false),
+            }
+        };
+        if next == node {
+            return Ok(false);
+        }
+        node = next;
+    }
+    Ok(false)
+}
+
+/// The logical homes a folder-scoped dispatch may name by id even though
+/// their own records sit outside the grant: exactly the granted folders the
+/// person can currently View, judged person-level (the app scope never
+/// narrows its own grant's identity). Only the id is authorised: callers
+/// must not admit the folder's row or values, which stay outside the grant
+/// when the folder's own home is. Empty for person and unscoped dispatches,
+/// so their logical-home masking is unchanged.
+///
+/// Only the probe-gated kernel_v2 SQL surface calls this; the default
+/// build has no folder-scoped app masking to compute.
+#[cfg(feature = "v2-kernel-probe")]
+#[inline(never)]
+pub(crate) fn app_scope_authorized_homes_on<'a>(
+    conn: &'a mut SqliteConnection,
+    principal_id: &'a str,
+) -> futures::future::BoxFuture<'a, Result<Vec<String>>> {
+    Box::pin(async move {
+        let Some(scope) = app_installs::scope::active_scope_on(conn, principal_id).await? else {
+            return Ok(Vec::new());
+        };
+        let Some(folders) = scope.folders() else {
+            return Ok(Vec::new());
+        };
+        let mut authorized = Vec::with_capacity(folders.len());
+        for folder in folders {
+            match kernel_effective_capability_uncached_on(conn, principal_id, folder).await {
+                Ok(capability) if capability.allows(Capability::View) => {
+                    authorized.push(folder.clone());
+                }
+                Ok(_) => {}
+                // A grant naming a folder the person can no longer see
+                // authorises nothing; it is not an error for the read.
+                Err(Error::Engine(message)) if message == HIDDEN_OR_MISSING => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(authorized)
+    })
+}
+
+/// The typed direct-reach refusal for a scoped app, when the person-level
+/// capability would have allowed the access the scope denied.
+#[inline(never)]
+pub(crate) fn app_scope_direct_refusal_on<'a>(
+    conn: &'a mut SqliteConnection,
+    principal_id: &'a str,
+    target_id: &'a str,
+    required: Capability,
+) -> futures::future::BoxFuture<'a, Result<Option<Error>>> {
+    Box::pin(app_scope_direct_refusal_inner(
+        conn,
+        principal_id,
+        target_id,
+        required,
+    ))
+}
+
+async fn app_scope_direct_refusal_inner(
+    conn: &mut SqliteConnection,
+    principal_id: &str,
+    target_id: &str,
+    required: Capability,
+) -> Result<Option<Error>> {
+    let Some(scope) = app_installs::scope::active_scope_on(conn, principal_id).await? else {
+        return Ok(None);
+    };
+    if !scope.is_scoped() || app_scope_allows_target_on(conn, target_id, &scope).await? {
+        return Ok(None);
+    }
+    // A missing target produces the uniform hidden refusal upstream, not
+    // a scope verdict: only a person-visible target can be out of scope.
+    let base = match kernel_effective_capability_uncached_on(conn, principal_id, target_id).await {
+        Ok(capability) => capability,
+        Err(Error::Engine(message)) if message == HIDDEN_OR_MISSING => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(base
+        .allows(required)
+        .then(|| Error::engine(OUTSIDE_APP_SCOPE)))
+}
+
 pub(crate) async fn kernel_effective_capability_on(
     conn: &mut SqliteConnection,
     principal_id: &str,
     target_id: &str,
 ) -> Result<Capability> {
     type Capabilities = std::sync::Mutex<std::collections::HashMap<String, Capability>>;
+    // Synchronous scope state: person dispatches (and, after a request's
+    // first resolution, unscoped apps) take exactly the pre-scope path.
+    let narrow = matches!(
+        app_installs::scope::active_scope_cached(principal_id),
+        app_installs::scope::ActiveScope::Unresolved(_)
+            | app_installs::scope::ActiveScope::Known(app_installs::AppScope::Folders(_))
+    );
     let key = read_cache::capability_key_on(conn, principal_id).await?;
     if key.is_none() {
-        return kernel_effective_capability_uncached_on(conn, principal_id, target_id).await;
+        let capability =
+            kernel_effective_capability_uncached_on(conn, principal_id, target_id).await?;
+        if !narrow {
+            return Ok(capability);
+        }
+        return app_scope_narrow_on(conn, principal_id, target_id, capability).await;
     }
     let values = read_cache::get::<Capabilities>(&key).unwrap_or_default();
     let cached = values
@@ -2749,13 +3250,70 @@ pub(crate) async fn kernel_effective_capability_on(
     if let Some(capability) = cached {
         return Ok(capability);
     }
+    // The cache key carries the app-scope fingerprint, so the narrowed
+    // value stored here is only ever read back under the same scope.
     let capability = kernel_effective_capability_uncached_on(conn, principal_id, target_id).await?;
+    let capability = if narrow {
+        app_scope_narrow_on(conn, principal_id, target_id, capability).await?
+    } else {
+        capability
+    };
     values
         .lock()
         .expect("capability cache poisoned")
         .insert(target_id.to_owned(), capability);
     read_cache::put(key, values);
     Ok(capability)
+}
+
+/// A scoped app gets no capability outside its folder grant. Person
+/// dispatches and unscoped apps pass through untouched.
+#[inline(never)]
+fn app_scope_narrow_on<'a>(
+    conn: &'a mut SqliteConnection,
+    principal_id: &'a str,
+    target_id: &'a str,
+    capability: Capability,
+) -> futures::future::BoxFuture<'a, Result<Capability>> {
+    Box::pin(app_scope_narrow_inner(
+        conn,
+        principal_id,
+        target_id,
+        capability,
+    ))
+}
+
+async fn app_scope_narrow_inner(
+    conn: &mut SqliteConnection,
+    principal_id: &str,
+    target_id: &str,
+    capability: Capability,
+) -> Result<Capability> {
+    if capability == Capability::None {
+        return Ok(capability);
+    }
+    // Synchronous fast path: person dispatches, unscoped apps, and every
+    // check after this request's first resolution never await here.
+    let scope = match app_installs::scope::active_scope_cached(principal_id) {
+        app_installs::scope::ActiveScope::None => return Ok(capability),
+        app_installs::scope::ActiveScope::Known(scope) => scope,
+        app_installs::scope::ActiveScope::Unresolved(_) => {
+            match app_installs::scope::active_scope_on(conn, principal_id).await? {
+                Some(scope) => scope,
+                None => return Ok(capability),
+            }
+        }
+    };
+    if !scope.is_scoped() {
+        return Ok(capability);
+    }
+    Ok(
+        if app_scope_allows_target_on(conn, target_id, &scope).await? {
+            capability
+        } else {
+            Capability::None
+        },
+    )
 }
 
 async fn kernel_effective_capability_uncached_on(
@@ -2885,7 +3443,7 @@ pub(crate) async fn kernel_policy_anchor_on(
     Ok(anchor)
 }
 
-type ReadPolicyCapabilities =
+pub(crate) type ReadPolicyCapabilities =
     std::sync::Mutex<std::collections::HashMap<String, Option<Capability>>>;
 
 /// Policy only; record and home owner floors are composed separately.
@@ -3001,6 +3559,100 @@ pub(crate) async fn visible_home_anchors_as(
             failed_homes: 0,
         });
     }
+    // One read of `kernel_roots` yields both the home list (with owners, in
+    // its scan order) and the parent map; record homes without a root row
+    // follow, as the former `UNION ALL` listed them. Bulk-load topology and
+    // policy facts, then use the same nearest-anchor walk and evaluator as
+    // the single-target gate. No visibility SQL or historical-policy
+    // decisions are introduced here.
+    let roots: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT root_id,parent_id,owner_id FROM kernel_roots")
+            .fetch_all(&mut *conn)
+            .await?;
+    let orphans: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT r.home_id FROM kernel_records r WHERE NOT EXISTS(SELECT 1 FROM kernel_roots h WHERE h.root_id=r.home_id)",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut parents = std::collections::BTreeMap::<String, Option<String>>::new();
+    let mut homes: Vec<(String, Option<String>)> = Vec::with_capacity(roots.len() + orphans.len());
+    for (root, parent, owner) in roots {
+        parents.insert(root.clone(), parent);
+        homes.push((root, owner));
+    }
+    homes.extend(orphans.into_iter().map(|home| (home, None)));
+    let boundaries: std::collections::BTreeSet<String> =
+        sqlx::query_scalar("SELECT root_id FROM kernel_policies")
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+    let mut policies =
+        std::collections::BTreeMap::<String, Vec<(String, String, String, String)>>::new();
+    // The physical account subjects come from this same read, before any
+    // hosted rows replace an anchor's entries: the hosted loader needs them
+    // and would otherwise read the table a second time.
+    let mut subjects = hosted_identity::AccountSubjects::new();
+    for (home, kind, id, effect, capability) in
+        sqlx::query_as::<_, (String, String, String, String, String)>(
+            "SELECT root_id,subject_kind,subject_id,effect,capability FROM kernel_policy_entries",
+        )
+        .fetch_all(&mut *conn)
+        .await?
+    {
+        if kind == "account" {
+            subjects.entry(home.clone()).or_default().insert(id.clone());
+        }
+        policies
+            .entry(home)
+            .or_default()
+            .push((kind, id, effect, capability));
+    }
+    policies.extend(
+        hosted_identity::policy_rows_bulk_with_subjects_on(conn, principal, &subjects).await?,
+    );
+    let policy_key = read_cache::capability_key_on(conn, principal).await?;
+    let policy_memo = read_cache::get::<ReadPolicyCapabilities>(&policy_key).unwrap_or_default();
+    let mut result = evaluate_homes(
+        principal,
+        homes,
+        &parents,
+        &boundaries,
+        &policies,
+        policy_key.is_some().then_some(&*policy_memo),
+    )?;
+    if result.failed_homes > 0 {
+        tracing::warn!(
+            failed_homes = result.failed_homes,
+            "bulk kernel visibility omitted broken policy scopes"
+        );
+    }
+    // A scoped app's bulk surfaces omit out-of-scope homes outright:
+    // merely marking them unviewable would still admit the person's own
+    // records through the owner floor in `sql_record_visible`.
+    retain_in_scope_homes(conn, principal, &parents, &mut result).await?;
+    read_cache::put(policy_key, policy_memo);
+    read_cache::put(key, std::sync::Arc::new(result.clone()));
+    Ok(result)
+}
+
+/// The census exactly as it was before the duplicate-read removal, kept as
+/// the parity reference (test only).
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn visible_home_anchors_previous_for_test(
+    conn: &mut SqliteConnection,
+    principal: &str,
+) -> Result<VisibleHomeAnchors> {
+    let key = read_cache::key_on(conn, principal, "home_visibility").await?;
+    if let Some(cached) = read_cache::get::<VisibleHomeAnchors>(&key) {
+        return Ok((*cached).clone());
+    }
+    if !hosted_identity::admitted(conn, principal).await? {
+        return Ok(VisibleHomeAnchors {
+            homes: Vec::new(),
+            failed_homes: 0,
+        });
+    }
     let homes: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT h.root_id,h.owner_id FROM kernel_roots h UNION ALL SELECT DISTINCT r.home_id,NULL FROM kernel_records r WHERE NOT EXISTS(SELECT 1 FROM kernel_roots h WHERE h.root_id=r.home_id)",
     ).fetch_all(&mut *conn).await?;
@@ -3033,9 +3685,72 @@ pub(crate) async fn visible_home_anchors_as(
             .or_default()
             .push((kind, id, effect, capability));
     }
-    policies.extend(hosted_identity::policy_rows_bulk_on(conn, principal).await?);
+    policies.extend(
+        hosted_identity::policy_rows_loaded_previous_for_test(conn, principal, None).await?,
+    );
     let policy_key = read_cache::capability_key_on(conn, principal).await?;
     let policy_memo = read_cache::get::<ReadPolicyCapabilities>(&policy_key).unwrap_or_default();
+    let mut result = evaluate_homes(
+        principal,
+        homes,
+        &parents,
+        &boundaries,
+        &policies,
+        policy_key.is_some().then_some(&*policy_memo),
+    )?;
+    if result.failed_homes > 0 {
+        tracing::warn!(
+            failed_homes = result.failed_homes,
+            "bulk kernel visibility omitted broken policy scopes"
+        );
+    }
+    // A scoped app's bulk surfaces omit out-of-scope homes outright:
+    // merely marking them unviewable would still admit the person's own
+    // records through the owner floor in `sql_record_visible`.
+    retain_in_scope_homes(conn, principal, &parents, &mut result).await?;
+    read_cache::put(policy_key, policy_memo);
+    read_cache::put(key, std::sync::Arc::new(result.clone()));
+    Ok(result)
+}
+
+/// The nearest-anchor walk of the bulk and demand-scoped gates, shared with
+/// the stored-visibility derivation (`stored_visibility::derive`). The
+/// policy boundary is tested **before** the parent lookup, so a home that is
+/// itself an anchor resolves to itself whether or not it has a root row.
+/// Each hop past the start counts towards [`MAX_HOME_DEPTH`]. `None` is a
+/// broken walk: a missing or NULL parent before any anchor, or a walk deeper
+/// than the cap (which also ends cycles). Callers map `None` to
+/// `HIDDEN_OR_MISSING`. `parents` and `boundaries` may be partial maps if
+/// they hold every key this walk reads for `home`.
+pub(crate) fn nearest_anchor<'a>(
+    home: &'a str,
+    parents: &'a std::collections::BTreeMap<String, Option<String>>,
+    boundaries: &std::collections::BTreeSet<String>,
+) -> Option<&'a str> {
+    let mut anchor = home;
+    let mut depth = 0usize;
+    while !boundaries.contains(anchor) {
+        depth += 1;
+        if depth > MAX_HOME_DEPTH {
+            return None;
+        }
+        anchor = parents.get(anchor).and_then(|p| p.as_deref())?;
+    }
+    Some(anchor)
+}
+
+/// The nearest-anchor walk and evaluator shared by the workspace census and
+/// the demand-scoped point read (`demand_visibility`). `parents`, `boundaries`
+/// and `policies` may be partial maps, but only if they hold every key this
+/// walk reads for `homes`; the demand loader fills them by the same walk.
+pub(crate) fn evaluate_homes(
+    principal: &str,
+    homes: Vec<(String, Option<String>)>,
+    parents: &std::collections::BTreeMap<String, Option<String>>,
+    boundaries: &std::collections::BTreeSet<String>,
+    policies: &std::collections::BTreeMap<String, Vec<(String, String, String, String)>>,
+    policy_memo: Option<&ReadPolicyCapabilities>,
+) -> Result<VisibleHomeAnchors> {
     let mut result = VisibleHomeAnchors {
         homes: Vec::new(),
         failed_homes: 0,
@@ -3046,26 +3761,15 @@ pub(crate) async fn visible_home_anchors_as(
         #[cfg(not(feature = "v2-kernel-probe"))]
         let (home, _) = row;
         let capability = (|| {
-            let mut anchor = home.as_str();
-            let mut depth = 0usize;
-            while !boundaries.contains(anchor) {
-                depth += 1;
-                if depth > MAX_HOME_DEPTH {
-                    return Err(Error::engine(HIDDEN_OR_MISSING));
-                }
-                anchor = parents
-                    .get(anchor)
-                    .and_then(|p| p.as_deref())
-                    .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
-            }
+            let anchor = nearest_anchor(home.as_str(), parents, boundaries)
+                .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
             evaluate_kernel_policy(
                 principal,
                 policies.get(anchor).map(Vec::as_slice).unwrap_or(&[]),
             )
         })();
-        if policy_key.is_some() {
-            policy_memo
-                .lock()
+        if let Some(memo) = policy_memo {
+            memo.lock()
                 .expect("policy read cache poisoned")
                 .insert(home.clone(), capability.as_ref().ok().copied());
         }
@@ -3095,15 +3799,126 @@ pub(crate) async fn visible_home_anchors_as(
             Err(error) => return Err(error),
         }
     }
-    if result.failed_homes > 0 {
-        tracing::warn!(
-            failed_homes = result.failed_homes,
-            "bulk kernel visibility omitted broken policy scopes"
-        );
-    }
-    read_cache::put(policy_key, policy_memo);
-    read_cache::put(key, std::sync::Arc::new(result.clone()));
     Ok(result)
+}
+
+#[inline(never)]
+fn retain_in_scope_homes<'a>(
+    conn: &'a mut SqliteConnection,
+    principal: &'a str,
+    parents: &'a std::collections::BTreeMap<String, Option<String>>,
+    result: &'a mut VisibleHomeAnchors,
+) -> futures::future::BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+        if let Some(scope) = app_installs::scope::active_scope_on(conn, principal).await? {
+            if let Some(folders) = scope.folders() {
+                let placed = LogicalPlacement::load_on(conn, parents).await?;
+                result
+                    .homes
+                    .retain(|home| placed.home_in_scope(&home.home_id, folders));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Bulk logical-folder placement, mirroring
+/// `v1_state::lifecycle_bearer_on` without per-home queries.
+struct LogicalPlacement {
+    home_bearer: std::collections::BTreeMap<String, String>,
+    record_home: std::collections::BTreeMap<String, String>,
+    rehomed: std::collections::BTreeMap<String, String>,
+    legacy_home: std::collections::BTreeMap<String, String>,
+    parents: std::collections::BTreeMap<String, Option<String>>,
+}
+
+impl LogicalPlacement {
+    #[inline(never)]
+    fn load_on<'a>(
+        conn: &'a mut SqliteConnection,
+        parents: &'a std::collections::BTreeMap<String, Option<String>>,
+    ) -> futures::future::BoxFuture<'a, Result<Self>> {
+        Box::pin(Self::load_inner(conn, parents))
+    }
+
+    async fn load_inner(
+        conn: &mut SqliteConnection,
+        parents: &std::collections::BTreeMap<String, Option<String>>,
+    ) -> Result<Self> {
+        // First binding event wins for home bearers; latest wins for moves.
+        let mut home_bearer = std::collections::BTreeMap::new();
+        for (home, bearer) in sqlx::query_as::<_, (String, String)>(
+            "SELECT record_id,json_extract(payload,'$.source_record_id') FROM main.content_events WHERE type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq",
+        ).fetch_all(&mut *conn).await? {
+            home_bearer.entry(home).or_insert(bearer);
+        }
+        let record_home: std::collections::BTreeMap<String, String> =
+            sqlx::query_as::<_, (String, String)>("SELECT id,home_id FROM kernel_records")
+                .fetch_all(&mut *conn)
+                .await?
+                .into_iter()
+                .collect();
+        let mut rehomed = std::collections::BTreeMap::new();
+        for (record, logical) in sqlx::query_as::<_, (String, String)>(
+            "SELECT record_id,json_extract(payload,'$.logical_home_id') FROM main.content_events WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') AND json_extract(payload,'$.logical_home_id') IS NOT NULL ORDER BY seq",
+        ).fetch_all(&mut *conn).await? {
+            rehomed.insert(record, logical);
+        }
+        let mut legacy_home = std::collections::BTreeMap::new();
+        for (record, original) in sqlx::query_as::<_, (String, String)>(
+            "SELECT record_id,json_extract(payload,'$.legacy.payload.original_home') FROM main.content_events WHERE type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' AND json_extract(payload,'$.legacy.payload.policy_anchor')=record_id AND json_extract(payload,'$.legacy.payload.original_home') IS NOT NULL ORDER BY seq",
+        ).fetch_all(&mut *conn).await? {
+            legacy_home.insert(record, original);
+        }
+        Ok(Self {
+            home_bearer,
+            record_home,
+            rehomed,
+            legacy_home,
+            parents: parents.clone(),
+        })
+    }
+
+    fn bearer(&self, home: &str, record: Option<&str>) -> String {
+        if home == crate::events::KERNEL_ROOT_ID {
+            return "native:root".into();
+        }
+        let mapped = self
+            .home_bearer
+            .get(home)
+            .cloned()
+            .unwrap_or_else(|| home.to_owned());
+        if record == Some(mapped.as_str()) {
+            if let Some(moved) = self.rehomed.get(&mapped) {
+                return moved.clone();
+            }
+            if let Some(original) = self.legacy_home.get(&mapped) {
+                return original.clone();
+            }
+        }
+        mapped
+    }
+
+    fn home_in_scope(&self, home: &str, folders: &[String]) -> bool {
+        let mut node = self.bearer(home, None);
+        for _ in 0..=MAX_HOME_DEPTH {
+            if folders.iter().any(|folder| folder == &node) {
+                return true;
+            }
+            let next = if let Some(record_home) = self.record_home.get(&node) {
+                self.bearer(record_home, Some(&node))
+            } else if let Some(Some(parent)) = self.parents.get(&node) {
+                self.bearer(parent, None)
+            } else {
+                return false;
+            };
+            if next == node {
+                return false;
+            }
+            node = next;
+        }
+        false
+    }
 }
 
 /// Snapshot-scoped evaluation for callers without their own transaction.
@@ -3130,6 +3945,13 @@ pub(crate) async fn kernel_require(
     // indistinguishable, with no id of either in the message.
     let capability = kernel_effective_capability_on(tx, principal_id, target_id).await?;
     if !capability.allows(required) {
+        // A scoped app reaching directly for a person-visible target
+        // outside its grant gets the typed scope refusal instead.
+        if let Some(error) =
+            app_scope_direct_refusal_on(tx, principal_id, target_id, required).await?
+        {
+            return Err(error);
+        }
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
     Ok(())
@@ -3141,24 +3963,29 @@ pub(crate) async fn kernel_require(
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn folder_home_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     actor: &str,
     requested: &str,
 ) -> Result<()> {
     let logical: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
-        .bind(requested).fetch_optional(&mut **tx).await?;
+        .bind(requested).fetch_optional(&mut *tx).await?;
     let folder = logical.as_deref().unwrap_or(requested);
     let is_home: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
             .bind(folder)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
     if is_home || folder == "native:root" {
         return Ok(());
     }
     let capability = kernel_effective_capability_on(tx, actor, folder).await?;
     if !capability.allows(Capability::View) {
+        if let Some(error) =
+            app_scope_direct_refusal_on(tx, actor, folder, Capability::View).await?
+        {
+            return Err(error);
+        }
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
     let row = read_record_on(tx, actor, folder)
@@ -3179,20 +4006,25 @@ pub(crate) async fn folder_home_in(
         return Err(Error::engine("home_id must name a live unarchived folder"));
     }
     if !capability.allows(Capability::Edit) {
+        if let Some(error) =
+            app_scope_direct_refusal_on(tx, actor, folder, Capability::Edit).await?
+        {
+            return Err(error);
+        }
         return Err(Error::engine("Edit on the destination folder is required"));
     }
     let home = v1_import_home_id(folder);
     let bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id')=?)")
-        .bind(&home).bind(folder).fetch_one(&mut **tx).await?;
+        .bind(&home).bind(folder).fetch_one(&mut *tx).await?;
     if !bound {
         // The member-facing view may redact another principal's identity.
         // This is authority state, read only after the folder Edit gate.
         let owner: Option<String> =
             sqlx::query_scalar("SELECT owner_id FROM kernel_records WHERE id=?")
                 .bind(folder)
-                .fetch_one(&mut **tx)
+                .fetch_one(&mut *tx)
                 .await?;
-        append_in(
+        crate::store::append_on(
             db,
             tx,
             AppendSpec {
@@ -3201,7 +4033,7 @@ pub(crate) async fn folder_home_in(
                 payload: serde_json::to_value(KernelHomeCreatedPayload {
                     source_record_id: Some(folder.into()),
                     parent_id: row.home_id,
-                    owner_id: owner.ok_or_else(|| Error::engine("folder has no owner"))?,
+                    owner_id: Some(owner.ok_or_else(|| Error::engine("folder has no owner"))?),
                     entries: None,
                 })?,
                 actor: Some(actor.into()),
@@ -3218,7 +4050,7 @@ pub(crate) async fn folder_home_in(
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn account_only_record_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     actor: &str,
     record: &str,
@@ -3241,7 +4073,7 @@ pub(crate) async fn account_only_record_in(
             payload: serde_json::to_value(KernelHomeCreatedPayload {
                 source_record_id: Some(record.into()),
                 parent_id: old,
-                owner_id: actor.into(),
+                owner_id: Some(actor.into()),
                 entries: Some(vec![KernelHomeEntryPayload {
                     subject_id: actor.into(),
                     capability: "manage".into(),
@@ -3310,7 +4142,7 @@ pub async fn create_home(
             payload: serde_json::to_value(KernelHomeCreatedPayload {
                 source_record_id: None,
                 parent_id: parent_id.to_string(),
-                owner_id: actor_principal_id.to_string(),
+                owner_id: Some(actor_principal_id.to_string()),
                 entries: payload_entries,
             })?,
             actor: Some(actor_principal_id.into()),
@@ -3839,6 +4671,17 @@ pub const KERNEL_POLICY_REPLACED_EVENT: &str = "kernel.home_policy_replaced.v1";
 #[serde(deny_unknown_fields)]
 struct KernelPolicyReplacedPayload {
     entries: Vec<KernelHomeEntryPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_policy: Option<RecordPolicyMetadata>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordPolicyMetadata {
+    target: String,
+    inherit: bool,
+    members: Option<String>,
+    reason: String,
 }
 
 pub(crate) async fn project_kernel_home_policy_replaced(
@@ -3851,7 +4694,65 @@ pub(crate) async fn project_kernel_home_policy_replaced(
             .bind(&event.record_id)
             .fetch_one(&mut *conn)
             .await?;
-    if !policy_exists {
+    if let Some(metadata) = &p.record_policy {
+        if metadata.target != event.record_id {
+            let bound: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.home_created.v1','kernel.import_home.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
+                .bind(&event.record_id).fetch_optional(&mut *conn).await?;
+            let physical: Option<String> =
+                sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+                    .bind(&metadata.target)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+            let parent: Option<String> =
+                sqlx::query_scalar("SELECT parent_id FROM kernel_roots WHERE root_id=?")
+                    .bind(&event.record_id)
+                    .fetch_optional(&mut *conn)
+                    .await?
+                    .flatten();
+            if bound.as_deref() != Some(metadata.target.as_str())
+                || physical.is_none()
+                || (physical.as_deref() != Some(event.record_id.as_str()) && physical != parent)
+            {
+                return Err(Error::engine(
+                    "record policy event targets an unrelated home",
+                ));
+            }
+        }
+        if metadata.reason.trim().is_empty()
+            || metadata.inherit && (!p.entries.is_empty() || metadata.members.is_some())
+        {
+            return Err(Error::engine("invalid record policy metadata"));
+        }
+        if let Some(cap) = &metadata.members {
+            if !matches!(cap.as_str(), "view" | "edit") {
+                return Err(Error::engine("invalid member policy baseline"));
+            }
+        }
+        let home: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
+                .bind(&event.record_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        if !home || metadata.inherit && event.record_id == KERNEL_ROOT_ID {
+            return Err(Error::engine("invalid record policy target"));
+        }
+        if metadata.inherit {
+            if !policy_exists {
+                return Err(Error::engine(
+                    "record policy inheritance requires an own anchor",
+                ));
+            }
+            sqlx::query("DELETE FROM kernel_policy_entries WHERE root_id=?")
+                .bind(&event.record_id)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("DELETE FROM kernel_policies WHERE root_id=?")
+                .bind(&event.record_id)
+                .execute(&mut *conn)
+                .await?;
+            return Ok(());
+        }
+    } else if !policy_exists {
         return Err(Error::engine(
             "kernel policy replace targets no home anchor",
         ));
@@ -3861,6 +4762,13 @@ pub(crate) async fn project_kernel_home_policy_replaced(
             return Err(Error::engine("invalid kernel policy replacement entry"));
         }
         parse_kernel_capability(&entry.capability)?;
+    }
+    if !policy_exists {
+        sqlx::query("INSERT INTO kernel_policies(root_id,created_at) VALUES(?,?)")
+            .bind(&event.record_id)
+            .bind(&event.created_at)
+            .execute(&mut *conn)
+            .await?;
     }
     sqlx::query("DELETE FROM kernel_policy_entries WHERE root_id = ?")
         .bind(&event.record_id)
@@ -3910,6 +4818,7 @@ pub async fn replace_home_policy(
             event_type: KERNEL_POLICY_REPLACED_EVENT.into(),
             payload: serde_json::to_value(KernelPolicyReplacedPayload {
                 entries: payload_entries,
+                record_policy: None,
             })?,
             actor: Some(actor_principal_id.into()),
         },
@@ -4276,7 +5185,7 @@ pub(crate) fn sql_record_visible(alias: &str, actor: &str, homes: &str, messages
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn move_record_with_comments_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     actor: &str,
     record: &str,
@@ -4289,7 +5198,7 @@ pub(crate) async fn move_record_with_comments_in(
         sql_is_derived_artifact("c")
     ))
     .bind(record)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     if derived {
         return Err(Error::engine(
@@ -4298,17 +5207,17 @@ pub(crate) async fn move_record_with_comments_in(
     }
     let old: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
         .bind(record)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
     // Keep a record-local ACL on its existing home. Its browse parent moves
     // independently; folder children inherit through their reparented home.
     let self_policy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id')=?)")
-        .bind(&old).bind(record).fetch_one(&mut **tx).await?;
+        .bind(&old).bind(record).fetch_one(&mut *tx).await?;
     // Imported and native folders share a deterministic child-home binding.
     // Older native folders without children can still move without a binding.
     let folder_home = v1_import_home_id(record);
     let bound_folder: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e JOIN kernel_roots h ON h.root_id=e.record_id WHERE e.record_id=? AND e.type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(e.payload,'$.source_record_id')=?)")
-        .bind(&folder_home).bind(record).fetch_one(&mut **tx).await?;
+        .bind(&folder_home).bind(record).fetch_one(&mut *tx).await?;
     let physical_home = if self_policy { old.as_str() } else { home };
     let moving_home = if self_policy {
         Some(old.clone())
@@ -4325,9 +5234,9 @@ pub(crate) async fn move_record_with_comments_in(
         validate_move_parent(tx, change).await?;
     }
     let logical_home: Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
-        .bind(home).fetch_optional(&mut **tx).await?;
+        .bind(home).fetch_optional(&mut *tx).await?;
     let imported_root:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type='kernel.import_home_policy.v1')")
-        .bind(KERNEL_ROOT_ID).fetch_one(&mut **tx).await?;
+        .bind(KERNEL_ROOT_ID).fetch_one(&mut *tx).await?;
     let logical_home = logical_home.unwrap_or_else(|| {
         if home == KERNEL_ROOT_ID && imported_root {
             "native:root".into()
@@ -4344,7 +5253,7 @@ pub(crate) async fn move_record_with_comments_in(
         // and every Document/attachment follows its unique part_of bearer.
         // Ordinary records with part_of links retain independent placement.
         let children: Vec<String> = sqlx::query_scalar(&format!("SELECT DISTINCT l.source_id FROM kernel_generic_links l JOIN kernel_records c ON c.id=l.source_id WHERE l.target_id=? AND l.relationship='part_of' AND l.active=1 AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=c.id) AND {} ORDER BY c.id", sql_is_derived_artifact("c")))
-            .bind(&cohort[index]).fetch_all(&mut **tx).await?;
+            .bind(&cohort[index]).fetch_all(&mut *tx).await?;
         for child in children {
             let bearers = comments_v2::bearer_on(tx, &child).await?;
             if !seen.insert(child.clone())
@@ -4371,7 +5280,7 @@ pub(crate) async fn move_record_with_comments_in(
         } else {
             None
         };
-        append_in(
+        crate::store::append_on(
             db,
             tx,
             AppendSpec {
@@ -4422,7 +5331,7 @@ pub async fn read_record_as(
     principal_id: &str,
     record_id: &str,
 ) -> Result<Option<KernelRecordView>> {
-    let mut snapshot = db.write_pool().begin().await?;
+    let mut snapshot = db.pool().begin().await?;
     #[cfg(feature = "v2-kernel-probe")]
     app_installs::admit_dispatched_on(&mut snapshot, principal_id).await?;
     let view = read_record_on(&mut snapshot, principal_id, record_id).await?;
@@ -4465,6 +5374,32 @@ pub(crate) async fn read_record_on(
     Ok(view)
 }
 
+/// Admission-internal record read at person level: consent/source checks
+/// are machinery, not app data access, so an app's folder grant must not
+/// narrow them (or an app whose source artifact sits outside its folders
+/// could never be admitted). Never memoized.
+pub(crate) async fn read_record_admission_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    record_id: &str,
+) -> Result<Option<KernelRecordView>> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id = ?)")
+            .bind(record_id)
+            .fetch_optional(&mut *snapshot)
+            .await?
+            .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+    let capability =
+        kernel_effective_capability_uncached_on(snapshot, principal_id, record_id).await?;
+    if !capability.allows(Capability::View) {
+        return Ok(None);
+    }
+    read_record_unchecked_on(snapshot, principal_id, record_id).await
+}
+
 async fn read_record_uncached_on(
     snapshot: &mut SqliteConnection,
     principal_id: &str,
@@ -4496,6 +5431,67 @@ pub(crate) async fn read_record_unchecked_on(
     principal_id: &str,
     record_id: &str,
 ) -> Result<Option<KernelRecordView>> {
+    read_record_projection_unchecked_on(snapshot, principal_id, record_id, false).await
+}
+
+/// Body-free list hydration. This deliberately bypasses the full-view cache so
+/// a metadata view cannot answer a later full read in the same snapshot.
+pub(crate) async fn read_record_metadata_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    record_id: &str,
+) -> Result<Option<KernelRecordView>> {
+    // Match full reads: an absent artifact is a missing list target, not a
+    // capability-evaluation error that aborts every installed-app entry.
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id = ?)")
+            .bind(record_id)
+            .fetch_one(&mut *snapshot)
+            .await?;
+    if !exists {
+        return Ok(None);
+    }
+    if !kernel_effective_capability_on(snapshot, principal_id, record_id)
+        .await?
+        .allows(Capability::View)
+    {
+        return Ok(None);
+    }
+    read_record_projection_unchecked_on(snapshot, principal_id, record_id, true).await
+}
+
+/// Test-only observation of body hydration on the authorized record read.
+/// Metadata reads must never touch it: disclosure naming and blocker counting
+/// rely on reading candidates without their text. A control full read in the
+/// same scope proves the probe observes the real kernel body query.
+#[cfg(test)]
+pub(crate) mod body_read_probe {
+    use std::cell::Cell;
+    tokio::task_local! {
+        static LOADS: Cell<u64>;
+    }
+    pub(crate) fn note() {
+        let _ = LOADS.try_with(|loads| loads.set(loads.get() + 1));
+    }
+    /// Only the probe-gated kernel_v2 tests scope body reads; the default
+    /// build only counts them.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) async fn scoped<T>(work: impl std::future::Future<Output = T>) -> (T, u64) {
+        LOADS
+            .scope(Cell::new(0), async {
+                let output = work.await;
+                (output, LOADS.with(Cell::get))
+            })
+            .await
+    }
+}
+
+async fn read_record_projection_unchecked_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    record_id: &str,
+    metadata_only: bool,
+) -> Result<Option<KernelRecordView>> {
     let row: Option<RecordViewRow> = sqlx::query_as(
         "SELECT id, home_id, owner_id, kind, pin_family, pin_version, pin_digest, interpreter
          FROM kernel_records WHERE id = ?",
@@ -4513,7 +5509,11 @@ pub(crate) async fn read_record_unchecked_on(
     // Fields and pin ride along only after the caller's View gate: hidden
     // records yield `None` before any of this runs.
     let field_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT name, value_json FROM kernel_record_fields WHERE record_id = ? ORDER BY name",
+        if metadata_only {
+            "SELECT name, value_json FROM kernel_record_fields WHERE record_id = ? AND name IN ('title','name','summary','lifecycle','v1_type','v1_kind') ORDER BY name"
+        } else {
+            "SELECT name, value_json FROM kernel_record_fields WHERE record_id = ? ORDER BY name"
+        },
     )
     .bind(record_id)
     .fetch_all(&mut *snapshot)
@@ -4541,7 +5541,13 @@ pub(crate) async fn read_record_unchecked_on(
     .await?;
     let owner_id = disclose_owner(principal_id, owner_id, root_visible);
     let archived = hq::archived_on(&mut *snapshot, &id).await?;
-    let body = hq::body_on(&mut *snapshot, &id).await?;
+    let body = if metadata_only {
+        None
+    } else {
+        #[cfg(test)]
+        body_read_probe::note();
+        hq::body_on(&mut *snapshot, &id).await?
+    };
     Ok(Some(KernelRecordView {
         metadata: record_metadata::read_on(snapshot, &id).await?,
         body,
@@ -4739,6 +5745,10 @@ pub async fn list_records_as(db: &Db, principal_id: &str) -> Result<Vec<KernelRe
 /// events and no signal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KernelHistoryEvent {
+    /// Native collaborative body payload, disclosed only in full detail to
+    /// holders of root View (the existing kernel attribution boundary).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_body_version: Option<serde_json::Value>,
     /// Retained v1 interpretation; payloads redacted at read time, source withheld.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retained_legacy: Option<serde_json::Value>,
@@ -5013,6 +6023,12 @@ async fn history_page_selected_on(
                 .allows(Capability::View)
         };
         if !visible {
+            if let Some(error) =
+                app_scope_direct_refusal_on(snapshot, principal_id, subject_id, Capability::View)
+                    .await?
+            {
+                return Err(error);
+            }
             return Ok(Vec::new());
         }
         if is_record
@@ -5073,7 +6089,7 @@ async fn history_page_selected_on(
         LEFT JOIN kernel_principals p ON p.principal_id=e.actor
         LEFT JOIN kernel_records r ON r.id=e.record_id
         WHERE {selection}
-        AND e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT IN ('kernel.identity_binding_added.v1','kernel.account_config_bound.v1','kernel.v1_state_imported.v1','kernel.message_state.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1')
+        AND e.type NOT GLOB 'kernel.hcp_*' AND e.type NOT GLOB 'kernel.webhook_*' AND e.type NOT IN ('kernel.identity_binding_added.v1','kernel.identity_binding_removed.v1','kernel.identity_bindings_reconciled.v1','kernel.account_config_bound.v1','kernel.v1_state_imported.v1','kernel.message_state.v1','kernel.notification_preference_set.v1','kernel.message_command_committed.v1','kernel.mcp_write_receipt_recorded.v1','kernel.mcp_write_fenced.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1')
         AND (e.type!='kernel.import_receipt.v1' OR (?5 AND receipt_legacy.seq IS NOT NULL))
         AND (h.seq IS NULL OR (NOT h.hidden AND (?6 OR NOT h.restricted OR h.owner=?7)))
         ORDER BY e.seq {direction} LIMIT ?3");
@@ -5108,6 +6124,28 @@ async fn history_page_selected_on(
             {
                 continue;
             }
+            let native_body_version =
+                if full && root_visible && row.event_type == "kernel.body_set.v1" {
+                    let mut payload: hq::KernelBodyPayload =
+                        serde_json::from_str(row.payload.as_deref().ok_or_else(|| {
+                            Error::engine("native body history payload missing")
+                        })?)?;
+                    if let Some(metadata) = &payload.coedit {
+                        crate::coedit::version_metadata::validate_kernel_metadata(
+                            &payload.body,
+                            metadata,
+                        )?;
+                        // Native body history is a body/coedit view. Source
+                        // declarations are released by event context after
+                        // checking each source's current visibility.
+                        payload.basis = None;
+                        Some(serde_json::to_value(payload)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
             let mut retained_legacy = None;
             if let Some(event_type) = &row.legacy_type {
                 if row.hidden == Some(true) || row.acknowledgement {
@@ -5247,7 +6285,7 @@ async fn history_page_selected_on(
                 row.actor,
                 row.created_at,
             );
-            visible_rows.push((compact, provenance, retained_legacy));
+            visible_rows.push((compact, provenance, retained_legacy, native_body_version));
             if visible_rows.len() >= limit {
                 break;
             }
@@ -5263,6 +6301,7 @@ async fn history_page_selected_on(
                 (seq, event_type, record_id, actor, created_at),
                 (id, run_key, causal_status, actor_name),
                 retained_legacy,
+                native_body_version,
             )| {
                 let disclosed = match actor {
                     None => None,
@@ -5271,6 +6310,7 @@ async fn history_page_selected_on(
                     Some(_) => None,
                 };
                 KernelHistoryEvent {
+                    native_body_version,
                     retained_legacy,
                     id,
                     run_key: if root_visible { run_key } else { None },
@@ -7877,14 +8917,17 @@ pub(crate) async fn create_input_in(
 /// This narrow route admits only the fixed compat attachment shape and the
 /// bearer's canonical placement; it cannot create arbitrary records elsewhere.
 #[cfg(feature = "v2-kernel-probe")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_attachment_input_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     actor: &str,
     bearer: &str,
     input: FieldInput<'_>,
     home: &str,
+    requested_id: Option<&str>,
+    origin: Option<serde_json::Value>,
 ) -> Result<String> {
     create_input_admitted_in(
         db,
@@ -7897,8 +8940,8 @@ pub(crate) async fn create_attachment_input_in(
         home,
         Some(bearer),
         true,
-        None,
-        None,
+        requested_id,
+        origin,
         None,
     )
     .await
@@ -7907,7 +8950,7 @@ pub(crate) async fn create_attachment_input_in(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_input_admitted_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     acts: &mut crate::act::ActAllocation,
     creator_principal_id: &str,
     family: &str,
@@ -8094,6 +9137,8 @@ pub const KERNEL_REVISED_EVENT: &str = "kernel.record_revised.v1";
 struct KernelRevisePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basis: Option<serde_json::Value>,
     fields: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -8104,6 +9149,8 @@ pub const KERNEL_STRUCTURED_REVISED_EVENT: &str = "kernel.record_revised.v2";
 struct StructuredRevisePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basis: Option<serde_json::Value>,
     fields: serde_json::Map<String, serde_json::Value>,
     base_revision: i64,
     pin: RevisionIdentity,
@@ -8179,6 +9226,7 @@ pub(crate) async fn project_kernel_record_revised(
     let p = if let Some(p) = &guarded {
         KernelRevisePayload {
             origin: None,
+            basis: None,
             fields: p.fields.clone(),
         }
     } else {
@@ -8383,7 +9431,7 @@ pub(crate) async fn revise_input_in(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn revise_input_with_origin_in(
     db: &Db,
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     acts: &mut crate::act::ActAllocation,
     actor_principal_id: &str,
     record_id: &str,
@@ -8391,11 +9439,39 @@ pub(crate) async fn revise_input_with_origin_in(
     expected_revision: Option<i64>,
     origin: Option<serde_json::Value>,
 ) -> Result<()> {
+    revise_input_with_basis_in(
+        db,
+        tx,
+        acts,
+        actor_principal_id,
+        record_id,
+        input,
+        expected_revision,
+        origin,
+        None,
+    )
+    .await
+}
+
+/// Keep declared authoring evidence in the event envelope, outside the
+/// definition's editable fields. The adapter resolves it on this transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn revise_input_with_basis_in(
+    db: &Db,
+    tx: &mut SqliteConnection,
+    acts: &mut crate::act::ActAllocation,
+    actor_principal_id: &str,
+    record_id: &str,
+    input: FieldInput<'_>,
+    expected_revision: Option<i64>,
+    origin: Option<serde_json::Value>,
+    basis: Option<serde_json::Value>,
+) -> Result<()> {
     let row: Option<KindPinRow> = sqlx::query_as(
         "SELECT kind, pin_family, pin_version, pin_digest FROM kernel_records WHERE id = ?",
     )
     .bind(record_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some((kind, pin_family, pin_version, pin_digest)) = row else {
         return Err(Error::engine(HIDDEN_OR_MISSING));
@@ -8406,7 +9482,7 @@ pub(crate) async fn revise_input_with_origin_in(
             "SELECT COALESCE(MAX(seq), 0) FROM main.content_events WHERE record_id = ?",
         )
         .bind(record_id)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         if current != expected {
             return Err(Error::conflict(format!(
@@ -8443,7 +9519,7 @@ pub(crate) async fn revise_input_with_origin_in(
     let stored_rows: Vec<(String, String)> =
         sqlx::query_as("SELECT name, value_json FROM kernel_record_fields WHERE record_id = ?")
             .bind(record_id)
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?;
     let mut stored = serde_json::Map::new();
     for (name, value_json) in stored_rows {
@@ -8459,6 +9535,7 @@ pub(crate) async fn revise_input_with_origin_in(
     let payload = if structured {
         serde_json::to_value(StructuredRevisePayload {
             origin: origin.clone(),
+            basis,
             fields: crate::structured_values::normalize(&serde_json::Value::Object(patch.clone()))
                 .as_object()
                 .unwrap()
@@ -8478,10 +9555,11 @@ pub(crate) async fn revise_input_with_origin_in(
     } else {
         serde_json::to_value(KernelRevisePayload {
             origin,
+            basis,
             fields: patch.clone(),
         })?
     };
-    append_in(
+    crate::store::append_on(
         db,
         &mut *tx,
         AppendSpec {

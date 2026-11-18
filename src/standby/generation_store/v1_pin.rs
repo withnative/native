@@ -39,7 +39,7 @@ impl GenerationStore {
         generations.sort_by(compare_generation_newest_first);
         for generation in generations {
             if self
-                .verify_generation_for_startup(&generation.id, observed)
+                .verify_generation_for_startup(&generation.id, observed, "v1_pin")
                 .await
                 .is_err()
             {
@@ -74,7 +74,9 @@ impl GenerationStore {
             .pinned_v1_generation()?
             .ok_or_else(|| Error::engine("no v1 rollback pin"))?;
         if switch_back {
-            let generation = self.verify_generation_for_startup(&id, observed).await?;
+            let generation = self
+                .verify_generation_for_startup(&id, observed, "v1_pin")
+                .await?;
             if generation.manifest.kernel_v2.is_some() {
                 return Err(Error::engine("rollback pin does not select v1"));
             }

@@ -391,6 +391,7 @@ mod tests {
                 ddl_sha256: "b".repeat(64),
             },
             consumer: StandbyConsumerIdentity {
+                kernel_v2_reader: Default::default(),
                 contract: STANDBY_CONSUMER_CONTRACT.to_owned(),
                 version: 1,
                 platform: StandbyConsumerPlatform::LinuxX8664,

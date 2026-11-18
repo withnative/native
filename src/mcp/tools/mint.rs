@@ -56,6 +56,9 @@ pub(super) struct MintRequest<'a> {
     pub(super) record_type: &'a str,
     pub(super) kind: &'a str,
     pub(super) name: Option<&'a str>,
+    pub(super) origin: Option<&'a Value>,
+    pub(super) persistence: Option<&'a str>,
+    pub(super) maturity: Option<&'a str>,
     pub(super) body: Option<&'a str>,
     pub(super) summary: Option<&'a str>,
     pub(super) lifecycle: Option<&'a str>,
@@ -127,6 +130,8 @@ pub(super) async fn mint_record_in(
     fields.insert("kind".into(), json!(record_kind));
     for (key, value) in [
         ("name", request.name),
+        ("persistence", request.persistence),
+        ("maturity", request.maturity),
         ("body", request.body),
         ("summary", request.summary),
         ("lifecycle", request.lifecycle),
@@ -135,6 +140,9 @@ pub(super) async fn mint_record_in(
         if let Some(value) = value {
             fields.insert(key.into(), json!(value));
         }
+    }
+    if let Some(origin) = request.origin {
+        fields.insert("intake_origin".into(), origin.clone());
     }
     if let Some(owner) = caller_owner {
         fields.insert("owner_id".into(), json!(owner));

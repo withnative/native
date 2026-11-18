@@ -39,6 +39,103 @@ pub use crate::domain_transaction::request::{
     governed_request_pipeline_is_exhaustive, GovernedRequestOperation, GovernedRequestStage,
     ToolCallOutcome, GOVERNED_REQUEST_PIPELINE,
 };
+/// Process-local positive COMMIT observation only. Not serializable/Clone and
+/// not a terminal journal/restart authority. No receipt-data constructor exists.
+#[cfg(feature = "mcp-executor-prototype")]
+#[doc(hidden)]
+pub struct CommittedStopObservation {
+    binding: crate::provenance::cancellation_request::stop::ObservationBinding,
+    receipt: crate::provenance::cancellation_request::stop::CommittedHeldStop,
+}
+#[cfg(feature = "mcp-executor-prototype")]
+impl CommittedStopObservation {
+    pub fn binding(&self) -> &crate::provenance::cancellation_request::stop::ObservationBinding {
+        &self.binding
+    }
+    pub fn receipt(&self) -> &crate::provenance::cancellation_request::stop::CommittedHeldStop {
+        &self.receipt
+    }
+    pub fn into_receipt(self) -> crate::provenance::cancellation_request::stop::CommittedHeldStop {
+        self.receipt
+    }
+}
+
+/// DATA describing positive governed local evidence, never terminal settlement.
+#[cfg(feature = "mcp-executor-prototype")]
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeldLocalOutcome {
+    Cancelled { event_id: String },
+    Saved { attestation_id: String },
+}
+/// Process-local snapshot evidence under trusted host/database custody. This
+/// does not prove projection replay equivalence or authorize journal settlement.
+#[cfg(feature = "mcp-executor-prototype")]
+#[doc(hidden)]
+pub struct HeldLocalEvidence {
+    binding: crate::provenance::cancellation_request::stop::ObservationBinding,
+    outcome: HeldLocalOutcome,
+    database_handle: uuid::Uuid,
+}
+#[cfg(feature = "mcp-executor-prototype")]
+impl HeldLocalEvidence {
+    pub fn binding(&self) -> &crate::provenance::cancellation_request::stop::ObservationBinding {
+        &self.binding
+    }
+    pub fn outcome(&self) -> &HeldLocalOutcome {
+        &self.outcome
+    }
+    pub fn database_handle(&self) -> uuid::Uuid {
+        self.database_handle
+    }
+}
+
+/// Explicit trusted-local-journal consumer profile, distinct from lookup DATA.
+/// Private construction after rollback; owns already-admitted resources through
+/// the consumer transaction. The registry borrow excludes mutable gate rebinding.
+#[cfg(feature = "mcp-executor-prototype")]
+#[doc(hidden)]
+pub struct HeldLocalSettlementEvidence<'a> {
+    candidate: crate::provenance::LocalEvidenceData,
+    database: Db,
+    lease: DeploymentPersistenceLease,
+    pass: super::host_writer_pause::InFlightGuard,
+    registry: &'a ToolRegistry,
+}
+#[cfg(feature = "mcp-executor-prototype")]
+impl HeldLocalSettlementEvidence<'_> {
+    pub fn binding(&self) -> &crate::provenance::cancellation_request::stop::ObservationBinding {
+        &self.candidate.binding
+    }
+    pub fn outcome(&self) -> &HeldLocalOutcome {
+        &self.candidate.outcome
+    }
+    pub fn database_handle(&self) -> uuid::Uuid {
+        self.database.handle_id()
+    }
+    /// Pure existing-owner/scope and trusted-clock check; admits no new work.
+    pub fn ensure_fresh(&self) -> Result<()> {
+        self.registry.validate_held_stop_admission(
+            &self.candidate.binding.workspace_id,
+            &self.lease,
+            &self.pass,
+        )?;
+        let now = chrono::Utc::now().timestamp_millis();
+        if self.candidate.issued_at < 0
+            || self.candidate.issued_at > now
+            || self.candidate.deadline <= now
+            || self
+                .candidate
+                .deadline
+                .checked_sub(self.candidate.issued_at)
+                .is_none_or(|n| n <= 0 || n > 30_000)
+        {
+            return Err(Error::auth("held_stop_evidence_unavailable"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 use crate::domain_transaction::request::{
     GovernedRequestStageDisposition, GovernedRequestStageEvent,
@@ -180,7 +277,36 @@ pub const FOCUSED_PROFILE_MAX_BYTES: usize = 72_704;
 /// `minLength`, a 61-byte description), leaving the lens Complete projection
 /// at 244,887 bytes, 151 over the old ceiling. The smallest whole-KiB step
 /// that clears it, leaving about 870 bytes. It does not answer `cc34ddc`.
-pub const COMPLETE_PROFILE_MAX_BYTES: usize = 245_760;
+///
+/// Raised from 240 KiB to 300 KiB on 6 Nov 2026 by Richard's decision
+/// (`cc34ddc`), when `merge_body` (task `0ce2a1c`) left the combined hosted
+/// catalogue 168 bytes over. This is a deliberate reframing, not another
+/// stopgap: the ceiling is a boot-safety backstop — a profile over it stops
+/// `serve` from starting — and no longer the agent-context budget. That budget
+/// is governed on the executor facade's own ceiling (tasks `69c546c`,
+/// `8d36a3a`), so a new tool no longer has to be squeezed into the Complete
+/// profile to fit it.
+pub const COMPLETE_PROFILE_MAX_BYTES: usize = 307_200;
+
+/// Tools whose keyed writes the KernelV2 adapter answers with its own
+/// atomic receipts, so the v1 provenance-seam refusal
+/// (`keyed_replay::refuse_on_engine`) does not apply to them. Every other
+/// keyed write refuses plainly on KernelV2. Only compiled with the probe
+/// graph that has a KernelV2 engine to dispatch to.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) const KERNEL_V2_ADAPTER_KEYED_WRITES: &[&str] = &[
+    "create_record",
+    "update_record",
+    "merge_body",
+    "manage_links",
+    "archive_record",
+    "attach_text",
+    "attach_from_url",
+    "manage_messages",
+    "manage_participants",
+    "resolve_suggestions",
+    "create_many",
+];
 
 /// Trusted workspace audience classification supplied by the transport.
 /// Agent-authored tool arguments cannot influence this value.
@@ -198,6 +324,44 @@ impl TrustedAudience {
             Self::Shared => "shared",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct HostedOpaqueSession {
+    id: String,
+    catalog_path: String,
+}
+
+impl std::fmt::Debug for HostedOpaqueSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostedOpaqueSession([redacted])")
+    }
+}
+
+/// Genuine cookie admission, distinct from the opaque MCP capability.
+#[derive(Clone, PartialEq, Eq)]
+struct HostedCookieSession {
+    id: String,
+    catalog_path: String,
+}
+impl std::fmt::Debug for HostedCookieSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostedCookieSession([redacted])")
+    }
+}
+
+/// Request-local proof result; no wire representation and no public constructor.
+#[cfg(feature = "mcp-executor-prototype")]
+#[derive(Clone, PartialEq, Eq)]
+struct DesktopAppIngressBinding {
+    binding: crate::mcp::desktop_app_proof::DesktopAppProofBinding,
+    expires_at_ms: i64,
+}
+#[cfg(feature = "mcp-executor-prototype")]
+impl std::fmt::Debug for DesktopAppIngressBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DesktopAppIngressBinding([redacted])")
     }
 }
 
@@ -266,6 +430,13 @@ pub struct Caller {
     hosting_database: Option<String>,
     /// Issuing cookie session, attached only by trusted hosted ingress.
     hosting_session_id: Option<String>,
+    /// Verified bearer-JWT coordinates for v2 artifact launch, attached only
+    /// by trusted hosted ingress after verifying this request's own token.
+    /// It stands in for the session that a JWT caller does not have.
+    hosting_jwt_binding: Option<native_artifact_html::bundle_url::JwtBinding>,
+    /// Separate trusted opaque-session admission, never a cookie capability.
+    hosted_opaque_session: Option<HostedOpaqueSession>,
+    hosted_cookie_session: Option<HostedCookieSession>,
     /// Current hosted roster established by the catalog at request ingress.
     /// Routing context alone never populates this capability.
     hosted_activity_roster: Option<Vec<crate::query::principal::ActivityRosterMember>>,
@@ -287,6 +458,8 @@ pub struct Caller {
     parent_key: Option<String>,
     intent: Option<String>,
     deferred_run_context: Option<(String, Option<String>, Option<String>)>,
+    #[cfg(feature = "v2-kernel-probe")]
+    verified_release_append: bool,
     /// Self-asserted MCP client identity from this call's
     /// `params._meta["io.modelcontextprotocol/clientInfo"]`, attached by the
     /// protocol layer before dispatch. This is a CLIENT-ASSERTED FACT, not a
@@ -372,6 +545,8 @@ pub struct Caller {
     /// the unattributed path pays one pointer per `Caller` copy: callers are
     /// moved by value through deeply nested dispatch futures.
     host_asserted_app: Option<Arc<crate::mcp::app_attribution::AppAttribution>>,
+    #[cfg(feature = "mcp-executor-prototype")]
+    desktop_app_ingress: Option<Arc<DesktopAppIngressBinding>>,
     /// Trusted policy evaluator authority. Ordinary authenticated agent calls
     /// never receive this bit and therefore cannot reroute obligations.
     policy_authority: bool,
@@ -390,6 +565,110 @@ pub struct Caller {
     /// mutation to the durable plan claim in one transaction.
     #[cfg(feature = "mcp-executor-prototype")]
     hosted_plan_execution: Option<HostedMembershipPlanExecution>,
+    /// Resolved membership bundle for this caller (slice 2b, no behaviour
+    /// change). `None` means no catalog plane (standalone, stdio, local, and
+    /// most tests): the historical member-plus-owner footing, which
+    /// [`ResolvedMembershipBundle::standalone`] reproduces. `Some` is the
+    /// host-folded role fact, set alongside `hosting_is_member` by every
+    /// setter that attaches hosting context. Nothing outside tests reads this
+    /// yet; authorization still reads `hosting_is_member`/`hosting_owner`.
+    membership_bundle: Option<ResolvedMembershipBundle>,
+}
+
+/// Resolved membership bundle carried on each [`Caller`] (slice 2b).
+///
+/// The id plus the nine settings of slice 2a as a small typed struct. Values
+/// mirror the code-defined seeded bundles in 2a
+/// (`kernel::hosted_identity::bundles::seeded_bundle`), never a per-request
+/// kernel read; custom kernel bundles arrive in a later slice, which replaces
+/// [`ResolvedMembershipBundle::for_hosted`]. The mirror is pinned by a
+/// probe-gated test comparing every setting against the 2a definitions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMembershipBundle {
+    pub id: String,
+    pub members_baseline: bool,
+    pub mcp: bool,
+    pub expiry_required: bool,
+    pub private_agent_context: bool,
+    pub see_member_list: bool,
+    pub counts_in_audience: bool,
+    pub offline_copy: bool,
+    pub manage_access: bool,
+    pub manage_workspace: bool,
+}
+
+impl ResolvedMembershipBundle {
+    fn from_seeded_id(id: &str) -> Self {
+        // Mirrors `seeded_bundle` in 2a: owner is everything except
+        // `expiry_required`; member additionally lacks `manage_access` and
+        // `manage_workspace`; guest carries only `expiry_required`.
+        let (
+            members_baseline,
+            mcp,
+            expiry_required,
+            private_agent_context,
+            see_member_list,
+            counts_in_audience,
+            offline_copy,
+            manage_access,
+            manage_workspace,
+        ) = match id {
+            "owner" => (true, true, false, true, true, true, true, true, true),
+            "member" => (true, true, false, true, true, true, true, false, false),
+            "guest" => (false, false, true, false, false, false, false, false, false),
+            _ => panic!("unknown seeded membership bundle id"),
+        };
+        Self {
+            id: id.to_string(),
+            members_baseline,
+            mcp,
+            expiry_required,
+            private_agent_context,
+            see_member_list,
+            counts_in_audience,
+            offline_copy,
+            manage_access,
+            manage_workspace,
+        }
+    }
+
+    /// Seeded owner bundle: everything except `expiry_required`.
+    pub fn owner() -> Self {
+        Self::from_seeded_id("owner")
+    }
+
+    /// Seeded member bundle: like owner, without `manage_access`/`manage_workspace`.
+    pub fn member() -> Self {
+        Self::from_seeded_id("member")
+    }
+
+    /// Seeded guest bundle: `expiry_required` only.
+    pub fn guest() -> Self {
+        Self::from_seeded_id("guest")
+    }
+
+    /// Standalone callers (no hosting database) behave today as member
+    /// footing plus owner (`is_host_member()` defaults true; `is_host_owner()`
+    /// is true with no hosting database). That is exactly the seeded owner
+    /// bundle, so standalone carries the owner id and values.
+    pub fn standalone() -> Self {
+        Self::owner()
+    }
+
+    /// Single role-to-bundle map for hosted callers. Owners and members match
+    /// the `native:members` baseline; guests resolve to their own account
+    /// grants only. A later slice replaces this with a kernel-log lookup for
+    /// custom bundles.
+    pub fn for_hosted(is_owner: bool, is_member: bool) -> Self {
+        if !is_member {
+            debug_assert!(!is_owner, "owner without member footing");
+            Self::guest()
+        } else if is_owner {
+            Self::owner()
+        } else {
+            Self::member()
+        }
+    }
 }
 
 /// Counter-visibility footing for a [`Caller`]. Owners keep workspace-wide
@@ -564,6 +843,9 @@ impl Caller {
             hosting_principal: None,
             hosting_database: None,
             hosting_session_id: None,
+            hosting_jwt_binding: None,
+            hosted_opaque_session: None,
+            hosted_cookie_session: None,
             hosted_activity_roster: None,
             hosting_owner: false,
             hosting_is_member: None,
@@ -573,6 +855,8 @@ impl Caller {
             parent_key: None,
             intent: None,
             deferred_run_context: None,
+            #[cfg(feature = "v2-kernel-probe")]
+            verified_release_append: false,
             reported_mcp_client_name: None,
             reported_mcp_client_version: None,
             oauth_client_id: None,
@@ -588,11 +872,81 @@ impl Caller {
             verified_alpha_tab_adopt: None,
             verified_alpha_tab_adopt_authored: None,
             host_asserted_app: None,
+            #[cfg(feature = "mcp-executor-prototype")]
+            desktop_app_ingress: None,
             policy_authority: false,
             write_plan_execution: None,
             catalog_operations: None,
             #[cfg(feature = "mcp-executor-prototype")]
             hosted_plan_execution: None,
+            membership_bundle: None,
+        }
+    }
+
+    /// Resolved membership bundle for this caller (slice 2b, no behaviour change).
+    ///
+    /// Callers with no folded bundle (no hosting database) derive it from
+    /// their effective flags: members report the standalone bundle (the
+    /// seeded owner values, matching `is_host_owner()` off the catalog
+    /// plane) and non-members report guest. Hosted callers report the
+    /// bundle folded from their catalog role. Nothing outside tests calls
+    /// this in this slice; authorization still reads
+    /// `is_host_member()`/`is_host_owner()`.
+    ///
+    /// The hosted guard is a debug assertion, not a compile-time check:
+    /// only the `is_member` parameter of `with_verified_hosted_activity`
+    /// fails to compile when omitted. A hosted caller without a folded
+    /// bundle fails debug builds and tests instead of defaulting silently.
+    pub fn bundle(&self) -> ResolvedMembershipBundle {
+        if let Some(bundle) = self.membership_bundle.clone() {
+            debug_assert!(
+                self.hosting_database.is_some(),
+                "resolved bundle without a hosting route"
+            );
+            self.debug_check_bundle_agreement(&bundle);
+            return bundle;
+        }
+        debug_assert!(
+            self.hosting_database.is_none(),
+            "hosted caller without a resolved membership bundle"
+        );
+        // No folded bundle: derive from the effective flags. Non-members
+        // report guest even when the off-catalog-plane owner bit is set
+        // (there is no seeded bundle for non-member owners); members report
+        // the owner bundle off the catalog plane because `is_host_owner()`
+        // is true there.
+        let is_member = self.hosting_is_member.unwrap_or(true);
+        let derived = if !is_member {
+            ResolvedMembershipBundle::guest()
+        } else {
+            ResolvedMembershipBundle::for_hosted(
+                self.hosting_database.is_none() || self.hosting_owner,
+                true,
+            )
+        };
+        self.debug_check_bundle_agreement(&derived);
+        derived
+    }
+
+    fn debug_check_bundle_agreement(&self, bundle: &ResolvedMembershipBundle) {
+        let is_member = self.hosting_is_member.unwrap_or(true);
+        let is_owner = self.hosting_database.is_none() || self.hosting_owner;
+        debug_assert_eq!(
+            bundle.members_baseline, is_member,
+            "bundle members_baseline must match is_host_member"
+        );
+        // Guests never manage, even where the off-catalog-plane owner bit
+        // is set; on every hosted path a guest also carries owner false,
+        // so the exemption changes nothing there.
+        if is_member {
+            debug_assert_eq!(
+                bundle.manage_access, is_owner,
+                "bundle manage_access must match owner footing"
+            );
+            debug_assert_eq!(
+                bundle.manage_workspace, is_owner,
+                "bundle manage_workspace must match owner footing"
+            );
         }
     }
 
@@ -739,6 +1093,35 @@ impl Caller {
         self.deferred_run_context.as_ref()
     }
 
+    /// Require the release-window append guard on the canonical transaction.
+    ///
+    /// # Safety
+    /// Only hosted replay may set this, after checking the signed command
+    /// and resolving current browser-session and workspace authority.
+    #[cfg(feature = "v2-kernel-probe")]
+    #[doc(hidden)]
+    pub unsafe fn with_verified_release_append(mut self) -> Self {
+        self.verified_release_append = true;
+        self
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn verified_release_append(&self) -> bool {
+        self.verified_release_append
+    }
+
+    /// Fixture for reads reusing an already resolved deferred run. Production
+    /// callers must obtain their pinned context from the hosted verifier.
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn with_test_deferred_run(mut self, run: &str) -> Self {
+        assert!(matches!(
+            crate::runkey::validate_run_key_value(Some(&serde_json::json!(run))),
+            crate::runkey::KeyOutcome::Valid(_)
+        ));
+        self.deferred_run_context = Some((run.to_owned(), None, None));
+        self
+    }
+
     pub(crate) fn with_intent(mut self, intent: Option<String>) -> Self {
         self.intent = intent;
         self
@@ -761,11 +1144,30 @@ impl Caller {
         database: impl Into<String>,
     ) -> Self {
         self.hosting_session_id = None;
+        self.hosting_jwt_binding = None;
+        self.hosted_opaque_session = None;
+        self.hosted_cookie_session = None;
         self.hosting_principal = Some(principal.into());
         self.hosting_database = Some(database.into());
         self.hosting_is_member = Some(true);
+        self.membership_bundle = Some(ResolvedMembershipBundle::member());
         self.trusted_audience = TrustedAudience::Unknown;
+        self.debug_check_bundle_agreement(
+            self.membership_bundle.as_ref().expect("bundle just set"),
+        );
         self
+    }
+
+    /// Node-only advisory fork identity. The accepted standby has already
+    /// resolved this portable account; this does not authenticate hosted ingress
+    /// or supply a current hosted roster. Never use on a canonical write path.
+    pub(crate) fn for_node_pending_fork(account: String, database: String) -> Self {
+        let mut caller = Self::local_owner(account.clone());
+        caller.hosting_principal = Some(account);
+        caller.hosting_database = Some(database);
+        // Routing fields disable local_owner's standalone owner footing.
+        // Fold the equivalent advisory role explicitly, without a roster.
+        caller.with_hosting_member(true).with_hosting_owner(true)
     }
 
     /// Attach the catalog id of the authenticated cookie session.
@@ -784,6 +1186,75 @@ impl Caller {
     /// Catalog session id carried by trusted cookie ingress.
     pub fn hosting_session_id(&self) -> Option<&str> {
         self.hosting_session_id.as_deref()
+    }
+
+    /// Attach the verified bearer-JWT coordinates of this request.
+    ///
+    /// # Safety
+    ///
+    /// Trusted hosted ingress must have verified this request's own JWT
+    /// (signature, issuer, audience, expiry, not revoked) and admitted it for
+    /// the hosted principal and v2 database already attached to this caller.
+    /// The binding must come from that token's claims only. Tool arguments,
+    /// client-supplied identity and opaque credentials must never reach it.
+    #[cfg(feature = "v2-kernel-probe")]
+    #[doc(hidden)]
+    pub unsafe fn with_verified_hosting_jwt_binding(
+        mut self,
+        binding: native_artifact_html::bundle_url::JwtBinding,
+    ) -> Self {
+        self.hosting_jwt_binding = Some(binding);
+        self
+    }
+
+    /// Verified bearer-JWT coordinates carried by trusted hosted ingress.
+    pub fn hosting_jwt_binding(&self) -> Option<&native_artifact_html::bundle_url::JwtBinding> {
+        self.hosting_jwt_binding.as_ref()
+    }
+
+    /// Attach the final opaque-session admission for this exact hosted route.
+    ///
+    /// # Safety
+    /// Trusted ingress must have re-admitted this session and catalog locator
+    /// for the caller's current user and database. Never pass tool arguments.
+    #[doc(hidden)]
+    pub unsafe fn with_verified_hosted_opaque_session(
+        mut self,
+        id: String,
+        catalog_path: String,
+    ) -> Self {
+        self.hosted_opaque_session = Some(HostedOpaqueSession { id, catalog_path });
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn hosted_opaque_session(&self) -> Option<(&str, &str)> {
+        self.hosted_opaque_session
+            .as_ref()
+            .map(|session| (session.id.as_str(), session.catalog_path.as_str()))
+    }
+
+    /// Attach a genuine cookie session after final hosted route admission.
+    ///
+    /// # Safety
+    /// Cookie ingress must have authenticated and re-admitted this exact
+    /// session, user, database and locator after H3 identity reconciliation.
+    /// Neither bearer credentials nor client arguments may reach this seam.
+    #[doc(hidden)]
+    pub unsafe fn with_verified_hosted_cookie_session(
+        mut self,
+        id: String,
+        catalog_path: String,
+    ) -> Self {
+        self.hosted_cookie_session = Some(HostedCookieSession { id, catalog_path });
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn hosted_cookie_session(&self) -> Option<(&str, &str)> {
+        self.hosted_cookie_session
+            .as_ref()
+            .map(|session| (session.id.as_str(), session.catalog_path.as_str()))
     }
 
     /// Attach current hosted membership authority and its portable roster.
@@ -821,11 +1292,20 @@ impl Caller {
             ));
         }
         self.hosting_session_id = None;
+        self.hosting_jwt_binding = None;
+        self.hosted_opaque_session = None;
+        self.hosted_cookie_session = None;
         self.hosting_principal = Some(principal);
         self.hosting_database = Some(database);
         self.hosted_activity_roster = Some(roster);
         self.hosting_is_member = Some(is_member);
+        // Owner is not known on this seam yet; assume the non-owner bundle and
+        // let `with_hosting_owner(true)` upgrade it. Guests never upgrade.
+        self.membership_bundle = Some(ResolvedMembershipBundle::for_hosted(false, is_member));
         self.trusted_audience = TrustedAudience::Unknown;
+        self.debug_check_bundle_agreement(
+            self.membership_bundle.as_ref().expect("bundle just set"),
+        );
         Ok(self)
     }
 
@@ -849,12 +1329,19 @@ impl Caller {
         is_owner: bool,
     ) -> Self {
         self.hosting_session_id = None;
+        self.hosting_jwt_binding = None;
+        self.hosted_opaque_session = None;
+        self.hosted_cookie_session = None;
         self.hosting_principal = Some(principal.into());
         self.hosting_database = Some(database.into());
         self.hosted_activity_roster = None;
         self.hosting_is_member = Some(true);
         self.hosting_owner = is_owner;
+        self.membership_bundle = Some(ResolvedMembershipBundle::for_hosted(is_owner, true));
         self.trusted_audience = TrustedAudience::Unknown;
+        self.debug_check_bundle_agreement(
+            self.membership_bundle.as_ref().expect("bundle just set"),
+        );
         self
     }
 
@@ -871,6 +1358,16 @@ impl Caller {
     #[doc(hidden)]
     pub fn with_hosting_owner(mut self, is_owner: bool) -> Self {
         self.hosting_owner = is_owner;
+        // Recompute the bundle from the same two role facts the flags carry.
+        // A guest (non-member) never upgrades: `for_hosted` keeps it on guest.
+        let is_member = self.hosting_is_member.unwrap_or(true);
+        if self.hosting_database.is_some() {
+            self.membership_bundle =
+                Some(ResolvedMembershipBundle::for_hosted(is_owner, is_member));
+            self.debug_check_bundle_agreement(
+                self.membership_bundle.as_ref().expect("bundle just set"),
+            );
+        }
         self
     }
 
@@ -883,6 +1380,16 @@ impl Caller {
     #[doc(hidden)]
     pub fn with_hosting_member(mut self, is_member: bool) -> Self {
         self.hosting_is_member = Some(is_member);
+        // Recompute the bundle from the same two role facts the flags carry,
+        // so a later fold cannot leave flags and bundle disagreeing.
+        if self.hosting_database.is_some() {
+            let is_owner = self.hosting_owner;
+            self.membership_bundle =
+                Some(ResolvedMembershipBundle::for_hosted(is_owner, is_member));
+            self.debug_check_bundle_agreement(
+                self.membership_bundle.as_ref().expect("bundle just set"),
+            );
+        }
         self
     }
 
@@ -890,7 +1397,10 @@ impl Caller {
     /// `None` (no catalog plane: standalone, stdio, local, tests) keeps the
     /// historical member footing. A hosted caller always carries an explicit
     /// fold — omission fails to compile at the construction site — so this
-    /// `unwrap_or` is only reachable off the catalog plane.
+    /// `unwrap_or` is only reachable off the catalog plane. The same guard
+    /// covers the resolved bundle: every hosting setter folds it alongside
+    /// the flags, and a hosted caller without one fails debug builds/tests
+    /// instead of defaulting silently.
     pub fn is_host_member(&self) -> bool {
         // Fail-open would be silent here, so debug builds refuse a hosted
         // caller with no folded footing instead. `with_hosting_context` is
@@ -899,6 +1409,10 @@ impl Caller {
         debug_assert!(
             self.hosting_database.is_none() || self.hosting_is_member.is_some(),
             "hosted caller without folded membership footing"
+        );
+        debug_assert!(
+            self.hosting_database.is_none() || self.membership_bundle.is_some(),
+            "hosted caller without a resolved membership bundle"
         );
         self.hosting_is_member.unwrap_or(true)
     }
@@ -946,6 +1460,17 @@ impl Caller {
         } else {
             CounterFooting::NonOwner
         }
+    }
+
+    /// Caller eligibility for personal app updates. The kernel separately
+    /// checks the account's ownership of both the artifact and the install.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    #[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+    pub(crate) fn can_update_personal_app(&self) -> bool {
+        self.host_asserted_app().is_none()
+            && !self.is_member_copy()
+            && (self.counter_footing().is_owner()
+                || (self.hosting_database.is_some() && self.hosting_is_member == Some(true)))
     }
 
     /// The authenticated identity stamped on every event, independent of any
@@ -1150,6 +1675,10 @@ impl Caller {
     /// failing the app attribution re-check forever.
     pub(crate) fn without_host_asserted_app(mut self) -> Self {
         self.host_asserted_app = None;
+        #[cfg(feature = "mcp-executor-prototype")]
+        {
+            self.desktop_app_ingress = None;
+        }
         self
     }
 
@@ -1162,6 +1691,10 @@ impl Caller {
     #[doc(hidden)]
     #[inline(never)]
     pub fn set_host_asserted_app(&mut self, app: crate::mcp::app_attribution::AppAttribution) {
+        #[cfg(feature = "mcp-executor-prototype")]
+        {
+            self.desktop_app_ingress = None;
+        }
         self.host_asserted_app = Some(Arc::new(app));
     }
 
@@ -1177,8 +1710,55 @@ impl Caller {
         mut self,
         app: crate::mcp::app_attribution::AppAttribution,
     ) -> Self {
+        #[cfg(feature = "mcp-executor-prototype")]
+        {
+            self.desktop_app_ingress = None;
+        }
         self.host_asserted_app = Some(Arc::new(app));
         self
+    }
+
+    /// Consume a sealed identity proof result at trusted hosted ingress. This
+    /// adds no authority and never replaces canonical per-operation admission.
+    #[cfg(feature = "mcp-executor-prototype")]
+    pub fn with_verified_desktop_app_identity(
+        mut self,
+        identity: crate::mcp::desktop_app_proof::VerifiedDesktopAppIdentity,
+        now_ms: i64,
+    ) -> Result<Self> {
+        let binding = identity.binding();
+        if self.credential() != binding.account_id
+            || self.hosting_database() != Some(binding.hosted_db_id.as_str())
+            || now_ms < 0
+            || now_ms >= identity.expires_at_ms()
+        {
+            return Err(Error::engine("desktop app proof refused"));
+        }
+        self.set_host_asserted_app(binding.app.clone());
+        self.desktop_app_ingress = Some(Arc::new(DesktopAppIngressBinding {
+            binding: binding.clone(),
+            expires_at_ms: identity.expires_at_ms(),
+        }));
+        Ok(self)
+    }
+
+    /// A cookie app assertion alone never qualifies as Desktop-vouched MCP.
+    /// Recheck at the shared carrier gate and again before registry dispatch.
+    pub(crate) fn check_desktop_app_identity(&self, now_ms: i64) -> Result<bool> {
+        #[cfg(feature = "mcp-executor-prototype")]
+        if let Some(marker) = &self.desktop_app_ingress {
+            if now_ms < 0
+                || now_ms >= marker.expires_at_ms
+                || self.credential() != marker.binding.account_id
+                || self.hosting_database() != Some(marker.binding.hosted_db_id.as_str())
+                || self.host_asserted_app() != Some(&marker.binding.app)
+            {
+                return Err(Error::engine("desktop app proof refused"));
+            }
+            return Ok(true);
+        }
+        let _ = now_ms;
+        Ok(false)
     }
 
     pub(crate) fn verified_alpha_tab_adopt(&self) -> Option<&VerifiedAlphaTabPreview> {
@@ -1501,6 +2081,7 @@ mod query_principal_conversion_tests {
                 selector_field: None,
                 selector_value: None,
                 advertised_directly: true,
+                requires_acceptance: false,
             }]);
         let caller = Caller::local().with_catalog_operations_snapshot(snapshot);
         let principal = QueryPrincipal::from(&caller);
@@ -2655,6 +3236,41 @@ struct KernelV2RequestLifecycle<'a> {
     caller: &'a Caller,
 }
 
+/// Resolve the installed node's original passive context through the ordinary
+/// native request port. The caller is issued by its verified serving lease;
+/// this does not admit app scope or mint a run on a read-only accepted copy.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn working_ingress_context(
+    db: &Db,
+    caller: Caller,
+    envelope: &Value,
+) -> Result<(Caller, crate::store::EventAnnotations)> {
+    if matches!(
+        crate::runkey::validate_run_key_value(envelope.get("run_key")),
+        crate::runkey::KeyOutcome::Requested { .. }
+    ) {
+        return Err(Error::engine(
+            "working append needs an existing run or no run; bootstrap remains canonical",
+        ));
+    }
+    let resolved = crate::domain_transaction::request::resolve_run_context(
+        &KernelV2RequestLifecycle {
+            db,
+            caller: &caller,
+        },
+        caller.clone(),
+        envelope,
+        None,
+    )
+    .await?;
+    let annotations = crate::store::EventAnnotations {
+        run_key: resolved.caller.run_key().map(str::to_owned),
+        parent_key: resolved.caller.parent_key().map(str::to_owned),
+        intent: resolved.intent,
+    };
+    Ok((resolved.caller, annotations))
+}
+
 #[cfg(feature = "v2-kernel-probe")]
 impl crate::domain_transaction::request::RequestLifecyclePort for KernelV2RequestLifecycle<'_> {
     fn backend_label(&self) -> &'static str {
@@ -2779,6 +3395,7 @@ async fn dispatch_with_request_port<
     hint_missing_records: bool,
     handler: &HandlerFn,
 ) -> Result<ToolCallOutcome> {
+    caller.check_desktop_app_identity(chrono::Utc::now().timestamp_millis())?;
     crate::domain_transaction::request::execute_request(
         port,
         caller,
@@ -2805,6 +3422,7 @@ async fn dispatch_with_request_port<
                 &engine, &caller, name, arguments,
             ))
             .await?;
+            caller.check_desktop_app_identity(chrono::Utc::now().timestamp_millis())?;
             crate::mcp::request_timing::pre_handler_complete();
             // The handler consumes the arguments, so a refusal that names a
             // record cannot be traced back to them afterwards. Remember only
@@ -2906,10 +3524,24 @@ impl ToolSpec {
         self.operation_schemas.get(selector_value)
     }
 
+    /// Authoritative on-demand operation schemas, omitted from compact cards.
+    #[doc(hidden)]
+    pub fn operation_schemas(&self) -> impl Iterator<Item = &Value> {
+        self.operation_schemas.values()
+    }
+
     pub(crate) fn input_schema_for_engine(&self, engine: EngineKind) -> &Value {
         self.engine_input_schemas
             .get(&engine)
             .unwrap_or(&self.input_schema)
+    }
+
+    pub(crate) fn description_for_engine(&self, engine: EngineKind) -> &str {
+        self.engine_input_schemas
+            .get(&engine)
+            .and_then(|schema| schema.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.description)
     }
 
     /// The authored MCP descriptor before surface-specific runtime projection.
@@ -3018,6 +3650,7 @@ impl AppMetadata {
 /// registration order is preserved (it is the `tools/list` order).
 #[derive(Default)]
 pub struct ToolRegistry {
+    catalog_assets: Option<Arc<crate::mcp::tools::catalog_assets::CatalogAssets>>,
     tools: Vec<ToolSpec>,
     exposure_profile: ExposureProfile,
     /// Standby is a runtime capability boundary, not a discovery preference.
@@ -3035,6 +3668,9 @@ pub struct ToolRegistry {
     /// Optional process-wide persistence boundary for hosted deployment
     /// transitions. Immutable standby remains a separate capability mode.
     deployment_mutation_barrier: Option<DeploymentMutationBarrier>,
+    // Privileged composition only; invalidated by every barrier replacement.
+    #[cfg(feature = "mcp-executor-prototype")]
+    held_stop_pause: Option<super::host_writer_pause::WriterPause>,
     /// Deployment-authoritative origin for model-facing follow links. `None`
     /// is the stdio/local shape and deliberately renders a relative route.
     public_origin: Option<String>,
@@ -3233,6 +3869,25 @@ impl ToolRegistry {
         Some(format!("{origin}{path}"))
     }
 
+    /// Supply the trusted host catalog before registering kernel tools.
+    pub fn set_catalog_assets(&mut self, assets: crate::mcp::tools::catalog_assets::CatalogAssets) {
+        debug_assert!(
+            self.tools.iter().all(|tool| matches!(
+                tool.kind,
+                None | Some(ToolKind::Ping | ToolKind::EngineInfo | ToolKind::StandbyStatus)
+            )),
+            "catalog assets must be configured before registering surface tools"
+        );
+        self.catalog_assets = Some(Arc::new(assets));
+    }
+    // Only read by mcp::kernel_v2 (v2-kernel-probe).
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn catalog_assets(
+        &self,
+    ) -> Option<Arc<crate::mcp::tools::catalog_assets::CatalogAssets>> {
+        self.catalog_assets.clone()
+    }
+
     /// Configure installed-app delivery before registering surface tools.
     pub fn set_app_bundle_delivery(
         &mut self,
@@ -3313,7 +3968,214 @@ impl ToolRegistry {
     }
 
     pub fn set_deployment_mutation_barrier(&mut self, barrier: DeploymentMutationBarrier) {
+        #[cfg(feature = "mcp-executor-prototype")]
+        {
+            self.held_stop_pause = None;
+        }
         self.deployment_mutation_barrier = Some(barrier);
+    }
+
+    /// Privileged host composition, not authentication. A replaced barrier
+    /// requires explicit rebinding, even when its caller believes it unchanged.
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[doc(hidden)]
+    pub fn bind_held_stop_pause(
+        &mut self,
+        pause: super::host_writer_pause::WriterPause,
+    ) -> Result<()> {
+        if self.deployment_mutation_barrier.is_none() {
+            return Err(Error::engine("held_stop_admission_unavailable"));
+        }
+        self.held_stop_pause = Some(pause);
+        Ok(())
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    fn validate_held_stop_admission(
+        &self,
+        workspace: &str,
+        lease: &DeploymentPersistenceLease,
+        pass: &super::host_writer_pause::InFlightGuard,
+    ) -> Result<()> {
+        if self.standby_read_only
+            || self.member_copy.is_some()
+            || !self
+                .held_stop_pause
+                .as_ref()
+                .is_some_and(|gate| gate.owns(pass))
+            || !self
+                .deployment_mutation_barrier
+                .as_ref()
+                .is_some_and(|gate| gate.for_database(workspace).owns_scoped_persistence(lease))
+        {
+            return Err(Error::engine("held_stop_admission_unavailable"));
+        }
+        Ok(())
+    }
+
+    /// Compatible receipt DATA wrapper; no data-to-observation conversion.
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[doc(hidden)]
+    pub async fn stop_held_command_with_persistence(
+        &self,
+        db: Db,
+        packet: &[u8],
+        lease: DeploymentPersistenceLease,
+        pass: super::host_writer_pause::InFlightGuard,
+    ) -> Result<crate::provenance::cancellation_request::stop::CommittedHeldStop> {
+        self.stop_held_command_observation_with_persistence(db, packet, lease, pass)
+            .await
+            .map(CommittedStopObservation::into_receipt)
+    }
+
+    /// Dark Rust-only author STOP. No registered operation/transport or raw
+    /// authority inputs. Requires the actual already-scoped host lease/pass;
+    /// no new admission/file locks may be acquired after the tenant writer.
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[doc(hidden)]
+    pub async fn stop_held_command_observation_with_persistence(
+        &self,
+        db: Db,
+        packet: &[u8],
+        lease: DeploymentPersistenceLease,
+        pass: super::host_writer_pause::InFlightGuard,
+    ) -> Result<CommittedStopObservation> {
+        use crate::provenance::cancellation_request::stop::CommittedHeldStop;
+        // The configured pin chooses scope; unauthenticated JSON cannot select
+        // another database or manufacture the barrier/pass being checked.
+        let scope = crate::provenance::held_stop_fingerprint()?
+            .ok_or_else(|| Error::auth("held_stop_unavailable"))?
+            .scope;
+        self.validate_held_stop_admission(&scope.workspace, &lease, &pass)?;
+        crate::provenance::preflight_held_stop(packet)?;
+        if db.open_mode() != crate::db::DatabaseOpenMode::ReadWrite
+            || db.has_enrolled_execution()
+            || db.is_enrolled()
+        {
+            return Err(Error::auth("held_stop_unavailable"));
+        }
+        let result = crate::storage_profile::with_operation(
+            &db,
+            "held_command.author_stop",
+            Some("native.held-command-cancellation.v1"),
+            async {
+                let mut tx = crate::db::begin_write(db.write_pool()).await?;
+                // Pure existing-scope checks, not reuse's fleet-lease upgrade.
+                self.validate_held_stop_admission(&scope.workspace, &lease, &pass)?;
+                let staged = crate::provenance::stage_held_stop(&db, &mut tx, packet).await?;
+                tx.commit().await?;
+                let receipt = match staged.decision {
+                    crate::provenance::HeldStopDecision::Cancelled { event_id } => {
+                        CommittedHeldStop::Cancelled { event_id }
+                    }
+                    crate::provenance::HeldStopDecision::AlreadySaved { attestation_id } => {
+                        CommittedHeldStop::AlreadySaved { attestation_id }
+                    }
+                };
+                Ok(CommittedStopObservation {
+                    binding: staged.binding,
+                    receipt,
+                })
+            },
+        )
+        .await;
+        // Explicit retention across the complete COMMIT/error boundary.
+        drop(pass);
+        drop(lease);
+        result
+    }
+
+    /// Strictly weaker read-only use of fresh STOP authorization. None is unknown.
+    /// Existing lookup DATA remains nonterminal and releases guards on return.
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[doc(hidden)]
+    pub async fn lookup_held_stop_evidence_with_persistence(
+        &self,
+        db: Db,
+        packet: &[u8],
+        lease: DeploymentPersistenceLease,
+        pass: super::host_writer_pause::InFlightGuard,
+    ) -> Result<Option<HeldLocalEvidence>> {
+        let result = self
+            .lookup_held_stop_candidate(&db, packet, &lease, &pass)
+            .await;
+        drop(pass);
+        drop(lease);
+        result.map(|v| {
+            v.map(|candidate| HeldLocalEvidence {
+                binding: candidate.binding,
+                outcome: candidate.outcome,
+                database_handle: db.handle_id(),
+            })
+        })
+    }
+
+    /// Explicit local settlement profile. No staging, dispatch or canonical COMMIT.
+    /// A positive retains the actual existing gates until the journal consumer drops it.
+    #[cfg(feature = "mcp-executor-prototype")]
+    #[doc(hidden)]
+    pub async fn lookup_held_stop_for_local_settlement<'a>(
+        &'a self,
+        db: Db,
+        packet: &[u8],
+        lease: DeploymentPersistenceLease,
+        pass: super::host_writer_pause::InFlightGuard,
+    ) -> Result<Option<HeldLocalSettlementEvidence<'a>>> {
+        let candidate = self
+            .lookup_held_stop_candidate(&db, packet, &lease, &pass)
+            .await?;
+        Ok(candidate.map(|candidate| HeldLocalSettlementEvidence {
+            candidate,
+            database: db,
+            lease,
+            pass,
+            registry: self,
+        }))
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    async fn lookup_held_stop_candidate(
+        &self,
+        db: &Db,
+        packet: &[u8],
+        lease: &DeploymentPersistenceLease,
+        pass: &super::host_writer_pause::InFlightGuard,
+    ) -> Result<Option<crate::provenance::LocalEvidenceData>> {
+        let hidden = || Error::auth("held_stop_evidence_unavailable");
+        let result = async {
+            let scope = crate::provenance::held_stop_fingerprint()?
+                .ok_or_else(hidden)?
+                .scope;
+            self.validate_held_stop_admission(&scope.workspace, lease, pass)?;
+            crate::provenance::preflight_held_stop(packet)?;
+            if db.open_mode() != crate::db::DatabaseOpenMode::ReadWrite
+                || db.has_enrolled_execution()
+                || db.is_enrolled()
+            {
+                return Err(hidden());
+            }
+            crate::storage_profile::with_operation(
+                db,
+                "held_command.author_stop_lookup",
+                Some("native.held-command-cancellation.v1"),
+                async {
+                    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+                    let candidate = async {
+                        self.validate_held_stop_admission(&scope.workspace, lease, pass)?;
+                        crate::provenance::lookup_held_stop(db, &mut tx, packet).await
+                    }
+                    .await;
+                    // Await rollback on refusals too, retaining both actual guards.
+                    let rolled_back = tx.rollback().await;
+                    let candidate = candidate?;
+                    rolled_back?;
+                    Ok(candidate)
+                },
+            )
+            .await
+        }
+        .await;
+        result.map_err(|_| hidden())
     }
 
     pub fn deployment_mutation_barrier(&self) -> Option<&DeploymentMutationBarrier> {
@@ -3652,6 +4514,27 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Narrow an existing handler's advertised selectors without replacing it.
+    pub(crate) fn restrict_engine_operations(
+        &mut self,
+        name: &str,
+        engine: EngineKind,
+        field: &'static str,
+        values: &'static [&'static str],
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Err(Error::engine("operation support cannot be empty"));
+        }
+        let handler = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.handlers.get_mut(&engine))
+            .ok_or_else(|| Error::engine(format!("missing {name} handler")))?;
+        handler.operations = EngineOperationSupport::SelectorValues { field, values };
+        Ok(())
+    }
+
     /// Mark a descriptor-only registration as non-executable. Generators use
     /// this after reusing the production schema registrar; runtime registrars
     /// must retain their concrete handler.
@@ -3711,6 +4594,18 @@ impl ToolRegistry {
         let v2_schema = std::mem::replace(&mut tool.input_schema, original);
         tool.engine_input_schemas
             .insert(EngineKind::KernelV2, v2_schema);
+        Ok(())
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn set_kernel_v2_schema(&mut self, name: &str, schema: Value) -> Result<()> {
+        let tool = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+            .ok_or_else(|| Error::engine("missing KernelV2 tool descriptor"))?;
+        tool.engine_input_schemas
+            .insert(EngineKind::KernelV2, schema);
         Ok(())
     }
 
@@ -3857,7 +4752,7 @@ impl ToolRegistry {
         if !self.standby_read_only {
             return Ok(());
         }
-        if name == "manage_account_config" {
+        if matches!(name, "manage_account_config" | "manage_saved_tabs") {
             return Err(Error::unavailable_offline(
                 name,
                 "canonical online account-config authority",
@@ -4000,7 +4895,11 @@ impl ToolRegistry {
         Ok(())
     }
 
-    async fn exposure_summary(&self, policy: &ResolvedToolExposure, hosted: bool) -> Result<Value> {
+    pub(crate) async fn exposure_summary(
+        &self,
+        policy: &ResolvedToolExposure,
+        hosted: bool,
+    ) -> Result<Value> {
         let advertised_count = self.specs_for_policy(policy).count();
         let complete_count = self.specs_for_profile(ExposureProfile::Complete).count();
         let mut summary = serde_json::json!({
@@ -4024,8 +4923,7 @@ impl ToolRegistry {
                 serde_json::json!("NATIVE_CE_MCP_TOOL_PROFILE=focused|complete");
         }
         if let Some(provider) = &self.standby_status {
-            summary["runtime"] = serde_json::to_value(Box::pin(provider.status()).await)
-                .expect("standby status is serializable");
+            summary["runtime"] = Box::pin(provider.status()).await.bootstrap_summary();
         } else if self.standby_read_only {
             summary["runtime"] = serde_json::json!({
                 "mode": "standby",
@@ -4241,6 +5139,15 @@ impl ToolRegistry {
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> BoxFuture<'a, Result<ToolCallOutcome>> {
         async move {
+            caller.check_desktop_app_identity(chrono::Utc::now().timestamp_millis())?;
+            super::proposal_run::check(name, &arguments)?;
+            if super::proposal_run::is_proposal(name, &arguments) {
+                if let Some((run, _, _)) = caller.deferred_run_context() {
+                    if matches!(crate::runkey::validate(Some(run)), crate::runkey::KeyOutcome::Requested { .. }) {
+                        return Err(Error::engine("propose_view cannot allocate a run; reuse the bootstrap run_key"));
+                    }
+                }
+            }
             let mut caller = caller;
             // One source of truth for member serving: the engine open mode.
             // `ReadLens::member` derives from the same `Db`, so the caller
@@ -4362,7 +5269,7 @@ impl ToolRegistry {
             // provenance seam. Other backends/tools retain the refusal.
             #[cfg(feature = "v2-kernel-probe")]
             let adapter_keyed_write = matches!(engine_kind, EngineKind::KernelV2)
-                && matches!(name, "create_record" | "update_record" | "manage_links" | "archive_record" | "attach_text" | "manage_messages" | "manage_participants" | "resolve_suggestions");
+                && KERNEL_V2_ADAPTER_KEYED_WRITES.contains(&name);
             #[cfg(not(feature = "v2-kernel-probe"))]
             let adapter_keyed_write = false;
             if engine.sqlite().is_none() && !adapter_keyed_write {
@@ -4411,6 +5318,7 @@ impl ToolRegistry {
                         },
                     };
                     let principal = caller.credential().to_string();
+                    let command_app = crate::provenance::CommandAppContext::from_caller(&caller);
                     let lookup_arguments = arguments.clone();
                     let (dispatched_result, receipt_disposition) =
                         with_fresh_receipt_scope(Box::pin(async {
@@ -4476,6 +5384,7 @@ impl ToolRegistry {
                             name,
                             &lookup_arguments,
                             dispatched.run_context.get("intent").and_then(Value::as_str),
+                            &command_app,
                         )
                         .await
                         {
@@ -5360,6 +6269,63 @@ mod hosting_context_tests {
                 .registered_operation_access("reach_connect", &json!({"provider": "slack"}))
                 .unwrap(),
             super::OperationAccess::Mutation
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_header_run_refusal_precedes_registry_dispatch() {
+        // This registry admission invariant is unconditional, including a
+        // non-probe build. The hosted v2 fixture tests real header-key reuse.
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_custom(
+                "manage_named_views",
+                super::CustomInteractionPolicy::NoRecordInteractions,
+                super::ToolExposure::extension(true),
+                "Header ingress witness",
+                json!({"type":"object"}),
+                |_db, caller, _args| async move {
+                    Ok(json!({"reached":true,"header":caller.deferred_run_context().map(|r| &r.0)}))
+                },
+            )
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for key in ["new", "new:scout-chair"] {
+            // The attested public constructor already rejects these. Exercise
+            // the registry's defensive check even against invalid host state.
+            let mut caller = Caller::authenticated("acct:header");
+            caller.deferred_run_context = Some((key.into(), None, None));
+            let error = registry
+                .call_engine(
+                    super::EngineHandle::Sqlite(db.clone()),
+                    caller,
+                    "manage_named_views",
+                    json!({"action":"propose_view"}),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("cannot allocate a run"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            before,
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            0,
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_runs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
         );
     }
 
@@ -8324,5 +9290,222 @@ mod first_call_harness_tests {
             "echo writes nothing"
         );
         db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod membership_bundle_tests {
+    use super::{Caller, ResolvedMembershipBundle};
+
+    fn roster_member(account: &str) -> crate::query::principal::ActivityRosterMember {
+        // SAFETY: unit test constructing the one admission capability the
+        // accessor reads; no query or storage runs.
+        unsafe {
+            crate::query::principal::ActivityRosterMember::verified_unchecked(
+                account,
+                format!("native:workspace-member:{account}"),
+            )
+        }
+    }
+
+    fn v1_hosted(account: &str, is_member: bool) -> Caller {
+        unsafe {
+            Caller::authenticated(account).with_verified_hosted_activity(
+                format!("catalog-{account}"),
+                "db-1",
+                vec![roster_member(account)],
+                is_member,
+            )
+        }
+        .expect("the roster contains its own caller")
+    }
+
+    #[test]
+    fn role_map_matches_the_seeded_table() {
+        let owner = ResolvedMembershipBundle::for_hosted(true, true);
+        assert_eq!(owner, ResolvedMembershipBundle::owner());
+        assert_eq!(owner.id, "owner");
+        assert!(owner.members_baseline);
+        assert!(!owner.expiry_required);
+        assert!(owner.manage_access && owner.manage_workspace);
+
+        let member = ResolvedMembershipBundle::for_hosted(false, true);
+        assert_eq!(member, ResolvedMembershipBundle::member());
+        assert_eq!(member.id, "member");
+        assert!(member.members_baseline);
+        assert!(!member.expiry_required);
+        assert!(!member.manage_access && !member.manage_workspace);
+        assert!(member.mcp);
+
+        let guest = ResolvedMembershipBundle::for_hosted(false, false);
+        assert_eq!(guest, ResolvedMembershipBundle::guest());
+        assert_eq!(guest.id, "guest");
+        assert!(!guest.members_baseline);
+        assert!(guest.expiry_required);
+        assert!(!guest.mcp);
+    }
+
+    #[test]
+    fn standalone_matches_todays_member_plus_owner_behaviour() {
+        // No catalog plane: member footing plus owner, exactly the seeded
+        // owner values.
+        for caller in [
+            Caller::authenticated("alice"),
+            Caller::local(),
+            Caller::local_owner("alice"),
+            Caller::member_copy("alice"),
+        ] {
+            assert!(caller.is_host_member());
+            assert!(caller.is_host_owner());
+            assert_eq!(caller.bundle(), ResolvedMembershipBundle::owner());
+            assert_eq!(caller.bundle(), ResolvedMembershipBundle::standalone());
+        }
+    }
+
+    #[test]
+    fn v1_hosted_folds_each_catalog_role_into_its_seeded_bundle() {
+        let owner = v1_hosted("acct:owner", true)
+            .with_hosting_owner(true)
+            .with_hosting_member(true);
+        assert!(owner.is_host_member());
+        assert!(owner.is_host_owner());
+        assert_eq!(owner.bundle(), ResolvedMembershipBundle::owner());
+
+        let member = v1_hosted("acct:member", true)
+            .with_hosting_owner(false)
+            .with_hosting_member(true);
+        assert!(member.is_host_member());
+        assert!(!member.is_host_owner());
+        assert_eq!(member.bundle(), ResolvedMembershipBundle::member());
+
+        let guest = v1_hosted("acct:guest", false)
+            .with_hosting_owner(false)
+            .with_hosting_member(false);
+        assert!(!guest.is_host_member());
+        assert!(!guest.is_host_owner());
+        assert_eq!(guest.bundle(), ResolvedMembershipBundle::guest());
+    }
+
+    #[test]
+    fn flags_without_a_hosting_route_derive_the_bundle() {
+        // Test callers that fold flags without a hosting route (e.g. guest
+        // footing probes) carry no folded bundle; the bundle derives from
+        // the effective flags so the two agree by construction.
+        let guest = Caller::authenticated("acct:guest").with_hosting_member(false);
+        assert!(!guest.is_host_member());
+        assert_eq!(guest.bundle(), ResolvedMembershipBundle::guest());
+
+        let member = Caller::authenticated("acct:member").with_hosting_member(true);
+        assert!(member.is_host_member());
+        assert_eq!(member.bundle(), ResolvedMembershipBundle::owner());
+    }
+
+    #[test]
+    fn with_hosting_context_carries_the_member_bundle() {
+        let caller = Caller::authenticated("alice").with_hosting_context("catalog", "db-1");
+        assert!(caller.is_host_member());
+        assert_eq!(caller.bundle(), ResolvedMembershipBundle::member());
+    }
+
+    #[test]
+    #[should_panic(expected = "resolved membership bundle")]
+    fn hosted_caller_without_a_bundle_fails_instead_of_defaulting() {
+        let mut caller = Caller::authenticated("alice");
+        caller.hosting_database = Some("db-1".into());
+        caller.hosting_is_member = Some(true);
+        let _ = caller.bundle();
+    }
+
+    #[test]
+    #[should_panic(expected = "members_baseline")]
+    fn agreement_check_fires_when_flags_and_bundle_disagree() {
+        let mut caller = v1_hosted("acct:member", true)
+            .with_hosting_owner(false)
+            .with_hosting_member(true);
+        caller.membership_bundle = Some(ResolvedMembershipBundle::guest());
+        let _ = caller.bundle();
+    }
+
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    #[test]
+    fn v2_hosted_folds_owner_and_member_into_their_seeded_bundles() {
+        let owner = unsafe {
+            Caller::authenticated("acct:owner").with_verified_hosted_v2_identity(
+                "catalog-owner",
+                "db-1",
+                true,
+            )
+        };
+        assert!(owner.is_host_member());
+        assert!(owner.is_host_owner());
+        assert_eq!(owner.bundle(), ResolvedMembershipBundle::owner());
+
+        let member = unsafe {
+            Caller::authenticated("acct:member").with_verified_hosted_v2_identity(
+                "catalog-member",
+                "db-1",
+                false,
+            )
+        };
+        assert!(member.is_host_member());
+        assert!(!member.is_host_owner());
+        assert_eq!(member.bundle(), ResolvedMembershipBundle::member());
+    }
+
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    #[test]
+    fn resolved_bundles_mirror_the_2a_seeded_definitions() {
+        use crate::kernel::hosted_identity::bundles::{self, BundleSetting};
+        for id in ["owner", "member", "guest"] {
+            let definition = bundles::seeded_bundle(id).expect("seeded id");
+            let resolved = match id {
+                "owner" => ResolvedMembershipBundle::owner(),
+                "member" => ResolvedMembershipBundle::member(),
+                _ => ResolvedMembershipBundle::guest(),
+            };
+            assert_eq!(resolved.id, definition.id);
+            let get = |setting| definition.setting(setting).expect("seeded carries setting");
+            assert_eq!(
+                resolved.members_baseline,
+                get(BundleSetting::MembersBaseline),
+                "{id}"
+            );
+            assert_eq!(resolved.mcp, get(BundleSetting::Mcp), "{id}");
+            assert_eq!(
+                resolved.expiry_required,
+                get(BundleSetting::ExpiryRequired),
+                "{id}"
+            );
+            assert_eq!(
+                resolved.private_agent_context,
+                get(BundleSetting::PrivateAgentContext),
+                "{id}"
+            );
+            assert_eq!(
+                resolved.see_member_list,
+                get(BundleSetting::SeeMemberList),
+                "{id}"
+            );
+            assert_eq!(
+                resolved.counts_in_audience,
+                get(BundleSetting::CountsInAudience),
+                "{id}"
+            );
+            assert_eq!(
+                resolved.offline_copy,
+                get(BundleSetting::OfflineCopy),
+                "{id}"
+            );
+            assert_eq!(
+                resolved.manage_access,
+                get(BundleSetting::ManageAccess),
+                "{id}"
+            );
+            assert_eq!(
+                resolved.manage_workspace,
+                get(BundleSetting::ManageWorkspace),
+                "{id}"
+            );
+        }
     }
 }

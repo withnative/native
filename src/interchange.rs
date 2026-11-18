@@ -2220,7 +2220,10 @@ where
 /// standby authority act-range cut both build their `Column` inventory and
 /// `ORDER BY` from it, so a schema change cannot move one path without the
 /// other.
-async fn section_shape<'e, E>(executor: E, table: &str) -> Result<(Vec<Column>, Vec<String>)>
+pub(crate) async fn section_shape<'e, E>(
+    executor: E,
+    table: &str,
+) -> Result<(Vec<Column>, Vec<String>)>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {

@@ -10,15 +10,32 @@ exact declared basis through the existing Receipt aggregate; the latter
 combines the current account, revision coverage, direct concerns, recorded
 treatment and inherited uncertainty. Neither operation runs a model.
 
-Create a new ordinary note through `create_record` first, then use
-`save_account` for its authored text and basis. Record creation and the first
-basis save are separate operations; a failed save leaves the initial document
-without a new basis claim. Subsequent authored saves use the same guarded
-operation. The supported save does not accept executable artifacts.
+On the kernel v2 engine neither operation is served: `get_reuse_context`
+has no receipt or basis data to read, and `save_account` has no basis to
+declare or renew. Use each when it appears in your operation list or
+`describe_operation`. Otherwise read the account with `get_record` and
+`include_comments` for the current body, `body_digest`, version, and
+comment threads, `get_history` for exact body revisions, and
+`get_event_context` on the creation event for declared sources on
+records created with `sources`. Declare sources only at creation
+through `sources` on `create_record`; later body edits through
+`update_record` do not declare or renew a basis. Revision coverage and
+inherited uncertainty are not available on that route.
 
-Read the account and proposed Document sources with `get_reuse_context` to
-obtain their current `record.revision.revision_event_id`. The packet also identifies
-body revisions for its visible comments. Then declare the exact revisions
+Create a new ordinary note through `create_record` first, then use
+`save_account` when it is advertised for its authored text and basis.
+Record creation and the first basis save are separate operations; a
+failed save leaves the initial document without a new basis claim.
+Subsequent authored saves use the same guarded operation. The
+supported save does not accept executable artifacts. When
+`save_account` is not advertised, declare sources at creation through
+`sources` on `create_record`; later `update_record` edits do not
+declare or renew a basis.
+
+When `get_reuse_context` is advertised, read the account and proposed
+Document sources with it to obtain their current
+`record.revision.revision_event_id`. The packet also identifies body
+revisions for its visible comments. Then declare the exact revisions
 used, with a role and reason for each source:
 
 ```json
@@ -40,10 +57,10 @@ used, with a role and reason for each source:
 }
 ```
 
-This envelope goes to `records_write`. The matching read goes to
-`records_read` with `operation: "get_reuse_context"` and
-`arguments: {"record_id": "<account id>"}`. Event identifiers are exact;
-they are not record abbreviations.
+This envelope goes to `records_write`. On an engine that advertises
+it, the matching read goes to `records_read` with `operation:
+"get_reuse_context"` and `arguments: {"record_id": "<account id>"}`.
+Event identifiers are exact; they are not record abbreviations.
 
 ## Revision coverage
 

@@ -182,6 +182,17 @@ pub(super) async fn invoke(
     let Some(record_id) = invocation.slots.get(slot) else {
         return Ok(invalid(invocation, "record slot missing"));
     };
+    // The guard surface carries no provenance app claim, so enforce the
+    // admitted install's folder grant on the effect target directly.
+    if admitted.scope.is_scoped()
+        && !kernel::app_scope_allows_target_on(&mut tx, record_id, &admitted.scope).await?
+    {
+        return Ok(result(
+            invocation,
+            "outside_app_scope",
+            "not shared with this app",
+        ));
+    }
     let (need, cap) = if body {
         match effect_bounds::body_admission(&declaration, &entry.id) {
             Ok((bound, need)) => (

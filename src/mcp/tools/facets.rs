@@ -326,8 +326,6 @@ async fn governed_record_response(
             "resolve_facets: value set exceeds {MAX_RESOLVED_VALUES} rows"
         )));
     }
-    let record_type = record.record.record_type.clone();
-    let kind = record.record.kind.clone();
     let owner = match record.record.owner_id.as_deref() {
         Some(owner) => {
             let visible = if caller.is_member_copy() {
@@ -339,11 +337,33 @@ async fn governed_record_response(
         }
         None => None,
     };
-    let response = json!({
+    Ok(record_facet_response(
+        &record,
+        rows,
+        record_id,
+        owner,
+        cascade::bears_shape_from_rows(rows, record_id),
+        SHAPE_GUARANTEE,
+    ))
+}
+
+// Presentation only: callers retain their existing admission and visibility
+// folds and provide facts established by their own source, never an ACL flag.
+fn record_facet_response(
+    record: &read::EnrichedRecord,
+    rows: &[cascade::SchemaConfigRow],
+    record_id: &str,
+    owner: Option<String>,
+    bears_shape: bool,
+    shape_guarantee: &str,
+) -> Value {
+    let record_type = record.record.record_type.clone();
+    let kind = record.record.kind.clone();
+    json!({
         "record_id": record_id,
         "type": record_type,
         "kind": kind,
-        "bears_shape": cascade::bears_shape_from_rows(rows, record_id),
+        "bears_shape": bears_shape,
         "spine": {
             "lifecycle": record.record.lifecycle,
             "owner": owner,
@@ -355,9 +375,8 @@ async fn governed_record_response(
         "pack_shape": cascade::pack_facets_for_record_context(rows, &record_type, kind.as_deref(), Some(record_id)),
         "provenance": cascade::provenance_for_record_context(rows, &record_type, kind.as_deref(), Some(record_id)),
         "values": record.facets,
-        "shape_guarantee": SHAPE_GUARANTEE,
-    });
-    Ok(response)
+        "shape_guarantee": shape_guarantee,
+    })
 }
 
 async fn resolve_facets(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -385,27 +404,237 @@ async fn resolve_facets(db: Db, caller: Caller, arguments: Value) -> Result<Valu
             // Type path untouched by M4: schema configuration has no
             // record-index lookup to replace; behavior identical to before.
             let rows = visible_schema_rows(&db, &caller).await?;
-            let resolved = cascade::resolve_from_rows(&rows);
-            let kind = args.kind;
-            let mut response = json!({
-                "type": record_type,
-                "kind": kind,
-                "spine": SPINE_FACET_KEYS,
-                "shape": cascade::facets_for_type(&resolved.resolved, &record_type, kind.as_deref()),
-                "pack_shape": cascade::facets_for_type(&resolved.pack, &record_type, kind.as_deref()),
-                "provenance": cascade::provenance_for_type(&rows, &record_type, kind.as_deref()),
-                "shape_guarantee": SHAPE_GUARANTEE,
-            });
-            if kind.is_none() {
-                response["kind_shapes"] =
-                    json!(cascade::kind_shapes(&resolved.resolved, &record_type));
-            }
-            Ok(response)
+            Ok(type_facet_response(
+                &rows,
+                &record_type,
+                args.kind.as_deref(),
+                SHAPE_GUARANTEE,
+            ))
         }
         _ => Err(Error::engine(
             "resolve_facets takes exactly one of record_id or type",
         )),
     }
+}
+
+fn type_facet_response(
+    rows: &[cascade::SchemaConfigRow],
+    record_type: &str,
+    kind: Option<&str>,
+    shape_guarantee: &str,
+) -> Value {
+    let resolved = cascade::resolve_from_rows(rows);
+    let mut response = json!({
+        "type": record_type,
+        "kind": kind,
+        "spine": SPINE_FACET_KEYS,
+        "shape": cascade::facets_for_type(&resolved.resolved, record_type, kind),
+        "pack_shape": cascade::facets_for_type(&resolved.pack, record_type, kind),
+        "provenance": cascade::provenance_for_type(rows, record_type, kind),
+        "shape_guarantee": shape_guarantee,
+    });
+    if kind.is_none() {
+        response["kind_shapes"] = json!(cascade::kind_shapes(&resolved.resolved, record_type));
+    }
+    response
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_resolve_facets(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    if caller
+        .member_schema_incomplete_for()
+        .iter()
+        .any(|scope| scope == "global")
+    {
+        return Err(Error::unavailable_offline(
+            "resolve_facets",
+            "schema_incomplete",
+        ));
+    }
+    let args: ResolveFacetsArgs = parse_args("resolve_facets", arguments)?;
+    match (args.record_id, args.record_type) {
+        (Some(record_id), None) => {
+            let record_id = super::lifecycle::native_member_resolve_reference(
+                session,
+                &record_id,
+                "resolve_facets",
+            )
+            .await?;
+            if crate::mcp::member_serving::member_schema_incomplete_applies(caller, &record_id) {
+                return Err(Error::unavailable_offline(
+                    "resolve_facets",
+                    "schema_incomplete",
+                ));
+            }
+            let opts = read::EnrichOptions {
+                children_limit: 0,
+                links_limit: 0,
+                ..Default::default()
+            };
+            let items =
+                read::get_records_native_member(session, std::slice::from_ref(&record_id), opts)
+                    .await?;
+            let record = match items.into_iter().next() {
+                Some(read::BatchGetItem::Found(record)) => record,
+                _ => return Err(Error::engine(format!("record {record_id} does not exist"))),
+            };
+            if record.facets.len() > MAX_RESOLVED_VALUES {
+                return Err(Error::engine(format!(
+                    "resolve_facets: value set exceeds {MAX_RESOLVED_VALUES} rows"
+                )));
+            }
+            let rows = cascade::schema_config_rows_on(session.transaction()).await?;
+            // Owner and bears_shape were selected on the authenticated source
+            // cut, closed over held records and verified with this generation.
+            // Archive/comment identity comes from the native reader, not v1
+            // catalogue classification or a synthetic legacy archived facet.
+            let owner = record.record.owner_id.clone();
+            Ok(record_facet_response(
+                &record,
+                &rows,
+                &record_id,
+                owner,
+                record.bears_shape,
+                crate::mcp::kernel_v2::NATIVE_SCHEMA_SHAPE_GUARANTEE,
+            ))
+        }
+        (None, Some(record_type)) => {
+            let rows = cascade::schema_config_rows_on(session.transaction()).await?;
+            Ok(type_facet_response(
+                &rows,
+                &record_type,
+                args.kind.as_deref(),
+                crate::mcp::kernel_v2::NATIVE_SCHEMA_SHAPE_GUARANTEE,
+            ))
+        }
+        _ => Err(Error::engine(
+            "resolve_facets takes exactly one of record_id or type",
+        )),
+    }
+}
+
+// Serialization only; each source retains its existing authority, catalogue
+// lookup and bounds before handing its actual typed values to this fold.
+fn facet_suggestion_response<V: serde::Serialize, S: serde::Serialize>(
+    facet_key: &str,
+    record_type: &str,
+    kind: Option<&str>,
+    declared_type: Value,
+    vocabulary: V,
+    suggestions: S,
+    shape_guarantee: &str,
+) -> Value {
+    json!({"facet_key":facet_key,"type":record_type,"kind":kind,"declared_type":declared_type,
+        "vocabulary":vocabulary,"suggestions":suggestions,"shape_guarantee":shape_guarantee})
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn native_member_suggest_facet_values(
+    session: &mut crate::member_copy_kernel_v2::profile::session::NativeMemberReadSession,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<Value> {
+    if !caller.is_member_copy() || caller.actor() != session.principal() {
+        return Err(Error::copy_unavailable());
+    }
+    if caller
+        .member_schema_incomplete_for()
+        .iter()
+        .any(|scope| scope == "global")
+    {
+        return Err(Error::unavailable_offline(
+            "suggest_facet_values",
+            "schema_incomplete",
+        ));
+    }
+    let args: SuggestFacetValuesArgs = parse_args("suggest_facet_values", arguments)?;
+    let (record_type, kind, bearer_id) = match (args.record_id, args.record_type) {
+        (Some(record_id), None) => {
+            let record_id = super::lifecycle::native_member_resolve_reference(
+                session,
+                &record_id,
+                "suggest_facet_values",
+            )
+            .await?;
+            if crate::mcp::member_serving::member_schema_incomplete_applies(caller, &record_id) {
+                return Err(Error::unavailable_offline(
+                    "suggest_facet_values",
+                    "schema_incomplete",
+                ));
+            }
+            let items = read::get_records_native_member(
+                session,
+                std::slice::from_ref(&record_id),
+                read::EnrichOptions {
+                    children_limit: 0,
+                    links_limit: 0,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let record = match items.into_iter().next() {
+                Some(read::BatchGetItem::Found(record)) => record,
+                _ => {
+                    return Err(Error::engine(format!(
+                        "suggest_facet_values: record {record_id} does not exist"
+                    )))
+                }
+            };
+            (
+                record.record.record_type,
+                record.record.kind,
+                Some(record_id),
+            )
+        }
+        (None, Some(record_type)) => (record_type, args.kind, None),
+        _ => {
+            return Err(Error::engine(
+                "suggest_facet_values takes exactly one of record_id or type",
+            ))
+        }
+    };
+    let rows = cascade::schema_config_rows_on(session.transaction()).await?;
+    let shape = cascade::facets_for_record_context(
+        &rows,
+        &record_type,
+        kind.as_deref(),
+        bearer_id.as_deref(),
+    );
+    let declaration = shape.get(&args.facet_key);
+    let declared_type = declaration
+        .and_then(|shape| shape.get("type"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let governing = declaration
+        .and_then(|shape| shape.get("vocab").or_else(|| shape.get("vocab_ref")))
+        .and_then(Value::as_str);
+    let (vocabulary, suggestions) = if let Some(governing) = governing {
+        let mut executor =
+            crate::portable_sql::BorrowedSqliteStatementExecutor::new(session.transaction());
+        crate::domain_transaction::vocabulary_and_active_values(
+            &mut executor,
+            resolve_vocab_ref(governing),
+        )
+        .await?
+    } else {
+        (Value::Null, Vec::new())
+    };
+    Ok(facet_suggestion_response(
+        &args.facet_key,
+        &record_type,
+        kind.as_deref(),
+        declared_type,
+        vocabulary,
+        suggestions,
+        crate::mcp::kernel_v2::NATIVE_SCHEMA_SHAPE_GUARANTEE,
+    ))
 }
 
 async fn suggest_facet_values(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -467,15 +696,15 @@ async fn suggest_facet_values(db: Db, caller: Caller, arguments: Value) -> Resul
             .and_then(Value::as_str)
             .map(String::from)
     }) else {
-        return Ok(json!({
-            "facet_key": args.facet_key,
-            "type": record_type,
-            "kind": kind,
-            "declared_type": declared_type,
-            "vocabulary": Value::Null,
-            "suggestions": [],
-            "shape_guarantee": SHAPE_GUARANTEE,
-        }));
+        return Ok(facet_suggestion_response(
+            &args.facet_key,
+            &record_type,
+            kind.as_deref(),
+            declared_type,
+            Value::Null,
+            Vec::<Value>::new(),
+            SHAPE_GUARANTEE,
+        ));
     };
     let vocabulary = resolve_vocab_ref(&governing);
     let suggestions = list_values(
@@ -494,15 +723,15 @@ async fn suggest_facet_values(db: Db, caller: Caller, arguments: Value) -> Resul
     }
     // `list_values` errored if the vocabulary were missing, so this is `Some`.
     let vocab = get_vocabulary(&db, vocabulary).await?;
-    Ok(json!({
-        "facet_key": args.facet_key,
-        "type": record_type,
-        "kind": kind,
-        "declared_type": declared_type,
-        "vocabulary": vocab,
-        "suggestions": suggestions,
-        "shape_guarantee": SHAPE_GUARANTEE,
-    }))
+    Ok(facet_suggestion_response(
+        &args.facet_key,
+        &record_type,
+        kind.as_deref(),
+        declared_type,
+        vocab,
+        suggestions,
+        SHAPE_GUARANTEE,
+    ))
 }
 
 /// Register tools 14–15.

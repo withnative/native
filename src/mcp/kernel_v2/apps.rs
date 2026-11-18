@@ -7,17 +7,26 @@ use crate::mcp::tools::alpha_tabs::{self, AppBundleDelivery, ManageAlphaTabsArgs
 
 pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
     let delivery = registry.app_bundle_delivery();
+    let local_copy = registry.is_standby_read_only();
+    let catalog = registry.catalog_assets();
+    let public_origin = registry.public_origin().map(str::to_owned);
     registry.register_engine_handler_for_selector_values(
         "manage_alpha_tabs",
         EngineKind::KernelV2,
         "action",
         &[
+            "install_link",
+            "shelf_add",
+            "shelf_remove",
             "list",
             "inspect",
             "prepare_install",
+            "publish_catalog_update",
+            "materialize_catalog_update",
             "install",
             "preview",
             "adopt",
+            "set_scope",
             "remove",
             "launch",
             "live_read",
@@ -25,6 +34,8 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
         ],
         move |engine, caller, args| {
             let delivery = delivery.clone();
+            let catalog = catalog.clone();
+            let public_origin = public_origin.clone();
             async move {
                 let EngineHandle::KernelV2(db) = engine else {
                     unreachable!()
@@ -35,7 +46,19 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
                         "manage_alpha_tabs: app callers cannot manage consent",
                     ));
                 }
-                execute(&db, &actor, &caller, args, delivery.as_ref()).await
+                execute(
+                    &db,
+                    &actor,
+                    &caller,
+                    args,
+                    RegistryDelivery {
+                        config: delivery.as_ref(),
+                        local_copy,
+                    },
+                    public_origin.as_deref(),
+                    catalog.as_deref(),
+                )
+                .await
             }
         },
     )
@@ -59,8 +82,11 @@ fn outcome(
     delivery: Option<&AppBundleDelivery>,
 ) -> Value {
     availability(&mut result.install, delivery);
+    // The UI reads the effective grant from the top level as well as
+    // `install.scope`; echo it in both places.
+    let scope = result.install["scope"].clone();
     json!({"package":package,"changed":result.outcome.changed,
-        "idempotent_retry":!result.outcome.changed,"install":result.install})
+        "idempotent_retry":!result.outcome.changed,"scope":scope,"install":result.install})
 }
 
 fn refusal(code: &str, message: &str) -> Value {
@@ -76,15 +102,115 @@ fn reason_valid(reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Local install evidence does not depend on a hosted bundle signer. The
+/// separate read_app_bundle path still admits each device-held bundle.
+struct RegistryDelivery<'a> {
+    config: Option<&'a AppBundleDelivery>,
+    local_copy: bool,
+}
+
+/// `install` with `from_shelf: true`. A human act for the caller alone: it
+/// stages the caller's own install row from the live shelf entry, and consent
+/// is the usual preview and adopt.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct ShelfInstall {
+    action: String,
+    package: String,
+    #[serde(deserialize_with = "must_be_true")]
+    from_shelf: bool,
+    shelf_event_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+fn must_be_true<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    if <bool as serde::Deserialize>::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom(
+            "from_shelf must be true; omit it for an explicit install",
+        ))
+    }
+}
+
 async fn execute(
     db: &Db,
     actor: &str,
     caller: &Caller,
     args: Value,
-    delivery: Option<&AppBundleDelivery>,
+    delivery: RegistryDelivery<'_>,
+    public_origin: Option<&str>,
+    catalog: Option<&installs::catalog::CatalogAssets>,
 ) -> Result<Value> {
+    let RegistryDelivery {
+        config: delivery,
+        local_copy,
+    } = delivery;
+    // Enabling from the shelf has its own closed argument shape: the pin is
+    // never a request field, so it cannot be mistaken for an explicit install.
+    if args["action"] == "install" && args.get("from_shelf").is_some() {
+        let ShelfInstall {
+            package,
+            shelf_event_id,
+            reason,
+            idempotency_key,
+            ..
+        } = serde_json::from_value(args)?;
+        alpha_tabs::require_package(&package)?;
+        let result = installs::install_from_shelf_as(
+            db,
+            actor,
+            &package,
+            &shelf_event_id,
+            reason,
+            idempotency_key,
+        )
+        .await?;
+        return Ok(outcome(package, result, delivery));
+    }
     let args: ManageAlphaTabsArgs = serde_json::from_value(args)?;
     match args {
+        ManageAlphaTabsArgs::MaterializeCatalogUpdate(request) => {
+            if !caller.counter_footing().is_owner() {
+                return Err(Error::auth(
+                    "catalog materialization requires workspace-owner footing",
+                ));
+            }
+            let catalog =
+                catalog.ok_or_else(|| Error::engine("host catalog materialization unavailable"))?;
+            installs::materialized::materialize_as(db, actor, catalog, request).await
+        }
+        ManageAlphaTabsArgs::PublishCatalogUpdate(request) => {
+            if !caller.counter_footing().is_owner() {
+                return Err(Error::auth(
+                    "catalog publication requires workspace-owner footing",
+                ));
+            }
+            let catalog =
+                catalog.ok_or_else(|| Error::engine("host catalog publication unavailable"))?;
+            installs::catalog::publish_as(db, actor, catalog, request).await
+        }
+        ManageAlphaTabsArgs::ShelfAdd {
+            package,
+            idempotency_key,
+        } => {
+            let catalog =
+                catalog.ok_or_else(|| Error::engine("host catalog shelf staging unavailable"))?;
+            installs::shelf::add_as(db, actor, catalog, &package, &idempotency_key).await
+        }
+        ManageAlphaTabsArgs::ShelfRemove {
+            package,
+            expected_shelf_event_id,
+        } => installs::shelf::remove_as(db, actor, &package, &expected_shelf_event_id).await,
+        ManageAlphaTabsArgs::InstallLink { package } => {
+            alpha_tabs::install_link::prepare(&package, public_origin)
+        }
         ManageAlphaTabsArgs::LiveRead {
             package,
             expected_install_event_id,
@@ -203,12 +329,13 @@ async fn execute(
                 "launch":launch,
                 "sandbox":{"sandbox":"allow-scripts","referrerPolicy":"no-referrer","allow":"","bridge_version":crate::artifact_html::BRIDGE_VERSION},
                 "input_digest":alpha_tabs::alpha_tab_sample_input_digest(&sample),"input":sample,
-                "live_reads":source.pin["consented_declaration"].as_str().and_then(|raw| serde_json::from_str::<Value>(raw).ok()).is_some_and(|d| d.get("contract").is_none()),"effects_wired":false}),
+                "live_reads":false,"effects_wired":false}),
             )
         }
         ManageAlphaTabsArgs::List {
             view,
             include_removed,
+            ..
         } => {
             let mut result = installs::list_as(db, actor, view, include_removed).await?;
             // A host-owned development contract, never app-supplied admission.
@@ -219,7 +346,9 @@ async fn execute(
             }
             if let Some(entries) = result["installs"].as_array_mut() {
                 for entry in entries {
-                    availability(entry, delivery);
+                    if !local_copy {
+                        availability(entry, delivery);
+                    }
                 }
             }
             Ok(result)
@@ -227,7 +356,7 @@ async fn execute(
         ManageAlphaTabsArgs::Inspect { package } => {
             alpha_tabs::require_package(&package)?;
             let mut result = installs::inspect_as(db, actor, &package).await?;
-            if result["installed"] == true {
+            if !local_copy && result["installed"] == true {
                 availability(&mut result["install"], delivery);
             }
             Ok(result)
@@ -248,7 +377,66 @@ async fn execute(
             {
                 return Err(Error::engine("manage_alpha_tabs: prepare_install requires a source revision or body digest guard"));
             }
-            let pins = installs::frozen_sources_as(db, actor).await?;
+            let mut pins = installs::frozen_sources_as(db, actor).await?;
+            // Derive a source pin without publishing package identity or consent.
+            let mut snapshot = db.write_pool().begin().await?;
+            let native_request = InstallRequest {
+                package: args.package.clone(),
+                version: args.version.clone(),
+                artifact_id: args.artifact_id.clone(),
+                source_revision: args.expected_source_revision.clone().unwrap_or_default(),
+                digest: String::new(),
+                declaration: args.declaration.clone(),
+                reason: args.reason.clone(),
+                request: args.request.clone(),
+                idempotency_key: None,
+                expected_install_event_id: None,
+            };
+            // A hidden source must not disclose whether native publication
+            // evidence exists. Frozen discovery is already caller-filtered.
+            let candidate = if kernel::read_record_on(&mut snapshot, actor, &args.artifact_id)
+                .await?
+                .is_some()
+            {
+                installs::sources::native_pin_on(&mut snapshot, &native_request).await?
+            } else {
+                None
+            };
+            // Only the guarded native candidate needs owner admission. An
+            // unrelated newer publication must not obstruct frozen-pin installs.
+            let candidate = candidate.filter(|(pin, _, _)| {
+                args.expected_body_digest
+                    .as_ref()
+                    .is_none_or(|guard| pin["bundle_sha256"] == *guard)
+            });
+            if let Some((pin, _, _)) = candidate {
+                let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_app_installs WHERE principal=? AND package=? AND status!='removed' AND json_extract(row_json,'$.artifact_id')=? AND json_extract(row_json,'$.consented_source_revision')=?)")
+                    .bind(actor).bind(&args.package).bind(&args.artifact_id).bind(pin["source_revision"].as_str()).fetch_one(&mut *snapshot).await?;
+                if !same {
+                    let revision = pin["source_revision"]
+                        .as_str()
+                        .ok_or_else(|| Error::engine("app source revision missing"))?;
+                    installs::sources::require_update_footing_on(
+                        &mut snapshot,
+                        caller,
+                        &args.artifact_id,
+                        revision,
+                    )
+                    .await?;
+                    installs::sources::require_update_owner_on(
+                        &mut snapshot,
+                        actor,
+                        &args.artifact_id,
+                        Some(&args.package),
+                        revision,
+                    )
+                    .await?;
+                }
+                if !pins.contains(&pin) {
+                    pins.push(pin);
+                }
+            }
+            snapshot.rollback().await?;
             let mut matches = Vec::new();
             for pin in pins {
                 let declaration: Value = serde_json::from_str(
@@ -275,7 +463,7 @@ async fn execute(
             if matches.len() != 1 {
                 return Ok(refusal(
                     "unsupported_on_v2",
-                    "Select one exact frozen source pin available to this account.",
+                    "Select one exact attested source pin available to this account. For a new personal app, publish its native.html.v1 app_package=true artifact with guarded update_record, then prepare_install again.",
                 ));
             }
             let pin = matches.pop().expect("one matching frozen pin");
@@ -303,10 +491,38 @@ async fn execute(
                 .as_ref()
                 .is_some_and(|(_, status)| status != "removed")
             {
-                return Ok(refusal(
-                    "already_installed",
-                    "This account already has this package installed.",
-                ));
+                let mut tx = db.write_pool().begin().await?;
+                let unchanged:bool=sqlx::query_scalar("SELECT json_extract(row_json,'$.consented_source_revision')=? FROM kernel_app_installs WHERE principal=? AND package=?")
+                    .bind(&request.source_revision).bind(actor).bind(&request.package).fetch_one(&mut *tx).await?;
+                if unchanged
+                    || !installs::sources::is_native_on(
+                        &mut tx,
+                        &request.artifact_id,
+                        &request.source_revision,
+                    )
+                    .await?
+                {
+                    return Ok(refusal(
+                        "already_installed",
+                        "This account already has this package installed.",
+                    ));
+                }
+                installs::sources::require_update_footing_on(
+                    &mut tx,
+                    caller,
+                    &request.artifact_id,
+                    &request.source_revision,
+                )
+                .await?;
+                installs::sources::require_update_owner_on(
+                    &mut tx,
+                    actor,
+                    &request.artifact_id,
+                    Some(&request.package),
+                    &request.source_revision,
+                )
+                .await?;
+                tx.rollback().await?;
             }
             let manifest = match crate::artifact_html::validate_cached_with_limit(
                 &prepared.body,
@@ -326,6 +542,15 @@ async fn execute(
                     "The frozen source's required app kit is unavailable.",
                 ));
             }
+            let review_path = caller.hosting_database().map(|database| {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                query
+                    .append_pair("workspace", database)
+                    .append_pair("view", &format!("pending:{}", request.package))
+                    .append_pair("review_update", &request.package)
+                    .append_pair("review_source_revision", &request.source_revision);
+                format!("/alpha/?{}", query.finish())
+            });
             let previous = prepared
                 .current_install
                 .as_ref()
@@ -339,7 +564,7 @@ async fn execute(
                 "source_bytes":prepared.body.len(),"runtime":"native.html.v1",
                 "digest_version":alpha_tabs::ALPHA_TAB_DIGEST_VERSION,"bundle_sha256":prepared.pin["bundle_sha256"],
                 "declaration_digest":prepared.pin["declaration_digest"],"digest":request.digest,
-                "current_install_event_id":previous,"current_install_status":prepared.current_install.as_ref().map(|(_,s)|s),
+                "review_path":review_path,"current_install_event_id":previous,"current_install_status":prepared.current_install.as_ref().map(|(_,s)|s),
                 "adoption":"caller_asserted","kit":{"policy":manifest.kit_policy,"available":true,"basis":"packaged_default","delivery_rechecks":true},
                 "findings":[],"findings_truncated":false,
                 "next_call":{"executor":"artifacts_write","operation":"manage_alpha_tabs.install","arguments":arguments}}),
@@ -358,6 +583,21 @@ async fn execute(
             expected_install_event_id,
         } => {
             alpha_tabs::require_package(&package)?;
+            let mut auth = db.write_pool().begin().await?;
+            let native =
+                installs::sources::is_native_on(&mut auth, &artifact_id, &source_revision).await?;
+            let different: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_app_installs WHERE principal=? AND package=? AND status!='removed' AND json_extract(row_json,'$.consented_source_revision')!=?)")
+                .bind(actor).bind(&package).bind(&source_revision).fetch_one(&mut *auth).await?;
+            if native && different {
+                installs::sources::require_update_footing_on(
+                    &mut auth,
+                    caller,
+                    &artifact_id,
+                    &source_revision,
+                )
+                .await?;
+            }
+            auth.rollback().await?;
             let result = installs::install_for_user_as(
                 db,
                 actor,
@@ -469,6 +709,7 @@ async fn execute(
             expected_install_event_id,
             reason,
             idempotency_key,
+            scope,
         } => {
             alpha_tabs::require_package(&package)?;
             let result = installs::adopt_as(
@@ -491,9 +732,16 @@ async fn execute(
                     receipt_id,
                     nonce,
                     preview_session,
+                    scope,
                 },
             )
             .await?;
+            Ok(outcome(package, result, delivery))
+        }
+        ManageAlphaTabsArgs::SetScope { package, scope } => {
+            alpha_tabs::require_package(&package)?;
+            let scope = installs::AppScope::from_json(&scope)?;
+            let result = installs::set_scope_as(db, actor, &package, scope).await?;
             Ok(outcome(package, result, delivery))
         }
         ManageAlphaTabsArgs::Remove {

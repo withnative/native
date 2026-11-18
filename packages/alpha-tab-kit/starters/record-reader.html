@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Record reader</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem;color:#243047;max-width:65rem}input,textarea,button{font:inherit;padding:.5rem}label{display:block;margin:.8rem 0}textarea{width:95%;min-height:4rem}.columns{display:grid;grid-template-columns:1fr 2fr;gap:2rem}li{margin:.5rem 0}.kit-error{color:#9c2630}.kit-record-link{cursor:pointer}@media(max-width:650px){.columns{display:block}}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact?.useRecordList) root.textContent = 'Open in Native with core kit 1.7.0.';
+else {
+  const { html, render, useState, useRecord, useRecordList, Loading, Empty, ErrorState, FeedNotice, RecordLink, Markdown } = kit.preact;
+  const nf = n => n.toLocaleString('en-US');
+  // One record by id. `record` is only ever the requested id's; while another id loads it is null.
+  function Reader({ id, onPrevious, onNext }) {
+    const r = useRecord(id); // body is read up to 120,000 characters
+    return html`<article>
+      <p><button type="button" id="previous" disabled=${!onPrevious} onClick=${onPrevious}>Previous</button> <button type="button" id="next" disabled=${!onNext} onClick=${onNext}>Next</button></p>
+      ${r.status === 'loading' && html`<${Loading} what="record" />`}
+      ${r.status === 'unsupported' && html`<p role="alert">This host does not offer app-v2 query subscriptions.</p>`}
+      ${r.status === 'error' && html`<${ErrorState} error=${r.error} onRetry=${r.retry} />`}
+      ${r.status === 'missing' && html`<${Empty}>This record is unavailable.<//>`}
+      <${FeedNotice} feed=${r} />
+      ${r.record && html`<h2>${r.record.name || r.record.id}</h2>
+        <p><${RecordLink} id=${r.record.id}>Open record<//>${r.cached && ' · Showing a saved copy; checking for updates.'}</p>
+        ${r.bodyTruncated && html`<p role="status">Showing the first ${nf(r.body.length)} of ${nf(r.bodyLength)} characters.</p>`}
+        <${Markdown} source=${r.body || ''} />`}
+    </article>`;
+  }
+  function App() {
+    const [mode, setMode] = useState('folder');
+    const [draft, setDraft] = useState('native:root'); // Any folder id; try native:unfiled too.
+    const [folder, setFolder] = useState('native:root');
+    const [text, setText] = useState('');
+    const [ids, setIds] = useState([]);
+    const [selected, setSelected] = useState(null);
+    // A folder's children, newest first, or the ids you list in order. Never more than 200 rows.
+    const list = useRecordList(mode === 'folder' ? { folder } : { ids }, { limit: 20 });
+    const rows = list.rows, at = rows.findIndex(row => row.id === selected);
+    const go = step => () => { const row = rows[at + step]; if (row) setSelected(row.id); };
+    const start = next => { setMode(next); setSelected(null); };
+    return html`<section><h1>Record reader</h1>
+      <p><button type="button" id="mode-folder" disabled=${mode === 'folder'} onClick=${() => start('folder')}>Folder</button> <button type="button" id="mode-ids" disabled=${mode === 'ids'} onClick=${() => start('ids')}>Id list</button></p>
+      ${mode === 'folder'
+        ? html`<label>Folder id <input id="folder" value=${draft} onInput=${e => setDraft(e.currentTarget.value)} /></label><button type="button" id="open" onClick=${() => { setFolder(draft.trim()); setSelected(null); }}>Open</button>`
+        : html`<label>Record ids, one per line <textarea id="ids" value=${text} onInput=${e => setText(e.currentTarget.value)} /></label><button type="button" id="open" onClick=${() => { setIds(text.split('\n').map(id => id.trim()).filter(Boolean)); setSelected(null); }}>Open</button>`}
+      <div class="columns"><nav aria-label="Records">
+        ${list.status === 'loading' && html`<${Loading} what="records" />`}
+        ${list.status === 'unsupported' && html`<p role="alert">This host does not offer app-v2 query subscriptions.</p>`}
+        ${list.status === 'error' && html`<${ErrorState} error=${list.error} onRetry=${list.retry} />`}
+        <${FeedNotice} feed=${list} />
+        ${list.status === 'ready' && !rows.length && !list.missing.length && html`<${Empty}>No records here.<//>`}
+        <ul>${rows.map(row => html`<li key=${row.id}><button type="button" onClick=${() => setSelected(row.id)}>${row.name || row.id}</button> — ${row.type}</li>`)}</ul>
+        ${list.missing.length > 0 && html`<p>${list.missing.length} listed record${list.missing.length > 1 ? 's are' : ' is'} unavailable to this account: ${list.missing.join(', ')}</p>`}
+        ${list.omitted > 0 && html`<p>${list.omitted} more ids past the 200 limit were not read.</p>`}
+        ${list.more && !list.capped && html`<button type="button" id="more" disabled=${list.refreshing} onClick=${list.loadMore}>${list.refreshing ? 'Loading…' : 'Load more'}</button>`}
+        ${list.capped && html`<p>Showing the first 200.</p>`}
+      </nav>
+      ${selected ? html`<${Reader} id=${selected} onPrevious=${at > 0 ? go(-1) : undefined} onNext=${at >= 0 && at < rows.length - 1 ? go(1) : undefined} />` : html`<article><p>Select a record to read it.</p></article>`}</div>
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>

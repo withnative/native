@@ -719,6 +719,25 @@ where
         .read_blob_range(&blob_id, offset, length)
         .await?
         .expect("blob row existed for metadata");
+    Ok(attachment_read_response(
+        attachment_id,
+        &name,
+        deleted_at,
+        meta,
+        offset,
+        slice,
+    ))
+}
+
+/// Presentation only: callers establish attachment identity and read authority.
+pub(crate) fn attachment_read_response(
+    attachment_id: &str,
+    name: &str,
+    deleted_at: Option<String>,
+    meta: BlobMeta,
+    offset: u64,
+    slice: BlobSlice,
+) -> Value {
     let returned = slice.bytes.len();
     let texty = meta.mime.as_deref().is_some_and(is_text_mime);
     let (content, content_encoding) = match String::from_utf8(slice.bytes) {
@@ -726,7 +745,7 @@ where
         Ok(text) => (encode_base64(text.as_bytes()), "base64"),
         Err(error) => (encode_base64(error.as_bytes()), "base64"),
     };
-    Ok(json!({
+    json!({
         "attachment_id": attachment_id,
         "name": name,
         "deleted_at": deleted_at,
@@ -736,7 +755,7 @@ where
         "eof": slice.eof,
         "content": content,
         "content_encoding": content_encoding,
-    }))
+    })
 }
 
 pub(crate) async fn list_attachments<E: DomainStatementExecutor>(
@@ -832,17 +851,19 @@ async fn list_attachments_with_scope<E: DomainStatementExecutor>(
         if !CoreKind::DocumentAttachment.matches(&resolution) {
             continue;
         }
-        attachments.push(json!({
-            "attachment_id": id,
-            "name": text(&row, "name", "attachment list")?,
-            "created_at": text(&row, "created_at", "attachment list")?,
-            "blob_id": optional_text(&row, "blob_id", "attachment list")?,
-            "mime": optional_text(&row, "mime", "attachment list")?,
-            "size_bytes": optional_integer(&row, "size_bytes", "attachment list")?,
-            "sha256": optional_text(&row, "sha256", "attachment list")?,
-            "original_filename": optional_text(&row, "original_filename", "attachment list")?,
-            "storage_tier": optional_text(&row, "storage_tier", "attachment list")?,
-        }));
+        attachments.push(attachment_list_response(
+            &id,
+            &text(&row, "name", "attachment list")?,
+            &text(&row, "created_at", "attachment list")?,
+            AttachmentListBlob {
+                id: optional_text(&row, "blob_id", "attachment list")?,
+                mime: optional_text(&row, "mime", "attachment list")?,
+                size_bytes: optional_integer(&row, "size_bytes", "attachment list")?,
+                sha256: optional_text(&row, "sha256", "attachment list")?,
+                original_filename: optional_text(&row, "original_filename", "attachment list")?,
+                storage_tier: optional_text(&row, "storage_tier", "attachment list")?,
+            },
+        ));
     }
     Ok(json!({ "record_id": record_id, "attachments": attachments }))
 }
@@ -880,14 +901,52 @@ async fn inspect_attachment_with_scope<E: DomainStatementExecutor>(
     let (name, deleted_at, created_at, blob_id) =
         resolve_attachment(executor, tool, attachment_id).await?;
     let meta = blob_meta(executor, &blob_id).await?;
-    Ok(json!({
-        "attachment_id": attachment_id,
-        "name": name,
-        "created_at": created_at,
-        "detached": deleted_at.is_some(),
-        "deleted_at": deleted_at,
-        "blob": meta,
-    }))
+    Ok(attachment_inspect_response(
+        attachment_id,
+        &name,
+        &created_at,
+        deleted_at,
+        meta,
+    ))
+}
+
+/// Optional fields preserve the existing dangling-blob list presentation.
+pub(crate) struct AttachmentListBlob {
+    pub id: Option<String>,
+    pub mime: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub sha256: Option<String>,
+    pub original_filename: Option<String>,
+    pub storage_tier: Option<String>,
+}
+impl From<&BlobMeta> for AttachmentListBlob {
+    fn from(meta: &BlobMeta) -> Self {
+        Self {
+            id: Some(meta.id.clone()),
+            mime: meta.mime.clone(),
+            size_bytes: Some(meta.size_bytes),
+            sha256: Some(meta.sha256.clone()),
+            original_filename: meta.original_filename.clone(),
+            storage_tier: Some(meta.storage_tier.clone()),
+        }
+    }
+}
+pub(crate) fn attachment_list_response(
+    id: &str,
+    name: &str,
+    created_at: &str,
+    blob: AttachmentListBlob,
+) -> Value {
+    json!({"attachment_id":id,"name":name,"created_at":created_at,"blob_id":blob.id,"mime":blob.mime,"size_bytes":blob.size_bytes,"sha256":blob.sha256,"original_filename":blob.original_filename,"storage_tier":blob.storage_tier})
+}
+pub(crate) fn attachment_inspect_response(
+    id: &str,
+    name: &str,
+    created_at: &str,
+    deleted_at: Option<String>,
+    meta: Option<BlobMeta>,
+) -> Value {
+    json!({"attachment_id":id,"name":name,"created_at":created_at,"detached":deleted_at.is_some(),"deleted_at":deleted_at,"blob":meta})
 }
 
 async fn attachment_detach_state<E: DomainStatementExecutor>(

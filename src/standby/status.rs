@@ -45,11 +45,38 @@ pub enum StandbyFreshnessState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StandbyFreshness {
+    /// Operational check-age classification, not proof of missing content.
     pub state: StandbyFreshnessState,
     pub age_seconds: Option<u64>,
+    pub age_basis: &'static str,
     pub target_rpo_seconds: u64,
     pub target_refresh_interval_seconds: u64,
     pub beyond_rpo: Option<bool>,
+}
+
+/// Reporting only. Neither elapsed time nor these observations admit reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StandbySyncObservation {
+    /// Conservative sample before the check/export that established this head.
+    pub last_matching_hosted_check_at: Option<String>,
+    /// Local completion, independent of subsequent checks that change nothing.
+    pub last_local_materialization_at: Option<String>,
+    /// The export/head protocol does not supply a source change timestamp.
+    pub last_data_change_at: Option<String>,
+    pub age_basis: &'static str,
+}
+
+/// How recently the serving copy's rows were last re-judged against its
+/// receipts (the required audit). Present only for a copy advanced in place
+/// while audits are required; machine fields, never user-facing text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StandbyAudit {
+    /// `current` (within twice the interval), `overdue`, `unaudited` (no
+    /// readable record) or `failed` (the last audit found damage).
+    pub state: &'static str,
+    /// Seconds since the last audit's snapshot was acquired.
+    pub age_seconds: Option<u64>,
+    pub interval_seconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -84,12 +111,59 @@ pub enum StandbyRefreshDiagnosticsState {
     Unavailable,
 }
 
+/// An observation, not a promise that an old process can enforce its deadline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InFlightRefresh {
+    pub attempt_id: Option<String>,
+    pub cause: Option<super::RefreshCause>,
+    pub phase: super::refresh::StandbyTransferStage,
+    pub started_at: String,
+    pub elapsed_seconds: Option<u64>,
+    pub deadline_seconds: u64,
+    pub overdue: bool,
+}
+
+fn in_flight(
+    state: &super::StandbyRefreshState,
+    now: Option<DateTime<Utc>>,
+) -> Option<InFlightRefresh> {
+    if !state.refresh_active {
+        return None;
+    }
+    let started_at = state.last_attempt_at.as_ref()?;
+    let elapsed_seconds = now
+        .zip(DateTime::parse_from_rfc3339(started_at).ok())
+        .and_then(|(now, start)| {
+            u64::try_from(now.signed_duration_since(start).num_seconds()).ok()
+        });
+    let phase = state
+        .transfer_progress
+        .as_ref()
+        .map(|p| p.stage)
+        .unwrap_or(super::refresh::StandbyTransferStage::Following);
+    let deadline_seconds = if phase == super::refresh::StandbyTransferStage::Following {
+        super::refresh::FOLLOW_ATTEMPT_TIMEOUT.as_secs()
+    } else {
+        super::refresh::ATTEMPT_TIMEOUT.as_secs()
+    };
+    Some(InFlightRefresh {
+        attempt_id: state.last_attempt_id.clone(),
+        cause: state.last_attempt_cause,
+        phase,
+        started_at: normalized_timestamp(started_at),
+        elapsed_seconds,
+        deadline_seconds,
+        overdue: elapsed_seconds.is_some_and(|elapsed| elapsed >= deadline_seconds),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StandbyRefreshStatus {
     pub configured: bool,
     pub controller_available: bool,
     pub diagnostics: StandbyRefreshDiagnosticsState,
     pub refresh_active: Option<bool>,
+    pub in_flight: Option<InFlightRefresh>,
     pub transfer_progress: Option<super::StandbyTransferProgress>,
     pub manual_refresh_pending: Option<bool>,
     pub last_attempt_at: Option<String>,
@@ -151,6 +225,9 @@ pub struct StandbyStatus {
     pub accepted_generation: Option<StandbyGenerationStatus>,
     pub accepted_generation_provenance: &'static str,
     pub freshness: StandbyFreshness,
+    pub sync_observation: StandbySyncObservation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_audit: Option<StandbyAudit>,
     pub refresh: StandbyRefreshStatus,
     pub installed_consumer: Option<ObservedInstalledConsumerIdentity>,
     pub consumer_compatible: Option<bool>,
@@ -169,6 +246,73 @@ pub struct StandbyStatus {
     pub degraded_reasons: Vec<&'static str>,
     pub summary: &'static str,
     pub next_safe_action: Option<&'static str>,
+    /// Process-lifetime full verification passes and their total wall time,
+    /// from the same place the `startup-generation-verify` line logs.
+    pub verification_passes: u64,
+    pub verification_total_seconds: u64,
+}
+
+impl StandbyStatus {
+    /// Bootstrap has a shared 8 KiB tool-exposure budget, including executor
+    /// discovery. Keep operational footing here; full identity, frontier and
+    /// consumer-rebind receipts remain available through `standby_status`.
+    /// Select generation fields explicitly so growth of identity diagnostics
+    /// cannot silently expand this projection. Serving and accepted generations
+    /// may each carry the same large rebind receipt after a binary replacement.
+    pub(crate) fn bootstrap_summary(&self) -> serde_json::Value {
+        fn generation(value: &Option<StandbyGenerationStatus>) -> serde_json::Value {
+            value.as_ref().map_or(serde_json::Value::Null, |value| {
+                serde_json::json!({
+                    "generation_id": value.generation_id,
+                    "captured_at": value.captured_at,
+                    "snapshot_completed_at": value.snapshot_completed_at,
+                    "promoted_at": value.promoted_at,
+                    "head_act": value.head_act,
+                    "materialization": value.materialization,
+                    "synced_at": value.synced_at,
+                    "source_history": value.source_history,
+                    "consumer_rebound_at": value.consumer_rebind.as_ref().map(|receipt| &receipt.accepted_at),
+                })
+            })
+        }
+        serde_json::json!({
+            "contract": self.contract,
+            "version": self.version,
+            "status_scope": "bootstrap_summary",
+            "full_status_tool": "standby_status",
+            "observed_at": self.observed_at,
+            "mode": self.mode,
+            "read_only": self.read_only,
+            "writes_supported": self.writes_supported,
+            "mutation_error": self.mutation_error,
+            "canonical_authority": self.canonical_authority,
+            "projection": self.projection,
+            "interaction_capture": self.interaction_capture,
+            "run_persistence": self.run_persistence,
+            "hosted_route_database_id": self.hosted_route_database_id,
+            "origin_database_id": self.origin_database_id,
+            "serving_generation": generation(&self.serving_generation),
+            "accepted_generation": generation(&self.accepted_generation),
+            "accepted_generation_provenance": self.accepted_generation_provenance,
+            "freshness": self.freshness,
+            "sync_observation": self.sync_observation,
+            "serving_audit": self.serving_audit,
+            "refresh": self.refresh,
+            "consumer_compatible": self.consumer_compatible,
+            "retained_generation_count": self.retained_generation_count,
+            "unverified_candidate_count": self.unverified_candidate_count,
+            "unusable_candidate_count": self.unusable_candidate_count,
+            "startup_fallback": self.startup_fallback,
+            "startup_fallback_diagnostics_available": self.startup_fallback_diagnostics_available,
+            "status_only": self.status_only,
+            "accepted_plus_pending_supported": self.accepted_plus_pending_supported,
+            "pending_writes_supported": self.pending_writes_supported,
+            "degraded": self.degraded,
+            "degraded_reasons": self.degraded_reasons,
+            "summary": self.summary,
+            "next_safe_action": self.next_safe_action,
+        })
+    }
 }
 
 /// Cheap immutable warning context suitable for attachment to every MCP
@@ -177,6 +321,10 @@ pub struct StandbyStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StandbyResponseContext {
     pub status_scope: &'static str,
+    pub in_flight_refresh: Option<InFlightRefresh>,
+    pub last_refresh_success_at: Option<String>,
+    /// Legacy last_refresh_success_at includes unchanged successful checks.
+    pub sync_observation: StandbySyncObservation,
     pub full_status_tool: &'static str,
     pub mode: StandbyStatusMode,
     pub canonical_authority: &'static str,
@@ -190,6 +338,9 @@ pub struct StandbyResponseContext {
     pub serving_source_history: Option<&'static str>,
     /// Present when this consumer locally re-admitted the original checkpoint.
     pub serving_consumer_rebound_at: Option<String>,
+    /// The required audit's age, next to the freshness (serving) age.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_audit: Option<StandbyAudit>,
     pub freshness: StandbyFreshness,
     pub freshness_degraded: bool,
     pub degraded_reasons: Vec<&'static str>,
@@ -199,6 +350,7 @@ pub struct StandbyResponseContext {
 #[derive(Clone, Debug)]
 struct ServingGeneration {
     generation_id: String,
+    act_lineage: String,
     snapshot_path: std::path::PathBuf,
     captured_at: String,
     snapshot_completed_at: String,
@@ -211,6 +363,8 @@ struct ServingGeneration {
     engine: StandbySnapshotEngineIdentity,
     consumer: StandbyConsumerIdentity,
     consumer_rebound_at: Option<String>,
+    /// Set when an audit or check found the copy unfit; read from its head.
+    full_refresh_required: bool,
 }
 
 impl ServingGeneration {
@@ -260,6 +414,13 @@ impl StandbyStatusProvider {
             observed: Some(observed),
             serving: Some(ServingGeneration {
                 generation_id: active.generation.id.clone(),
+                act_lineage: match &active.generation.manifest.kernel_v2 {
+                    Some(kernel) => format!(
+                        "v2:{}:{}",
+                        active.generation.manifest.origin_database_id, kernel.genesis_event_id
+                    ),
+                    None => format!("v1:{}", active.generation.manifest.origin_database_id),
+                },
                 snapshot_path: active.generation.snapshot_path.clone(),
                 captured_at: active.generation.manifest.captured_at.clone(),
                 snapshot_completed_at: active.generation.manifest.snapshot_completed_at.clone(),
@@ -269,6 +430,7 @@ impl StandbyStatusProvider {
                 synced_at: None,
                 reader_deferrals: 0,
                 busy_deferrals: 0,
+                full_refresh_required: false,
                 engine: active.generation.manifest.engine.clone(),
                 consumer: active.generation.manifest.consumer.clone(),
                 consumer_rebound_at,
@@ -333,12 +495,18 @@ impl StandbyStatusProvider {
         self.collect_status(None).await
     }
 
+    pub(crate) fn act_lineage(&self) -> Option<&str> {
+        self.serving
+            .as_ref()
+            .map(|generation| generation.act_lineage.as_str())
+    }
+
     pub fn response_context(&self) -> StandbyResponseContext {
         self.response_context_observed(None)
     }
 
     #[cfg(test)]
-    fn response_context_at(&self, now: DateTime<Utc>) -> StandbyResponseContext {
+    pub(crate) fn response_context_at(&self, now: DateTime<Utc>) -> StandbyResponseContext {
         self.response_context_observed(Some(now))
     }
 
@@ -370,7 +538,53 @@ impl StandbyStatusProvider {
                 degraded_reasons.push("database_busy");
             }
         }
-        let next_safe_action = if self.serving.is_none() {
+        // A copy advanced in place that the required audit has not recently
+        // vouched for is still served (offline reads, and explicit local
+        // routes, are caller-owned), but the disclosure says so, and the
+        // default-routed online path (`online_local_reads`) forwards.
+        let serving_audit = live_serving
+            .as_ref()
+            .and_then(|serving| self.audit_of(serving, now));
+        if let Some(audit) = &serving_audit {
+            match audit.state {
+                "overdue" => degraded_reasons.push("audit_overdue"),
+                "unaudited" => degraded_reasons.push("audit_unaudited"),
+                "failed" => degraded_reasons.push("audit_failed"),
+                _ => {}
+            }
+        }
+        // Restart continuity: while the post-restart background recheck is
+        // running, the serving copy stays readable (continuity over
+        // freshness). The reason names the recheck neutrally, and the
+        // actual age stays disclosed beside it.
+        if live_serving.is_some() && self.store.startup_recheck_pending() {
+            degraded_reasons.push("restart_recheck_pending");
+        }
+        // A held-back last failure reads as routine scheduling here too: the
+        // per-request context has no refresh section, so read the state file
+        // directly. A missing or unreadable file keeps the existing advice.
+        let refresh_state = observe_refresh_state(&self.runtime.replica_root);
+        let refresh_state = match &refresh_state {
+            RefreshStateObservation::Available(state) => Some(state.as_ref()),
+            _ => None,
+        };
+        let in_flight_refresh = refresh_state.and_then(|state| in_flight(state, Some(now)));
+        let last_refresh_success_at = refresh_state.and_then(|state| state.last_success_at.clone());
+        let refresh_idle_throttled = refresh_state.is_some_and(|state| {
+            last_failure_is_idle_throttle(state.last_failure_class, state.consecutive_failure_count)
+        });
+        if in_flight_refresh
+            .as_ref()
+            .is_some_and(|attempt| attempt.overdue)
+        {
+            degraded_reasons.push("refresh_attempt_overdue");
+        }
+        let next_safe_action = if in_flight_refresh
+            .as_ref()
+            .is_some_and(|attempt| attempt.overdue)
+        {
+            Some("a refresh exceeded its deadline; run `native status --diagnose`, then `native restart` if it remains stuck")
+        } else if self.serving.is_none() {
             Some(if self.connected_handoff {
                 "run a verified external refresh; the connected session will attempt full handoff"
             } else {
@@ -381,14 +595,23 @@ impl StandbyStatusProvider {
         } else if degraded_reasons.contains(&"database_busy") {
             Some(DATABASE_BUSY_ACTION)
         } else if matches!(freshness.state, StandbyFreshnessState::BeyondRpo) {
-            Some("restore hosted connectivity or authentication and run the supported refresh command")
+            Some(if refresh_idle_throttled {
+                "the standby refresh is catching up and retries on its own"
+            } else {
+                "run `native status` to check hosted health and refresh progress; the node retries automatically"
+            })
         } else if matches!(freshness.state, StandbyFreshnessState::Unavailable) {
             Some("inspect standby snapshot provenance before relying on freshness")
+        } else if degraded_reasons.contains(&"restart_recheck_pending") {
+            Some("the local copy is being re-checked after this restart; no action needed")
         } else {
             None
         };
         StandbyResponseContext {
             status_scope: "serving_generation_freshness_only",
+            in_flight_refresh,
+            last_refresh_success_at,
+            sync_observation: self.sync_observation(live_serving.as_ref()),
             full_status_tool: "standby_status",
             mode: if self.serving.is_some() {
                 StandbyStatusMode::Standby
@@ -415,11 +638,82 @@ impl StandbyStatusProvider {
                 .serving
                 .as_ref()
                 .and_then(|serving| serving.consumer_rebound_at.clone()),
+            serving_audit,
             freshness,
             freshness_degraded: !degraded_reasons.is_empty(),
             degraded_reasons,
             next_safe_action,
         }
+    }
+
+    fn sync_observation(&self, serving: Option<&ServingGeneration>) -> StandbySyncObservation {
+        StandbySyncObservation {
+            last_matching_hosted_check_at: serving
+                .map(|s| s.synced_at.clone().unwrap_or_else(|| s.captured_at.clone())),
+            last_local_materialization_at: serving.and_then(|s| {
+                s.head_act
+                    .and_then(|head| self.store.materialized_at(&s.generation_id, head))
+            }),
+            last_data_change_at: None,
+            age_basis: "last_matching_hosted_check_or_snapshot_capture",
+        }
+    }
+
+    /// The required audit's standing for `serving` as of `now`: only for a
+    /// kernel-v2 copy advanced in place, and only while audits are required
+    /// (the in-place flag is on). Read on every call, like the head: a stalled
+    /// audit must be noticed by the next request, not the next restart.
+    #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+    fn audit_of(&self, _serving: &ServingGeneration, _now: DateTime<Utc>) -> Option<StandbyAudit> {
+        None
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn audit_of(&self, serving: &ServingGeneration, now: DateTime<Utc>) -> Option<StandbyAudit> {
+        let interval = self.store.audit_interval()?;
+        if serving.engine.name != super::kernel_v2::ENGINE
+            || serving.materialization != StandbyGenerationMaterialization::Delta
+        {
+            return None;
+        }
+        let interval_seconds = interval.as_secs();
+        let deadline = interval_seconds.saturating_mul(2);
+        let Some(record) = self.store.generation_audit(&serving.generation_id) else {
+            return Some(StandbyAudit {
+                state: if serving.full_refresh_required {
+                    "failed"
+                } else {
+                    "unaudited"
+                },
+                age_seconds: None,
+                interval_seconds,
+            });
+        };
+        // Wall-clock age, for disclosure. A record from the future (a clock
+        // that went backwards, or a forged file) is ignored: it has no age.
+        let age = record
+            .acquired()
+            .and_then(|at| u64::try_from(now.signed_duration_since(at).num_seconds()).ok());
+        // Online eligibility needs a success THIS process observed, timed on
+        // the monotonic clock: the wall clock alone can be set back.
+        let observed = self
+            .store
+            .audit_last_success(&serving.generation_id)
+            .map(|at| at.elapsed().as_secs());
+        let state = if !record.passed() || serving.full_refresh_required {
+            "failed"
+        } else {
+            match (age, observed) {
+                (None, _) | (_, None) => "unaudited",
+                (Some(age), Some(seen)) if age > deadline || seen > deadline => "overdue",
+                (Some(_), Some(_)) => "current",
+            }
+        };
+        Some(StandbyAudit {
+            state,
+            age_seconds: age,
+            interval_seconds,
+        })
     }
 
     /// The serving generation with its live head: deltas advance the leased
@@ -428,10 +722,13 @@ impl StandbyStatusProvider {
         let mut serving = self.serving.clone()?;
         if let Ok(Some(head)) = self.store.generation_head(&serving.generation_id) {
             serving.head_act = Some(head.head_act);
-            if serving.engine.name != super::kernel_v2::ENGINE {
+            // A staged kernel-v2 head stays `snapshot` (its manifest says how
+            // the file was derived); only a copy advanced in place is `delta`.
+            if serving.engine.name != super::kernel_v2::ENGINE || head.advanced_in_place() {
                 serving.materialization = head.materialization;
             }
             serving.synced_at = Some(head.synced_at);
+            serving.full_refresh_required = head.full_refresh_required;
         }
         let counts = self.store.deferral_counts(&serving.generation_id);
         serving.reader_deferrals = counts.reader_not_upgraded;
@@ -544,6 +841,22 @@ fn build_status_observed(
     store: GenerationStoreStatus,
     refresh_observation: RefreshStateObservation,
     now: Option<DateTime<Utc>>,
+) -> StandbyStatus {
+    build_status_with_verification(
+        provider,
+        store,
+        refresh_observation,
+        now,
+        super::generation_store::verification_stats(),
+    )
+}
+
+fn build_status_with_verification(
+    provider: &StandbyStatusProvider,
+    store: GenerationStoreStatus,
+    refresh_observation: RefreshStateObservation,
+    now: Option<DateTime<Utc>>,
+    verification: (u64, u64),
 ) -> StandbyStatus {
     let refresh_state = match &refresh_observation {
         RefreshStateObservation::Available(state) => Some(state.as_ref()),
@@ -710,9 +1023,21 @@ fn build_status_observed(
             "accepted_generation_pending_restart"
         });
     }
+    // Same neutral disclosure as the per-response context: a copy serving
+    // while its post-restart integrity re-check completes.
+    if live_serving.is_some() && provider.store.startup_recheck_pending() {
+        degraded_reasons.push("restart_recheck_pending");
+    }
     degraded_reasons.sort_unstable();
     degraded_reasons.dedup();
 
+    if refresh
+        .in_flight
+        .as_ref()
+        .is_some_and(|attempt| attempt.overdue)
+    {
+        degraded_reasons.push("refresh_attempt_overdue");
+    }
     let accepted_generation_available = accepted_generation.is_some();
     let pending_handoff = provider.connected_handoff
         && accepted_generation_available
@@ -722,7 +1047,13 @@ fn build_status_observed(
             != accepted_generation
                 .as_ref()
                 .map(|generation| &generation.generation_id);
-    let next_safe_action = if pending_handoff {
+    let next_safe_action = if refresh
+        .in_flight
+        .as_ref()
+        .is_some_and(|attempt| attempt.overdue)
+    {
+        Some("a refresh exceeded its deadline; run `native status --diagnose`, then `native restart` if it remains stuck")
+    } else if pending_handoff {
         Some("the connected session will attempt device verification and readiness; inspect aggregate handoff diagnostics if serving does not advance")
     } else if provider.serving.is_none() && accepted_generation_available {
         Some("restart the standby to activate the verified accepted generation")
@@ -735,7 +1066,9 @@ fn build_status_observed(
         // owner to run a refresh, and none of them can succeed while the
         // credential is being refused. Naming connectivity or provenance first
         // would send someone round a loop that cannot terminate.
-        Some("reissue the standby snapshot credential and run the supported refresh command")
+        Some("run `native login` to renew the node credential; refresh retries automatically")
+    } else if degraded_reasons.contains(&"restart_recheck_pending") {
+        Some("the local copy is being re-checked after this restart; no action needed")
     } else if store.current_provenance == GenerationProvenanceStatus::Unverified {
         Some("wait for local generation verification to finish; inspect node diagnostics if it remains unavailable")
     } else if matches!(
@@ -754,7 +1087,14 @@ fn build_status_observed(
     } else if matches!(freshness.state, StandbyFreshnessState::BeyondRpo)
         || refresh.consecutive_failure_count.unwrap_or(0) > 0
     {
-        Some("restore hosted connectivity or authentication and run the supported refresh command")
+        if last_failure_is_idle_throttle(
+            refresh.last_failure_class,
+            refresh.consecutive_failure_count.unwrap_or(0),
+        ) {
+            Some("the standby refresh is catching up and retries on its own")
+        } else {
+            Some("run `native status` to check hosted health and refresh progress; the node retries automatically")
+        }
     } else if provider.refresh_configured && !provider.refresh_available {
         Some("repair the local refresh configuration before relying on the target RPO")
     } else if !provider.refresh_configured {
@@ -764,6 +1104,7 @@ fn build_status_observed(
     };
     let degraded = !degraded_reasons.is_empty();
 
+    let (verification_passes, verification_total_ms) = verification;
     let retained_generation_count = store.retained_generation_ids.len();
     let mut retained_generation_ids = store.retained_generation_ids;
     retained_generation_ids.truncate(MAX_STATUS_RETAINED_GENERATIONS);
@@ -799,6 +1140,10 @@ fn build_status_observed(
             GenerationProvenanceStatus::Unverified => "unverified",
         },
         freshness,
+        sync_observation: provider.sync_observation(live_serving.as_ref()),
+        serving_audit: live_serving
+            .as_ref()
+            .and_then(|serving| provider.audit_of(serving, now)),
         refresh,
         installed_consumer: provider.observed.clone(),
         consumer_compatible,
@@ -836,6 +1181,8 @@ fn build_status_observed(
             "This is a read-only local Native standby serving a verified snapshot; hosted Native remains canonical."
         },
         next_safe_action,
+        verification_passes,
+        verification_total_seconds: verification_total_ms / 1000,
     }
 }
 
@@ -865,6 +1212,7 @@ fn freshness(serving: Option<&ServingGeneration>, now: DateTime<Utc>) -> Standby
             StandbyFreshnessState::Fresh
         },
         age_seconds: Some(age_seconds),
+        age_basis: "last_matching_hosted_check_or_snapshot_capture_not_content_lag",
         target_rpo_seconds: STANDBY_RPO_SECONDS,
         target_refresh_interval_seconds: STANDBY_REFRESH_INTERVAL_SECONDS,
         beyond_rpo: Some(beyond_rpo),
@@ -875,6 +1223,7 @@ fn unavailable_freshness() -> StandbyFreshness {
     StandbyFreshness {
         state: StandbyFreshnessState::Unavailable,
         age_seconds: None,
+        age_basis: "last_matching_hosted_check_or_snapshot_capture_not_content_lag",
         target_rpo_seconds: STANDBY_RPO_SECONDS,
         target_refresh_interval_seconds: STANDBY_REFRESH_INTERVAL_SECONDS,
         beyond_rpo: None,
@@ -901,6 +1250,7 @@ fn refresh_status(
         controller_available,
         diagnostics,
         refresh_active: state.as_ref().map(|state| state.refresh_active),
+        in_flight: state.as_ref().and_then(|state| in_flight(state, Some(now))),
         transfer_progress: state
             .as_ref()
             .and_then(|state| state.transfer_progress.clone())
@@ -1020,6 +1370,16 @@ fn safe_delta_fallback_message(class: super::refresh::DeltaFallbackClass) -> &'s
     }
 }
 
+/// A held-back last failure with no counted consecutive failures is routine
+/// scheduling — a busy hosted export, or a whole-snapshot cooldown — never a
+/// connectivity or authentication outage worth repairing.
+fn last_failure_is_idle_throttle(
+    class: Option<super::RefreshFailureClass>,
+    consecutive_failure_count: u32,
+) -> bool {
+    class == Some(super::RefreshFailureClass::Throttled) && consecutive_failure_count == 0
+}
+
 fn safe_refresh_failure_message(class: super::RefreshFailureClass) -> &'static str {
     match class {
         super::RefreshFailureClass::Authentication => "standby refresh authentication failed",
@@ -1032,8 +1392,11 @@ fn safe_refresh_failure_message(class: super::RefreshFailureClass) -> &'static s
         super::RefreshFailureClass::Compatibility => "standby refresh compatibility check failed",
         super::RefreshFailureClass::Timeout => "standby refresh exceeded its time bound",
         super::RefreshFailureClass::LocalIo => "standby refresh local storage failed",
+        // Throttled is scheduling, never an outage: a busy hosted export or
+        // a whole-snapshot cooldown. Either way the refresh retries on its
+        // own schedule, so the message must not name an outage or a hold.
         super::RefreshFailureClass::Throttled => {
-            "standby refresh held back by its minimum interval"
+            "standby refresh is waiting to retry on its schedule"
         }
         super::RefreshFailureClass::RevisionUnsupported => {
             "standby refresh paused: hosted uses a newer interchange revision"
@@ -1043,6 +1406,35 @@ fn safe_refresh_failure_message(class: super::RefreshFailureClass) -> &'static s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn in_flight_refresh_reports_deadline_and_clock_uncertainty() {
+        let mut state = super::super::StandbyRefreshState {
+            refresh_active: true,
+            last_attempt_id: Some(uuid::Uuid::new_v4().to_string()),
+            last_attempt_at: Some("2026-11-16T08:00:00Z".into()),
+            last_attempt_cause: Some(super::super::RefreshCause::Scheduled),
+            ..Default::default()
+        };
+        let now = "2026-11-16T08:11:00Z".parse().unwrap();
+        let attempt = super::in_flight(&state, Some(now)).unwrap();
+        assert!(attempt.overdue);
+        assert_eq!(attempt.elapsed_seconds, Some(660));
+        assert_eq!(attempt.deadline_seconds, 600);
+        assert_eq!(
+            super::in_flight(&state, None).unwrap().elapsed_seconds,
+            None
+        );
+        let before = "2026-11-16T07:00:00Z".parse().unwrap();
+        assert_eq!(
+            super::in_flight(&state, Some(before))
+                .unwrap()
+                .elapsed_seconds,
+            None
+        );
+        state.refresh_active = false;
+        assert!(super::in_flight(&state, Some(now)).is_none());
+    }
+
     use super::*;
     use crate::standby_snapshot::{
         StandbyConsumerPlatform, StandbySnapshotBytes, StandbySnapshotEngineIdentity,
@@ -1052,6 +1444,7 @@ mod tests {
 
     fn consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,
@@ -1145,6 +1538,7 @@ mod tests {
             runtime,
             store,
             observed: Some(ObservedInstalledConsumerIdentity {
+                kernel_v2_reader: Default::default(),
                 platform: StandbyConsumerPlatform::LinuxX8664,
                 source_sha: "a".repeat(40),
                 artifact_sha256: "b".repeat(64),
@@ -1153,6 +1547,7 @@ mod tests {
             }),
             serving: Some(ServingGeneration {
                 generation_id: "c".repeat(64),
+                act_lineage: "v1:fixture".into(),
                 snapshot_path: directory.join("missing-snapshot.db"),
                 captured_at: captured_at.into(),
                 snapshot_completed_at: captured_at.into(),
@@ -1162,6 +1557,7 @@ mod tests {
                 synced_at: None,
                 reader_deferrals: 0,
                 busy_deferrals: 0,
+                full_refresh_required: false,
                 engine: manifest(captured_at, captured_at).engine,
                 consumer: consumer(),
                 consumer_rebound_at: None,
@@ -1196,6 +1592,62 @@ mod tests {
         assert!(future
             .degraded_reasons
             .contains(&"snapshot_age_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn unchanged_hosted_check_preserves_materialization_time() {
+        let provider = provider("2026-09-02T12:00:00Z");
+        let generation = super::super::InstalledGeneration {
+            id: "c".repeat(64),
+            snapshot_path: provider.serving.as_ref().unwrap().snapshot_path.clone(),
+            manifest: manifest("2026-09-02T12:00:00Z", "2026-09-02T12:00:00Z"),
+        };
+        provider
+            .store
+            .record_synced(&generation, 7, "2026-09-02T13:00:00Z")
+            .unwrap();
+        let advanced = provider.response_context();
+        let materialized = advanced
+            .sync_observation
+            .last_local_materialization_at
+            .clone();
+        assert!(materialized.is_some());
+        provider
+            .store
+            .record_synced(&generation, 7, "2026-09-02T14:00:00Z")
+            .unwrap();
+        let unchanged = provider.response_context();
+        assert_eq!(
+            unchanged.sync_observation.last_local_materialization_at,
+            materialized
+        );
+        assert_eq!(
+            unchanged
+                .sync_observation
+                .last_matching_hosted_check_at
+                .as_deref(),
+            Some("2026-09-02T14:00:00Z")
+        );
+        assert_eq!(unchanged.sync_observation.last_data_change_at, None);
+        assert_eq!(unchanged.serving_head_act, advanced.serving_head_act);
+        // Old in-place copies have no diagnostic sidecar. Do not substitute
+        // their checkpoint completion or their latest no-change check.
+        std::fs::remove_file(
+            provider
+                .runtime
+                .replica_root
+                .join("accepted")
+                .join("heads")
+                .join(format!("{}.materialized.json", generation.id)),
+        )
+        .unwrap();
+        assert_eq!(
+            provider
+                .response_context()
+                .sync_observation
+                .last_local_materialization_at,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1283,8 +1735,80 @@ mod tests {
         );
         assert_eq!(
             status.next_safe_action,
-            Some("reissue the standby snapshot credential and run the supported refresh command"),
+            Some("run `native login` to renew the node credential; refresh retries automatically"),
             "the action must name credential reissue, not generic connectivity"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_export_is_scheduling_not_an_outage() {
+        // A healthy hosted answering 409 export_in_progress must never read
+        // as connectivity trouble: no failure degradation beyond the honest
+        // age, no connectivity/auth repair advice, and scheduling wording
+        // with no internal stale/throttled words.
+        let provider = provider("2026-09-02T12:00:00Z");
+        let refresh = provider.runtime.replica_root.join("refresh");
+        std::fs::create_dir_all(&refresh).unwrap();
+        let busy = StandbyRefreshState {
+            consecutive_failure_count: 0,
+            last_failure_class: Some(super::super::RefreshFailureClass::Throttled),
+            last_failure: Some("hosted delta export is already in progress".into()),
+            ..StandbyRefreshState::default()
+        };
+        std::fs::write(
+            refresh.join("state.json"),
+            serde_jcs::to_vec(&busy).unwrap(),
+        )
+        .unwrap();
+
+        // A fresh copy shows the scheduling wording and no failure reason.
+        let status = provider
+            .status_at("2026-09-02T12:00:01Z".parse().unwrap())
+            .await;
+        assert!(
+            !status.degraded_reasons.contains(&"refresh_failed"),
+            "an uncounted busy hold is not a failure"
+        );
+        assert_eq!(
+            status.refresh.last_failure.as_deref(),
+            Some("standby refresh is waiting to retry on its schedule")
+        );
+        assert!(
+            !status
+                .refresh
+                .last_failure
+                .as_deref()
+                .is_some_and(|message| {
+                    message.contains("stale") || message.contains("throttl")
+                }),
+            "user-facing text keeps internal stale/throttled words out"
+        );
+
+        // Past RPO the honest age still degrades, but the per-request advice
+        // stays scheduling: no connectivity or authentication repair.
+        let context = provider.response_context_at("2026-09-02T12:05:01Z".parse().unwrap());
+        assert_eq!(context.degraded_reasons, vec!["snapshot_beyond_rpo"]);
+        assert_eq!(
+            context.next_safe_action,
+            Some("the standby refresh is catching up and retries on its own")
+        );
+
+        // A counted throttled failure keeps the existing advice: the
+        // scheduling projection is only for the uncounted idle hold.
+        let counted = build_status(
+            &provider,
+            store_status(None, GenerationProvenanceStatus::Available),
+            RefreshStateObservation::Available(Box::new(StandbyRefreshState {
+                consecutive_failure_count: 2,
+                ..busy
+            })),
+            "2026-09-02T12:00:01Z".parse().unwrap(),
+        );
+        assert_eq!(
+            counted.next_safe_action,
+            Some(
+                "run `native status` to check hosted health and refresh progress; the node retries automatically"
+            )
         );
     }
 
@@ -1545,7 +2069,7 @@ mod tests {
             store_status(Some(accepted), GenerationProvenanceStatus::Available);
         observed_store.retained_generation_ids =
             (0..20).map(|index| format!("{index:064x}")).collect();
-        let status = build_status(
+        let mut status = build_status(
             &provider,
             observed_store,
             RefreshStateObservation::Available(Box::new(refresh)),
@@ -1578,11 +2102,87 @@ mod tests {
         assert_eq!(status.retained_generation_count, 20);
         assert_eq!(status.retained_generation_ids.len(), 8);
         assert!(status.retained_generation_ids_truncated);
-        let status_bytes = serde_json::to_vec(&status).unwrap().len();
+        // A replacement consumer can leave rebind receipts on both generations.
+        // Full status is allowed to exceed bootstrap's component budget; it
+        // must remain exact on the separate diagnostic surface.
+        for generation in [
+            &mut status.serving_generation,
+            &mut status.accepted_generation,
+        ] {
+            let generation = generation.as_mut().unwrap();
+            generation.consumer_rebind = Some(super::super::ConsumerRebind {
+                contract: "native.standby-consumer-rebind.v1".into(),
+                version: 1,
+                generation_id: generation.generation_id.clone(),
+                original_consumer: generation.consumer.clone(),
+                accepted_consumer: provider.observed.clone().unwrap(),
+                native_interchange_revision: 8,
+                accepted_at: "2026-09-02T12:04:02.000Z".into(),
+                checks_passed: [
+                    "generation-route-origin",
+                    "manifest",
+                    "format",
+                    "checkpoint-bytes-or-consistent-copy",
+                    "engine-frontier",
+                    "sqlite-quick-check-foreign-keys",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            });
+        }
+        status.refresh.transfer_progress = Some(super::super::StandbyTransferProgress {
+            stage: super::super::StandbyTransferStage::Verification,
+            activity: super::super::StandbyTransferActivity::Active,
+            updated_at: "2026-09-02T12:05:00Z".into(),
+            bytes_completed: Some(2_395_116_798),
+            bytes_remaining: Some(0),
+            bytes_total: Some(2_395_116_798),
+            retained_for_resume: true,
+        });
+        let full_status = serde_json::to_value(&status).unwrap();
+        let status_bytes = serde_json::to_vec(&full_status).unwrap().len();
         assert!(
-            status_bytes + 1024 < 8 * 1024,
-            "status plus bootstrap exposure envelope exceeded its budget: {status_bytes} bytes"
+            status_bytes + 1024 > 8 * 1024,
+            "fixture must reproduce the old budget failure: {status_bytes}"
         );
+        let summary = status.bootstrap_summary();
+        // Leave 3 KiB for registry/executor discovery, including lean routing.
+        let summary_bytes = serde_json::to_vec(&summary).unwrap().len();
+        assert!(
+            summary_bytes + 3 * 1024 <= 8 * 1024,
+            "bootstrap summary leaves insufficient discovery headroom: {summary_bytes} bytes"
+        );
+        assert_eq!(summary["status_scope"], "bootstrap_summary");
+        assert_eq!(summary["full_status_tool"], "standby_status");
+        for key in [
+            "freshness",
+            "serving_audit",
+            "refresh",
+            "degraded",
+            "degraded_reasons",
+            "next_safe_action",
+            "mode",
+            "read_only",
+            "writes_supported",
+            "run_persistence",
+            "mutation_error",
+            "canonical_authority",
+        ] {
+            assert_eq!(summary[key], full_status[key], "{key}");
+        }
+        for key in ["serving_generation", "accepted_generation"] {
+            assert_eq!(
+                summary[key]["generation_id"],
+                full_status[key]["generation_id"]
+            );
+            assert_eq!(summary[key]["synced_at"], full_status[key]["synced_at"]);
+            assert_eq!(
+                summary[key]["consumer_rebound_at"],
+                full_status[key]["consumer_rebind"]["accepted_at"]
+            );
+            assert!(summary[key].get("consumer_rebind").is_none());
+            assert!(full_status[key]["consumer_rebind"]["checks_passed"].is_array());
+        }
         assert!(status
             .degraded_reasons
             .contains(&"accepted_generation_pending_restart"));
@@ -1703,6 +2303,25 @@ mod tests {
         assert!(!status.writes_supported);
         assert!(!status.pending_writes_supported);
         assert!(status.serving_generation.is_none());
+    }
+
+    #[test]
+    fn status_projects_process_lifetime_verification_passes() {
+        // Injected stats, not the process-global counters: other tests run
+        // full verifications in parallel, so sampling the globals here and
+        // asserting equality after `build_status` would race. Exact values
+        // prove the projection is wired; the churn test proves the counters
+        // themselves increment on a full pass.
+        let provider = provider("2026-09-02T12:00:00Z");
+        let status = super::build_status_with_verification(
+            &provider,
+            unavailable_store_status(),
+            RefreshStateObservation::NeverRecorded,
+            Some("2026-09-02T12:00:01Z".parse().unwrap()),
+            (7, 12_345),
+        );
+        assert_eq!(status.verification_passes, 7);
+        assert_eq!(status.verification_total_seconds, 12);
     }
 
     #[test]

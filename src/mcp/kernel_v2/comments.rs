@@ -10,7 +10,7 @@ use crate::{
     Error, Result,
 };
 use serde_json::{json, Value};
-use sqlx::{Sqlite, Transaction};
+use sqlx::{Sqlite, SqliteConnection, Transaction};
 
 pub(super) fn is_comment_type(typ: &str, kind: &str) -> bool {
     typ == "Annotation" && kind == "comment"
@@ -54,7 +54,7 @@ pub(super) struct CreatePlan {
 }
 
 pub(super) async fn prepare_create(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     actor: &str,
     args: &Value,
     body: Option<&str>,
@@ -176,7 +176,7 @@ pub(super) async fn prepare_create(
 /// its own, no nesting, a nonblank body, and a named root lifecycle.
 /// Mirrors the v1 reply-bearing checks without the deferred-plan path.
 async fn validate_reply_root(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     tool: &str,
     root_id: &str,
 ) -> Result<()> {
@@ -205,7 +205,7 @@ async fn validate_reply_root(
 }
 
 async fn prepare_anchor(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     tool: &str,
     bearer: &str,
     target: &Value,
@@ -280,7 +280,7 @@ async fn prepare_anchor(
 /// digest, and that body must still be current. Anything else is a stale
 /// pin and the anchor is refused, exactly like v1.
 async fn enforce_source_pin(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut Transaction<'_, Sqlite>,
     tool: &str,
     bearer: &str,
     current_body: &str,
@@ -338,13 +338,13 @@ pub(super) fn record_is_comment(view: &kernel::KernelRecordView) -> bool {
         && view.fields.get("v1_kind").and_then(Value::as_str) == Some("comment")
 }
 
-/// v1 resolve rules on `update_record`: the one admitted lifecycle write is
-/// an atomic root-only `open -> resolved` carrying a nonblank summary.
+/// Root-only lifecycle writes match v1: `open -> resolved` with a nonblank
+/// summary, or `resolved -> open` with the summary explicitly cleared.
 /// Replies and `informational` roots are not resolvable; a summary may only
-/// be written atomically with that transition.
+/// be written or cleared atomically with the corresponding transition.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn check_update(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     id: &str,
     previous: &kernel::KernelRecordView,
     lifecycle_touched: bool,
@@ -429,6 +429,15 @@ pub(super) async fn check_update(
                 ));
             }
         },
+    }
+    if lifecycle_touched
+        && summary_touched
+        && position == comments_v2::Position::Root
+        && current_lifecycle == Some(crate::comments::RESOLVED)
+        && resulting_lifecycle == Some(crate::comments::OPEN)
+        && resulting_summary.is_none()
+    {
+        return Ok(());
     }
     if lifecycle_touched {
         let subject = match position {

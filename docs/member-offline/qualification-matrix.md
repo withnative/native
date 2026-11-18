@@ -1,6 +1,6 @@
 # Member-offline qualification matrix (independent, Q1)
 
-Contract: Native record c323277 rev 7 (`/tmp/mo/c323277-rev7.md`;
+Contract: Native record c323277 rev 7 (`c323277-rev7.md`;
 body digest `86b18563...9a432`). Base: `8a486471f` (origin/main).
 Worker: Q1 independent qualifier, branch `member-offline/q1-qualification`.
 

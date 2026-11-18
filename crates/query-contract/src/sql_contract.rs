@@ -524,6 +524,15 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         ],
     },
     QuerySqlRelationContract {
+        identity: "native.query-sql.viewer",
+        name: "viewer",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: &["sqlite-local", "postgres-server"],
+        columns: &["person_id", "display_name"],
+    },
+    QuerySqlRelationContract {
         identity: "native.query-sql.actors",
         name: "actors",
         semantic_version: LOGICAL_RELATION_VERSION,
@@ -819,6 +828,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "selector_field",
             "selector_value",
             "advertised_directly",
+            "requires_acceptance",
         ],
     },
 ];
@@ -1587,6 +1597,7 @@ const RELATION_COMMENTS: &[(&str, &str)] = &[
     ("effective_relationship_endpoints", "one row per endpoint of a relationship present in effective_relationships - join both relationship_origin_db_id and relationship_id - ordinal is the endpoint order - a relationship with any hidden endpoint yields no rows - online SQLite only, member/offline unavailable"),
     ("agent_activity", "best-effort run presence over the last 24 hours - declared_intent is caller disclosure, not verified fact"),
     ("agent_activity_claims", "durable claim events - join activity_id to agent_activity, record_id to records.id"),
+    ("viewer", "one caller row without history - nullable person_id, display_name - raw author name (v2 principal label fallback) - display only, never authorization - SELECT person_id, display_name FROM viewer"),
     ("actors", "actors disclosed in the caller's own history under the get_history rule, never members who have not acted there - join content_events.actor to actor, person_id to records.id - display_name is the visible person's name, NULL when there is none"),
     ("runs", "durable agent runs of every age whose owner the get_history rule discloses - principal_person_id is the visible person, NULL when there is none - reported_model and reported_client are self-declared, never verified - page by started_at_ms, run_key"),
     ("run_intents", "ordered set_intent declarations of each run in runs - join run_key to runs.run_key - ordinal counts from 1 within a run - empty when the workspace keeps no read log"),
@@ -1603,7 +1614,7 @@ const RELATION_COMMENTS: &[(&str, &str)] = &[
     ("body_task_items", "GFM task-list items in visible records' current bodies - byte offsets in body, document order by item_index - checked and quoted rows remain present, source event sequence is withheld"),
     ("catalog_relations", "this catalog - one row per declared relation, filter profiles for queryability"),
     ("catalog_columns", "one row per (relation, column) - order by relation_name, column_position"),
-    ("catalog_operations", "one row per serving executor operation from this pinned catalogue - matches describe_operation pairs and digests - order by executor, operation - access is read or mutation, plan_required, direct_execution_enabled and advertised_directly are 0 or 1, advertised_directly is 0 only on a lean surface for operations reachable through call_executor, selector fields are NULL without a selector - online SQLite executor query_sql only with serving standby included, member and offline copies refuse it, saved SQL and alpha-tab needs refuse it, other profiles refuse it"),
+    ("catalog_operations", "one row per serving executor operation from this pinned catalogue - matches describe_operation pairs and digests - order by executor, operation - access is read or mutation, plan_required, direct_execution_enabled, advertised_directly and requires_acceptance are 0 or 1, advertised_directly is 0 only on a lean surface for operations reachable through call_executor, requires_acceptance is 1 for a write that is queued and shown as waiting until hosted accepts it, rather than applied to the local copy straight away (reads are 0), selector fields are NULL without a selector - online SQLite executor query_sql only with serving standby included, member and offline copies refuse it, saved SQL and alpha-tab needs refuse it, other profiles refuse it"),
 ];
 
 /// Rows of `catalog_relations`, generated from `LOGICAL_RELATIONS`:
@@ -1720,6 +1731,7 @@ const CARD_COLUMN_RELATIONS: &[&str] = &["records", "links", "content_events", "
 /// keeps a note for every relation so one can be promoted by listing it here.
 const CARD_LISTED_RELATIONS: &[&str] = &[
     "records",
+    "viewer",
     "record_lifecycle_interpretations",
     "links",
     "facet_values",
@@ -1759,6 +1771,7 @@ const CARD_NOTES: &[(&str, &str)] = &[
     ("effective_relationship_endpoints", "join on both ids; ordinal order"),
     ("agent_activity", "best-effort run presence, 24h"),
     ("agent_activity_claims", "activity_id=agent_activity"),
+    ("viewer", "one caller row, no history; nullable person_id/display_name; raw author name; display only"),
     ("actors", "content_events.actor=actor; person_id=records.id; hidden display_name NULL"),
     ("runs", "principal_person_id=records.id; model self-declared; order started_at_ms,run_key"),
     ("run_intents", "run_key=runs.run_key; order ordinal"),
@@ -7727,6 +7740,12 @@ mod tests {
             &["appears_active", "declared_intent", "declared_intent_state"]
         );
         assert_eq!(relation("agent_activity_claims").semantic_version, 1);
+        let viewer = relation("viewer");
+        assert_eq!(viewer.identity, "native.query-sql.viewer");
+        assert_eq!(viewer.semantic_version, 1);
+        assert!(viewer.caller_relative);
+        assert_eq!(viewer.profiles, &["sqlite-local", "postgres-server"]);
+        assert_eq!(viewer.columns, &["person_id", "display_name"]);
         let actors = relation("actors");
         assert_eq!(actors.identity, "native.query-sql.actors");
         assert_eq!(actors.semantic_version, 1);

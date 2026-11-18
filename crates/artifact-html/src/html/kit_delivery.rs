@@ -2,8 +2,8 @@
 use super::*;
 use serde::Deserialize;
 
-const JS_MAX: usize = 65536;
-const TYPES_MAX: usize = 32768;
+const JS_MAX: usize = 155648;
+const TYPES_MAX: usize = 65536;
 const METADATA_MAX: usize = 1024;
 // Covers a full DNS hostname (including a trailing dot), HTTPS and a
 // nondefault port with room to spare; applies to parent and artifact origins.
@@ -159,6 +159,138 @@ impl KitDelivery {
                     include_bytes!("../../kit-releases/1.1.0/core.js"),
                     include_bytes!("../../kit-releases/1.1.0/core.d.ts"),
                 ),
+                (
+                    "1.1.1",
+                    include_bytes!("../../kit-releases/1.1.1/manifest.json"),
+                    include_bytes!("../../kit-releases/1.1.1/core.js"),
+                    include_bytes!("../../kit-releases/1.1.1/core.d.ts"),
+                ),
+                (
+                    "1.1.2",
+                    include_bytes!("../../kit-releases/1.1.2/manifest.json"),
+                    include_bytes!("../../kit-releases/1.1.2/core.js"),
+                    include_bytes!("../../kit-releases/1.1.2/core.d.ts"),
+                ),
+                (
+                    "1.2.0",
+                    include_bytes!("../../kit-releases/1.2.0/manifest.json"),
+                    include_bytes!("../../kit-releases/1.2.0/core.js"),
+                    include_bytes!("../../kit-releases/1.2.0/core.d.ts"),
+                ),
+                (
+                    "1.3.0",
+                    include_bytes!("../../kit-releases/1.3.0/manifest.json"),
+                    include_bytes!("../../kit-releases/1.3.0/core.js"),
+                    include_bytes!("../../kit-releases/1.3.0/core.d.ts"),
+                ),
+                (
+                    "1.4.0",
+                    include_bytes!("../../kit-releases/1.4.0/manifest.json"),
+                    include_bytes!("../../kit-releases/1.4.0/core.js"),
+                    include_bytes!("../../kit-releases/1.4.0/core.d.ts"),
+                ),
+                (
+                    "1.5.0",
+                    include_bytes!("../../kit-releases/1.5.0/manifest.json"),
+                    include_bytes!("../../kit-releases/1.5.0/core.js"),
+                    include_bytes!("../../kit-releases/1.5.0/core.d.ts"),
+                ),
+                (
+                    "1.6.0",
+                    include_bytes!("../../kit-releases/1.6.0/manifest.json"),
+                    include_bytes!("../../kit-releases/1.6.0/core.js"),
+                    include_bytes!("../../kit-releases/1.6.0/core.d.ts"),
+                ),
+                (
+                    "1.7.0",
+                    include_bytes!("../../kit-releases/1.7.0/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.0/core.js"),
+                    include_bytes!("../../kit-releases/1.7.0/core.d.ts"),
+                ),
+                (
+                    "1.7.1",
+                    include_bytes!("../../kit-releases/1.7.1/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.1/core.js"),
+                    include_bytes!("../../kit-releases/1.7.1/core.d.ts"),
+                ),
+                (
+                    "1.7.2",
+                    include_bytes!("../../kit-releases/1.7.2/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.2/core.js"),
+                    include_bytes!("../../kit-releases/1.7.2/core.d.ts"),
+                ),
+                (
+                    "1.7.3",
+                    include_bytes!("../../kit-releases/1.7.3/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.3/core.js"),
+                    include_bytes!("../../kit-releases/1.7.3/core.d.ts"),
+                ),
+                (
+                    "1.7.4",
+                    include_bytes!("../../kit-releases/1.7.4/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.4/core.js"),
+                    include_bytes!("../../kit-releases/1.7.4/core.d.ts"),
+                ),
+                (
+                    "1.7.5",
+                    include_bytes!("../../kit-releases/1.7.5/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.5/core.js"),
+                    include_bytes!("../../kit-releases/1.7.5/core.d.ts"),
+                ),
+                (
+                    "1.7.6",
+                    include_bytes!("../../kit-releases/1.7.6/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.6/core.js"),
+                    include_bytes!("../../kit-releases/1.7.6/core.d.ts"),
+                ),
+                (
+                    "1.7.7",
+                    include_bytes!("../../kit-releases/1.7.7/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.7/core.js"),
+                    include_bytes!("../../kit-releases/1.7.7/core.d.ts"),
+                ),
+                (
+                    "1.7.8",
+                    include_bytes!("../../kit-releases/1.7.8/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.8/core.js"),
+                    include_bytes!("../../kit-releases/1.7.8/core.d.ts"),
+                ),
+                (
+                    "1.7.9",
+                    include_bytes!("../../kit-releases/1.7.9/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.9/core.js"),
+                    include_bytes!("../../kit-releases/1.7.9/core.d.ts"),
+                ),
+                (
+                    "1.7.10",
+                    include_bytes!("../../kit-releases/1.7.10/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.10/core.js"),
+                    include_bytes!("../../kit-releases/1.7.10/core.d.ts"),
+                ),
+                (
+                    "1.7.11",
+                    include_bytes!("../../kit-releases/1.7.11/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.11/core.js"),
+                    include_bytes!("../../kit-releases/1.7.11/core.d.ts"),
+                ),
+                (
+                    "1.7.12",
+                    include_bytes!("../../kit-releases/1.7.12/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.12/core.js"),
+                    include_bytes!("../../kit-releases/1.7.12/core.d.ts"),
+                ),
+                (
+                    "1.7.13",
+                    include_bytes!("../../kit-releases/1.7.13/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.13/core.js"),
+                    include_bytes!("../../kit-releases/1.7.13/core.d.ts"),
+                ),
+                (
+                    "1.7.14",
+                    include_bytes!("../../kit-releases/1.7.14/manifest.json"),
+                    include_bytes!("../../kit-releases/1.7.14/core.js"),
+                    include_bytes!("../../kit-releases/1.7.14/core.d.ts"),
+                ),
             ],
             selector,
         )
@@ -305,7 +437,7 @@ impl KitDelivery {
 impl Default for KitDelivery {
     fn default() -> Self {
         static DEFAULT: OnceLock<KitDelivery> = OnceLock::new();
-        DEFAULT.get_or_init(|| Self::from_selector(r#"{"schema":"native.app-kit.selector.v1","selections":[{"major":1,"version":"1.1.0"}]}"#).expect("admitted embedded kit")).clone()
+        DEFAULT.get_or_init(|| Self::from_selector(r#"{"schema":"native.app-kit.selector.v1","selections":[{"major":1,"version":"1.7.14"}]}"#).expect("admitted embedded kit")).clone()
     }
 }
 
@@ -516,7 +648,7 @@ mod tests {
         let token = launch.url.rsplit('/').next().unwrap();
         let store = store.lock().unwrap();
         let ticket = &store.entries[token];
-        assert_eq!(launch.kit_release.as_ref().unwrap().version, "1.1.0");
+        assert_eq!(launch.kit_release.as_ref().unwrap().version, "1.7.14");
         assert_eq!(ticket._body_digest, manifest.body_digest);
         assert_eq!(
             ticket.html,
@@ -542,7 +674,7 @@ mod tests {
             .skip(1)
             .map(|part| part.split("```").next().unwrap())
             .collect();
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 3);
         let config = RuntimeConfig::new("https://parent.test", "https://artifact.test").unwrap();
         let store = Mutex::new(TicketStore::default());
         for (index, source) in sources.iter().enumerate() {
@@ -563,7 +695,7 @@ mod tests {
             let token = launch.url.rsplit('/').next().unwrap();
             let store = store.lock().unwrap();
             let ticket = &store.entries[token];
-            assert_eq!(launch.kit_release.as_ref().unwrap().version, "1.1.0");
+            assert_eq!(launch.kit_release.as_ref().unwrap().version, "1.7.14");
             if let Ok(dir) = std::env::var("NATIVE_KIT_DELIVERY_EVIDENCE_DIR") {
                 std::fs::write(
                     std::path::Path::new(&dir).join(format!("real-starter-{index}.html")),

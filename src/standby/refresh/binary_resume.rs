@@ -148,7 +148,7 @@ impl ResumeLedger {
 }
 
 /// Current runtime binding a stored ledger must exactly match.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResumeBinding {
     pub origin: String,
     pub hosted_route_database_id: String,
@@ -920,6 +920,7 @@ mod tests {
 
     fn test_consumer() -> StandbyConsumerIdentity {
         StandbyConsumerIdentity {
+            kernel_v2_reader: Default::default(),
             contract: STANDBY_CONSUMER_CONTRACT.into(),
             version: 1,
             platform: StandbyConsumerPlatform::LinuxX8664,

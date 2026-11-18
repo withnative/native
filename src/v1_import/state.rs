@@ -527,9 +527,41 @@ async fn deletion_guards(
         } else {
             None
         };
+        // Type correction has a stronger, historical identity guard than deletion:
+        // even a retired derivation head or release fixes this bearer identity.
+        let mut correction_specialized = Some(false);
+        for (table, column, predicate) in [
+            (
+                "derivation_target_heads",
+                "target_record_id",
+                "target_kind='record'",
+            ),
+            (
+                "derivation_artifact_role_heads",
+                "target_record_id",
+                "target_kind='record'",
+            ),
+            ("recipe_releases", "program_id", "1=1"),
+            ("semantic_units", "unit_id", "1=1"),
+            ("attribution_assertions", "annotation_id", "1=1"),
+        ] {
+            if present(source, table).await? {
+                let exists: bool = sqlx::query_scalar(&format!(
+                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=? AND {predicate})"
+                ))
+                .bind(&id)
+                .fetch_one(&mut *source)
+                .await?;
+                if exists {
+                    correction_specialized = Some(true);
+                }
+            } else if correction_specialized != Some(true) {
+                correction_specialized = None;
+            }
+        }
         guards.push((
             id.clone(),
-            json!({"record_id":id,"active_body_binding":body,"active_artifact_role":role}),
+            json!({"record_id":id,"active_body_binding":body,"active_artifact_role":role,"type_correction_specialized":correction_specialized}),
         ));
     }
     sections.insert("record_deletion_guards".into(), guards);

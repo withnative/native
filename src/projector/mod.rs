@@ -424,6 +424,25 @@ pub async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()
     project_intent(conn, event, &intent).await
 }
 
+/// The same enrolled/parsed retained-event route, carrying only an internal
+/// shape witness from this replay's checked native coordinates.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn project_on_registered_copy(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    admitted: &crate::standby::kernel_v2_delta::ProjectionShape,
+) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
+    let intent = ProjectorIntent::from_event(event)?;
+    if event.event_type == "kernel.app_action_recorded.v1" {
+        crate::kernel::app_installs::project_on_registered_copy(conn, event, Some(admitted))
+            .await?;
+        finish_kernel_event_projection(conn, event).await
+    } else {
+        project_intent(conn, event, &intent).await
+    }
+}
+
 /// [`project`], recording body derivations in `defer` instead of running them.
 /// Only a private scratch fold that flushes `defer` before exposing its
 /// database may call this; see [`BodyDeferrals`].
@@ -459,10 +478,50 @@ async fn project_intent_with(
     }
     project_extended(conn, event, intent, defer).await?;
     #[cfg(any(test, feature = "v2-kernel-probe"))]
+    finish_kernel_event_projection(conn, event).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static APP_ACTION_SUFFIX_FAILURE: ();
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn with_app_action_suffix_failure<T>(
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    APP_ACTION_SUFFIX_FAILURE.scope((), future).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+async fn finish_kernel_event_projection(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+) -> Result<()> {
     if event.event_type.starts_with("kernel.") {
         crate::kernel::v1_state::validate_native_event(conn, event).await?;
         crate::kernel::record_metadata::touch_event(conn, event).await?;
+        crate::kernel::publications::invalidate_on(conn, event).await?;
         crate::kernel::facet_time_reads::project_on(conn, event).await?;
+        // Existing suffix operations are intentionally no-ops for app actions.
+        // A task-scoped fault checks reachability, ordering and rollback without
+        // adding a new shipping policy or a cross-test/global trust signal.
+        #[cfg(test)]
+        if event.event_type == "kernel.app_action_recorded.v1"
+            && APP_ACTION_SUFFIX_FAILURE.try_with(|_| ()).is_ok()
+        {
+            let applied: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM kernel_app_actions WHERE event_seq=?)",
+            )
+            .bind(event.local_seq)
+            .fetch_one(conn)
+            .await?;
+            if !applied {
+                return Err(Error::engine("app action suffix ran before its projection"));
+            }
+            return Err(Error::engine("injected app action suffix failure"));
+        }
     }
     Ok(())
 }
@@ -499,6 +558,8 @@ async fn project_extended(
             crate::kernel::notifications::project_preference(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.publication_changed.v1" => crate::kernel::publications::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.message_command_committed.v1" => {
             crate::kernel::messaging::project_command(conn, event).await
         }
@@ -511,8 +572,14 @@ async fn project_extended(
             crate::kernel::messaging::project(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
-        "kernel.comment_anchor_set.v1" | "kernel.comment_anchor_imported.v1" => {
+        "kernel.comment_anchor_set.v1"
+        | "kernel.comment_anchor_imported.v1"
+        | "kernel.comment_anchor_removed.v1" => {
             crate::kernel::comments_v2::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.record_type_corrected.v1" => {
+            crate::kernel::type_correction::project(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.app_state_imported.v1" => crate::kernel::app_state::project(conn, event).await,
@@ -525,15 +592,32 @@ async fn project_extended(
             crate::kernel::artifact_closures::project_exclusion(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.app_catalog_update_materialized.v1" => {
+            crate::kernel::app_installs::materialized::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.app_catalog_source_published.v1" => {
+            crate::kernel::app_installs::catalog::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.app_source_published.v1" => {
+            crate::kernel::app_installs::sources::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.artifact_closure_activated.v1" => {
             crate::kernel::artifact_closures::project(conn, event).await
         }
 
         #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.workspace_app_added.v1" | "kernel.workspace_app_removed.v1" => {
+            crate::kernel::app_installs::shelf::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.app_installs_activated.v1"
         | "kernel.app_install_removed.v1"
         | "kernel.app_install_recorded.v1"
         | "kernel.app_install_adopted.v1"
+        | "kernel.app_install_scope_set.v1"
         | "kernel.app_action_started.v1"
         | "kernel.app_action_recorded.v1" => {
             crate::kernel::app_installs::project(conn, event).await
@@ -543,8 +627,27 @@ async fn project_extended(
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.v1_state_imported.v1" => crate::kernel::v1_state::project(conn, event).await,
         #[cfg(any(test, feature = "v2-kernel-probe"))]
-        "kernel.identity_binding_added.v1" => {
+        "kernel.identity_binding_added.v1"
+        | "kernel.identity_binding_removed.v1"
+        | "kernel.identity_bindings_reconciled.v1" => {
             crate::kernel::identity_bindings::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.saved_tab_changed.v1" => crate::kernel::saved_tabs::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.webhook_configured.v1"
+        | "kernel.webhook_revoked.v1"
+        | "kernel.webhook_accepted.v1"
+        | "kernel.webhook_diagnostic.v1" => {
+            crate::kernel::webhooks::validate_recorded(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.schema_config_written.v1" => {
+            crate::kernel::schema_configuration::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.vocabulary_mutated.v1" => {
+            crate::kernel::schema_catalogue::project(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.account_config_bound.v1" => {
@@ -556,6 +659,14 @@ async fn project_extended(
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.metadata_set.v1" => crate::kernel::record_metadata::project(conn, event).await,
         #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.mcp_write_fenced.v1" => {
+            crate::kernel::mcp_write_receipts::fences::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.mcp_write_receipt_recorded.v1" => {
+            crate::kernel::mcp_write_receipts::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.workspace_metadata_imported.v1" => {
             crate::kernel::workspace_metadata::project(conn, event).await
         }
@@ -564,6 +675,9 @@ async fn project_extended(
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.hosted_offboarding.v1"
         | "kernel.hosted_membership.v1"
+        | "kernel.hosted_membership.v2"
+        | "kernel.membership_bundle_defined.v1"
+        | "kernel.membership_bundle_updated.v1"
         | "kernel.import_member_policy.v1"
         | "kernel.import_hosted_accounts.v1" => {
             crate::kernel::hosted_identity::project(conn, event).await
@@ -724,6 +838,12 @@ async fn project_extended(
         "reconciliation.recorded.v1" => project_reconciliation_recorded(conn, event).await,
         "unit.superseded.v1" => project_unit_superseded(conn, event).await,
         "receipt.dependency_audited.v1" => project_receipt_dependency_audited(conn, event).await,
+        "webhook.configured.v1"
+        | "webhook.revoked.v1"
+        | "webhook.accepted.v1"
+        | "webhook.diagnostic.v1" => {
+            crate::mcp::tools::webhooks::validate_recorded(conn, event).await
+        }
         other => Err(Error::engine(format!("unknown event type: {other}"))),
     }
 }

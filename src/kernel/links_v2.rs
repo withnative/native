@@ -15,6 +15,35 @@ pub(super) const LINK4_DDL: &str = r#"CREATE TABLE kernel_link4_edges (
  UNIQUE(principal_id, operation_key)
 )"#;
 
+/// Endpoint seeks for the P2 link-candidate superset (LINK_CANDIDATES): both
+/// directions of every link4 edge touching an anchor. Covering both endpoint
+/// columns keeps the union branches off the table.
+pub(crate) const LINK4_SOURCE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_kernel_link4_edges_source ON kernel_link4_edges(source_id,target_id)";
+pub(crate) const LINK4_TARGET_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_kernel_link4_edges_target ON kernel_link4_edges(target_id,source_id)";
+
+/// Reject same-name indexes with different keys or predicates. SQLite retains
+/// the canonical CREATE statement without IF NOT EXISTS.
+pub(crate) async fn require_endpoint_indexes_on(conn: &mut SqliteConnection) -> Result<()> {
+    for (name, ddl) in [
+        ("idx_kernel_link4_edges_source", LINK4_SOURCE_INDEX),
+        ("idx_kernel_link4_edges_target", LINK4_TARGET_INDEX),
+    ] {
+        let actual: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+        )
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
+        if actual.as_deref() != Some(ddl.replacen(" IF NOT EXISTS", "", 1).as_str()) {
+            return Err(Error::engine(format!(
+                "v2 endpoint index preparation found an unexpected definition for {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", deny_unknown_fields)]
 pub enum EndpointBinding {
@@ -370,7 +399,7 @@ pub async fn prepare_link4_as(
     target: &str,
     operation_key: &str,
 ) -> Result<Link4Request> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     authority(&mut tx, principal, source, target).await?;
     refuse_governed_directed(&mut tx, source, target, predicate).await?;
     if let Some((request, _)) = existing_request(&mut tx, principal, operation_key).await? {
@@ -593,7 +622,7 @@ pub async fn describe_record_links_as(
     principal: &str,
     record: &str,
 ) -> Result<serde_json::Value> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     kernel_require(&mut tx, principal, record, Capability::View).await?;
     let witness = endpoint(&mut tx, record, i64::MAX).await?;
     let mut links = Vec::new();

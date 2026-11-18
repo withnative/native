@@ -63,7 +63,7 @@ async function engine(name, args) {
 
 const chromium = await loadChromium();
 assert.ok(chromium, 'Playwright required');
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, ...(process.env.ALPHA_TAB_KIT_CHROMIUM ? { executablePath: process.env.ALPHA_TAB_KIT_CHROMIUM } : {}) });
 const inbox = starters[1];
 try {
   await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'source-starters-real-engine', version: '0' } });
@@ -88,36 +88,35 @@ try {
     calls: async (operation, args) => { const result = await engine(operation, args); hub.revalidate(); return result; } });
   const frame = page.frames().find((f) => f.url().includes('/frame'));
 
-  // The real engine answers named objects, and the starter shows title and excerpt.
-  await frame.getByRole('button', { name: 'Weekly planning', exact: true }).waitFor();
+  // The real engine answers named objects, and this list reads metadata only.
+  await frame.locator(`ul [data-native-record-id="${savedId}"]`).waitFor();
   const first = delivered[0].rows[0];
   assert.ok(first && !Array.isArray(first) && first.id === savedId && first.name === 'Weekly planning', JSON.stringify(first));
-  assert.match(await frame.locator('nav').textContent(), /Agenda first\./);
-  await frame.locator('#filter').fill('weekly');
-  await frame.getByRole('button', { name: 'Weekly planning', exact: true }).waitFor();
-  await frame.locator('#filter').fill('no such title');
-  await frame.getByText('No matching notes.').waitFor();
-  await frame.locator('#filter').fill('');
-
-  // Selecting keeps the real id, renders Markdown and links the record.
-  await frame.getByRole('button', { name: 'Weekly planning', exact: true }).click();
-  await frame.locator('article h2').getByText('Weekly planning', { exact: true }).waitFor();
-  assert.equal(await frame.locator('article strong').textContent(), 'Decide');
-  assert.equal(await frame.locator(`article [data-native-record-id="${savedId}"]`).count(), 1);
+  assert.equal('body' in first, false);
+  assert.equal('body_length' in first, false);
+  assert.equal(await frame.locator(`ul [data-native-record-id="${savedId}"]`).textContent(), 'Weekly planning');
 
   // A note created through the starter persists and comes back through the same reads.
-  await frame.locator('#title').fill('Created in starter');
-  await frame.locator('#body').fill('Made by the app');
-  await frame.locator('#create').click();
-  await frame.getByText('Saved.', { exact: true }).waitFor();
-  await frame.getByRole('button', { name: 'Created in starter', exact: true }).waitFor();
+  await frame.locator('input[name="title"]').fill('Created in starter');
+  await frame.locator('textarea[name="body"]').fill('Made by the app');
+  await frame.getByRole('button', { name: 'Create note', exact: true }).click();
+  // This fake host performs one-shot queries; forward the controlled host invalidation
+  // to its subscriptions. The app itself never calls retry after writing.
+  // The engine's receipt names the record, so the list shows it at once; the forwarded invalidation then brings the
+  // list's own row, which replaces it. One record, one row.
+  await frame.locator('ul [data-native-record-id]').filter({ hasText: 'Created in starter' }).waitFor();
+  for (const sub of await tab.subscriptions()) await tab.pushSubscription(sub);
+  await frame.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await frame.locator('ul [data-native-record-id]').filter({ hasText: 'Created in starter' }).waitFor();
+  await frame.locator('section[aria-label="Note actions"] article').waitFor({ state: 'hidden' });
+  assert.equal(await frame.locator('ul [data-native-record-id]').filter({ hasText: 'Created in starter' }).count(), 1);
   const stored = await engine('query_sql', { sql: "SELECT id, home_id FROM records WHERE name = 'Created in starter' AND kind = 'note' ORDER BY id LIMIT 2" });
   assert.equal(stored.rows.length, 1);
   assert.equal(stored.rows[0].home_id, 'native:unfiled');
 
   await tab.expectHealthy(); await tab.close(); await page.close();
   hub.dispose?.();
-  console.log('Meeting-notes starter: real read hub and engine rows display, filter, select and persist.');
+  console.log('Meeting-notes starter: real read hub and engine metadata rows display, reconcile and persist.');
 } finally {
   await browser.close();
   child.kill();

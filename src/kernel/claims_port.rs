@@ -228,7 +228,7 @@ pub async fn prepare_claim_as(
     key: &str,
     command: provider::Command,
 ) -> Result<ClaimRequest> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     let run = run_ledger::resolve(&mut tx, context, false).await?;
     visible(&mut tx, &run.owner, record).await?;
     operation_key(key)?;
@@ -493,7 +493,7 @@ pub async fn claims_as(db: &Db, principal: &str, records: &[String]) -> Result<V
         ));
     }
     let ids: std::collections::BTreeSet<_> = records.iter().collect();
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     for id in &ids {
         visible(&mut tx, principal, id).await?;
     }
@@ -529,7 +529,7 @@ pub async fn release_retry_command_as(
     record: &str,
     key: &str,
 ) -> Result<Option<provider::Command>> {
-    let mut tx = db.write_pool().begin().await?;
+    let mut tx = db.pool().begin().await?;
     let run = run_ledger::resolve(&mut tx, context, false).await?;
     visible(&mut tx, &run.owner, record).await?;
     operation_key(key)?;
