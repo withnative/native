@@ -5057,3 +5057,515 @@ async fn working_original_terminal_tail_recovery_orders_answer_and_real_native_f
         canonical.close().await;
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn working_enrolled_drafts_keep_originals_and_yield_to_exact_global_acceptance() {
+    use super::working_v2::{
+        manager::WorkingManager, BindingControl, OwnerPinnedBase, WorkingBinding,
+    };
+    use crate::kernel::original_settlement::{
+        self as settlement, installed, AuthenticatedRoute, RouteGuard,
+    };
+    use crate::mcp::kernel_v2::writes::replay;
+    use crate::node::working_v2::WorkingJournal;
+    use crate::standby::{kernel_v2, kernel_v2_delta, AcceptedKernelDelta};
+
+    struct Allow;
+    impl RouteGuard for Allow {
+        fn recheck(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let mut f = fixture().await;
+    f.base.close().await;
+    let canonical = crate::db::open_existing_v2_file(f.path.to_str().unwrap())
+        .await
+        .unwrap();
+    settlement::prepare(&canonical, true).await.unwrap();
+    let origin = settlement::origin(&canonical).await.unwrap();
+    f.base = crate::db::open_kernel_v2_standby_read_only(f.path.to_str().unwrap())
+        .await
+        .unwrap();
+    let mut cut = f.base.pool().begin().await.unwrap();
+    let before = kernel_v2::coordinates(&mut cut).await.unwrap();
+    cut.rollback().await.unwrap();
+    let install = "1".repeat(64);
+    let binding = WorkingBinding {
+        account_id: "acct:admin".into(),
+        database_id: "route".into(),
+        origin_database_id: origin.clone(),
+        history_lineage: format!("v2:{origin}:{}", before.genesis_event_id),
+        resource_origin: "https://fixture.test".into(),
+        install_id: Some(install.clone()),
+    };
+    let owner = OwnerPinnedBase::from_verified_owner(
+        f.base.clone(),
+        binding.clone(),
+        before.genesis_event_id.clone(),
+        before.content_event_seq,
+        &f.caller,
+    )
+    .await
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let area_id = Uuid::new_v4().to_string();
+    let area_path = root.path().join(&area_id);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&area_path)
+        .unwrap();
+    let journal = WorkingJournal::fixture_installed(root.path(), binding.clone())
+        .unwrap()
+        .with_location_scope(root.path().to_owned(), area_id)
+        .unwrap();
+    assert!(journal.clone().with_refusal_drafts().is_err());
+    journal.qualify_enrolled_fixture();
+    let journal = journal.with_refusal_drafts().unwrap();
+    let contract = crate::mcp::executor_prototype::original_settlement_contract(
+        7,
+        "update_record",
+        None,
+        "records_write",
+        "update_record",
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let (_close, guard) = BindingControl::new();
+    let area = ForkArea::new(&area_path, std::slice::from_ref(&f.path)).unwrap();
+    let (manager, control) = WorkingManager::open_workspace_shared(
+        owner,
+        f.caller.clone(),
+        (area, ForkLimits::default()),
+        journal.clone(),
+        guard,
+        (contract.clone(), None),
+    )
+    .await
+    .unwrap();
+    let args = manager_append(&f, "draft-nontail", " REAPPLIED_ELSEWHERE");
+    let first = manager
+        .append(f.caller.clone(), args.clone())
+        .unwrap()
+        .await
+        .unwrap();
+    let second = manager
+        .append(
+            f.caller.clone(),
+            manager_append(&f, "draft-tail", " STAYS_DRAFT"),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let old = manager.pin(f.caller.clone()).await.unwrap();
+    let route = AuthenticatedRoute {
+        guard: Arc::new(Allow),
+        account: "acct:admin",
+        principal: &f.admin,
+        database: "route",
+        origin: &origin,
+        node_client: "dedicated-client",
+    };
+    let mut preserved = Vec::new();
+    for ack in [&first, &second] {
+        control.requires_undo();
+        let original = journal.fixture_resolution_requested(&ack.proposal_id).await;
+        let answer = installed::settle(
+            &canonical,
+            &route,
+            &install,
+            installed::Action::Abandon,
+            original,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer["verdict"], "unapplied_terminal");
+        journal
+            .fixture_resolution_verified(&ack.proposal_id, answer)
+            .await;
+        preserved.push(journal.fixture_entry_bytes(&ack.proposal_id));
+    }
+    assert!(manager.dispatch_exclusions().await.is_err());
+    let fold = |before: kernel_v2::KernelGeneration| {
+        let canonical = canonical.clone();
+        async move {
+            let mut tx = canonical.pool().begin().await.unwrap();
+            let wire = kernel_v2_delta::cut_versioned(
+                &mut tx,
+                before.head_act,
+                &[],
+                kernel_v2_delta::WIRE_VERSION_3,
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+            let delta = kernel_v2_delta::TrustedKernelDelta::assume_trusted_for_test(wire).unwrap();
+            let head = delta.delta().head.generation.clone();
+            (
+                AcceptedKernelDelta::fixture_materialized(
+                    "fixture-source".into(),
+                    "fixture-accepted".into(),
+                    before,
+                    delta,
+                )
+                .unwrap(),
+                head,
+            )
+        }
+    };
+    let (packet, first_cut) = fold(before).await;
+    control.accepted_kernel(packet);
+    manager.drain_notifications_for_test().await;
+    assert_eq!(
+        manager.dispatch_exclusions().await.unwrap(),
+        [first.proposal_id.clone(), second.proposal_id.clone()]
+    );
+    let now = manager
+        .get(f.caller.clone(), &f.seed)
+        .await
+        .unwrap()
+        .to_string();
+    assert!(!now.contains("REAPPLIED_ELSEWHERE"));
+    assert!(!now.contains("STAYS_DRAFT"));
+    let deadline = || std::time::Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        manager
+            .await_terminal_draft(&first.proposal_id, deadline())
+            .await
+            .unwrap()
+            .1,
+        Some("draft")
+    );
+
+    // Originals authored on the newly grounded view are ordinary successors.
+    // A later accepted cut must preserve both even before either is sent.
+    for (key, body) in [
+        ("after-draft-one", " SURVIVOR_ONE"),
+        ("after-draft-two", " SURVIVOR_TWO"),
+    ] {
+        manager
+            .append(f.caller.clone(), manager_append(&f, key, body))
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    // An exact global acceptance remains possible after this install's fence.
+    let proposal = replay::ReplayProposal::from_original(
+        "update_record",
+        args,
+        Some("draft-nontail".into()),
+        &Default::default(),
+    )
+    .unwrap();
+    let mut tx = crate::db::begin_write(canonical.write_pool())
+        .await
+        .unwrap();
+    let accepted = replay::replay_write_in_transaction(
+        &canonical,
+        &mut tx,
+        &replay::ReplayCaller {
+            actor: f.admin.clone(),
+            mint: Default::default(),
+        },
+        &proposal,
+        &replay::ReplaySavepoint::claim(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(accepted, replay::ReplayOutcome::Applied { .. }));
+    canonical.commit_kernel_content(tx).await.unwrap();
+    let (packet, second_cut) = fold(first_cut).await;
+    control.accepted_kernel(packet);
+    manager.drain_notifications_for_test().await;
+    assert_eq!(
+        manager
+            .await_terminal_draft(&first.proposal_id, deadline())
+            .await
+            .unwrap()
+            .1,
+        Some("applied_elsewhere")
+    );
+    let now = manager
+        .get(f.caller.clone(), &f.seed)
+        .await
+        .unwrap()
+        .to_string();
+    assert_eq!(now.matches("REAPPLIED_ELSEWHERE").count(), 1);
+    assert_eq!(now.matches("SURVIVOR_ONE").count(), 1);
+    assert_eq!(now.matches("SURVIVOR_TWO").count(), 1);
+    assert!(manager.dispatch_exclusions().await.is_ok());
+
+    assert!(!now.contains("STAYS_DRAFT"));
+    assert!(old
+        .get(f.caller.clone(), &f.seed)
+        .await
+        .unwrap()
+        .value
+        .to_string()
+        .contains("STAYS_DRAFT"));
+    for (ack, bytes) in [&first, &second].into_iter().zip(&preserved) {
+        assert_eq!(&journal.fixture_entry_bytes(&ack.proposal_id), bytes);
+    }
+    drop(old);
+    drop(control);
+    manager.stop_for_test().await;
+
+    let owner = OwnerPinnedBase::from_verified_owner(
+        f.base.clone(),
+        binding,
+        second_cut.genesis_event_id,
+        second_cut.content_event_seq,
+        &f.caller,
+    )
+    .await
+    .unwrap();
+    let (_close, guard) = BindingControl::new();
+    let area = ForkArea::open_retained(&area_path, std::slice::from_ref(&f.path)).unwrap();
+    let (resumed, _) = WorkingManager::open_workspace_shared(
+        owner,
+        f.caller.clone(),
+        (area, ForkLimits::default()),
+        journal,
+        guard,
+        (contract, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resumed.dispatch_exclusions().await.unwrap(),
+        [first.proposal_id, second.proposal_id]
+    );
+    assert_eq!(
+        resumed
+            .get(f.caller.clone(), &f.seed)
+            .await
+            .unwrap()
+            .to_string(),
+        now
+    );
+    resumed.stop_for_test().await;
+    canonical.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn working_enrolled_drafts_retain_dependants_and_progress_only_proved_survivors() {
+    working_enrolled_dependency_case(false).await;
+    working_enrolled_dependency_case(true).await;
+}
+
+async fn working_enrolled_dependency_case(attempted: bool) {
+    use super::working_v2::{
+        manager::WorkingManager, BindingControl, OwnerPinnedBase, WorkingBinding,
+    };
+    use crate::kernel::original_settlement::{
+        self as settlement, installed, AuthenticatedRoute, RouteGuard,
+    };
+    use crate::mcp::kernel_v2::writes::replay::CapturedFirstPartyCreate;
+    use crate::node::working_v2::WorkingJournal;
+    use crate::standby::{kernel_v2, kernel_v2_delta, AcceptedKernelDelta};
+
+    struct Allow;
+    impl RouteGuard for Allow {
+        fn recheck(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let mut f = fixture().await;
+    f.base.close().await;
+    let canonical = crate::db::open_existing_v2_file(f.path.to_str().unwrap())
+        .await
+        .unwrap();
+    settlement::prepare(&canonical, true).await.unwrap();
+    let origin = settlement::origin(&canonical).await.unwrap();
+    f.base = crate::db::open_kernel_v2_standby_read_only(f.path.to_str().unwrap())
+        .await
+        .unwrap();
+    let mut cut = f.base.pool().begin().await.unwrap();
+    let before = kernel_v2::coordinates(&mut cut).await.unwrap();
+    cut.rollback().await.unwrap();
+    let install = "2".repeat(64);
+    let binding = WorkingBinding {
+        account_id: "acct:admin".into(),
+        database_id: "route".into(),
+        origin_database_id: origin.clone(),
+        history_lineage: format!("v2:{origin}:{}", before.genesis_event_id),
+        resource_origin: "https://fixture.test".into(),
+        install_id: Some(install.clone()),
+    };
+    let owner = OwnerPinnedBase::from_verified_owner(
+        f.base.clone(),
+        binding.clone(),
+        before.genesis_event_id.clone(),
+        before.content_event_seq,
+        &f.caller,
+    )
+    .await
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let journal = WorkingJournal::fixture_installed(root.path(), binding).unwrap();
+    journal.qualify_enrolled_fixture();
+    let journal = journal.with_refusal_drafts().unwrap();
+    let source = serde_json::json!({
+        "type":"Document", "kind":"note", "name":"Pending refused create",
+        "body":"Original create bytes", "home_id":f.home, "reason":"Fixture for draft ancestry",
+        "idempotency_key":"draft-created-record"
+    });
+    let scope = crate::provenance::ProvenanceDispatch::from_caller(
+        &f.caller,
+        "create_record",
+        &source,
+        None,
+    );
+    let captured = crate::mcp::kernel_v2::writes::with_minted_ids_for_settlement_test(
+        scope.scope(async { CapturedFirstPartyCreate::capture(f.caller.clone(), source).unwrap() }),
+    )
+    .await;
+    let proposal = captured.prepare(&f.admin, None).unwrap();
+    let create_id = proposal.args()["id"].as_str().unwrap().to_owned();
+    let contract = crate::mcp::executor_prototype::original_settlement_contract(
+        8,
+        "create_record",
+        None,
+        "records_write",
+        "create_record",
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let (_close, guard) = BindingControl::new();
+    let area = ForkArea::new(root.path(), std::slice::from_ref(&f.path)).unwrap();
+    let (manager, control) = WorkingManager::open_workspace_shared(
+        owner,
+        f.caller.clone(),
+        (area, ForkLimits::default()),
+        journal.clone(),
+        guard,
+        (contract, Some(captured.context().clone())),
+    )
+    .await
+    .unwrap();
+    let create = WorkingManager::captured_create(&captured, proposal).unwrap();
+    let create = manager.append_original(create).unwrap().await.unwrap();
+    let mut dependant_args = manager_append(&f, "draft-dependant", " DEPENDANT_BYTES");
+    dependant_args["id"] = serde_json::json!(create_id);
+    let dependent = manager
+        .append(f.caller.clone(), dependant_args)
+        .unwrap()
+        .await
+        .unwrap();
+    let survivor = manager
+        .append(
+            f.caller.clone(),
+            manager_append(&f, "draft-survivor", " SURVIVOR_BYTES"),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let old = manager.pin(f.caller.clone()).await.unwrap();
+    if attempted {
+        journal
+            .fixture_transport_uncertain(&dependent.proposal_id)
+            .await;
+    }
+    let dependant_bytes = journal.fixture_entry_bytes(&dependent.proposal_id);
+
+    control.requires_undo();
+    let original = journal
+        .fixture_resolution_requested(&create.proposal_id)
+        .await;
+    let route = AuthenticatedRoute {
+        guard: Arc::new(Allow),
+        account: "acct:admin",
+        principal: &f.admin,
+        database: "route",
+        origin: &origin,
+        node_client: "dedicated-client",
+    };
+    let answer = installed::settle(
+        &canonical,
+        &route,
+        &install,
+        installed::Action::Abandon,
+        original,
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["verdict"], "unapplied_terminal");
+    journal
+        .fixture_resolution_verified(&create.proposal_id, answer)
+        .await;
+    let mut tx = canonical.pool().begin().await.unwrap();
+    let wire = kernel_v2_delta::cut_versioned(
+        &mut tx,
+        before.head_act,
+        &[],
+        kernel_v2_delta::WIRE_VERSION_3,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    control.accepted_kernel(
+        AcceptedKernelDelta::fixture_materialized(
+            "fixture-source".into(),
+            "fixture-accepted".into(),
+            before,
+            kernel_v2_delta::TrustedKernelDelta::assume_trusted_for_test(wire).unwrap(),
+        )
+        .unwrap(),
+    );
+    manager.drain_notifications_for_test().await;
+    let (publication, value) = manager.read(f.caller.clone(), &f.seed).await.unwrap();
+    assert!(value.to_string().contains("SURVIVOR_BYTES"));
+    assert_eq!(
+        journal.fixture_entry_bytes(&dependent.proposal_id),
+        dependant_bytes
+    );
+    if attempted {
+        assert_eq!(publication, survivor.publication);
+        assert!(manager.dispatch_exclusions().await.is_err());
+        assert!(manager
+            .original_disposition(&dependent.proposal_id)
+            .await
+            .unwrap()
+            .is_none());
+    } else {
+        assert!(publication.publication > survivor.publication.publication);
+        assert_eq!(
+            manager.dispatch_exclusions().await.unwrap(),
+            [create.proposal_id, dependent.proposal_id.clone()]
+        );
+        assert_eq!(
+            manager
+                .original_disposition(&dependent.proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            Some("dependent_draft")
+        );
+        assert!(!manager
+            .get(f.caller.clone(), &create_id)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("DEPENDANT_BYTES"));
+    }
+    assert!(old
+        .get(f.caller.clone(), &create_id)
+        .await
+        .unwrap()
+        .value
+        .to_string()
+        .contains("DEPENDANT_BYTES"));
+    drop(old);
+    manager.stop_for_test().await;
+    canonical.close().await;
+}

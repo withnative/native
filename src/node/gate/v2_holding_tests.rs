@@ -15,6 +15,7 @@ struct Verified {
     contract_override: StdMutex<Option<NodeHoldingContract>>,
     receiver95: AtomicBool,
     published_ordinal: std::sync::atomic::AtomicI64,
+    dispatch_exclusions: StdMutex<Option<Vec<String>>>,
     protocols: StdMutex<Vec<Option<String>>>,
     protocol_contracts: StdMutex<std::collections::BTreeMap<String, NodeHoldingContract>>,
     credential: [u8; 32],
@@ -29,6 +30,17 @@ impl Outage for Verified {
             self.binding.lock().unwrap().as_ref() == Some(scope)
                 && ordinal > 0
                 && self.published_ordinal.load(Ordering::Acquire) == ordinal
+        })
+    }
+    fn working_dispatch_exclusions<'a>(
+        &'a self,
+        scope: &'a CustodyBinding,
+    ) -> Ready<'a, Option<Vec<String>>> {
+        Box::pin(async move {
+            if self.binding.lock().unwrap().as_ref() != Some(scope) {
+                return None;
+            }
+            self.dispatch_exclusions.lock().unwrap().clone()
         })
     }
     fn confirm_down(&self) -> Ready<'_, bool> {
@@ -223,6 +235,7 @@ impl ExistingRig {
             contract_override: StdMutex::new(None),
             receiver95: AtomicBool::new(false),
             published_ordinal: std::sync::atomic::AtomicI64::new(0),
+            dispatch_exclusions: StdMutex::new(None),
             protocols: StdMutex::new(Vec::new()),
             protocol_contracts: StdMutex::new(Default::default()),
             replace_scope_before_send: StdMutex::new(None),
@@ -3432,4 +3445,85 @@ async fn installed_working_update_required_retains_original_and_prior_uncertaint
         assert!(after.working_resolution_ref().unwrap().answer().is_none());
         assert_eq!(after.maybe_applied, prior_lost_reply);
     }
+}
+
+#[tokio::test]
+async fn enrolled_draft_exclusion_clears_only_the_working_drain_and_preserves_ingress() {
+    let mut rig = ExistingRig::new().await;
+    let key_file = rig
+        .upstream
+        .config
+        .socket_directory
+        .join("fixture-install-key");
+    super::super::oauth::atomic_private_write(&key_file, "1".repeat(64).as_bytes()).unwrap();
+    let key = crate::node_credential::InstallKey::load(&key_file).unwrap();
+    let install = key.id();
+    {
+        let upstream = Arc::get_mut(&mut rig.upstream).unwrap();
+        upstream.install_key = Some(key);
+        upstream.config.node_install_id = Some(install.clone());
+        upstream.config.working_refusal_drafts = true;
+    }
+    rig.verified
+        .binding
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .install_id = Some(install);
+    let record = record(&rig.home.world, "base").await;
+    let scoped = rig.scoped();
+    let journal = scoped
+        .working_journal(installed_binding(rig.binding()))
+        .unwrap();
+    journal.qualify_enrolled_fixture();
+    let digest = scoped
+        .hold_contracts("update_record")
+        .digest("records_write", "update_record")
+        .unwrap()
+        .to_owned();
+    let ticket = journal
+        .persist_original(
+            rig.home.world.admin.clone(),
+            &installed_proposal(&record, "drafted-record"),
+            crate::node::working_v2::FirstPartyIdentity::FirstParty,
+            digest,
+        )
+        .await
+        .unwrap();
+    journal.fixture_resolution_requested(ticket.id()).await;
+    let retained = journal.fixture_entry_bytes(ticket.id());
+    assert_eq!(rig.drain().await, queue::Halt::Local);
+    assert!(rig.wire_requests.lock().unwrap().is_empty());
+
+    // The pinned-working publication is proved by the manager tests. This
+    // test supplies its exclusion at the production gate hook.
+    *rig.verified.dispatch_exclusions.lock().unwrap() = Some(vec![ticket.id().to_owned()]);
+    assert_eq!(rig.drain().await, queue::Halt::Empty);
+    assert_eq!(
+        scoped.journal.pending_count(),
+        1,
+        "draft bytes stay in custody"
+    );
+    let ordinary = rig
+        .send(
+            "update_record",
+            json!({
+                "id":record,"body_append":" forbidden","reason":"ordinary ingress proof",
+                "idempotency_key":"other-original"
+            }),
+        )
+        .await;
+    assert!(ordinary
+        .to_string()
+        .contains("Enrolled nodes send only admitted keyed working originals"));
+    assert!(rig.wire_requests.lock().unwrap().is_empty());
+    assert_eq!(journal.fixture_entry_bytes(ticket.id()), retained);
+
+    Arc::get_mut(&mut rig.upstream)
+        .unwrap()
+        .config
+        .working_refusal_drafts = false;
+    assert_eq!(rig.drain().await, queue::Halt::Local);
+    assert!(rig.wire_requests.lock().unwrap().is_empty());
 }

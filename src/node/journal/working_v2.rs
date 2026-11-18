@@ -60,6 +60,10 @@ impl WorkingResolution {
             _ => None,
         }
     }
+    pub(crate) fn answer_sha256(&self) -> Option<String> {
+        let answer = serde_json::to_vec(self.answer()?).ok()?;
+        Some(hex::encode(Sha256::digest(answer)))
+    }
     fn valid(&self, entry: &Entry) -> bool {
         let schema = match self {
             Self::Requested { schema, .. } | Self::Verified { schema, .. } => schema,
@@ -735,6 +739,14 @@ impl DurableAppend {
     pub(crate) fn wire_arguments(&self) -> &Value {
         &self.args
     }
+    pub(crate) fn references_created_record(&self, id: &str) -> bool {
+        let args = self.arguments();
+        self.record_operation().map_or_else(
+            || args["id"].as_str() == Some(id),
+            |operation| operation.targets(args).iter().any(|target| target == id),
+        ) || args["home_id"].as_str() == Some(id)
+    }
+
     pub(crate) fn primary_target(&self) -> Option<&str> {
         if let Some(operation) = self.record_operation() {
             operation.primary_target(self.arguments())
@@ -783,6 +795,7 @@ pub(crate) enum WorkingCanonicalAnswer {
 pub(crate) struct WorkingOutcome {
     answer: WorkingCanonicalAnswer,
     uncertain: bool,
+    never_attempted: bool,
 }
 impl WorkingOutcome {
     pub(crate) fn answer(&self) -> WorkingCanonicalAnswer {
@@ -790,6 +803,9 @@ impl WorkingOutcome {
     }
     pub(crate) fn uncertain(&self) -> bool {
         self.uncertain
+    }
+    pub(crate) fn never_attempted(&self) -> bool {
+        self.never_attempted
     }
 }
 impl JournalFence {
@@ -819,6 +835,11 @@ impl WorkingJournalView {
     pub(crate) fn has_resolution(&self) -> bool {
         !self.resolutions.is_empty()
     }
+    pub(crate) fn resolutions(&self) -> impl Iterator<Item = (&str, &WorkingResolution)> {
+        self.resolutions
+            .iter()
+            .map(|(id, resolution)| (id.as_str(), resolution))
+    }
     pub(crate) fn prefix_revision(&self, count: usize) -> Result<String> {
         let pieces = self
             .revision_pieces
@@ -846,8 +867,33 @@ pub(crate) struct WorkingJournal {
     version: u32,
     installed_admission: Option<Arc<crate::node::gate::WriteGate>>,
     location_scope: Option<(std::path::PathBuf, String)>,
+    refusal_drafts: bool,
 }
 impl WorkingJournal {
+    pub(crate) fn with_refusal_drafts(mut self) -> Result<Self> {
+        if self.binding.install_id.is_none() || self.version != INSTALLED_WORKING_VERSION {
+            return Err(Error::engine(
+                "draft recovery requires enrolled working custody",
+            ));
+        }
+        if self
+            .journal
+            .enrolled_qualification()
+            .and_then(tokio::sync::OnceCell::get)
+            .is_none()
+        {
+            return Err(Error::engine(
+                "draft recovery requires verified journal continuity",
+            ));
+        }
+        self.refusal_drafts = true;
+        Ok(self)
+    }
+
+    pub(crate) fn refusal_drafts(&self) -> bool {
+        self.refusal_drafts
+    }
+
     /// Read-only admission barrier from the sole journal, not a wake hint.
     pub(crate) fn has_resolution(&self) -> bool {
         self.journal.has_working_resolution()
@@ -908,6 +954,7 @@ impl WorkingJournal {
             version: WORKING_VERSION,
             installed_admission: None,
             location_scope: None,
+            refusal_drafts: false,
         })
     }
 
@@ -977,6 +1024,7 @@ impl WorkingJournal {
             version: INSTALLED_WORKING_VERSION,
             installed_admission: None,
             location_scope: None,
+            refusal_drafts: false,
         })
     }
 
@@ -1179,6 +1227,11 @@ impl WorkingJournal {
         contract_digest: String,
     ) -> Result<DurableAppend> {
         let _serial = self.serial.blocking_lock();
+        if self.journal.has_working_resolution() {
+            return Err(Error::engine(
+                "original resolution pauses admission; payload retained",
+            ));
+        }
         if admitted.binding() != &self.binding {
             return Err(Error::engine("working admission namespace changed"));
         }
@@ -1263,7 +1316,7 @@ impl WorkingJournal {
         if self.version == INSTALLED_WORKING_VERSION && self.installed_admission.is_none() {
             return Err(Error::engine("installed custody admission owner missing"));
         }
-        if self.journal.has_working_resolution() {
+        if !self.refusal_drafts && self.journal.has_working_resolution() {
             return Err(Error::engine(
                 "original resolution pauses admission; payload retained",
             ));
@@ -1358,6 +1411,11 @@ impl WorkingJournal {
                     .is_some_and(|old| old.actor == original.actor)
                 && entry.idempotency_key.as_deref() == Some(key)
         }) {
+            if entry.working_resolution.is_some() {
+                return Err(Error::conflict(
+                    "original has retained resolution; inspect its recovery disposition",
+                ));
+            }
             // Retry decoration belongs to this invocation, not request
             // identity. Keep the FIRST original's annotation bytes unchanged;
             // a new run/client may retrieve its own exact pending proposal.
@@ -1476,6 +1534,11 @@ impl WorkingJournal {
         let mut has_hosted_verdict = false;
         let mut requires_reconciliation = false;
         let mut outcomes = std::collections::BTreeMap::new();
+        let continuity_verified = self
+            .journal
+            .enrolled_qualification()
+            .and_then(tokio::sync::OnceCell::get)
+            .is_some();
         for entry in &retained {
             proposals.push(self.ticket(entry)?);
             let verdict = entry.answer.is_some()
@@ -1497,6 +1560,12 @@ impl WorkingJournal {
                 entry.id.clone(),
                 WorkingOutcome {
                     answer,
+                    never_attempted: continuity_verified
+                        && entry.attempts == 0
+                        && !entry.in_flight
+                        && !entry.maybe_applied
+                        && entry.state == EntryState::Pending
+                        && entry.answer.is_none(),
                     uncertain: entry.maybe_applied
                         || matches!(
                             entry.state,
@@ -1624,13 +1693,13 @@ impl WorkingJournal {
         let entry = self.journal.request_working_resolution(id).unwrap();
         settlement_original(&entry).unwrap()
     }
-    /// Real provider fixture answer only; installed proof must use the sealed
-    /// authenticated HTTP producer, never this test-only authority seam.
+    /// Real settlement answer for working-fold tests. HTTP ingress tests use
+    /// the sealed authenticated producer instead of this fixture seam.
     pub(crate) async fn fixture_resolution_verified(&self, id: &str, answer: Value) {
         let _turn = self.serial.lock().await;
         let entry = self.journal.get(id).unwrap();
         let original = settlement_original(&entry).unwrap();
-        validate_settlement_answer(&original, &answer).unwrap();
+        validate_settlement_for_entry(&entry, &original, &answer).unwrap();
         self.journal
             .update_checked(
                 id,
@@ -1689,6 +1758,16 @@ impl WorkingJournal {
         journal.serial = journal.journal.working_serial.clone();
         Ok(journal)
     }
+    /// Working-copy fixtures isolate replay and publication from the signed
+    /// hosted continuity protocol covered by the node ingress tests.
+    pub(crate) fn qualify_enrolled_fixture(&self) {
+        self.journal
+            .enrolled_qualification()
+            .unwrap()
+            .set(())
+            .unwrap();
+    }
+
     /// Format/order fixture only: actual provider projection and fingerprint,
     /// never runtime admission or a locally applied/hosted acceptance claim.
     pub(crate) async fn fixture_record_original(

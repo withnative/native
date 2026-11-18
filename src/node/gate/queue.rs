@@ -120,10 +120,9 @@ impl WriteGate {
     ) -> Halt {
         let mut sent = false;
         loop {
-            #[cfg(feature = "v2-kernel-probe")]
-            if self.journal.has_working_resolution() {
+            let Some(disposed) = self.working_dispatch_exclusions(upstream, hooks).await else {
                 return Halt::Local;
-            }
+            };
             if !self.scope_matches(hooks).await {
                 return Halt::Local;
             }
@@ -137,11 +136,7 @@ impl WriteGate {
                     } else {
                         false
                     });
-            let Some(entry) = (if merge_only {
-                self.journal.next_pending(true)
-            } else {
-                self.journal.oldest_pending()
-            }) else {
+            let Some(entry) = self.journal.next_pending_excluding(merge_only, &disposed) else {
                 return if self
                     .journal
                     .has_pending_hosted_creator_dependency(merge_only)
@@ -206,6 +201,23 @@ impl WriteGate {
                 Step::Halt(halt) => return halt,
             }
         }
+    }
+
+    pub(super) async fn working_dispatch_exclusions(
+        &self,
+        _upstream: &Upstream,
+        _hooks: Option<&dyn Outage>,
+    ) -> Option<Vec<String>> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.journal.has_working_resolution() {
+            if !_upstream.config.working_refusal_drafts {
+                return None;
+            }
+            return _hooks?
+                .working_dispatch_exclusions(self.custody_scope.as_ref()?)
+                .await;
+        }
+        Some(Vec::new())
     }
 
     /// The request exactly as the first attempt sent it, rebuilt from what

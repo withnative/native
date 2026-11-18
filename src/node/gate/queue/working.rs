@@ -413,6 +413,17 @@ impl WriteGate {
         principal: &str,
         deadline: Instant,
     ) -> Result<Entry> {
+        // Enrolled draft recovery shares the send turn. An in-flight write
+        // must record its outcome before abandonment can start.
+        let _drain = if upstream.config.working_refusal_drafts {
+            Some(
+                tokio::time::timeout_at(deadline.into(), self.drain_lock.write())
+                    .await
+                    .map_err(|_| Error::engine("working dispatch still owns the original"))?,
+            )
+        } else {
+            None
+        };
         let before = {
             let _turn = self.journal.working_serial.lock().await;
             if !self.scope_matches(Some(hooks)).await || !self.scope_targets(upstream) {

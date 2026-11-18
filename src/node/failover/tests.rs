@@ -599,6 +599,7 @@ impl Fixture {
         .unwrap();
         let config = NodeConfig {
             working_note_appends: false,
+            working_refusal_drafts: false,
             markdown_folder: None,
             hosted_base_url: format!("http://{address}"),
             home_id: "home".into(),
@@ -2655,6 +2656,7 @@ fn vault_off_switch_and_explicit_path_resolve() {
 fn standby_without_a_copy_treats_default_and_off_as_off() {
     let config = |markdown_folder: Option<MarkdownFolder>| NodeConfig {
         working_note_appends: false,
+        working_refusal_drafts: false,
         hosted_base_url: "https://h.example".into(),
         home_id: "h".into(),
         db_id: "d".into(),
@@ -3516,6 +3518,7 @@ async fn pre_read_act_requires_a_fresh_undegraded_copy_inside_the_bound_and_floo
 fn online_local_reads_bound_is_validated_at_config_load() {
     let base = |secs: u64| NodeConfig {
         working_note_appends: false,
+        working_refusal_drafts: false,
         online_local_reads: Some(OnlineLocalReads {
             max_age_seconds: secs,
         }),

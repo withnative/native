@@ -37,6 +37,10 @@
         },
         {
           "kind": "file",
+          "source": "glama.json"
+        },
+        {
+          "kind": "file",
           "source": "LICENSE.md"
         },
         {

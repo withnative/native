@@ -411,6 +411,9 @@ pub struct NodeConfig {
     /// canonical reconciliation pauses further acknowledgements until undo is qualified.
     #[serde(default)]
     pub working_note_appends: bool,
+    /// Qualify install-scoped refusal recovery on a private working copy.
+    #[serde(default)]
+    pub working_refusal_drafts: bool,
     /// Operator declaration that hosted runs the kernel-v2 engine, for a node
     /// without `standby_config` (the hosted-only pass-through). Only the
     /// standby router's head probe observes the engine, so a routerless node
@@ -589,6 +592,13 @@ impl NodeConfig {
         }
         if self.node_install_id.is_some() && self.node_install_key_file.is_none() {
             return Err(Error::engine("enrolled install id has no configured key"));
+        }
+        if self.working_refusal_drafts
+            && (!self.working_note_appends || self.node_install_id.is_none())
+        {
+            return Err(Error::engine(
+                "working_refusal_drafts requires an enrolled working node",
+            ));
         }
         if self.working_note_appends
             && (!cfg!(feature = "v2-kernel-probe")

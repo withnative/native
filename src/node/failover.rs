@@ -3506,6 +3506,13 @@ impl gate::Outage for Failover {
         Box::pin(async move { self.working_published(scope, ordinal).await })
     }
     #[cfg(feature = "v2-kernel-probe")]
+    fn working_dispatch_exclusions<'a>(
+        &'a self,
+        scope: &'a super::journal::CustodyBinding,
+    ) -> gate::Ready<'a, Option<Vec<String>>> {
+        Box::pin(async move { self.working_dispatch_exclusions(scope).await })
+    }
+    #[cfg(feature = "v2-kernel-probe")]
     fn working_canonical_changed<'a>(
         &'a self,
         scope: &'a super::journal::CustodyBinding,

@@ -175,14 +175,66 @@ struct TerminalDraft {
     original_ordinal: i64,
     proposal_id: String,
     verified_answer_sha256: String,
+    // The explicit field keeps older readers from adopting an enrolled draft
+    // publication with different recovery semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed_disposition: Option<InstalledDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dependency: Option<DraftDependency>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftDependency {
+    create_proposal_id: String,
+    created_record_id: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InstalledDisposition {
+    Draft,
+    AppliedElsewhere,
 }
 impl PublicationBase {
+    fn resolutions_grounded(&self, view: &crate::node::working_v2::WorkingJournalView) -> bool {
+        self.recovery_dispositions.iter().all(|draft| {
+            draft.dependency.is_none()
+                || view
+                    .outcome(&draft.proposal_id)
+                    .is_some_and(|outcome| outcome.never_attempted())
+        }) && view.resolutions().all(|(id, resolution)| {
+            self.recovery_dispositions.iter().any(|draft| {
+                draft.proposal_id == id
+                    && draft.installed_disposition.is_some()
+                    && resolution.answer_sha256().as_ref() == Some(&draft.verified_answer_sha256)
+            })
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         self.publication.validate()?;
         self.native.validate()?;
-        if self.recovery_dispositions.len() > 1
+        let legacy = self
+            .recovery_dispositions
+            .iter()
+            .any(|draft| draft.installed_disposition.is_none());
+        if (legacy && self.recovery_dispositions.len() != 1)
+            || (!legacy
+                && !self.recovery_dispositions.is_empty()
+                && self.publication.binding.install_id.is_none())
+            || self
+                .recovery_dispositions
+                .windows(2)
+                .any(|pair| pair[0].original_ordinal >= pair[1].original_ordinal)
             || self.recovery_dispositions.iter().any(|draft| {
-                draft.original_ordinal.checked_add(1) != Some(self.original_prefix)
+                draft.original_ordinal < 0
+                    || draft.original_ordinal >= self.original_prefix
+                    || (legacy
+                        && draft.original_ordinal.checked_add(1) != Some(self.original_prefix))
+                    || draft.dependency.as_ref().is_some_and(|dep| {
+                        draft.installed_disposition.is_none()
+                            || dep.create_proposal_id.is_empty()
+                            || dep.created_record_id.is_empty()
+                    })
                     || draft.proposal_id.is_empty()
                     || draft.verified_answer_sha256.len() != 64
                     || !draft

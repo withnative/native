@@ -158,6 +158,13 @@ pub(super) trait Outage: Send + Sync {
         Box::pin(async { false })
     }
     #[cfg(feature = "v2-kernel-probe")]
+    fn working_dispatch_exclusions<'a>(
+        &'a self,
+        _scope: &'a super::journal::CustodyBinding,
+    ) -> Ready<'a, Option<Vec<String>>> {
+        Box::pin(async { None })
+    }
+    #[cfg(feature = "v2-kernel-probe")]
     fn working_canonical_changed<'a>(
         &'a self,
         _scope: &'a super::journal::CustodyBinding,
@@ -1123,7 +1130,11 @@ impl WriteGate {
         known_write: bool,
     ) -> SendReport {
         #[cfg(feature = "v2-kernel-probe")]
-        if self.journal.has_working_resolution() {
+        if self
+            .working_dispatch_exclusions(upstream, request.outage)
+            .await
+            .is_none()
+        {
             return not_sent_report(
                 request.message.get("id"),
                 "Original resolution pending; existing work retained and dispatch paused",

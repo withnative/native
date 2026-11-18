@@ -524,11 +524,14 @@ impl Prepared {
             drop(tx);
             published = adopted;
         }
+        let readiness =
+            if shared.journal.refusal_drafts() && !published.resolutions_grounded(fence.view()) {
+                PublicationReadiness::AwaitingAcceptedMaterialization
+            } else {
+                PublicationReadiness::Ready
+            };
         let installed = std::panic::AssertUnwindSafe(actor::pin_install(
-            &shared,
-            &caller,
-            &published,
-            PublicationReadiness::Ready,
+            &shared, &caller, &published, readiness,
         ))
         .catch_unwind()
         .await;

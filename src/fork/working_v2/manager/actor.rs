@@ -596,6 +596,30 @@ impl Commands {
                         break;
                     }
                 };
+                if shared.journal.refusal_drafts()
+                    && !published.resolutions_grounded(captured.view())
+                {
+                    set_state(&shared, WorkingState::AwaitingQualifiedUndo);
+                    let _ = reply.send(Err(paused()));
+                    continue;
+                }
+                let disposed_retry = published.recovery_dispositions.iter().any(|draft| {
+                    usize::try_from(draft.original_ordinal)
+                        .ok()
+                        .and_then(|ordinal| captured.view().proposals().get(ordinal))
+                        .is_some_and(|ticket| {
+                            ticket.actor() == admitted.actor()
+                                && ticket.operation() == admitted.proposal().tool()
+                                && ticket.arguments()["idempotency_key"].as_str()
+                                    == admitted.proposal().idempotency_key()
+                        })
+                });
+                if disposed_retry {
+                    let _ = reply.send(Err(Error::conflict(
+                        "original has a retained recovery disposition",
+                    )));
+                    continue;
+                }
                 let journal = shared.journal.clone();
                 let original = admitted.clone();
                 let contract = admitted
@@ -1209,10 +1233,23 @@ pub(super) async fn audit_on(
     for draft in &previous.recovery_dispositions {
         let ordinal = usize::try_from(draft.original_ordinal).map_err(|_| paused())?;
         let ticket = fence.view().proposals().get(ordinal).ok_or_else(paused)?;
-        let resolution = fence.view().resolution(ticket.id()).ok_or_else(paused)?;
-        let actual = terminal_draft_on(tx, ticket, resolution, previous, owner, ordinal)
+        let actual = if let Some(dependency) = &draft.dependency {
+            dependent_disposition_on(tx, ticket, ordinal, dependency, previous, fence, owner)
+                .await?
+        } else {
+            let resolution = fence.view().resolution(ticket.id()).ok_or_else(paused)?;
+            terminal_draft_on(
+                tx,
+                ticket,
+                resolution,
+                previous,
+                owner,
+                ordinal,
+                draft.installed_disposition.is_some(),
+            )
             .await?
-            .ok_or_else(paused)?;
+            .ok_or_else(paused)?
+        };
         if &actual != draft || rows.iter().any(|row| row.0 == draft.proposal_id) {
             return Err(paused());
         }
@@ -1346,7 +1383,9 @@ async fn append_phase(
     let collector = owner.collector;
     with_handle(tx, |raw| collector.check(raw).map_err(undo_error)).await?;
     let audited = audit(tx, shared, previous, fence, owner).await?;
-    if fence.view().has_resolution() {
+    if !previous.resolutions_grounded(fence.view())
+        || (fence.view().has_resolution() && !shared.journal.refusal_drafts())
+    {
         return Ok(AppendStep::NeedsReconcile);
     }
     let count = fence.view().proposals().len();
@@ -1422,6 +1461,15 @@ async fn reconcile_phase(
 ) -> Result<Option<Reconciled>> {
     let (accepted, schema) = fold_input;
     let owner = replay::WorkingReplayOwner { schema, collector };
+    let installed_recovery = shared.journal.refusal_drafts();
+    if !installed_recovery
+        && previous
+            .recovery_dispositions
+            .iter()
+            .any(|d| d.installed_disposition.is_some())
+    {
+        return Err(paused());
+    }
     crate::storage_profile::enforce_write_boundary_on(tx).await?;
     with_handle(tx, |raw| collector.check(raw).map_err(undo_error)).await?;
     audit(tx, shared, previous, fence, owner).await?;
@@ -1480,17 +1528,81 @@ async fn reconcile_phase(
         .await?;
     let mut pending_seen = false;
     let mut readiness = PublicationReadiness::Ready;
+    let mut recovered_draft = false;
+    let mut refused_creates = std::collections::BTreeMap::<String, DraftDependency>::new();
     for (ordinal, ticket) in fence.view().proposals().iter().enumerate() {
         let outcome = fence.view().outcome(ticket.id()).ok_or_else(paused)?;
         let resolution = fence.view().resolution(ticket.id());
         if let Some(resolution) = resolution {
-            if ordinal.checked_add(1) != Some(fence.view().proposals().len()) {
+            if !installed_recovery && ordinal.checked_add(1) != Some(fence.view().proposals().len())
+            {
                 return Err(paused());
             }
-            readiness = PublicationReadiness::AwaitingAcceptedMaterialization;
-            if let Some(draft) =
-                terminal_draft_on(tx, ticket, resolution, &next, owner, ordinal).await?
+            if let Some(draft) = terminal_draft_on(
+                tx,
+                ticket,
+                resolution,
+                &next,
+                owner,
+                ordinal,
+                installed_recovery,
+            )
+            .await?
             {
+                if pending_seen
+                    && draft.installed_disposition == Some(InstalledDisposition::AppliedElsewhere)
+                {
+                    return Ok(None);
+                }
+                recovered_draft |= draft.installed_disposition == Some(InstalledDisposition::Draft)
+                    && !previous.recovery_dispositions.contains(&draft);
+                if !installed_recovery {
+                    readiness = PublicationReadiness::AwaitingAcceptedMaterialization;
+                }
+                remember_refused_create(ticket, &draft, &mut refused_creates)?;
+                next.recovery_dispositions.push(draft);
+                continue;
+            }
+            readiness = PublicationReadiness::AwaitingAcceptedMaterialization;
+            if installed_recovery && resolution.answer().is_none() {
+                // The accepted cut may arrive before the reply. Retain it as
+                // a packet and leave the current publication in place.
+                return Ok(None);
+            }
+        }
+        if installed_recovery && resolution.is_none() {
+            // A disposition is sticky. If its create later lands elsewhere,
+            // the dependent is still retained and only its own exact global
+            // outcome can supersede the draft.
+            let dependency = previous
+                .recovery_dispositions
+                .iter()
+                .find(|draft| draft.proposal_id == ticket.id())
+                .and_then(|draft| draft.dependency.as_ref())
+                .or_else(|| {
+                    refused_creates
+                        .values()
+                        .find(|dep| ticket.references_created_record(&dep.created_record_id))
+                });
+            if let Some(dependency) = dependency {
+                if !outcome.never_attempted() {
+                    // An attempted descendant needs its own proof. It can
+                    // already be independently accepted on this cut.
+                    if !pending_seen && materialized_on(tx, ticket, &next, owner).await? {
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                let draft =
+                    dependent_disposition_on(tx, ticket, ordinal, dependency, &next, fence, owner)
+                        .await?;
+                if pending_seen
+                    && draft.installed_disposition == Some(InstalledDisposition::AppliedElsewhere)
+                {
+                    return Ok(None);
+                }
+                remember_refused_create(ticket, &draft, &mut refused_creates)?;
+                recovered_draft |= !previous.recovery_dispositions.contains(&draft);
                 next.recovery_dispositions.push(draft);
                 continue;
             }
@@ -1512,6 +1624,15 @@ async fn reconcile_phase(
                 ));
             }
             continue;
+        }
+        if installed_recovery
+            && (resolution.is_some() || recovered_draft)
+            && (resolution.is_some()
+                || !outcome.never_attempted()
+                || !qualified_survivor_on(tx, ticket, &next, &fence.view().proposals()[..ordinal])
+                    .await?)
+        {
+            return Ok(None);
         }
         pending_seen = true;
         if outcome.uncertain() && resolution.is_none() {
@@ -1546,6 +1667,114 @@ async fn reconcile_phase(
     Ok(Some(Reconciled { next, readiness }))
 }
 
+fn remember_refused_create(
+    ticket: &DurableAppend,
+    draft: &TerminalDraft,
+    refused_creates: &mut std::collections::BTreeMap<String, DraftDependency>,
+) -> Result<()> {
+    if ticket.operation() == "create_record"
+        && draft.installed_disposition == Some(InstalledDisposition::Draft)
+    {
+        let id = ticket.primary_target().ok_or_else(paused)?.to_owned();
+        let dependency = DraftDependency {
+            create_proposal_id: ticket.id().to_owned(),
+            created_record_id: id.clone(),
+        };
+        if refused_creates.insert(id, dependency).is_some() {
+            return Err(paused());
+        }
+    }
+    Ok(())
+}
+
+async fn dependent_disposition_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ticket: &DurableAppend,
+    ordinal: usize,
+    dependency: &DraftDependency,
+    base: &PublicationBase,
+    fence: &JournalFence,
+    owner: replay::WorkingReplayOwner<'_>,
+) -> Result<TerminalDraft> {
+    let parent = base
+        .recovery_dispositions
+        .iter()
+        .find(|draft| draft.proposal_id == dependency.create_proposal_id)
+        .ok_or_else(paused)?;
+    let parent_ordinal = usize::try_from(parent.original_ordinal).map_err(|_| paused())?;
+    let create = fence
+        .view()
+        .proposals()
+        .get(parent_ordinal)
+        .ok_or_else(paused)?;
+    if parent_ordinal >= ordinal
+        || parent.installed_disposition.is_none()
+        || create.id() != dependency.create_proposal_id
+        || create.operation() != "create_record"
+        || create.primary_target() != Some(&dependency.created_record_id)
+        || !ticket.references_created_record(&dependency.created_record_id)
+        || !fence
+            .view()
+            .outcome(ticket.id())
+            .is_some_and(|outcome| outcome.never_attempted())
+    {
+        return Err(paused());
+    }
+    Ok(TerminalDraft {
+        original_ordinal: i64::try_from(ordinal).map_err(|_| paused())?,
+        proposal_id: ticket.id().into(),
+        verified_answer_sha256: parent.verified_answer_sha256.clone(),
+        installed_disposition: Some(installed_disposition_on(tx, ticket, base, owner).await?),
+        dependency: Some(dependency.clone()),
+    })
+}
+
+async fn qualified_survivor_on(
+    tx: &mut sqlx::SqliteConnection,
+    ticket: &DurableAppend,
+    base: &PublicationBase,
+    preceding: &[DurableAppend],
+) -> Result<bool> {
+    // Start with a record-local append. Multi-record and metadata mutations
+    // need proofs of their own inputs before they can pass a draft.
+    let args = ticket.arguments();
+    let Some(target) = ticket.primary_target() else {
+        return Ok(false);
+    };
+    if ticket.operation() != "update_record"
+        || !args["body_append"].is_string()
+        || !args.as_object().is_some_and(|args| {
+            args.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "id" | "body_append"
+                        | "if_body_digest"
+                        | "reason"
+                        | "response_mode"
+                        | "idempotency_key"
+                )
+            })
+        })
+        || preceding
+            .iter()
+            .any(|entry| entry.references_created_record(target))
+    {
+        return Ok(false);
+    }
+    // Replay still checks the current record shape, principal and authority.
+    // A projection or a speculative create alone cannot prove this input.
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM main.kernel_records r
+          JOIN main.content_events e ON e.seq=r.created_seq AND e.record_id=r.id
+          WHERE r.id=? AND e.seq<=? AND e.act<=?)",
+    )
+    .bind(target)
+    .bind(base.native.content_event_seq)
+    .bind(base.native.head_act)
+    .fetch_one(tx)
+    .await?)
+}
+
 /// A later queue receipt may arrive AFTER its accepted delta. Rebind only the
 /// journal revision, with no domain fold, when every changed outcome is already
 /// materialized on this grounded accepted cut. Pending markers cannot be
@@ -1561,7 +1790,9 @@ async fn outcome_phase(
     crate::storage_profile::enforce_write_boundary_on(tx).await?;
     with_handle(tx, |raw| collector.check(raw).map_err(undo_error)).await?;
     audit(tx, shared, previous, fence, owner).await?;
-    if fence.view().has_resolution() {
+    if !previous.resolutions_grounded(fence.view())
+        || (fence.view().has_resolution() && !shared.journal.refusal_drafts())
+    {
         return Err(paused());
     }
     let prefix = usize::try_from(previous.original_prefix).map_err(|_| paused())?;
@@ -1588,6 +1819,13 @@ async fn outcome_phase(
         }
     }
     for ticket in included {
+        if previous
+            .recovery_dispositions
+            .iter()
+            .any(|draft| draft.proposal_id == ticket.id())
+        {
+            continue;
+        }
         let outcome = fence.view().outcome(ticket.id()).ok_or_else(paused)?;
         let pending: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM main._native_working_applied WHERE proposal_id=?)",

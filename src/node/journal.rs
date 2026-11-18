@@ -2144,12 +2144,23 @@ impl Journal {
     /// blocked set transitive also protects creates that themselves depend on
     /// an older parked record. Sequence order remains the only tie breaker.
     pub(super) fn next_pending(&self, merge_only: bool) -> Option<Entry> {
+        self.next_pending_excluding(merge_only, &[])
+    }
+
+    pub(super) fn next_pending_excluding(
+        &self,
+        merge_only: bool,
+        disposed: &[String],
+    ) -> Option<Entry> {
         let entries = self.entries.lock().expect("journal entries");
         let mut ordered: Vec<_> = entries.values().collect();
         ordered.sort_by_key(|e| e.seq);
         let mut blocked = std::collections::HashSet::<String>::new();
         let mut merge_only_blocked = std::collections::HashSet::<String>::new();
         for entry in ordered {
+            if disposed.contains(&entry.id) {
+                continue;
+            }
             let open = matches!(
                 entry.state,
                 EntryState::Pending

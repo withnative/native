@@ -313,7 +313,7 @@ fn check_state(shared: &Shared) -> Result<()> {
 // behind the actual delta, not an accepted-only fallback.
 fn check_admission(shared: &Shared) -> Result<()> {
     shared.guard.check()?;
-    if shared.journal.has_resolution() {
+    if shared.journal.has_resolution() && !shared.journal.refusal_drafts() {
         return Err(paused());
     }
     let state = *shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -764,29 +764,38 @@ impl WorkingManager {
             .map(|published| published.read.clone())
             .ok_or_else(|| Error::engine("working publication unavailable"))
     }
+    pub(crate) async fn original_disposition(
+        &self,
+        id: &str,
+    ) -> Result<Option<(WorkingPublication, Option<&'static str>)>> {
+        let cell = self.shared.publication.read().await;
+        self.shared.guard.while_open(|| {
+            let published = cell.as_ref()?;
+            let entry = published
+                .base
+                .recovery_dispositions
+                .iter()
+                .find(|draft| draft.proposal_id == id)?;
+            let kind = entry.installed_disposition.map(|kind| match kind {
+                InstalledDisposition::Draft if entry.dependency.is_some() => "dependent_draft",
+                InstalledDisposition::Draft => "draft",
+                InstalledDisposition::AppliedElsewhere => "applied_elsewhere",
+            });
+            Some((published.base.publication.clone(), kind))
+        })
+    }
+
     pub(crate) async fn await_terminal_draft(
         &self,
         id: &str,
         deadline: std::time::Instant,
-    ) -> Result<WorkingPublication> {
+    ) -> Result<(WorkingPublication, Option<&'static str>)> {
         loop {
             let notice = self.shared.publication_notice.notified();
             tokio::pin!(notice);
             notice.as_mut().enable();
-            self.shared.guard.check()?;
-            {
-                let cell = self.shared.publication.read().await;
-                if let Some(published) = cell.as_ref().filter(|p| {
-                    p.base
-                        .recovery_dispositions
-                        .iter()
-                        .any(|draft| draft.proposal_id == id)
-                }) {
-                    return self
-                        .shared
-                        .guard
-                        .while_open(|| published.base.publication.clone());
-                }
+            if let Some(disposition) = self.original_disposition(id).await? {
+                return Ok(disposition);
             }
             if matches!(
                 *self.shared.state.lock().unwrap_or_else(|e| e.into_inner()),
@@ -821,6 +830,26 @@ impl WorkingManager {
             .as_ref()
             .map(|p| p.base.original_prefix)
             .ok_or_else(|| Error::engine("working publication unavailable"))
+    }
+    /// Sender-side exclusion is reconstructed after a verified restart.
+    /// Nothing on a network reply or the journal alone can remove an entry
+    /// from the send queue.
+    pub(crate) async fn dispatch_exclusions(&self) -> Result<Vec<String>> {
+        let fence = self.shared.journal.capture().await?;
+        let publication = self.shared.publication.read().await;
+        let base = &publication.as_ref().ok_or_else(paused)?.base;
+        check_state(&self.shared)?;
+        if !self.shared.journal.refusal_drafts()
+            || base.publication.journal_revision != fence.view().revision()
+            || !base.resolutions_grounded(fence.view())
+        {
+            return Err(paused());
+        }
+        Ok(base
+            .recovery_dispositions
+            .iter()
+            .map(|draft| draft.proposal_id.clone())
+            .collect())
     }
     /// A serving-status observation can only pause. It does not manufacture
     /// an unresolved data epoch after that exact cut was already grounded.
@@ -922,6 +951,7 @@ async fn terminal_draft_on(
     base: &PublicationBase,
     owner: replay::WorkingReplayOwner<'_>,
     ordinal: usize,
+    installed_recovery: bool,
 ) -> Result<Option<TerminalDraft>> {
     let Some(answer) = resolution.answer() else {
         return Ok(None);
@@ -952,7 +982,12 @@ async fn terminal_draft_on(
                 "terminal settlement and grounded original differ",
             ));
         }
-        return terminal_draft(ticket, answer, ordinal).map(Some);
+        let disposition = if installed_recovery {
+            Some(installed_disposition_on(tx, ticket, base, owner).await?)
+        } else {
+            None
+        };
+        return terminal_draft(ticket, answer, ordinal, disposition).map(Some);
     }
     let outcome = snapshot
         .lookup(
@@ -995,15 +1030,51 @@ async fn terminal_draft_on(
             "terminal settlement and grounded original differ",
         ));
     }
-    terminal_draft(ticket, answer, ordinal).map(Some)
+    terminal_draft(ticket, answer, ordinal, None).map(Some)
 }
 
-fn terminal_draft(ticket: &DurableAppend, answer: &Value, ordinal: usize) -> Result<TerminalDraft> {
+/// A terminal fact for this install can coexist with a global success. Look up
+/// the global key on the same transaction and require the exact canonical
+/// effect before calling that original applied elsewhere.
+async fn installed_disposition_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ticket: &DurableAppend,
+    base: &PublicationBase,
+    owner: replay::WorkingReplayOwner<'_>,
+) -> Result<InstalledDisposition> {
+    use crate::kernel::original_settlement::{outcome_profile::OutcomeLookup, KeyedOutcome};
+    let key = ticket.arguments()["idempotency_key"]
+        .as_str()
+        .ok_or_else(paused)?;
+    let mut snapshot = owner.outcomes(tx).await?;
+    match snapshot
+        .lookup(ticket.actor(), ticket.operation(), key)
+        .await
+        .map_err(|error| Error::engine(error.code()))?
+    {
+        OutcomeLookup::Typed(KeyedOutcome::Absent) => return Ok(InstalledDisposition::Draft),
+        OutcomeLookup::Typed(KeyedOutcome::Accepted { .. }) => (),
+        _ => return Err(Error::engine("global original outcome is unverified")),
+    }
+    if !materialized_on(tx, ticket, base, owner).await? {
+        return Err(Error::engine("global original effect is unverified"));
+    }
+    Ok(InstalledDisposition::AppliedElsewhere)
+}
+
+fn terminal_draft(
+    ticket: &DurableAppend,
+    answer: &Value,
+    ordinal: usize,
+    installed_disposition: Option<InstalledDisposition>,
+) -> Result<TerminalDraft> {
     use sha2::Digest;
     Ok(TerminalDraft {
         original_ordinal: i64::try_from(ordinal).map_err(|_| paused())?,
         proposal_id: ticket.id().into(),
         verified_answer_sha256: hex::encode(sha2::Sha256::digest(serde_json::to_vec(answer)?)),
+        installed_disposition,
+        dependency: None,
     })
 }
 

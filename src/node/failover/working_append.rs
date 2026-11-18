@@ -410,6 +410,9 @@ impl Failover {
                 }
             }
             let mut journal = scoped.working_journal(binding(scope))?;
+            if self.upstream.config.working_refusal_drafts {
+                journal = journal.with_refusal_drafts()?;
+            }
             let retained_location = journal.location()?;
             let retained = {
                 let fence = journal.capture().await?;
@@ -819,6 +822,16 @@ impl Failover {
                 .await
                 .is_ok_and(|prefix| prefix >= ordinal)
     }
+    pub(super) async fn working_dispatch_exclusions(
+        &self,
+        scope: &CustodyBinding,
+    ) -> Option<Vec<String>> {
+        let active = self.working.active()?;
+        if active.binding != *scope {
+            return None;
+        }
+        active.manager.dispatch_exclusions().await.ok()
+    }
     pub(super) fn working_canonical_changed(&self, scope: &CustodyBinding) {
         if self
             .working
@@ -891,6 +904,7 @@ impl Failover {
         {
             return Err(Error::engine("recovery owner differs"));
         }
+        let mut existing = None;
         if let Some(active) = self.working.active() {
             if active.binding != scope {
                 return Err(Error::engine("recovery working namespace changed"));
@@ -898,11 +912,14 @@ impl Failover {
             active
                 .manager
                 .check_recovery_owner(&binding(&scope), &principal)?;
-            if settle {
+            if self.upstream.config.working_refusal_drafts {
+                existing = active.manager.original_disposition(id).await?;
+            }
+            if settle && existing.is_none() {
                 active.control.requires_undo();
             }
         }
-        let saved = if settle {
+        let saved = if settle && existing.is_none() {
             scoped
                 .settle_working_original(&self.upstream, self, id, &principal, deadline)
                 .await?
@@ -913,20 +930,25 @@ impl Failover {
         if gate::Outage::custody_binding(self).await.as_ref() != Some(&scope) {
             return Err(Error::engine("recovery account changed"));
         }
-        let mut recovered_publication = None;
+        let (mut recovered_publication, mut disposition) = existing
+            .map_or((None, None), |(publication, kind)| {
+                (Some(publication), kind)
+            });
         if let Some(active) = self.working.active() {
             active
                 .manager
                 .check_recovery_owner(&binding(&scope), &principal)?;
-            if settle {
+            if settle && recovered_publication.is_none() {
                 active.control.canonical_changed();
                 if saved
                     .working_resolution_ref()
                     .and_then(|r| r.answer())
                     .is_some_and(|a| a["verdict"] == "unapplied_terminal")
                 {
-                    recovered_publication =
-                        Some(active.manager.await_terminal_draft(id, deadline).await?);
+                    let (publication, kind) =
+                        active.manager.await_terminal_draft(id, deadline).await?;
+                    recovered_publication = Some(publication);
+                    disposition = kind;
                     active
                         .manager
                         .check_recovery_owner(&binding(&scope), &principal)?;
@@ -936,10 +958,12 @@ impl Failover {
         if gate::Outage::custody_binding(self).await.as_ref() != Some(&scope) {
             return Err(Error::engine("recovery account changed"));
         }
-        Ok(
-            json!({"entry_id":saved.id,"operation":original.operation,"idempotency_key":original.operation_key,
+        let mut response = json!({"entry_id":saved.id,"operation":original.operation,"idempotency_key":original.operation_key,
             "original_arguments":original.arguments,"resolution":saved.working_resolution_ref(),
-            "canonical_attempt_reply":saved.reply,"payload_retained":true,"recovered_publication":recovered_publication,"queue":"paused_if_resolution_requested"}),
-        )
+            "canonical_attempt_reply":saved.reply,"payload_retained":true,"recovered_publication":recovered_publication,"queue":"paused_if_resolution_requested"});
+        if let Some(disposition) = disposition {
+            response["disposition"] = json!(disposition);
+        }
+        Ok(response)
     }
 }

@@ -474,6 +474,7 @@ impl Rig {
         });
         let config = NodeConfig {
             working_note_appends: false,
+            working_refusal_drafts: false,
             markdown_folder: None,
             hosted_base_url: format!("http://{address}"),
             home_id: "test-home".into(),
